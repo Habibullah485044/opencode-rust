@@ -3,8 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Root configuration, loaded from TOML.
-/// Precedence: $OPENCODE_RUST_CONFIG file > ~/.config/opencode-rust/config.toml > defaults.
+/// Root configuration, loaded from TOML. Where values come from, strongest
+/// first:
+/// 1. env `OPENCODE_RUST_API_KEY`, `OPENCODE_RUST_BASE_URL`, `OPENCODE_RUST_MODEL`
+///    (each only when not empty);
+/// 2. the config file: `$OPENCODE_RUST_CONFIG` when set (it must exist),
+///    otherwise `~/.config/opencode-rust/config.toml` (skipped when missing);
+/// 3. built-in defaults.
+/// Unknown keys in the file are reported on stderr and ignored.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -292,14 +298,25 @@ impl Default for AgentCfg {
 
 impl Config {
     pub fn load(workspace: &Path) -> Result<Self> {
-        let path = match std::env::var("OPENCODE_RUST_CONFIG") {
-            Ok(p) => PathBuf::from(p),
-            Err(_) => default_config_path(),
+        let explicit = std::env::var("OPENCODE_RUST_CONFIG").ok().filter(|p| !p.trim().is_empty());
+        let path = match &explicit {
+            Some(p) => PathBuf::from(p),
+            None => default_config_path(),
         };
+        // A path the user set on purpose must exist; silently using the
+        // defaults instead hides the mistake.
+        if explicit.is_some() && !path.is_file() {
+            anyhow::bail!("OPENCODE_RUST_CONFIG points to {}, which is not a file", path.display());
+        }
         let mut cfg = if path.is_file() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading config {}", path.display()))?;
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
+            let cfg: Config =
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            for key in unknown_config_keys(&text, &cfg) {
+                eprintln!("warning: {}: unknown key `{key}` (ignored)", path.display());
+            }
+            cfg
         } else {
             Config::default()
         };
@@ -330,6 +347,36 @@ impl Config {
         }
         Ok(u)
     }
+}
+
+/// Keys in the config text that this version does not know (typos, old
+/// names), as dotted paths like `provider.modle` or `mcp.servers[0].argz`.
+pub fn unknown_config_keys(text: &str, cfg: &Config) -> Vec<String> {
+    fn walk(user: &toml::Value, known: &toml::Value, path: &str, out: &mut Vec<String>) {
+        match (user, known) {
+            (toml::Value::Table(u), toml::Value::Table(k)) => {
+                for (key, v) in u {
+                    let here = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+                    match k.get(key) {
+                        Some(kv) => walk(v, kv, &here, out),
+                        None => out.push(here),
+                    }
+                }
+            }
+            (toml::Value::Array(u), toml::Value::Array(k)) => {
+                for (i, (uv, kv)) in u.iter().zip(k).enumerate() {
+                    walk(uv, kv, &format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (Ok(user), Ok(known)) = (text.parse::<toml::Table>(), toml::Value::try_from(cfg)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    walk(&toml::Value::Table(user), &known, "", &mut out);
+    out
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -448,6 +495,20 @@ mod tests {
         assert_eq!(Config::default().agent.context_tokens, 0);
         let c: Config = toml::from_str("[agent]\ncontext_tokens = 8192\n").unwrap();
         assert_eq!(c.agent.context_tokens, 8192);
+    }
+
+    #[test]
+    fn unknown_keys_are_reported() {
+        let text = "[provider]\nmodel = \"m\"\nmodle = \"typo\"\n\
+                    [[mcp.servers]]\nname = \"x\"\ncommand = \"node\"\nargz = []\n\
+                    [colour]\nx = 1\n";
+        let cfg: Config = toml::from_str(text).unwrap();
+        let mut keys = unknown_config_keys(text, &cfg);
+        keys.sort();
+        assert_eq!(keys, ["colour", "mcp.servers[0].argz", "provider.modle"]);
+        let clean = "[provider]\nmodel = \"m\"\nsmall_model = \"s\"\n";
+        let cfg: Config = toml::from_str(clean).unwrap();
+        assert!(unknown_config_keys(clean, &cfg).is_empty());
     }
 }
 

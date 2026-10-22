@@ -1,6 +1,8 @@
 # opencode-rust configuration file
 # Place this at: ~/.config/opencode-rust/config.toml
-# Or set OPENCODE_RUST_CONFIG="path/to/config.toml"
+# Or set OPENCODE_RUST_CONFIG="path/to/config.toml" (that file must exist).
+# OPENCODE_RUST_API_KEY / _BASE_URL / _MODEL, when set, override this file.
+# Unknown keys are reported at startup and ignored.
 
 [provider]
 # OpenAI-compatible API endpoint:
