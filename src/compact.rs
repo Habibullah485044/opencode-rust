@@ -118,7 +118,8 @@ async fn summarize(st: &Shared, transcript: &str, abort: &AtomicBool) -> Result<
             tool_call_id: None,
         },
     ];
-    let client = st.client.lock().await;
+    // B-29: copy the client out of the lock; never hold it while waiting.
+    let client = st.client.lock().await.clone();
     let model = st
         .cfg
         .provider
@@ -126,7 +127,6 @@ async fn summarize(st: &Shared, transcript: &str, abort: &AtomicBool) -> Result<
         .clone()
         .unwrap_or_else(|| client.model.clone());
     let mut stream = client.stream(&model, &msgs, &[]).await?;
-    drop(client);
     let mut text = String::new();
     while let Some(ev) = stream.next().await {
         if abort.load(Ordering::SeqCst) {

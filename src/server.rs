@@ -595,14 +595,14 @@ pub async fn one_shot(
             tool_call_id: None,
         },
     ];
-    let client = st.client.lock().await;
+    // B-29: copy the client out of the lock; never hold it while waiting.
+    let client = st.client.lock().await.clone();
     let model = if prefer_small {
         st.cfg.provider.small_model.clone().unwrap_or_else(|| client.model.clone())
     } else {
         client.model.clone()
     };
     let mut stream = client.stream(&model, &msgs, &[]).await?;
-    drop(client);
     let mut text = String::new();
     while let Some(ev) = stream.next().await {
         if abort.load(Ordering::SeqCst) {
@@ -1130,7 +1130,9 @@ impl AppState {
 
     /// M6: `/model` with no argument — ask the endpoint what it offers.
     pub async fn available_models(&self) -> Vec<String> {
-        self.client.lock().await.list_models().await.unwrap_or_default()
+        // B-29: list with a copy, so the lock is not held during the request.
+        let client = self.client.lock().await.clone();
+        client.list_models().await.unwrap_or_default()
     }
 
     /// M6: `/export` — the session transcript as a standalone markdown file.
@@ -1223,9 +1225,9 @@ pub async fn run_loop(
             return Ok("aborted".into());
         }
         let msgs = build_chat_messages(st, session_id, &opts.system)?;
-        let client = st.client.lock().await;
+        // B-29: copy the client out of the lock; never hold it while waiting.
+        let client = st.client.lock().await.clone();
         let mut stream = client.stream(&client.model, &msgs, &specs).await?;
-        drop(client);
 
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -3815,5 +3817,54 @@ mod b03_tests {
         let err = one_shot(&st, "sys", "hi", &AtomicBool::new(false), false).await.unwrap_err();
         assert!(err.to_string().contains("cut off"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod b29_tests {
+    use super::*;
+
+    /// A request whose prompt is "slow" waits 1.5 s before the provider
+    /// answers. A second, fast request must not wait for it.
+    #[tokio::test]
+    async fn a_slow_provider_call_does_not_block_other_calls() {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: axum::extract::Json<Value>| async move {
+                let user = body["messages"][1]["content"].as_str().unwrap_or("").to_string();
+                if user == "slow" {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+                let chunk = json!({"choices": [{"delta": {"content": user}, "finish_reason": "stop"}]});
+                let payload = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+
+        let st_slow = st.clone();
+        let slow = tokio::spawn(async move {
+            one_shot(&st_slow, "sys", "slow", &AtomicBool::new(false), false).await
+        });
+        // Let the slow call take the lock and send its request first.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        let fast = one_shot(&st, "sys", "fast", &AtomicBool::new(false), false).await.unwrap();
+        let waited = started.elapsed();
+        assert_eq!(fast, "fast");
+        assert!(
+            waited < std::time::Duration::from_millis(1000),
+            "fast call waited {waited:?} for the slow one"
+        );
+        assert_eq!(slow.await.unwrap().unwrap(), "slow");
     }
 }

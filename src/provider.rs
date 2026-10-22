@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 
 /// OpenAI-compatible chat client (works with OpenRouter, Ollama, vLLM,
 /// the user's Cloudflare-tunnel endpoint, etc). Streaming via SSE.
+/// Cheap to clone (B-29): the inner reqwest client shares its pool.
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
