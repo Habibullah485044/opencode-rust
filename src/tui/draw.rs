@@ -169,22 +169,23 @@ pub fn draw(f: &mut Frame, app: &App) {
             lines.push(Line::from(format!("{marker}{l}")).style(style));
         }
     }
-    let total = lines.len() as u16;
-    let view_h = transcript_area.height.saturating_sub(2) as u16;
+    // B-14: scroll by screen rows AFTER wrapping. Counting logical lines
+    // hid the newest output whenever long lines wrapped onto several rows.
+    let inner_w = transcript_area.width.saturating_sub(2);
+    let view_h = transcript_area.height.saturating_sub(2) as usize;
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total = paragraph.line_count(inner_w); // rows; no block set yet
     let max_scroll = total.saturating_sub(view_h);
-    let start = max_scroll.saturating_sub(app.scroll);
-    let visible: Vec<Line> = lines
-        .into_iter()
-        .skip(start as usize)
-        .take(view_h as usize)
-        .collect();
+    app.scroll_max.set(max_scroll.min(u16::MAX as usize) as u16);
+    let up = (app.scroll as usize).min(max_scroll);
+    let top = max_scroll - up; // first row shown
     // The title counts the scrollback so nobody wonders where the rest went.
-    let title = if start > 0 {
-        format!(" transcript · ↑{start} earlier ")
+    let title = if top > 0 {
+        format!(" transcript · ↑{top} earlier ")
     } else {
         " transcript ".to_string()
     };
-    let transcript = Paragraph::new(visible)
+    let transcript = paragraph
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -192,7 +193,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(FB_BORDER))
                 .title(title),
         )
-        .wrap(Wrap { trim: false });
+        .scroll((top.min(u16::MAX as usize) as u16, 0));
     f.render_widget(transcript, transcript_area);
 
     // Input

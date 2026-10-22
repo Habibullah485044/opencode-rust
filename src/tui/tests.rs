@@ -803,3 +803,30 @@
         assert!(!super::release_terminal(), "second restore is a no-op");
         assert!(!super::TERMINAL_TAKEN.load(Ordering::SeqCst));
     }
+
+    #[test]
+    fn transcript_shows_the_newest_line_when_lines_wrap() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        for i in 0..30 {
+            let long = "lorem ipsum dolor sit amet ".repeat(8);
+            app.push(EntryKind::Assistant, format!("para {i}: {long}"));
+        }
+        app.push(EntryKind::Assistant, "FINAL-LINE");
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String =
+            terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("FINAL-LINE"), "newest line visible at the bottom");
+        assert!(text.contains("earlier"), "scrollback counted in rows");
+        // ↑ stops at the real top, so ↓ works again right away.
+        for _ in 0..10_000 {
+            app.on_key(key(KeyCode::Up));
+        }
+        assert_eq!(app.scroll, app.scroll_max.get());
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String =
+            terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("para 0:"), "top of the transcript reachable");
+        assert!(!text.contains("FINAL-LINE"));
+    }

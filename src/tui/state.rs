@@ -272,6 +272,10 @@ pub struct App {
     pub should_quit: bool,
     pub session_id: Option<String>,
     pub scroll: u16,
+    /// B-14: how far the transcript can scroll up, in screen rows. `draw`
+    /// sets it every frame (it knows the wrapped height); `on_key` caps
+    /// `scroll` with it.
+    pub scroll_max: std::cell::Cell<u16>,
     /// M2: current plan/build mode (display; core holds authority).
     pub mode: AgentMode,
     /// M3: inline /edit preview awaiting accept, and Tab jump state.
@@ -318,6 +322,7 @@ impl App {
             should_quit: false,
             session_id: None,
             scroll: 0,
+            scroll_max: std::cell::Cell::new(0),
             mode: AgentMode::Build,
             pending_edit: None,
             jumps: JumpTracker::default(),
@@ -577,12 +582,21 @@ impl App {
                 self.cursor = self.input.chars().count();
                 None
             }
+            // B-14: scroll in screen rows, never past the top of the transcript.
             KeyCode::Up => {
-                self.scroll = self.scroll.saturating_add(1);
+                self.scroll = self.scroll.saturating_add(1).min(self.scroll_max.get());
                 None
             }
             KeyCode::Down => {
                 self.scroll = self.scroll.saturating_sub(1);
+                None
+            }
+            KeyCode::PageUp => {
+                self.scroll = self.scroll.saturating_add(10).min(self.scroll_max.get());
+                None
+            }
+            KeyCode::PageDown => {
+                self.scroll = self.scroll.saturating_sub(10);
                 None
             }
             KeyCode::Char(c) => {
