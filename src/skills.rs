@@ -2,7 +2,8 @@
 //! AGENTS.md project-instruction loader.
 //!
 //! Layout (all optional, missing dirs are just empty):
-//! - `<workspace>/.opencode/skills/**.md`  and user `~/.config/opencode-rust/skills/**.md`
+//! - `<workspace>/.opencode/skills/*.md` and `*/SKILL.md` (one level deep),
+//!   and the same under the user dir `~/.config/opencode-rust/skills/`
 //! - `<workspace>/.opencode/commands/*.md` and user `~/.config/opencode-rust/commands/*.md`
 //! - `<workspace>/AGENTS.md`
 //!
@@ -46,25 +47,34 @@ pub fn parse_md(path: &Path, text: &str) -> Doc {
 
     let mut name = fallback_name.clone();
     let mut description = String::new();
+    // Editors on Windows often start UTF-8 files with a byte-order mark.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut body = text;
 
-    if let Some(rest) = text.strip_prefix("---").and_then(|r| {
-        let end = r.find("\n---")?;
-        Some((r[..end].to_string(), &r[end + 4..]))
-    }) {
-        let (fm, rest) = rest;
-        // Body starts after the closing --- line.
-        let body_start = rest.find('\n').map(|i| i + 1).unwrap_or(rest.len());
-        let body_text = &rest[body_start..];
-        for line in fm.lines() {
-            if let Some((k, v)) = line.split_once(':') {
-                let v = v.trim();
+    if let Some((fm, body_text)) = split_frontmatter(text) {
+        let lines: Vec<&str> = fm.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            if let Some((k, v)) = lines[i].split_once(':') {
+                let mut v = v.trim().to_string();
+                // `key: >` or `key: |` (YAML block): the value is on the
+                // following indented lines.
+                if matches!(v.as_str(), ">" | "|" | ">-" | "|-") {
+                    let mut parts = Vec::new();
+                    while i + 1 < lines.len() && lines[i + 1].starts_with([' ', '\t']) {
+                        i += 1;
+                        parts.push(lines[i].trim());
+                    }
+                    v = parts.join(" ");
+                }
+                let v = unquote(&v);
                 match k.trim() {
                     "name" if !v.is_empty() => name = v.to_string(),
                     "description" if !v.is_empty() => description = v.to_string(),
                     _ => {}
                 }
             }
+            i += 1;
         }
         body = body_text;
     }
@@ -75,10 +85,35 @@ pub fn parse_md(path: &Path, text: &str) -> Doc {
             .lines()
             .map(str::trim)
             .find(|l| !l.is_empty())
-            .map(|l| l.trim_start_matches("# ").chars().take(120).collect())
+            .map(|l| l.trim_start_matches('#').trim_start().chars().take(120).collect())
             .unwrap_or_default();
     }
     Doc { name, description, body, path: path.to_path_buf() }
+}
+
+/// `---` as the whole first line, then everything up to the next line that
+/// is exactly `---` (trailing spaces allowed). Returns (frontmatter, body).
+fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("---")?;
+    let rest = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n'))?;
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end() == "---" {
+            return Some((&rest[..offset], &rest[offset + line.len()..]));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Strip one pair of matching quotes: `"Deploy the app"` → `Deploy the app`.
+fn unquote(v: &str) -> &str {
+    let b = v.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        &v[1..v.len() - 1]
+    } else {
+        v
+    }
 }
 
 /// Load every `*.md` directly under `dir`, plus `*/SKILL.md` in subdirectories.
@@ -299,6 +334,19 @@ pub fn install_skill(base: &Path, doc: &Doc) -> Result<PathBuf> {
         })
         .collect();
     let path = dir.join(format!("{safe}.md"));
+    // "my skill" and "my-skill" share one file name. Updating the same
+    // skill is fine; silently replacing a different one is not.
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let other = parse_md(&path, &existing);
+        if other.name != doc.name {
+            anyhow::bail!(
+                "{} already holds the skill `{}`; rename `{}` before installing it",
+                path.display(),
+                other.name,
+                doc.name
+            );
+        }
+    }
     // Frontmatter values are single lines: a line break in a name or a
     // description must not add keys or end the block early.
     let one_line = |s: &str| s.replace(['\r', '\n'], " ").trim().to_string();
@@ -534,5 +582,38 @@ mod tests {
         std::fs::write(ws.join("AGENTS.md"), "   \n").unwrap();
         assert!(init_agents_md(&ws).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn parser_handles_bom_quotes_and_blocks() {
+        let doc = parse_md(
+            Path::new("x.md"),
+            "\u{feff}---\nname: \"ship\"\ndescription: >\n  Deploy the app\n  safely\n---\nBody.",
+        );
+        assert_eq!(doc.name, "ship");
+        assert_eq!(doc.description, "Deploy the app safely");
+        assert_eq!(doc.body, "Body.");
+        let doc = parse_md(Path::new("y.md"), "## Second level\ntext");
+        assert_eq!(doc.description, "Second level");
+    }
+
+    #[test]
+    fn frontmatter_ends_only_at_a_whole_dash_line() {
+        let doc = parse_md(Path::new("z.md"), "---\nname: z\n---- not the end\n---\nreal body");
+        assert_eq!(doc.name, "z");
+        assert_eq!(doc.body, "real body");
+    }
+
+    #[test]
+    fn install_never_overwrites_a_different_skill() {
+        let base = tmp("collide");
+        let body = "A substantial body with real instructions for the agent to follow.".to_string();
+        let a = Doc { name: "my skill".into(), description: "A".into(), body: body.clone(), path: "a.md".into() };
+        let b = Doc { name: "my-skill".into(), description: "B".into(), body, path: "b.md".into() };
+        install_skill(&base, &a).unwrap();
+        let err = install_skill(&base, &b).unwrap_err();
+        assert!(err.to_string().contains("already holds"), "{err}");
+        install_skill(&base, &a).expect("re-installing the same skill is fine");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
