@@ -39,6 +39,11 @@ impl MissionKind {
         [Self::Explore, Self::Commit, Self::MergePr, Self::Custom]
     }
 
+    /// B-47: missions that must not change files run in plan mode.
+    pub fn read_only(&self) -> bool {
+        matches!(self, Self::Explore)
+    }
+
     /// What this mission means and how to approach it.
     fn playbook(&self) -> &'static str {
         match self {
@@ -74,19 +79,14 @@ impl MissionKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Effort {
     Low,
     Medium,
+    #[default]
     High,
     Xhigh,
     Max,
-}
-
-impl Default for Effort {
-    fn default() -> Self {
-        Self::High
-    }
 }
 
 impl Effort {
@@ -170,6 +170,19 @@ impl Mission {
     }
 }
 
+/// B-47: `/mission explore effort=max the auth flow` → (Max, "the auth flow").
+/// Without a valid `effort=` word the effort is the default (High).
+pub fn split_effort(goal: &str) -> (Effort, String) {
+    let goal = goal.trim();
+    if let Some(rest) = goal.strip_prefix("effort=") {
+        let (word, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        if let Some(effort) = Effort::parse(word) {
+            return (effort, tail.trim().to_string());
+        }
+    }
+    (Effort::default(), goal.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +233,17 @@ mod tests {
         assert_eq!(labels, vec!["Explore", "Commit", "Merge PR", "Custom"]);
         let efforts: Vec<&str> = Effort::all().iter().map(|e| e.label()).collect();
         assert_eq!(efforts, vec!["Low", "Medium", "High", "Xhigh", "Max"]);
+    }
+}
+
+#[cfg(test)]
+mod b47_tests {
+    use super::*;
+
+    #[test]
+    fn split_effort_reads_the_prefix() {
+        assert_eq!(split_effort("effort=max the auth flow"), (Effort::Max, "the auth flow".into()));
+        assert_eq!(split_effort("max out the cache"), (Effort::High, "max out the cache".into()));
+        assert!(MissionKind::Explore.read_only() && !MissionKind::Commit.read_only());
     }
 }

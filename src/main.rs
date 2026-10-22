@@ -533,11 +533,15 @@ async fn headless_run(
             }
             Cmd::Mission { kind, goal } => {
                 // Same expansion as the TUI: the brief is what runs.
+                let (effort, goal) = opencode_rust::mission::split_effort(&goal);
                 let mission = opencode_rust::mission::Mission {
                     kind: kind.unwrap_or(opencode_rust::mission::MissionKind::Custom),
-                    effort: opencode_rust::mission::Effort::default(),
+                    effort,
                     goal,
                 };
+                if mission.kind.read_only() {
+                    state.set_mode(&session.id, AgentMode::Plan);
+                }
                 // New (B-06): kick_run registers the run in `busy`.
                 state.kick_run(session.id.clone(), mission.briefing()).await;
                 team_spawned = true;
@@ -787,6 +791,13 @@ async fn tui_run(
                         st.kick_run(sid.clone(), content).await;
                     }
                     tui::InputAction::Mission(mission) => {
+                        if mission.kind.read_only() {
+                            st.set_mode(&sid, AgentMode::Plan);
+                            let _ = st.events.send(server::ServerEvent::Note {
+                                session_id: sid.clone(),
+                                text: "explore mission: plan mode (read-only) is on; /build switches back".into(),
+                            });
+                        }
                         // The mission expands into the well-worded brief —
                         // that brief is what the agent runs.
                         st.kick_run(sid.clone(), mission.briefing()).await;
