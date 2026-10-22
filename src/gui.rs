@@ -157,6 +157,14 @@ impl BrowserView {
         !self.url.is_empty() && self.error.is_none()
     }
 
+    /// New (B-11): should the native child view be on screen right now?
+    pub fn wants_native_view(&self) -> bool {
+        self.visible
+            && !self.covered
+            && self.error.is_none()
+            && matches!(self.rect, Some(r) if r.is_usable())
+    }
+
     fn payload(&self) -> serde_json::Value {
         serde_json::json!({
             "url": self.url,
@@ -545,10 +553,7 @@ fn show_browser(wv: &wry::WebView, view: &BrowserView) {
     if let Some(rect) = view.rect.filter(|r| r.is_usable()) {
         let _ = wv.set_bounds(rect.to_wry());
     }
-    let show = view.visible
-        && !view.covered
-        && view.error.is_none()
-        && matches!(view.rect, Some(r) if r.is_usable());
+    let show = view.wants_native_view();
     let _ = wv.set_visible(show);
 }
 
@@ -840,6 +845,8 @@ pub async fn run(
 
     eprintln!("[gui] entering the event loop");
     let st = state.clone();
+    // B-11: the `covered` value the native view got last time.
+    let mut covered_applied = false;
     event_loop.run(move |event, _, control_flow| {
         // While a modal countdown is on screen the loop has to wake up on its
         // own; otherwise a heartbeat-less idle window freezes the timer.
@@ -1068,6 +1075,17 @@ pub async fn run(
                 // A live countdown forces a repaint on every timed wake.
                 if gs.approval.is_some() {
                     changed = true;
+                }
+                // B-11: the approval modal is HTML, and the native preview
+                // view paints above all HTML. Hide the view while a modal is
+                // open and bring it back after — before the page repaints.
+                let covered = gs.approval.is_some();
+                if covered != covered_applied {
+                    covered_applied = covered;
+                    gs.browser.covered = covered;
+                    if let Some(wv) = &browser_webview {
+                        show_browser(wv, &gs.browser);
+                    }
                 }
                 if changed {
                     paint(&webview, &gs);
@@ -1606,6 +1624,29 @@ mod tests {
         });
         settle_approval(&mut g, "apr_1", true);
         assert_eq!(g.approval.as_ref().map(|a| a.id.as_str()), Some("apr_2"));
+    }
+
+    /// B-11: while the approval modal is open the native view must be hidden.
+    #[test]
+    fn approval_modal_hides_the_native_view_until_answered() {
+        let mut g = GuiState::new();
+        g.browser.open("http://localhost:3000");
+        g.browser.rect = Some(PanelRect { x: 800.0, y: 40.0, w: 400.0, h: 600.0 });
+        assert!(g.browser.wants_native_view());
+        // Built from JSON so the test works with or without optional fields
+        // (task B-22 adds `preview` to this event).
+        let ask: ServerEvent = serde_json::from_value(serde_json::json!({
+            "type": "approval_needed",
+            "session_id": "s",
+            "approval_id": "apr_1",
+            "tool": "bash",
+            "detail": "ls"
+        }))
+        .unwrap();
+        g.on_event(ask);
+        assert!(!g.browser.wants_native_view(), "the modal must not be painted over");
+        settle_approval(&mut g, "apr_1", true);
+        assert!(g.browser.wants_native_view(), "the page comes back after answering");
     }
 
     #[test]
