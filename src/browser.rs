@@ -184,8 +184,9 @@ pub fn valid_ref(r: &str) -> bool {
 /// JS installed into the panel on every navigation. It is the whole reason a
 /// snapshot stays small: the page does the pruning, we never receive raw HTML.
 ///
-/// Refs (`data-habi-ref`) are only valid for the snapshot that produced them;
-/// a navigation wipes the document, so a stale ref fails loudly instead of
+/// Refs (`data-habi-ref`) are only valid for the snapshot that produced them:
+/// every snapshot first removes all old refs, and click/type refuse an
+/// element that is gone or hidden, so a stale ref fails loudly instead of
 /// clicking something the model did not mean.
 pub const RUNTIME_JS: &str = r#"(function () {
   if (window.__habi) return;
@@ -217,6 +218,10 @@ pub const RUNTIME_JS: &str = r#"(function () {
   }
   window.__habi = {
     snapshot: function () {
+      // Refs from an older snapshot must not survive: clear them first, so
+      // every ref names exactly one element of THIS snapshot.
+      var old = document.querySelectorAll('[data-habi-ref]');
+      for (var k = 0; k < old.length; k++) old[k].removeAttribute('data-habi-ref');
       var nodes = document.querySelectorAll(SEL);
       var out = [];
       for (var i = 0; i < nodes.length && out.length < 100; i++) {
@@ -248,6 +253,7 @@ pub const RUNTIME_JS: &str = r#"(function () {
     click: function (ref) {
       var el = document.querySelector('[data-habi-ref="' + ref + '"]');
       if (!el) throw new Error('no element with ref ' + ref + ' — take a fresh snapshot');
+      if (!vis(el)) throw new Error('element ' + ref + ' is no longer visible — take a fresh snapshot');
       el.scrollIntoView({ block: 'center' });
       if (el.focus) el.focus();
       el.click();
@@ -256,6 +262,7 @@ pub const RUNTIME_JS: &str = r#"(function () {
     type: function (ref, text, submit) {
       var el = document.querySelector('[data-habi-ref="' + ref + '"]');
       if (!el) throw new Error('no element with ref ' + ref + ' — take a fresh snapshot');
+      if (!vis(el)) throw new Error('element ' + ref + ' is no longer visible — take a fresh snapshot');
       el.scrollIntoView({ block: 'center' });
       el.focus();
       var proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -579,5 +586,27 @@ globalThis.document = {
         }
         assert!(out.contains("alice"), "ordinary values are still reported: {out}");
         assert!(out.contains("[hidden]"), "the model is told the field has a value: {out}");
+    }
+
+    #[test]
+    fn refs_from_an_older_snapshot_never_win() {
+        let prelude = format!(
+            "{FAKE_DOM}\nvar FIELDS = [\n\
+             field('BUTTON', 'submit', '', {{ 'aria-label': 'Old' }}),\n\
+             field('BUTTON', 'submit', '', {{ 'aria-label': 'New' }})\n];"
+        );
+        let Some(out) = run_runtime_in_node(
+            &prelude,
+            "window.__habi.snapshot();\n\
+             FIELDS[0].hidden = true;\n\
+             var snap = window.__habi.snapshot();\n\
+             console.log(JSON.stringify(snap.nodes));\n\
+             console.log(JSON.stringify(window.__habi.click(snap.nodes[0].ref)));",
+        ) else {
+            return;
+        };
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("\"name\":\"New\"") && !lines[0].contains("Old"), "{out}");
+        assert!(lines[1].contains("\"name\":\"New\""), "click hit the newest snapshot's element: {out}");
     }
 }
