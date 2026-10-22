@@ -28,29 +28,33 @@ written so a coding AI can follow it one task at a time.
 
 ## Progress status
 
-*Updated 23 Oct 2026, checked against the code in `opencode-rust/` (git `523866a`).*
+*Updated 23 Oct 2026, checked against the code in `opencode-rust/` (git `960528b`).*
 
-**76 of 92 tasks done (83%).** Each finished task has its own commit; its code
+**91 of 92 tasks done (99%).** Each finished task has its own commit; its code
 changes and new tests are in the code.
 
 - **Build:** `cargo build` gives 0 warnings (Windows), with and without the `gui` feature.
-- **Tests:** `cargo test` gives **373 passed, 0 failed** on Windows (366 library + 7 binary); 330 with `--no-default-features`. `tests/gui/run.sh` (Edge) gives 0 FAIL (94 + 16 assertions). Seven new tests are Unix-only and do not run here.
-- **Next task:** `P-04` (Reuse gate: fewer false hints, one walk, honest comment), then `B-41` → `B-42` → `B-43` …
+- **Tests:** `cargo test` gives **397 passed, 0 failed** on Windows (390 library + 7 binary); 348 with `--no-default-features`. `tests/gui/run.sh` (Edge) gives 0 FAIL (94 + 16 assertions). `cargo build --release` is clean.
+- **Next task:** `H-06` (Remove the unused `separate_demo/` crate)
+- **Waiting on you:** H-06 (delete `separate_demo/`). Its step 2 says to ask first. Nothing
+  but `.gitignore` uses the folder.
 - **Not checked yet:** the manual checks in finished tasks that need a real terminal, the
   desktop window, MCP servers, Kaggle or real model APIs. Headless checks were run on the
-  real binary against local mock servers where a task allowed it. CI (H-03) has not run on
-  GitHub, because nothing was pushed.
-- **Timing-sensitive test:** `mcp::b19_startup_tests::servers_start_at_the_same_time` (B-19)
-  failed once while the whole suite ran on this machine (2.83 s against a 2.7 s limit) and
-  passed every time on its own and in later full runs.
+  real binary against local mock servers wherever a task allowed it. CI (H-03) has not run on
+  GitHub, because nothing was pushed. Linux/macOS were never run (7 Unix-only tests).
 - **Branches:** earlier sessions made one chained `task/…` branch per task. `main` stops at
   H-03; all later work is on the checked-out branch `task/b-06`, which `main` can
   fast-forward to. Nothing was pushed.
-- **Change from the plan:** S-14's test repo sets `core.autocrlf=false`, because Git for
-  Windows checks files out with CRLF and two byte-exact asserts failed. The product code is
-  as written in the plan.
-- **Gap seen, not fixed:** `/ponytail <unknown level>` (P-05) is sent to the model as chat,
-  although its code comment calls it a usage error.
+- **Written from prose (no full code in the plan):** F-12 (whole task), B-41 steps 1–5, 7, 8,
+  B-49, and H-04's checklist review. Their tests were written to the plan's "Tests to add".
+- **Changes from the plan:** S-14's test repo sets `core.autocrlf=false` (Git for Windows
+  checks out with CRLF). B-41's help/edit-preview scrolling also stops at the end (as B-14
+  does for the transcript). F-11's `build_state` step was done by hand because P-05 had
+  changed its "Find" lines. H-04 also ticked items that F-04, F-09 and F-13 built.
+- **Gaps seen, not fixed:** `/ponytail <unknown level>` goes to the model as chat (P-05);
+  `preview <url> --exit-after-ms N` never closes when the page fails to load (also before
+  B-46); the timing test `servers_start_at_the_same_time` (B-19) sometimes fails under full
+  load (2.84 s against a 2.7 s limit) and passes on reruns.
 
 | Phase | Done | Status |
 |---|---|---|
@@ -58,7 +62,7 @@ changes and new tests are in the code.
 | Phase 2 — Stop losing work, make runs reliable | 28 / 28 | done |
 | Phase 3 — Quality: remaining bugs and ponytail fixes | 26 / 26 | done |
 | Phase 4 — New features | 8 / 8 | done |
-| Phase 5 — Polish | 0 / 16 | not started |
+| Phase 5 — Polish | 15 / 16 | in progress |
 
 The **Status** column in 2.2 lists every task, with the commit that did it.
 `PLAN_PROGRESS.md` has one line per finished task with its test count and anything that was not checked.
@@ -532,19 +536,19 @@ Do the phases in order. Inside a phase, go left to right. A task's
 | B-38 | db: transactions, foreign keys, schema parity, readable parse errors, better ids | P2 | M | S-07 (moves the approvals table), B-05 (replaces `apply_compaction`). The Find blocks below are not touched by either task, so the order does not matter for applying; do them first for a clean history. | ✅ done (`cfdf392`) |
 | B-39 | gitsnap: clear redo on a new run, pop only after success, stable folder hash | P2 | M | S-14 (it validates stack ids, which this task relies on when it deletes snapshot folders; it also makes `restore_manifest` report problems instead of hiding them) | ✅ done (`67fd1ca`) |
 | B-40 | browser.rs: element refs from an older snapshot can hit the wrong element | P2 | S | S-13 (its test helpers `FAKE_DOM` and `run_runtime_in_node` are reused here) | ✅ done (`85485bb`) |
-| B-41 | TUI polish: scrolling overlays, visible selections, colors, small display bugs | P3 | M | B-15 | ⬜ to do |
-| B-42 | GUI: panel reopens itself, replay differences, empty sessions pile up | P3 | S | — | ⬜ to do |
-| B-43 | webfetch `html_to_text`: double decoding, slow on broken HTML | P3 | S | — | ⬜ to do |
-| B-44 | skills.rs: frontmatter parser fixes and no silent overwrite on install | P3 | S | — | ⬜ to do |
-| B-45 | config: warn on unknown keys, fail on a missing `OPENCODE_RUST_CONFIG` file, honest docs | P3 | S | — | ⬜ to do |
-| B-46 | preview.rs (standalone window): navigation filter and safe logging | P3 | S | — | ⬜ to do |
-| B-47 | Missions: Explore read-only, CLI effort, derived Default | P3 | S | — | ⬜ to do |
-| B-48 | No stderr output while the TUI runs; git off the async threads | P3 | S | — | ⬜ to do |
-| B-49 | Inline edit leftovers: CRLF files, size check first, cancel, test folders | P3 | S | B-02, B-06 | ⬜ to do |
+| B-41 | TUI polish: scrolling overlays, visible selections, colors, small display bugs | P3 | M | B-15 | ✅ done (`8572561`) |
+| B-42 | GUI: panel reopens itself, replay differences, empty sessions pile up | P3 | S | — | ✅ done (`43e6007`) |
+| B-43 | webfetch `html_to_text`: double decoding, slow on broken HTML | P3 | S | — | ✅ done (`df07076`) |
+| B-44 | skills.rs: frontmatter parser fixes and no silent overwrite on install | P3 | S | — | ✅ done (`ba3fc6e`) |
+| B-45 | config: warn on unknown keys, fail on a missing `OPENCODE_RUST_CONFIG` file, honest docs | P3 | S | — | ✅ done (`59b6524`) |
+| B-46 | preview.rs (standalone window): navigation filter and safe logging | P3 | S | — | ✅ done (`8b4d131`) |
+| B-47 | Missions: Explore read-only, CLI effort, derived Default | P3 | S | — | ✅ done (`63791d8`) |
+| B-48 | No stderr output while the TUI runs; git off the async threads | P3 | S | — | ✅ done (`448b8f9`) |
+| B-49 | Inline edit leftovers: CRLF files, size check first, cancel, test folders | P3 | S | B-02, B-06 | ✅ done (`60da573`) |
 | P-01 | Laziness meter counts only successful calls (and reads the right edit keys) | P2 | S | — | ✅ done (`831134b`) |
 | P-02 | Automatic review only when files really changed | P2 | M | — | ✅ done (`d3f0541`) |
 | P-03 | No automatic review after an abort | P2 | S | — | ✅ done (`4f39520`) |
-| P-04 | Reuse gate: fewer false hints, one walk, honest comment | P3 | M | — | ⏭️ next |
+| P-04 | Reuse gate: fewer false hints, one walk, honest comment | P3 | M | — | ✅ done (`de83b3f`) |
 | P-05 | Add the `/ponytail lite\|full\|ultra\|off` command the prompt promises | P2 | M | B-27 (order only: B-27 edits the same lines in `src/subagent.rs`; apply it first if you do it) | ✅ done (`94119f1`) |
 | F-01 | Retry the provider request with backoff (429 / 5xx / connection errors) | P1 | M | — | ✅ done (`5bb6ae7`) |
 | F-02 | Native Anthropic Messages API provider | P2 | L | F-01 (`send_with_retry`, `from_cfg`), B-08 (Stage 4 edits its heartbeat code); B-04 recommended first | ✅ done (`c8887db`) |
@@ -556,15 +560,15 @@ Do the phases in order. Inside a phase, go left to right. A task's
 | F-08 | Verification loop (`agent.verify_command`) | P2 | M | — | ✅ done (`c4bf79f`) |
 | F-09 | Loop guard: refuse the third identical tool call in a row | P2 | M | — | ✅ done (`c134ce5`) |
 | F-10 | Context7 + ast-grep MCP setup (config, docs, skill), Serena note | P3 | S | B-19 (start-up time limits, provider-safe tool names), B-20 (parallel MCP calls) | ✅ done (`523866a`) |
-| F-11 | Persist todos in SQLite | P3 | M | — | ⬜ to do |
-| F-12 | HTTP API parity: mode, model, permission mode, approvals list, rename/delete | P3 | M | S-01, B-06, B-09 | ⬜ to do |
-| F-13 | GUI release polish: WebView2-missing dialog, single-instance guard | P3 | S | F-04 (only its `Cargo.toml` step: the Windows-only `windows` dependency with the `Win32_UI_WindowsAndMessaging` feature) | ⬜ to do |
+| F-11 | Persist todos in SQLite | P3 | M | — | ✅ done (`900d437`) |
+| F-12 | HTTP API parity: mode, model, permission mode, approvals list, rename/delete | P3 | M | S-01, B-06, B-09 | ✅ done (`7acdd6d`) |
+| F-13 | GUI release polish: WebView2-missing dialog, single-instance guard | P3 | S | F-04 (only its `Cargo.toml` step: the Windows-only `windows` dependency with the `Win32_UI_WindowsAndMessaging` feature) | ✅ done (`6dcf53a`) |
 | H-01 | Add README.md, LICENSE and NOTICE | P1 | S | H-02 (the README mentions `--no-default-features`) | ✅ done (`a96d420`) |
 | H-02 | Make the desktop GUI an optional cargo feature | P1 | S | — | ✅ done (`feab2a4`) |
 | H-03 | Add GitHub Actions CI (Linux + Windows) | P1 | S | B-17 (otherwise the Linux job fails on a Windows-only test), H-02 (for the "core only" job) | ✅ done (`44e663d`) |
-| H-04 | Bring GOALS.md up to date | P3 | S | — | ⬜ to do |
-| H-05 | tests/gui/run.sh: also run on Linux/macOS | P3 | S | — | ⬜ to do |
-| H-06 | Remove the unused `separate_demo/` crate | P3 | S | — | ⬜ to do |
+| H-04 | Bring GOALS.md up to date | P3 | S | — | ✅ done (`f10a169`) |
+| H-05 | tests/gui/run.sh: also run on Linux/macOS | P3 | S | — | ✅ done (`960528b`) |
+| H-06 | Remove the unused `separate_demo/` crate | P3 | S | — | ⏭️ next |
 
 Totals: S = 19, B = 49, P = 5, F = 13, H = 6 — 92 tasks.
 
