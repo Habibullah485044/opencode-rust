@@ -311,6 +311,45 @@
   ok("code blocks get a Copy button without inline onclick",
     !!copyBtn && !copyBtn.hasAttribute("onclick") && !!copyBtn.getAttribute("data-copy"));
 
+  // --- Transcript look: Markdown paragraphs and tool steps ---
+  function basePage0() {
+    return { url: "", title: "", can_back: false, can_forward: false, loading: false, error: null, visible: false };
+  }
+  var md = payload(basePage0());
+  md.entries = [{ k: "a", t: "one\ntwo\n\nthree\n\n1. a\n2. b" }];
+  window.render(md);
+  var mdBox = document.querySelector("#log .e-bubble-a");
+  ok("blank lines end a paragraph instead of adding <br> rows",
+    mdBox.querySelectorAll("p").length === 2 && mdBox.innerHTML.indexOf("<br><br>") < 0, mdBox.innerHTML);
+  ok("consecutive lines stay one paragraph", /one<br>two/.test(mdBox.querySelector("p").innerHTML));
+  ok("numbered lists render as <ol>", mdBox.querySelectorAll("ol li").length === 2);
+
+  var steps = payload(basePage0());
+  steps.busy = true;
+  steps.entries = [
+    { k: "w", t: "⏺ read(src/a.rs)" }, { k: "w", t: "  ✓ read" },
+    { k: "w", t: "⏺ bash(cargo test)" }, { k: "w", t: "  ✗ bash" },
+    { k: "w", t: "⏺ grep(todo)" }
+  ];
+  window.render(steps);
+  var cards = document.querySelectorAll("#log .tool-card");
+  ok("a call and its result are one step", cards.length === 3, cards.length);
+  ok("a finished step shows ok", cards[0].classList.contains("ok"));
+  ok("a failed step shows fail", cards[1].classList.contains("fail"));
+  ok("an open step spins while the run is busy", cards[2].classList.contains("run"));
+  ok("live result rows are hidden", document.querySelectorAll("#log .tool-res.has-out").length === 0);
+  ok("neighbouring steps stack", document.querySelectorAll("#log .chain-up").length === 2);
+  steps.busy = false;
+  window.render(steps);
+  ok("an open step stops spinning when the run ends",
+    document.querySelectorAll("#log .tool-card")[2].classList.contains("idle"));
+  var replay = payload(basePage0());
+  replay.entries = [{ k: "w", t: "⏺ bash(ls)" }, { k: "w", t: "  ✓ Cargo.toml\nsrc" }];
+  window.render(replay);
+  ok("a replayed result shows its output under the step",
+    !!document.querySelector("#log .tool-res.has-out") &&
+    document.querySelector("#log .tool-card").classList.contains("ok"));
+
   // --- Permission mode selector: default / manual / turbo ---
   var basePage = { url: "", title: "", can_back: false, can_forward: false, loading: false, error: null, visible: false };
   function withMode(mode) {
