@@ -260,7 +260,7 @@ COMMANDS (in TUI, most also headless — type / for the palette, F1 for the refe
   /new             Start a fresh session
   /clear           Clear the transcript view (history kept)
   /model [id]      Show the active model, or switch to <id>
-  /export [path]   Write the transcript to markdown
+  /export [--force] [path]  Transcript to markdown, inside the workspace
   /todos           Show this session's todo list
   /init            Create a starter AGENTS.md
   /team <goal>     Team mode: plan → parallel workers → synthesis
@@ -504,20 +504,11 @@ async fn headless_run(
                 return Ok(());
             }
             Cmd::Export(arg) => {
-                let path = match arg {
-                    Some(p) => {
-                        let p = std::path::PathBuf::from(p);
-                        if p.is_absolute() { p } else { state.workspace.join(p) }
-                    }
-                    None => state
-                        .workspace
-                        .join(format!("opencode-rust-transcript-{}.md", session.id)),
-                };
-                let md = state.transcript_markdown(&session.id);
-                match std::fs::write(&path, md) {
-                    Ok(()) => println!("[export] wrote transcript to {}", path.display()),
+                // New (S-16): inside the workspace only, no silent overwrite.
+                match state.export_transcript(&session.id, arg.as_deref()) {
+                    Ok(path) => println!("[export] wrote transcript to {}", path.display()),
                     Err(e) => {
-                        eprintln!("[export] failed: {e}");
+                        eprintln!("[export] failed: {e:#}");
                         std::process::exit(1);
                     }
                 }
@@ -1068,19 +1059,10 @@ async fn tui_run(
                         });
                     }
                     tui::InputAction::Export(arg) => {
-                        let path = match &arg {
-                            Some(p) => {
-                                let p = std::path::PathBuf::from(p);
-                                if p.is_absolute() { p } else { st.workspace.join(p) }
-                            }
-                            None => st
-                                .workspace
-                                .join(format!("opencode-rust-transcript-{}.md", sid)),
-                        };
-                        let md = st.transcript_markdown(&sid);
-                        let text = match std::fs::write(&path, md) {
-                            Ok(()) => format!("[export] wrote transcript to {}\n", path.display()),
-                            Err(e) => format!("[export] failed: {e}\n"),
+                        // New (S-16): inside the workspace only, no silent overwrite.
+                        let text = match st.export_transcript(&sid, arg.as_deref()) {
+                            Ok(path) => format!("[export] wrote transcript to {}\n", path.display()),
+                            Err(e) => format!("[export] failed: {e:#}\n"),
                         };
                         let _ = st.events.send(server::ServerEvent::AssistantDelta {
                             session_id: sid.clone(),

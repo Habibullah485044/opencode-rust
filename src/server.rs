@@ -1208,6 +1208,77 @@ impl AppState {
         out
     }
 
+    /// New (S-16): first line of every exported transcript. `/export` only
+    /// replaces an existing file that starts with it (or with `--force`).
+    pub const EXPORT_MARKER: &'static str = "<!-- opencode-rust transcript export -->";
+
+    /// New (S-16): `/export [--force] [path]`: write the transcript as
+    /// markdown INSIDE the workspace and return the file written. Refuses
+    /// paths that leave the workspace, and refuses to replace a file that is
+    /// not an earlier export unless `--force` is given.
+    pub fn export_transcript(&self, session_id: &str, arg: Option<&str>) -> Result<PathBuf> {
+        let mut raw = arg.unwrap_or("").trim();
+        let mut force = false;
+        if let Some(rest) = raw.strip_prefix("--force") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                force = true;
+                raw = rest.trim();
+            }
+        }
+        let name = if raw.is_empty() {
+            format!("opencode-rust-transcript-{session_id}.md")
+        } else {
+            raw.to_string()
+        };
+        let path = Self::export_path(&self.workspace, &name)?;
+        if path.exists() && !force {
+            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            if !existing.starts_with(Self::EXPORT_MARKER) {
+                anyhow::bail!(
+                    "{} already exists and is not an earlier export; pick another name or use /export --force {name}",
+                    path.display()
+                );
+            }
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let md = format!("{}\n{}", Self::EXPORT_MARKER, self.transcript_markdown(session_id));
+        std::fs::write(&path, md).with_context(|| format!("writing {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// New (S-16): `raw` as a path inside `workspace`, checked on the text
+    /// only: no `..`, and an absolute path must start with the workspace.
+    fn export_path(workspace: &std::path::Path, raw: &str) -> Result<PathBuf> {
+        use std::path::Component;
+        let p = std::path::Path::new(raw);
+        let rel = if p.is_absolute() {
+            p.strip_prefix(workspace)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "export path must be inside the workspace ({}); use a relative path",
+                        workspace.display()
+                    )
+                })?
+                .to_path_buf()
+        } else {
+            p.to_path_buf()
+        };
+        let mut clean = PathBuf::new();
+        for part in rel.components() {
+            match part {
+                Component::Normal(x) => clean.push(x),
+                Component::CurDir => {}
+                _ => anyhow::bail!("export path must stay inside the workspace (no `..`): {raw}"),
+            }
+        }
+        if clean.as_os_str().is_empty() {
+            anyhow::bail!("export path is empty");
+        }
+        Ok(workspace.join(clean))
+    }
+
     /// M6: `/todos` — the session's todo list as a transcript block.
     pub fn todos_report(&self, session_id: &str) -> String {
         let items = self.todo_store.list_all(session_id);
@@ -2416,6 +2487,38 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// S-16: exports stay inside the workspace and never replace a file that
+    /// is not an earlier export (unless --force).
+    #[tokio::test]
+    async fn export_stays_inside_and_does_not_clobber() {
+        let dir = std::env::temp_dir().join(format!("ocrs-s16-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = build_state_ephemeral(crate::config::Config::default(), dir.clone()).await;
+        let s = st.db.create_session("exp", None).unwrap();
+
+        let first = st.export_transcript(&s.id, None).unwrap();
+        assert!(first.starts_with(&dir), "{}", first.display());
+        st.export_transcript(&s.id, None).expect("an earlier export may be replaced");
+        assert!(st.export_transcript(&s.id, Some("../outside.md")).is_err(), "no `..`");
+        let outside = std::env::temp_dir().join("ocrs-s16-outside.md");
+        assert!(
+            st.export_transcript(&s.id, Some(outside.to_str().unwrap())).is_err(),
+            "no absolute path outside the workspace"
+        );
+
+        std::fs::write(dir.join("notes.md"), "keep me").unwrap();
+        assert!(st.export_transcript(&s.id, Some("notes.md")).is_err(), "a foreign file is kept");
+        assert_eq!(std::fs::read_to_string(dir.join("notes.md")).unwrap(), "keep me");
+        st.export_transcript(&s.id, Some("--force notes.md")).unwrap();
+        let replaced = std::fs::read_to_string(dir.join("notes.md")).unwrap();
+        assert!(replaced.starts_with(AppState::EXPORT_MARKER));
+
+        let nested = st.export_transcript(&s.id, Some("docs/run.md")).unwrap();
+        assert!(nested.is_file(), "missing folders are created");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// P-03: an aborted run gets no automatic review, even after a write.
     #[tokio::test]
