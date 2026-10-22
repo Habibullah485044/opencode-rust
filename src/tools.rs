@@ -119,6 +119,18 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("missing string arg `{key}`"))
 }
 
+/// Environment variables that hold opencode-rust's own secrets (S-05).
+/// Child processes (bash, MCP servers, git) never get them.
+pub const SECRET_ENV_VARS: [&str; 2] = ["OPENCODE_RUST_API_KEY", "OPENCODE_RUST_API_TOKEN"];
+
+/// Remove our secrets from a child process's environment (S-05).
+pub fn scrub_secrets(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    for key in SECRET_ENV_VARS {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
 async fn bash(command: &str, workspace: &Path, timeout: Duration) -> Result<String> {
     #[cfg(windows)]
     let mut child = {
@@ -138,6 +150,8 @@ async fn bash(command: &str, workspace: &Path, timeout: Duration) -> Result<Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // S-05: the shell never sees our provider key or API token.
+    scrub_secrets(&mut child);
     let child = child.spawn().context("spawning shell")?;
     let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
     match result {
@@ -579,5 +593,61 @@ mod b01_tests {
         }
         assert_eq!(std::fs::read_to_string(ws.join("f.txt")).unwrap(), "abc", "file untouched");
         let _ = std::fs::remove_dir_all(&ws);
+    }
+}
+
+#[cfg(test)]
+mod s05_tests {
+    use super::*;
+
+    #[test]
+    fn scrub_secrets_removes_our_keys() {
+        let mut cmd = tokio::process::Command::new("git");
+        scrub_secrets(&mut cmd);
+        let removed: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for key in SECRET_ENV_VARS {
+            assert!(removed.iter().any(|k| k == key), "{key} not removed: {removed:?}");
+        }
+    }
+
+    /// End to end on Unix: the shell started by the bash tool cannot see
+    /// the key even when opencode-rust itself has it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_child_does_not_see_the_api_key() {
+        std::env::set_var("OPENCODE_RUST_API_KEY", "s05-test-secret");
+        let out = bash(
+            "echo \"key=${OPENCODE_RUST_API_KEY:-unset}\"",
+            &std::env::temp_dir(),
+            Duration::from_secs(10),
+        )
+        .await;
+        std::env::remove_var("OPENCODE_RUST_API_KEY");
+        let out = out.unwrap();
+        assert!(out.contains("key=unset"), "{out}");
+        assert!(!out.contains("s05-test-secret"), "{out}");
+    }
+
+    /// Same check on Windows: `cmd /C` must not see the key either.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn bash_child_does_not_see_the_api_key() {
+        std::env::set_var("OPENCODE_RUST_API_KEY", "s05-test-secret");
+        let out = bash(
+            "if defined OPENCODE_RUST_API_KEY (echo LEAKED) else (echo CLEAN)",
+            &std::env::temp_dir(),
+            Duration::from_secs(10),
+        )
+        .await;
+        std::env::remove_var("OPENCODE_RUST_API_KEY");
+        let out = out.unwrap();
+        assert!(out.contains("CLEAN"), "{out}");
+        assert!(!out.contains("LEAKED"), "{out}");
+        assert!(!out.contains("s05-test-secret"), "{out}");
     }
 }

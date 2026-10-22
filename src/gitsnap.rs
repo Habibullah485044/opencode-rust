@@ -47,9 +47,13 @@ fn now_ms() -> i64 {
 
 /// Run git in `cwd`; Err with stderr when git fails.
 pub fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(cwd);
+    // S-05: git hooks never see our provider key or API token.
+    for key in crate::tools::SECRET_ENV_VARS {
+        cmd.env_remove(key);
+    }
+    let out = cmd
         .output()
         .with_context(|| format!("running git {}", args.join(" ")))?;
     if !out.status.success() {

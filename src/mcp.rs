@@ -214,12 +214,15 @@ pub struct McpConn {
 impl McpConn {
     pub async fn spawn(name: &str, cfg: &McpServerCfg) -> Result<Self> {
         let server = sanitize_server(name);
-        let mut child = tokio::process::Command::new(&cfg.command)
-            .args(&cfg.args)
+        let mut cmd = tokio::process::Command::new(&cfg.command);
+        cmd.args(&cfg.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // S-05: MCP servers never see our provider key or API token.
+        crate::tools::scrub_secrets(&mut cmd);
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning `{}`", cfg.command))?;
         let stdin = child.stdin.take().context("mcp child has no stdin")?;
