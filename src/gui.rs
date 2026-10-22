@@ -1581,6 +1581,7 @@ mod tests {
             approval_id: "apr_1".into(),
             tool: "bash".into(),
             detail: "rm -rf build".into(),
+            preview: String::new(),
         });
         let v: serde_json::Value = serde_json::from_str(&g.payload()).unwrap();
         assert_eq!(v["approval"]["id"], "apr_1");
@@ -1601,6 +1602,7 @@ mod tests {
             approval_id: "apr_2".into(),
             tool: "write".into(),
             detail: "src/main.rs".into(),
+            preview: String::new(),
         });
         settle_approval(&mut g, "apr_1", true);
         assert_eq!(g.approval.as_ref().map(|a| a.id.as_str()), Some("apr_2"));

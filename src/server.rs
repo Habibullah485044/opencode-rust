@@ -92,6 +92,11 @@ pub enum ServerEvent {
         approval_id: String,
         tool: String,
         detail: String,
+        /// New (B-22): what the call will change (diff-like text) for
+        /// `write`/`edit`; empty for other tools. `detail` stays the key that
+        /// permission rules and "always allow" match on.
+        #[serde(default)]
+        preview: String,
     },
     /// An approval request is no longer pending (answered, timed out,
     /// aborted, or released by turbo). UIs drop the matching modal.
@@ -1319,7 +1324,16 @@ pub async fn run_loop(
                 Some("not run: the run was aborted".to_string())
             } else if !tool_allowed(mode, opts, &name) {
                 Some("tool blocked: not allowed in this mode/role".to_string())
-            } else if !check_permission(st, session_id, &name, &detail, abort).await {
+            } else if !check_permission_preview(
+                st,
+                session_id,
+                &name,
+                &detail,
+                &approval_preview(&name, &input),
+                abort,
+            )
+            .await
+            {
                 Some("permission denied by user".to_string())
             } else {
                 None
@@ -1743,12 +1757,77 @@ fn tool_detail(st: &Shared, tool: &str, input: &Value) -> String {
     }
 }
 
+/// New (B-22): what a `write`/`edit` call will change, for the approval
+/// prompt. Empty for other tools (their `detail` already says it all).
+pub fn approval_preview(tool: &str, input: &Value) -> String {
+    const MAX_LINES: usize = 40;
+    const MAX_CHARS: usize = 4_000;
+    let field = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+    let mut out = String::new();
+    match tool {
+        "write" => {
+            let content = field("content");
+            out.push_str(&format!(
+                "write {} — {} line(s), {} byte(s)\n",
+                field("path"),
+                content.lines().count(),
+                content.len()
+            ));
+            push_prefixed(&mut out, "+ ", content, MAX_LINES);
+        }
+        "edit" => {
+            let all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+            out.push_str(&format!("edit {}{}\n", field("path"), if all { " (every match)" } else { "" }));
+            push_prefixed(&mut out, "- ", field("old_str"), MAX_LINES / 2);
+            push_prefixed(&mut out, "+ ", field("new_str"), MAX_LINES / 2);
+        }
+        _ => return String::new(),
+    }
+    if out.len() > MAX_CHARS {
+        let mut cut = MAX_CHARS;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("\n… (preview cut)");
+    }
+    out
+}
+
+/// New (B-22): append up to `max_lines` lines of `text`, each with `prefix`.
+fn push_prefixed(out: &mut String, prefix: &str, text: &str, max_lines: usize) {
+    let total = text.lines().count();
+    for line in text.lines().take(max_lines) {
+        out.push_str(prefix);
+        out.push_str(line);
+        out.push('\n');
+    }
+    if total > max_lines {
+        out.push_str(&format!("  … {} more line(s)\n", total - max_lines));
+    }
+}
+
 /// Returns true if the tool call may proceed; blocks on an approval prompt when needed.
+/// (No preview. The run loop calls `check_permission_preview`.)
+#[allow(dead_code)] // used by tests; other callers may use it too
 async fn check_permission(
     st: &Shared,
     session_id: &str,
     tool: &str,
     detail: &str,
+    abort: &AtomicBool,
+) -> bool {
+    check_permission_preview(st, session_id, tool, detail, "", abort).await
+}
+
+/// New (B-22): `check_permission` plus a `preview` of what the call will
+/// change, shown with the approval prompt.
+async fn check_permission_preview(
+    st: &Shared,
+    session_id: &str,
+    tool: &str,
+    detail: &str,
+    preview: &str,
     abort: &AtomicBool,
 ) -> bool {
     // "Always allow" answers belong to this workspace only (S-07).
@@ -1771,6 +1850,13 @@ async fn check_permission(
     if permitted {
         return true;
     }
+    // New (B-22): show what will change, right before the prompt.
+    if !preview.is_empty() {
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: format!("approval needed — {}", preview.trim_end()),
+        });
+    }
 
     let (tx, rx) = oneshot::channel();
     let approval_id = crate::db::new_id("apr");
@@ -1782,6 +1868,7 @@ async fn check_permission(
         approval_id: approval_id.clone(),
         tool: tool.to_string(),
         detail: detail.to_string(),
+        preview: preview.to_string(),
     };
     {
         let mut map = match st.approvals.lock() {
@@ -2182,6 +2269,51 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// B-22: write/edit previews show the change; other tools get none.
+    #[test]
+    fn approval_preview_shows_the_change() {
+        let w = approval_preview("write", &serde_json::json!({"path": "a.txt", "content": "one\ntwo\n"}));
+        assert!(w.contains("write a.txt — 2 line(s)"), "{w}");
+        assert!(w.contains("+ one") && w.contains("+ two"), "{w}");
+        let e = approval_preview(
+            "edit",
+            &serde_json::json!({"path": "b.rs", "old_str": "let x = 1;", "new_str": "let x = 2;"}),
+        );
+        assert!(e.contains("- let x = 1;") && e.contains("+ let x = 2;"), "{e}");
+        assert!(approval_preview("bash", &serde_json::json!({"command": "ls"})).is_empty());
+        let big = "x\n".repeat(500);
+        let w = approval_preview("write", &serde_json::json!({"path": "big.txt", "content": big}));
+        assert!(w.contains("more line(s)"), "long content is shortened: {w}");
+    }
+
+    /// B-22: the prompt carries the preview, and a note shows it first.
+    #[tokio::test]
+    async fn approval_needed_carries_the_preview() {
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:9".into();
+        cfg.provider.model = "stub".into();
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        let mut rx = st.events.subscribe();
+        let st2 = st.clone();
+        let waiting = tokio::spawn(async move {
+            let abort = AtomicBool::new(false);
+            check_permission_preview(&st2, "s1", "write", "a.txt", "write a.txt\n+ hi\n", &abort).await
+        });
+        let id = pending_approval_id(&st).await;
+        assert!(st.decide(&id, false, false));
+        assert!(!waiting.await.unwrap());
+        let (mut note, mut preview) = (String::new(), String::new());
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ServerEvent::Note { text, .. } => note = text,
+                ServerEvent::ApprovalNeeded { preview: p, .. } => preview = p,
+                _ => {}
+            }
+        }
+        assert!(note.contains("+ hi"), "note shows the change: {note}");
+        assert_eq!(preview, "write a.txt\n+ hi\n");
+    }
 
     /// B-08: the heartbeat sends the API key (providers answer 401 without
     /// it) and a 2xx answer reports "up".
