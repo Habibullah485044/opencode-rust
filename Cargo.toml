@@ -49,12 +49,19 @@ bytes = "1"
 tao = { version = "0.37", optional = true }
 wry = { version = "0.57", optional = true }
 
+# F-04 / F-13: Windows-only APIs for the desktop GUI. These MUST stay the
+# versions wry already uses (Cargo.lock: webview2-com 0.39.1, windows 0.62.2),
+# or wry's ICoreWebView2 and ours are different types.
+[target.'cfg(windows)'.dependencies]
+webview2-com = { version = "0.39", optional = true }
+windows = { version = "0.62", optional = true, features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
 [features]
 # `gui` = the desktop window (`--gui`) and the `preview` subcommand.
 # Without it (`cargo build --no-default-features`) the crate needs no
 # GTK/WebKit on Linux; the terminal UI and headless mode still work.
 default = ["gui"]
-gui = ["dep:tao", "dep:wry"]
+gui = ["dep:tao", "dep:wry", "dep:webview2-com", "dep:windows"]
 
 [profile.release]
 opt-level = "z"

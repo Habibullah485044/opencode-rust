@@ -163,7 +163,7 @@ impl Default for PermissionsCfg {
         }
         // Goal B: reading the page and waiting are safe; clicking and typing
         // can submit forms, so they go through the approval modal (D1).
-        for t in ["browser_navigate", "browser_snapshot", "browser_wait"] {
+        for t in ["browser_navigate", "browser_snapshot", "browser_wait", "browser_screenshot"] {
             defaults.insert(t.to_string(), "allow".to_string());
         }
         for t in ["browser_click", "browser_type"] {

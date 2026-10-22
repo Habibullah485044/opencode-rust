@@ -114,6 +114,13 @@ pub fn specs() -> Vec<ToolSpec> {
                 }
             }),
         ),
+        spec(
+            "browser_screenshot",
+            "Save a PNG of what the preview panel shows right now and return its file path \
+             and size (Windows desktop app only). You cannot see the image; use it to hand \
+             the user a file.",
+            json!({"type":"object","properties":{}}),
+        ),
     ]
 }
 
@@ -169,6 +176,7 @@ pub async fn execute(
                 .call("wait", json!({ "selector": selector, "text": text, "ms": ms }))
                 .await
         }
+        "browser_screenshot" => handle.call("screenshot", json!({})).await,
         _ => return None,
     };
     Some(res)
@@ -441,6 +449,21 @@ mod tests {
         });
         let out = h.call("click", json!({"ref":"e1"})).await.unwrap();
         assert!(out.contains("clicked"));
+    }
+
+    /// F-04: the screenshot tool exists and asks the panel for a capture.
+    #[tokio::test]
+    async fn screenshot_tool_asks_the_panel() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Request>();
+        let h = Handle::new(tx, std::sync::Arc::new(|| {}));
+        tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            assert_eq!(req.method, "screenshot");
+            let _ = req.reply.send(Ok("{\"path\":\"x.png\"}".into()));
+        });
+        let out = execute(&h, "browser_screenshot", &json!({})).await.unwrap().unwrap();
+        assert!(out.contains("x.png"));
+        assert!(specs().iter().any(|s| s.function.name == "browser_screenshot"));
     }
 
     #[test]

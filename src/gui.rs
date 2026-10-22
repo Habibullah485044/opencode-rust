@@ -1613,6 +1613,15 @@ impl Bridge {
                 let js = crate::browser::wait_script(id, selector, text, budget);
                 let _ = wv.evaluate_script(&js);
             }
+            "screenshot" => {
+                // F-04: WebView2's own capture; other platforms say so.
+                #[cfg(windows)]
+                capture_screenshot(wv, req.reply);
+                #[cfg(not(windows))]
+                let _ = req.reply.send(Err(
+                    "browser_screenshot needs the Windows desktop app (WebView2)".into(),
+                ));
+            }
             method => {
                 let Some(js) = crate::browser::eval_wrapper(method, &req.input, id) else {
                     let _ = req.reply.send(Err(format!("unknown browser command `{method}`")));
@@ -1693,6 +1702,108 @@ impl Bridge {
             }
         }
     }
+}
+
+/// New (F-04): save a PNG of what the preview shows and answer the tool with
+/// its path. Windows only: WebView2's own `CapturePreview` (no DevTools
+/// protocol needed).
+#[cfg(windows)]
+fn capture_screenshot(
+    wv: &wry::WebView,
+    reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use webview2_com::CapturePreviewCompletedHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
+    use windows::Win32::UI::Shell::SHCreateMemStream;
+    use wry::WebViewExtWindows;
+
+    // SAFETY: SHCreateMemStream has no preconditions; it returns an owned
+    // in-memory COM stream (None when out of memory).
+    let Some(stream) = (unsafe { SHCreateMemStream(None) }) else {
+        let _ = reply.send(Err("could not create a memory stream".into()));
+        return;
+    };
+    // The completion callback and the error path below share the reply:
+    // whichever runs first sends it.
+    let slot = Rc::new(RefCell::new(Some(reply)));
+    let slot_cb = slot.clone();
+    let stream_cb = stream.clone();
+    let handler = CapturePreviewCompletedHandler::create(Box::new(move |result| {
+        let out = result
+            .map_err(|e| format!("capture failed: {e}"))
+            .and_then(|()| read_stream(&stream_cb))
+            .and_then(|png| save_screenshot(&png));
+        if let Some(tx) = slot_cb.borrow_mut().take() {
+            let _ = tx.send(out);
+        }
+        Ok(())
+    }));
+    // SAFETY: the webview, `stream` and `handler` are valid COM objects;
+    // WebView2 calls `handler` once, on this (the UI) thread.
+    let started = unsafe {
+        wv.webview()
+            .CapturePreview(COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, &stream, &handler)
+    };
+    if let Err(e) = started {
+        if let Some(tx) = slot.borrow_mut().take() {
+            let _ = tx.send(Err(format!("capture failed: {e}")));
+        }
+    }
+}
+
+/// New (F-04): read a whole COM stream into memory.
+#[cfg(windows)]
+fn read_stream(stream: &windows::Win32::System::Com::IStream) -> Result<Vec<u8>, String> {
+    use windows::Win32::System::Com::{STREAM_SEEK_END, STREAM_SEEK_SET};
+    let mut size = 0u64;
+    // SAFETY: plain IStream calls on a valid stream; `buf` outlives `Read`.
+    unsafe {
+        stream
+            .Seek(0, STREAM_SEEK_END, Some(&mut size as *mut u64))
+            .map_err(|e| format!("reading the capture: {e}"))?;
+        stream
+            .Seek(0, STREAM_SEEK_SET, None)
+            .map_err(|e| format!("reading the capture: {e}"))?;
+        let mut buf = vec![0u8; size as usize];
+        let mut read = 0u32;
+        stream
+            .Read(buf.as_mut_ptr().cast(), buf.len() as u32, Some(&mut read as *mut u32))
+            .ok()
+            .map_err(|e| format!("reading the capture: {e}"))?;
+        buf.truncate(read as usize);
+        Ok(buf)
+    }
+}
+
+/// New (F-04): store a PNG in the temp folder and describe it for the model.
+/// Platform-neutral, so it is unit-tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn save_screenshot(png: &[u8]) -> Result<String, String> {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if png.len() < 24 || &png[..8] != SIGNATURE {
+        return Err("the capture is not a PNG image".into());
+    }
+    // The IHDR chunk always comes first: width and height, big-endian u32.
+    let width = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+    let height = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+    let dir = std::env::temp_dir().join("opencode-rust-screenshots");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("shot-{stamp}.png"));
+    std::fs::write(&path, png).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "path": path.display().to_string(),
+        "width": width,
+        "height": height,
+        "bytes": png.len(),
+    })
+    .to_string())
 }
 
 fn tracing_boot(boot_ms: u128, addr: std::net::SocketAddr, session: &str) {
@@ -2177,6 +2288,21 @@ mod tests {
             parse_ipc(r#"{"type":"open_dev_server","url":"http://localhost:5173"}"#),
             Some(IpcMsg::OpenDevServer(Some("http://localhost:5173".into())))
         );
+    }
+
+    /// F-04: a capture is saved as a PNG file and described for the model.
+    #[test]
+    fn screenshots_are_saved_and_described() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&640u32.to_be_bytes());
+        png.extend_from_slice(&480u32.to_be_bytes());
+        let out: serde_json::Value = serde_json::from_str(&save_screenshot(&png).unwrap()).unwrap();
+        assert_eq!(out["width"], 640);
+        assert_eq!(out["height"], 480);
+        let path = std::path::PathBuf::from(out["path"].as_str().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), png);
+        let _ = std::fs::remove_file(path);
+        assert!(save_screenshot(b"not a png at all, sorry").is_err());
     }
 
     /// The payload is the whole frontend contract: a missing key here means a
