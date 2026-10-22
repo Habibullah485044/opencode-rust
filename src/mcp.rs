@@ -1008,3 +1008,13 @@ mod b28_list_tests {
         let _ = server.await;
     }
 }
+
+#[cfg(test)]
+mod f10_tests {
+    #[test]
+    fn example_config_still_parses() {
+        let cfg: crate::config::Config =
+            toml::from_str(include_str!("../config.example.toml")).expect("config.example.toml");
+        assert!(cfg.mcp.servers.is_empty(), "MCP entries stay commented out");
+    }
+}

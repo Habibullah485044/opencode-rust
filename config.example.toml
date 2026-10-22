@@ -83,3 +83,27 @@ webfetch = "ask"
 # tool = "read"
 # pattern = ".env"
 # action = "deny"
+
+# MCP servers (optional). Each runs as its own program; its tools reach the
+# model as mcp__<name>__<tool>. Run each command once in a terminal first:
+# the first start downloads packages and can take longer than the 20-second
+# start-up limit. Remove the leading "# " to enable an entry.
+
+# Context7 - current library docs (MIT). Needs Node.js. Optional API key for
+# higher rate limits: set CONTEXT7_API_KEY before starting opencode-rust.
+# Windows (npx is a .cmd script, so start it through cmd):
+# [[mcp.servers]]
+# name = "context7"
+# command = "cmd"
+# args = ["/c", "npx", "-y", "@upstash/context7-mcp"]
+# macOS / Linux:
+# [[mcp.servers]]
+# name = "context7"
+# command = "npx"
+# args = ["-y", "@upstash/context7-mcp"]
+
+# ast-grep - structural code search. Needs the ast-grep CLI and uv (uvx).
+# [[mcp.servers]]
+# name = "ast-grep"
+# command = "uvx"
+# args = ["--from", "git+https://github.com/ast-grep/ast-grep-mcp", "ast-grep-server"]
