@@ -28,16 +28,17 @@ written so a coding AI can follow it one task at a time.
 
 ## Progress status
 
-*Updated 23 Oct 2026, checked against the code in `opencode-rust/` (git `960528b`).*
+*Updated 23 Oct 2026, checked against the code in `opencode-rust/` (git `1549b9b`).*
 
-**91 of 92 tasks done (99%).** Each finished task has its own commit; its code
+**92 of 92 tasks done (100%).** Each finished task has its own commit; its code
 changes and new tests are in the code.
 
 - **Build:** `cargo build` gives 0 warnings (Windows), with and without the `gui` feature.
-- **Tests:** `cargo test` gives **397 passed, 0 failed** on Windows (390 library + 7 binary); 348 with `--no-default-features`. `tests/gui/run.sh` (Edge) gives 0 FAIL (94 + 16 assertions). `cargo build --release` is clean.
-- **Next task:** `H-06` (Remove the unused `separate_demo/` crate)
-- **Waiting on you:** H-06 (delete `separate_demo/`). Its step 2 says to ask first. Nothing
-  but `.gitignore` uses the folder.
+- **Tests:** `cargo test` gives **397 passed, 0 failed** on Windows (390 library + 7 binary); 348 with `--no-default-features`. `tests/gui/run.sh` (Edge) gives 0 FAIL (105 + 16 assertions). `cargo build --release` is clean.
+- **Next task:** none, every task is done
+- **Beyond the plan:** the desktop GUI (`src/gui.html`) was redesigned: calmer theme, one-line
+  tool steps with ✓/✗, real Markdown paragraphs, solid approval backdrop. Ids and the IPC
+  contract are unchanged; 11 new page assertions. See `PLAN_PROGRESS.md`, "Beyond the plan".
 - **Not checked yet:** the manual checks in finished tasks that need a real terminal, the
   desktop window, MCP servers, Kaggle or real model APIs. Headless checks were run on the
   real binary against local mock servers wherever a task allowed it. CI (H-03) has not run on
@@ -62,7 +63,7 @@ changes and new tests are in the code.
 | Phase 2 — Stop losing work, make runs reliable | 28 / 28 | done |
 | Phase 3 — Quality: remaining bugs and ponytail fixes | 26 / 26 | done |
 | Phase 4 — New features | 8 / 8 | done |
-| Phase 5 — Polish | 15 / 16 | in progress |
+| Phase 5 — Polish | 16 / 16 | done |
 
 The **Status** column in 2.2 lists every task, with the commit that did it.
 `PLAN_PROGRESS.md` has one line per finished task with its test count and anything that was not checked.
@@ -568,7 +569,7 @@ Do the phases in order. Inside a phase, go left to right. A task's
 | H-03 | Add GitHub Actions CI (Linux + Windows) | P1 | S | B-17 (otherwise the Linux job fails on a Windows-only test), H-02 (for the "core only" job) | ✅ done (`44e663d`) |
 | H-04 | Bring GOALS.md up to date | P3 | S | — | ✅ done (`f10a169`) |
 | H-05 | tests/gui/run.sh: also run on Linux/macOS | P3 | S | — | ✅ done (`960528b`) |
-| H-06 | Remove the unused `separate_demo/` crate | P3 | S | — | ⏭️ next |
+| H-06 | Remove the unused `separate_demo/` crate | P3 | S | — | ✅ done (`c6c70ce`) |
 
 Totals: S = 19, B = 49, P = 5, F = 13, H = 6 — 92 tasks.
 
