@@ -1,0 +1,326 @@
+// Appended to a copy of gui.html and run in headless Edge. Writes PASS/FAIL
+// lines into #testout so `--dump-dom` can be grepped for them.
+//
+// The panel deliberately delays revealing the native view by 300ms (CSS cannot
+// clip a child view), so this harness collapses that delay to zero instead of
+// waiting: `--dump-dom` snapshots at load, before any timer would fire.
+(function () {
+  var sent = [];
+  window.ipc = {
+    postMessage: function (s) {
+      try { sent.push(JSON.parse(s)); } catch (e) { sent.push({ type: "unparsable", raw: s }); }
+    }
+  };
+
+  // Deterministic clock: run the panel's reveal delay and rAF work inline.
+  var realTimeout = window.setTimeout;
+  window.setTimeout = function (fn, ms) {
+    if (ms === 300 || ms === 320) { fn(); return 0; }
+    return realTimeout(fn, ms);
+  };
+  window.requestAnimationFrame = function (fn) { fn(0); return 0; };
+
+  var log = [];
+  function ok(name, cond, extra) {
+    log.push((cond ? "PASS " : "FAIL ") + name + (extra !== undefined ? " [" + extra + "]" : ""));
+  }
+  function last(type) {
+    for (var i = sent.length - 1; i >= 0; i--) if (sent[i].type === type) return sent[i];
+    return null;
+  }
+  function count(type) {
+    return sent.filter(function (m) { return m.type === type; }).length;
+  }
+  function key(el, k) {
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true }));
+  }
+  function click(id) {
+    var el = document.getElementById(id);
+    if (!el) throw new Error("missing #" + id);
+    el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+  }
+  function payload(browser) {
+    return {
+      session: "s", title: "T", busy: false, api: [true, 12],
+      sessions: [], entries: [],
+      browser: browser,
+      dev_server: "http://localhost:5173"
+    };
+  }
+  window.addEventListener("error", function (e) {
+    log.push("FAIL script error: " + e.message);
+  });
+
+  // The app wires itself on DOMContentLoaded, so the assertions must run after
+  // it — otherwise every listener is still unattached and everything "fails".
+  function run() {
+  var url = document.getElementById("url");
+  var panel = document.getElementById("browser");
+  ok("page booted (render + initApp present)", typeof window.render === "function" && !!url && !!panel);
+  try {
+
+  // --- A-F1: the URL bar is a real, focusable input (the paste bug) ---
+  ok("url bar is an <input>", !!url && url.tagName === "INPUT", url && url.tagName);
+  ok("url bar is not readonly/disabled", !!url && !url.readOnly && !url.disabled);
+  ok("panel starts collapsed", panel.classList.contains("collapsed"));
+  url.focus();
+  ok("url bar can take focus", document.activeElement === url, document.activeElement && document.activeElement.id);
+  url.value = "typed";
+  ok("url bar accepts typed text", url.value === "typed", url.value);
+
+  // --- A-F1/A-F2/A-F4: render drives the chrome from the payload ---
+  url.blur(); // render must not fight the user while they are typing
+  window.render(payload({
+    url: "http://localhost:3000/app", title: "Fixture app",
+    can_back: true, can_forward: false, loading: true, error: null, visible: true
+  }));
+  ok("render shows the current url", url.value === "http://localhost:3000/app", url.value);
+  ok("back arrow enabled from payload", !document.getElementById("nav-back").disabled);
+  ok("forward arrow disabled from payload", document.getElementById("nav-fwd").disabled);
+  ok("reload spins while loading", document.getElementById("nav-reload").classList.contains("spin"));
+  ok("tab title comes from the page", document.getElementById("b-tab-title").textContent === "Fixture app",
+    document.getElementById("b-tab-title").textContent);
+  ok("empty card hidden once a page loads", document.getElementById("b-empty").hidden);
+
+  window.render(payload({
+    url: "", title: "", can_back: false, can_forward: false, loading: false,
+    error: "Blocked: `file:///etc/passwd` - the panel only loads http(s) pages.", visible: false
+  }));
+  ok("error card shown for a refusal", !document.getElementById("b-error").hidden);
+  ok("error text rendered", /Blocked/.test(document.getElementById("b-error-msg").textContent),
+    document.getElementById("b-error-msg").textContent.slice(0, 24));
+  ok("url bar flagged bad", url.classList.contains("bad"));
+  ok("empty card hidden while erroring", document.getElementById("b-empty").hidden);
+
+  // --- A-F1: Enter navigates, with shorthand expansion ---
+  sent = [];
+  url.value = "localhost:3000/x";
+  key(url, "Enter");
+  var b1 = last("browse");
+  ok("Enter posts browse", !!b1, b1 && b1.url);
+  ok("localhost:port expands to http", b1 && b1.url === "http://localhost:3000/x", b1 && b1.url);
+
+  sent = [];
+  url.value = ":5173";
+  key(url, "Enter");
+  ok(":port shorthand expands", last("browse") && last("browse").url === "http://localhost:5173",
+    last("browse") && last("browse").url);
+
+  sent = [];
+  url.value = "news.ycombinator.com";
+  key(url, "Enter");
+  ok("bare host gets https", last("browse") && last("browse").url === "https://news.ycombinator.com",
+    last("browse") && last("browse").url);
+
+  sent = [];
+  url.value = "https://example.com/a";
+  key(url, "Escape");
+  ok("Escape restores the current url", url.value === "", "value=" + url.value);
+
+  // --- A-F1: paste of a link with surrounding words navigates ---
+  sent = [];
+  try {
+    var dt = new DataTransfer();
+    dt.setData("text/plain", "look at https://example.com/page please");
+    url.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+    ok("pasting a link navigates", last("browse") && last("browse").url === "https://example.com/page",
+      last("browse") && last("browse").url);
+  } catch (e) {
+    ok("pasting a link navigates", false, "harness: " + e.message);
+  }
+
+  // --- A-F2: nav buttons post their verbs ---
+  window.render(payload({
+    url: "http://localhost:3000", title: "F", can_back: true, can_forward: true,
+    loading: false, error: null, visible: true
+  }));
+  sent = [];
+  click("nav-back");
+  click("nav-fwd");
+  click("nav-reload");
+  ok("back posts nav_back", count("nav_back") === 1);
+  ok("forward posts nav_fwd", count("nav_fwd") === 1);
+  ok("reload posts nav_reload", count("nav_reload") === 1);
+  ok("reload stops spinning when loaded", !document.getElementById("nav-reload").classList.contains("spin"));
+
+  // --- A-F2: disabled arrows post nothing ---
+  window.render(payload({
+    url: "", title: "", can_back: false, can_forward: false, loading: false, error: null, visible: false
+  }));
+  sent = [];
+  click("nav-back");
+  ok("disabled back posts nothing", count("nav_back") === 0);
+  sent = [];
+  click("nav-reload");
+  ok("reload with no page focuses the bar instead", count("nav_reload") === 0 && document.activeElement === url);
+
+  // --- A-F3: opening the panel reports geometry, then reveals the view ---
+  // Renders above may have surfaced the panel (agent-driven navigation); the
+  // toggle test needs a known starting state. The observer frame is flushed so
+  // the geometry cache knows the panel is now zero-width.
+  if (!panel.classList.contains("collapsed")) {
+    click("close-browser-btn");
+    window.dispatchEvent(new Event("resize"));
+  }
+  sent = [];
+  ok("close button collapses the panel", panel.classList.contains("collapsed"));
+  click("toggle-browser-btn");
+  ok("Preview button opens the panel", !panel.classList.contains("collapsed"));
+  var rect = last("panel_rect");
+  var vis = last("panel_visible");
+  ok("open reports a panel rect", !!rect, rect && rect.x + "," + rect.y + " " + rect.w + "x" + rect.h);
+  ok("rect is a usable size", !!rect && rect.w > 100 && rect.h > 100, rect && rect.w + "x" + rect.h);
+  ok("rect uses whole pixels", !!rect && (rect.w | 0) === rect.w && (rect.h | 0) === rect.h);
+  ok("open reveals the native view", !!vis && vis.visible === true, JSON.stringify(vis));
+  ok("rect is sent before visibility", !!rect && !!vis, "ordering is what avoids a flash at a stale rect");
+
+  // Resize must re-report geometry (resize event + observer share sendRect).
+  sent = [];
+  // The panel animates its width; kill the transition so this measures the
+  // geometry reporting, not a 250ms animation that has not started yet.
+  panel.style.transition = "none";
+  panel.style.width = "300px";
+  var bc = document.getElementById("bcontent");
+  window.dispatchEvent(new Event("resize"));
+  var r2 = last("panel_rect");
+  ok("resize re-reports the rect", !!r2 && r2.w < rect.w,
+    (r2 && r2.w) + " vs " + rect.w + " | panel=" + Math.round(panel.getBoundingClientRect().width) +
+    " content=" + Math.round(bc.getBoundingClientRect().width));
+
+  // Collapse: the view must go away immediately, not after the animation.
+  sent = [];
+  click("close-browser-btn");
+  ok("close applies the collapsed class", panel.classList.contains("collapsed"));
+  ok("close hides the native view", !!last("panel_visible") && last("panel_visible").visible === false,
+    JSON.stringify(last("panel_visible")));
+
+  // Ctrl+L reopens and focuses.
+  sent = [];
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "l", ctrlKey: true, bubbles: true, cancelable: true }));
+  ok("ctrl+L reopens the panel", !panel.classList.contains("collapsed"));
+  ok("ctrl+L focuses the address bar", document.activeElement === url, document.activeElement && document.activeElement.id);
+  ok("ctrl+L reveals the view", !!last("panel_visible") && last("panel_visible").visible === true);
+
+  // --- B-F1: an agent navigation must not happen invisibly ---
+  if (!panel.classList.contains("collapsed")) click("close-browser-btn");
+  ok("panel is collapsed before the agent browses", panel.classList.contains("collapsed"));
+  window.render(payload({
+    url: "http://localhost:4000/agent-page", title: "Agent page", can_back: false,
+    can_forward: false, loading: true, error: null, visible: true
+  }));
+  ok("agent navigation opens the panel", !panel.classList.contains("collapsed"));
+
+  // --- D1: approval modal ---
+  function withApproval(ap) {
+    return Object.assign(
+      payload({ url: "", title: "", can_back: false, can_forward: false, loading: false, error: null, visible: false }),
+      { approval: ap }
+    );
+  }
+  window.render(withApproval({ id: "apr_9", tool: "bash", detail: "rm -rf build", secs_left: 287 }));
+  var apEl = document.getElementById("approval");
+  ok("approval modal shows", !apEl.hidden);
+  ok("modal names the tool", document.getElementById("ap-tool").textContent === "bash",
+    document.getElementById("ap-tool").textContent);
+  ok("modal shows the exact command", document.getElementById("ap-detail").textContent === "rm -rf build");
+  ok("modal shows the countdown", document.getElementById("ap-count").textContent === "287s",
+    document.getElementById("ap-count").textContent);
+
+  sent = [];
+  click("ap-allow");
+  ok("allow once posts approve", !!last("approve") && last("approve").id === "apr_9" &&
+    last("approve").always === false, JSON.stringify(last("approve")));
+  sent = [];
+  click("ap-allow");
+  ok("answering twice posts nothing", count("approve") === 0);
+
+  window.render(withApproval({ id: "apr_10", tool: "write", detail: "src/main.rs", secs_left: 300 }));
+  sent = [];
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true, cancelable: true }));
+  ok("'a' always-allows", !!last("approve") && last("approve").always === true &&
+    last("approve").id === "apr_10", JSON.stringify(last("approve")));
+
+  window.render(withApproval({ id: "apr_11", tool: "bash", detail: "rm -rf /tmp/x", secs_left: 90 }));
+  sent = [];
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "n", bubbles: true, cancelable: true }));
+  ok("'n' denies", !!last("deny") && last("deny").id === "apr_11", JSON.stringify(last("deny")));
+
+  // Typing in the composer must never answer a permission prompt.
+  window.render(withApproval({ id: "apr_12", tool: "bash", detail: "ls", secs_left: 300 }));
+  sent = [];
+  var composer = document.getElementById("input");
+  composer.focus();
+  composer.dispatchEvent(new KeyboardEvent("keydown", { key: "y", bubbles: true, cancelable: true }));
+  ok("typing 'y' in the composer does not approve", count("approve") === 0);
+
+  window.render(payload({ url: "", title: "", can_back: false, can_forward: false, loading: false, error: null, visible: false }));
+  ok("modal hides when the run settles", document.getElementById("approval").hidden);
+
+  // --- Permission mode selector: default / manual / turbo ---
+  var basePage = { url: "", title: "", can_back: false, can_forward: false, loading: false, error: null, visible: false };
+  function withMode(mode) {
+    var p = payload(basePage);
+    p.perm_mode = mode;
+    return p;
+  }
+  function modeEl(mode) { return document.querySelector('.mode-btn[data-mode="' + mode + '"]'); }
+  ok("composer offers default, manual and turbo",
+    ["default", "manual", "turbo"].every(function (m) { return !!modeEl(m); }));
+  ok("composer keeps the send button", !!document.getElementById("send"));
+
+  window.render(withMode("default"));
+  ok("default mode is the selected one",
+    modeEl("default").classList.contains("on") && !modeEl("turbo").classList.contains("on"));
+  ok("composer is not flagged turbo in default mode",
+    !document.getElementById("comp").classList.contains("turbo"));
+
+  window.render(withMode("turbo"));
+  ok("turbo is selected from the payload",
+    modeEl("turbo").classList.contains("on") && modeEl("turbo").getAttribute("aria-checked") === "true");
+  ok("default is deselected in turbo", !modeEl("default").classList.contains("on"));
+  ok("composer says turbo is prompt-free",
+    /Turbo/.test(document.getElementById("mode-hint").textContent),
+    document.getElementById("mode-hint").textContent);
+  ok("composer is flagged turbo", document.getElementById("comp").classList.contains("turbo"));
+
+  // Layout: three pills + hint + send must still fit one row at 1280px wide.
+  var compBox = document.getElementById("comp").getBoundingClientRect();
+  var turboBox = modeEl("turbo").getBoundingClientRect();
+  var sendBox = document.getElementById("send").getBoundingClientRect();
+  ok("mode pills have real size and stay inside the composer",
+    turboBox.width > 0 && turboBox.left >= compBox.left - 0.5 && turboBox.right <= compBox.right + 0.5,
+    turboBox.left + "-" + turboBox.right + " in " + compBox.left + "-" + compBox.right);
+  ok("send button still sits on the row",
+    sendBox.width > 0 && sendBox.right <= compBox.right + 0.5);
+  ok("the composer row does not overflow",
+    document.getElementById("comp").scrollWidth <= document.getElementById("comp").clientWidth + 1,
+    document.getElementById("comp").scrollWidth + ">" + document.getElementById("comp").clientWidth);
+
+  sent = [];
+  modeEl("manual").dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+  ok("picking a mode posts it to Rust",
+    !!last("mode") && last("mode").mode === "manual", JSON.stringify(last("mode")));
+  window.render(withMode("manual"));
+  ok("manual mode is selected", modeEl("manual").classList.contains("on"));
+  ok("manual hint mentions asking",
+    /Manual/.test(document.getElementById("mode-hint").textContent),
+    document.getElementById("mode-hint").textContent);
+  ok("manual clears the turbo styling",
+    !document.getElementById("comp").classList.contains("turbo"));
+
+  } catch (e) {
+    ok("harness ran to completion", false, "threw: " + (e && e.message));
+  }
+
+  var out = document.createElement("pre");
+  out.id = "testout";
+  out.textContent = log.join("\n");
+  document.body.appendChild(out);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", run);
+  } else {
+    run();
+  }
+})();

@@ -1,0 +1,55 @@
+[package]
+name = "opencode-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight terminal AI coding agent — sessions, tools, permissions, team mode"
+license = "MIT"
+
+[[bin]]
+name = "opencode-rust"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+
+# core HTTP server + SSE (TUI talks to it like an API client)
+axum = { version = "0.8", default-features = false, features = ["json", "http1", "tokio", "query"] }
+
+# HTTP client for LLM endpoints (OpenAI-compatible streaming)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# serde stack
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+
+# persistence (SQLite) — bundled C if a C compiler exists; see build notes
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# file discovery respecting .gitignore (ripgrep's walker) + regex
+ignore = "0.4"
+regex = "1"
+
+# errors
+anyhow = "1"
+bytes = "1"
+
+# M4: embedded preview browser — Rust shell (tao window + wry WebView2).
+# The engine itself is the OS out-of-process Chromium (WebView2), which is
+# the lowest-RAM option that can still run real JS dev-server apps.
+tao = "0.37"
+wry = "0.57"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

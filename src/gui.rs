@@ -1,0 +1,1674 @@
+//! M8: the desktop app shell (working name "Habi") — a wry/WebView2 window
+//! hosting our own UI (`src/gui.html`), with every decision made in Rust.
+//!
+//! Why not egui/eframe: this machine's Intel HD Graphics 3000 caps at
+//! DX10.1 / OpenGL 3.1, so eframe's glow renderer ("extension to create ES
+//! context with wgl is not present") and wgpu ("no suitable adapter") both
+//! fail — egui cannot run on this GPU at all. WebView2 renders through
+//! ANGLE/D3D and works here (M4's preview proved it), and it is the same
+//! tech the M9 browser panel needs, so the whole app shares one renderer.
+
+use crate::db::{Message, Part};
+use crate::server::{self, PermissionMode, ServerEvent};
+use crate::tui::EntryKind;
+use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tao::{
+    dpi::LogicalSize,
+    event::{Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
+};
+
+const APP_HTML: &str = include_str!("gui.html");
+/// Sidebar title for fresh chats; renamed from the first user message.
+const NEW_CHAT: &str = "New chat";
+
+/// Testable GUI state: everything the window draws, minus the toolkit.
+pub struct GuiState {
+    pub entries: Vec<(EntryKind, String)>,
+    pub input: String,
+    pub busy: bool,
+    pub session: Option<String>,
+    pub api: Option<(bool, u64)>,
+    /// Sidebar chats, newest-first: (id, title). Mirrors `db.list_sessions()`.
+    pub sessions: Vec<(String, String)>,
+    /// Preview panel: URL, history flags, geometry. Drawn by the page;
+    /// the page itself lives in a separate native child webview.
+    pub browser: BrowserView,
+    /// Last `http://localhost:<port>` seen in tool output (A-B5).
+    pub dev_server: Option<String>,
+    /// D1: the tool call waiting on the user right now (`ask` permissions).
+    pub approval: Option<PendingApproval>,
+    /// `[permissions] approval_timeout_secs` — drives the modal countdown.
+    pub approval_timeout_secs: u64,
+    /// Autonomy mode shown by the composer selector. The core owns the real
+    /// value; this mirrors it for the page.
+    pub perm_mode: PermissionMode,
+}
+
+/// One `ask` decision the engine is blocked on. The core holds the actual
+/// oneshot; this is only what the window needs to draw and answer it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingApproval {
+    pub id: String,
+    pub tool: String,
+    pub detail: String,
+    pub started: std::time::Instant,
+}
+
+impl PendingApproval {
+    /// Seconds before the engine auto-denies (never negative).
+    fn secs_left(&self, timeout_secs: u64) -> u64 {
+        timeout_secs.saturating_sub(self.started.elapsed().as_secs())
+    }
+}
+
+impl Default for GuiState {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            input: String::new(),
+            busy: false,
+            session: None,
+            api: None,
+            sessions: Vec::new(),
+            browser: BrowserView::default(),
+            dev_server: None,
+            approval: None,
+            approval_timeout_secs: 300,
+            perm_mode: PermissionMode::Default,
+        }
+    }
+}
+
+/// Panel geometry in CSS pixels. These are *already* logical pixels — `dpi`
+/// does the scale-factor conversion, so multiplying by `devicePixelRatio`
+/// here would double-scale the child view off the panel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PanelRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl PanelRect {
+    /// Fixed size used until the page reports its real layout.
+    pub fn fallback() -> Self {
+        Self { x: 0.0, y: 0.0, w: 200.0, h: 200.0 }
+    }
+
+    /// A rect we can actually show a view in (finite, non-degenerate).
+    pub fn is_usable(self) -> bool {
+        [self.x, self.y, self.w, self.h].iter().all(|v| v.is_finite()) && self.w >= 1.0 && self.h >= 1.0
+    }
+
+    /// CSS pixels -> wry `Rect`, with no manual DPI math.
+    pub fn to_wry(self) -> wry::Rect {
+        wry::Rect {
+            position: wry::dpi::LogicalPosition::new(self.x, self.y).into(),
+            size: wry::dpi::LogicalSize::new(self.w, self.h).into(),
+        }
+    }
+}
+
+/// Everything the browser panel chrome draws, plus the native view's target.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrowserView {
+    pub url: String,
+    pub title: String,
+    pub can_back: bool,
+    pub can_forward: bool,
+    pub loading: bool,
+    /// Last refusal/failure, shown as a card in place of the page.
+    pub error: Option<String>,
+    /// Whether the native child view should be on screen.
+    pub visible: bool,
+    pub rect: Option<PanelRect>,
+    /// `[browser] home_url` — offered when there is nothing to load.
+    pub home: String,
+    /// Set while an HTML overlay covers the panel. A native child view always
+    /// paints above the page, so it must be hidden, not layered under.
+    pub covered: bool,
+}
+
+impl BrowserView {
+    /// Start a navigation: remember the URL, drop the error, reveal the view.
+    pub fn open(&mut self, url: &str) {
+        self.url = url.to_string();
+        self.error = None;
+        self.loading = true;
+        self.visible = true;
+    }
+
+    /// Refuse or fail: the native view cannot be composited under HTML, so it
+    /// has to go away for the error card to be readable.
+    pub fn fail(&mut self, msg: impl Into<String>) {
+        self.error = Some(msg.into());
+        self.loading = false;
+        self.visible = false;
+    }
+
+    /// True when a page (not the empty state) is showing.
+    pub fn has_page(&self) -> bool {
+        !self.url.is_empty() && self.error.is_none()
+    }
+
+    fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "url": self.url,
+            "title": self.title,
+            "can_back": self.can_back,
+            "can_forward": self.can_forward,
+            "loading": self.loading,
+            "error": self.error,
+            "visible": self.visible,
+            "home": self.home,
+        })
+    }
+}
+
+impl GuiState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Title of the active session (chat header + window title).
+    pub fn title(&self) -> &str {
+        self.session
+            .as_ref()
+            .and_then(|id| {
+                self.sessions
+                    .iter()
+                    .find(|(sid, _)| sid == id)
+                    .map(|(_, t)| t.as_str())
+            })
+            .unwrap_or(NEW_CHAT)
+    }
+
+    /// Streaming kinds merge into the previous entry (one bubble per reply).
+    pub fn push(&mut self, kind: EntryKind, text: impl Into<String>) {
+        let text = text.into();
+        let mergeable = matches!(kind, EntryKind::Assistant | EntryKind::Thinking);
+        if mergeable {
+            if let Some(last) = self.entries.last_mut() {
+                if last.0 == kind {
+                    last.1.push_str(&text);
+                    return;
+                }
+            }
+        }
+        self.entries.push((kind, text));
+    }
+
+    /// Drain one server event into the transcript.
+    pub fn on_event(&mut self, ev: ServerEvent) {
+        match ev {
+            ServerEvent::AssistantDelta { text, .. } => self.push(EntryKind::Assistant, text),
+            ServerEvent::ReasoningDelta { text, .. } => {
+                // First reasoning chunk carries the marker; appends merge bare.
+                let last_is_thinking = self
+                    .entries
+                    .last()
+                    .map(|(k, _)| *k == EntryKind::Thinking)
+                    .unwrap_or(false);
+                if last_is_thinking {
+                    self.push(EntryKind::Thinking, text);
+                } else {
+                    self.push(EntryKind::Thinking, format!("\u{273b} {text}"));
+                }
+            }
+            ServerEvent::ToolStarted { tool, detail, .. } => {
+                self.push(EntryKind::Tool, format!("\u{23fa} {tool}({detail})"));
+            }
+            ServerEvent::ToolFinished { tool, ok, .. } => {
+                self.push(EntryKind::Tool, format!("  {} {tool}", if ok { "\u{2713}" } else { "\u{2717}" }));
+            }
+            ServerEvent::Note { text, .. } => self.push(EntryKind::System, text),
+            ServerEvent::RunFinished { ok, message, .. } => {
+                eprintln!("[gui] run finished ok={ok}");
+                self.busy = false;
+                // A finished run cannot still be waiting on an approval.
+                self.approval = None;
+                self.browser.covered = false;
+                if let Some(m) = message {
+                    self.push(if ok { EntryKind::System } else { EntryKind::Error }, m);
+                }
+            }
+            ServerEvent::SessionCreated { session_id, .. } => self.session = Some(session_id),
+            ServerEvent::SessionLoaded { session_id, transcript, .. } => {
+                self.session = Some(session_id);
+                self.busy = false;
+                self.entries = transcript
+                    .into_iter()
+                    .map(|l| {
+                        let kind = if l.role == "user" { EntryKind::User } else { EntryKind::Assistant };
+                        (kind, l.text)
+                    })
+                    .collect();
+            }
+            ServerEvent::Heartbeat { ok, latency_ms } => self.api = Some((ok, latency_ms)),
+            ServerEvent::DevServer { url, .. } => self.dev_server = Some(url),
+            ServerEvent::ApprovalNeeded { approval_id, tool, detail, .. } => {
+                // The run is blocked until this is answered (or times out).
+                self.approval = Some(PendingApproval {
+                    id: approval_id,
+                    tool,
+                    detail,
+                    started: std::time::Instant::now(),
+                });
+                self.busy = true;
+                // Never leave a native view painted over the modal.
+                self.browser.covered = true;
+            }
+            ServerEvent::EditPreview { path, .. } | ServerEvent::EditApplied { path, .. } => {
+                self.push(EntryKind::System, format!("[edit] {path}"));
+            }
+            _ => {}
+        }
+    }
+
+    /// Drain one preview-webview callback (navigation, title, load state).
+    pub fn on_browser_event(&mut self, ev: BrowserEvt) {
+        match ev {
+            // Every fresh webview starts on about:blank; that is not a page.
+            BrowserEvt::Url(url) if url == "about:blank" => {}
+            BrowserEvt::Url(url) => {
+                self.browser.url = url;
+                self.browser.error = None;
+                self.browser.visible = true;
+            }
+            BrowserEvt::Title(t) => self.browser.title = t,
+            BrowserEvt::Loading(loading) => self.browser.loading = loading,
+            BrowserEvt::Blocked(url) => {
+                self.browser.fail(format!("Blocked: `{url}` — the panel only loads http(s) pages."))
+            }
+            // Requests/responses are matched by id in the event loop, not here.
+            BrowserEvt::Eval(_) => {}
+        }
+    }
+
+    /// Take the input box contents as a sendable message (None = nothing to send).
+    pub fn submit(&mut self) -> Option<String> {
+        let content = std::mem::take(&mut self.input);
+        let content = content.trim().to_string();
+        if content.is_empty() {
+            return None;
+        }
+        self.push(EntryKind::User, format!("\u{203a} {content}"));
+        self.busy = true;
+        Some(content)
+    }
+
+    /// JSON payload for `window.render(...)` — keys are read by gui.html.
+    pub fn payload(&self) -> String {
+        let entries: Vec<serde_json::Value> = self
+            .entries
+            .iter()
+            .map(|(k, t)| serde_json::json!({ "k": kind_class(k).to_string(), "t": t }))
+            .collect();
+        let sessions: Vec<serde_json::Value> = self
+            .sessions
+            .iter()
+            .map(|(id, title)| {
+                serde_json::json!({
+                    "id": id,
+                    "title": title,
+                    "active": self.session.as_deref() == Some(id.as_str()),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "session": self.session.clone().unwrap_or_default(),
+            "title": self.title(),
+            "busy": self.busy,
+            "perm_mode": self.perm_mode.as_str(),
+            "api": self.api.map(|(ok, ms)| serde_json::json!([ok, ms])),
+            "sessions": sessions,
+            "entries": entries,
+            "browser": self.browser.payload(),
+            "dev_server": self.dev_server,
+            "approval": self.approval.as_ref().map(|a| serde_json::json!({
+                "id": a.id,
+                "tool": a.tool,
+                "detail": a.detail,
+                "secs_left": a.secs_left(self.approval_timeout_secs),
+            })),
+        })
+        .to_string()
+    }
+}
+
+fn kind_class(k: &EntryKind) -> char {
+    match k {
+        EntryKind::User => 'u',
+        EntryKind::Assistant => 'a',
+        EntryKind::Thinking => 't',
+        EntryKind::Tool => 'w',
+        EntryKind::System => 's',
+        EntryKind::Error => 'x',
+    }
+}
+
+/// Clip text to `max` chars with an ellipsis (chat titles, tool outputs).
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}\u{2026}")
+    }
+}
+
+/// Rebuild transcript bubbles from persisted messages (session load).
+pub fn entries_from_messages(msgs: &[Message]) -> Vec<(EntryKind, String)> {
+    let mut out = Vec::new();
+    for m in msgs {
+        let base = match m.role.as_str() {
+            "user" => EntryKind::User,
+            "assistant" => EntryKind::Assistant,
+            _ => EntryKind::System,
+        };
+        for p in &m.parts {
+            match p {
+                Part::Text { text } => out.push((base.clone(), text.clone())),
+                Part::Reasoning { text } => out.push((EntryKind::Thinking, format!("\u{273b} {text}"))),
+                Part::ToolCall { name, input, .. } => {
+                    out.push((EntryKind::Tool, format!("\u{23fa} {name}({input})")));
+                }
+                Part::ToolResult { output, is_error, .. } => out.push((
+                    EntryKind::Tool,
+                    format!("  {} {}", if *is_error { "\u{2717}" } else { "\u{2713}" }, clip(output, 160)),
+                )),
+            }
+        }
+    }
+    out
+}
+
+/// A message from the page (`window.ipc.postMessage`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum IpcMsg {
+    Send(String),
+    NewSession,
+    Load(String),
+    /// The page finished loading — trigger the first paint.
+    Ready,
+    Minimize,
+    MaximizeToggle,
+    Close,
+    /// Navigate the preview panel (as typed; normalized when handled).
+    Browse(String),
+    NavBack,
+    NavFwd,
+    NavReload,
+    /// Where the page wants the native child view, in CSS pixels.
+    PanelRect(PanelRect),
+    /// Show/hide the native child view (collapsed panel, overlays, errors).
+    PanelVisible(bool),
+    /// The "Open Dev Server" CTA, optionally with an explicit URL.
+    OpenDevServer(Option<String>),
+    /// D1: answer a pending `ask` gate.
+    Approve { id: String, always: bool },
+    Deny(String),
+    /// Composer mode selector: default / manual / turbo autonomy.
+    Mode(PermissionMode),
+    /// An uncaught JS error in the page (`window.onerror`).
+    PageError(String),
+}
+
+/// Callbacks from the preview child webview itself (not from the page).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BrowserEvt {
+    Url(String),
+    Title(String),
+    Loading(bool),
+    /// A scheme we refuse to load (file://, javascript:, …).
+    Blocked(String),
+    /// A result frame posted by the injected page runtime (Goal B).
+    Eval(String),
+}
+
+/// One input to the event loop: either a page verb or a webview callback.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UiMsg {
+    Ipc(IpcMsg),
+    Browser(BrowserEvt),
+}
+
+/// Parse one IPC frame; `None` = ignore (unknown or malformed).
+pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    match v.get("type")?.as_str()? {
+        "send" => {
+            let text = v.get("text")?.as_str()?.trim().to_string();
+            if text.is_empty() { None } else { Some(IpcMsg::Send(text)) }
+        }
+        "new" => Some(IpcMsg::NewSession),
+        "load" => Some(IpcMsg::Load(v.get("id")?.as_str()?.to_string())),
+        "ready" => Some(IpcMsg::Ready),
+        "min" => Some(IpcMsg::Minimize),
+        "max" => Some(IpcMsg::MaximizeToggle),
+        "close" => Some(IpcMsg::Close),
+        "browse" => Some(IpcMsg::Browse(v.get("url")?.as_str()?.to_string())),
+        "nav_back" => Some(IpcMsg::NavBack),
+        "nav_fwd" => Some(IpcMsg::NavFwd),
+        "nav_reload" => Some(IpcMsg::NavReload),
+        "panel_rect" => {
+            let num = |k: &str| v.get(k)?.as_f64();
+            let rect = PanelRect { x: num("x")?, y: num("y")?, w: num("w")?, h: num("h")? };
+            if rect.is_usable() { Some(IpcMsg::PanelRect(rect)) } else { None }
+        }
+        "panel_visible" => Some(IpcMsg::PanelVisible(v.get("visible")?.as_bool()?)),
+        "open_dev_server" => {
+            Some(IpcMsg::OpenDevServer(v.get("url").and_then(|u| u.as_str()).map(str::to_string)))
+        }
+        "approve" => Some(IpcMsg::Approve {
+            id: v.get("id")?.as_str()?.to_string(),
+            always: v.get("always").and_then(|a| a.as_bool()).unwrap_or(false),
+        }),
+        "deny" => Some(IpcMsg::Deny(v.get("id")?.as_str()?.to_string())),
+        "mode" => Some(IpcMsg::Mode(PermissionMode::parse(v.get("mode")?.as_str()?)?)),
+        "page_error" => Some(IpcMsg::PageError(v.get("msg")?.as_str()?.to_string())),
+        _ => None,
+    }
+}
+
+/// Schemes the panel may load. Anything else (`file:`, `javascript:`, `data:`)
+/// is refused before it reaches the engine — a browsing surface inside the app
+/// must not be a way to read local files or run script against our origin.
+pub fn is_allowed_scheme(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower == "about:blank"
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("localhost")
+        || lower.starts_with("127.0.0.1")
+}
+
+/// Turn what a human typed into a URL we are willing to load.
+///
+/// `:3000` -> `http://localhost:3000`, `localhost:3000` -> `http://localhost:3000`,
+/// bare hosts get `https://`, and refused schemes come back as an error the
+/// page shows as a card instead of a silent no-op.
+fn normalize_url(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("Enter a URL to open.".into());
+    }
+    let lower = raw.to_ascii_lowercase();
+    // Refuse explicit non-web schemes with a message that says why.
+    if let Some(scheme) = lower.split(':').next() {
+        if matches!(scheme, "file" | "javascript" | "data" | "vbscript" | "chrome" | "edge") {
+            return Err(format!("`{scheme}:` URLs are blocked in the preview panel."));
+        }
+    }
+    if lower == "about:blank" || lower.starts_with("http://") || lower.starts_with("https://") {
+        return Ok(raw.to_string());
+    }
+    // Host:port shorthands people actually type.
+    if let Some(rest) = raw.strip_prefix(':') {
+        if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) && rest.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(format!("http://localhost:{rest}"));
+        }
+    }
+    let first = raw.split(['/', '?', '#']).next().unwrap_or(raw);
+    if lower.starts_with("localhost") || lower.starts_with("127.0.0.1") {
+        return Ok(format!("http://{raw}"));
+    }
+    // Bare IPv4 (optionally with a port) is a local server, so plain http.
+    let host = first.split(':').next().unwrap_or(first);
+    let octets: Vec<&str> = host.split('.').collect();
+    if octets.len() == 4 && octets.iter().all(|o| !o.is_empty() && o.chars().all(|c| c.is_ascii_digit())) {
+        return Ok(format!("http://{raw}"));
+    }
+    if !host.contains('.') {
+        return Err(format!("`{raw}` is not a URL — try `example.com` or `localhost:3000`."));
+    }
+    Ok(format!("https://{raw}"))
+}
+
+/// Push the current state into the page (no-op until the page is loaded).
+fn paint(webview: &wry::WebView, gs: &GuiState) {
+    let _ = webview.evaluate_script(&format!("window.render&&window.render({})", gs.payload()));
+}
+
+/// Apply the panel's rect and visibility to the native child view.
+///
+/// Bounds go first: a view shown at a stale rect flashes a grey/white
+/// rectangle outside the panel until the next frame. Child views are not
+/// clipped by CSS, so "hidden" really has to mean `set_visible(false)`.
+fn show_browser(wv: &wry::WebView, view: &BrowserView) {
+    if let Some(rect) = view.rect.filter(|r| r.is_usable()) {
+        let _ = wv.set_bounds(rect.to_wry());
+    }
+    let show = view.visible
+        && !view.covered
+        && view.error.is_none()
+        && matches!(view.rect, Some(r) if r.is_usable());
+    let _ = wv.set_visible(show);
+}
+
+/// Clear the modal for the request it belongs to and unhide the panel.
+/// `answered` is false when the engine already timed out / aborted it.
+fn settle_approval(gs: &mut GuiState, id: &str, answered: bool) {
+    let mine = gs.approval.as_ref().map(|a| a.id == id).unwrap_or(false);
+    if mine {
+        gs.approval = None;
+        gs.browser.covered = false;
+    }
+    if !answered {
+        gs.push(EntryKind::System, "That approval had already expired.".to_string());
+    }
+}
+
+/// Mirror the engine's history state into the payload (drives arrow buttons).
+fn sync_history(wv: &wry::WebView, view: &mut BrowserView) {
+    view.can_back = wv.can_go_back().unwrap_or(false);
+    view.can_forward = wv.can_go_forward().unwrap_or(false);
+}
+
+/// True for URLs that stay on this machine. Used to enforce the
+/// dev-server-only mode (`[browser] allow_remote = false`).
+pub fn is_local_url(url: &str) -> bool {
+    let u = url.trim().to_ascii_lowercase();
+    if u == "about:blank" {
+        return true;
+    }
+    let Some(rest) = ["http://", "https://"]
+        .iter()
+        .find_map(|scheme| u.strip_prefix(scheme))
+    else {
+        return false;
+    };
+    // IPv6 literals contain colons, so they cannot go through `split(':')`.
+    if rest.starts_with("[::1]") {
+        return true;
+    }
+    let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
+    matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0")
+}
+
+/// First `http://localhost:<port>` / `http://127.0.0.1:<port>` in tool output.
+///
+/// Dev servers print their URL in whatever shape the framework likes
+/// ("Local: http://localhost:5173/", "listening on http://127.0.0.1:3000"),
+/// so this scans rather than parses. Returns the origin only — the chip and
+/// the CTA want something navigable, not a log line.
+pub fn detect_dev_server(text: &str) -> Option<String> {
+    const PREFIXES: [&str; 2] = ["http://localhost:", "http://127.0.0.1:"];
+    for (i, _) in text.char_indices() {
+        let Some(tail) = text.get(i..) else { continue };
+        for p in PREFIXES {
+            let Some(rest) = tail.strip_prefix(p) else { continue };
+            let port: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if port.is_empty() {
+                continue;
+            }
+            return Some(format!("{p}{port}"));
+        }
+    }
+    None
+}
+
+/// Refresh the sidebar chat list from the database.
+fn refresh_sessions(gs: &mut GuiState, st: &server::AppState) {
+    if let Ok(list) = st.db.list_sessions() {
+        gs.sessions = list.into_iter().map(|s| (s.id, s.title)).collect();
+    }
+}
+
+/// Switch to an existing session, replaying its transcript into the chat.
+fn load_session(gs: &mut GuiState, st: &server::AppState, id: &str) {
+    match st.db.messages(id) {
+        Ok(msgs) => {
+            gs.session = Some(id.to_string());
+            gs.entries = entries_from_messages(&msgs);
+            gs.busy = false;
+        }
+        Err(e) => gs.push(EntryKind::Error, format!("load session failed: {e}")),
+    }
+}
+
+/// Submit the composer and name the chat after its first message. Shared by
+/// the CLI prefill and the typed-send path so a prefilled launch names its
+/// chat identically (it used to skip this and stay "New chat"). Returns the
+/// content to run, or None when there was nothing to send.
+fn submit_and_name(gs: &mut GuiState, st: &server::AppState) -> Option<String> {
+    let content = gs.submit()?;
+    if gs.title() == NEW_CHAT {
+        let sid = gs.session.clone().unwrap_or_default();
+        let _ = st.db.set_session_title(&sid, &clip(&content, 40));
+        refresh_sessions(gs, st);
+    }
+    Some(content)
+}
+
+/// Wake-up sent by the SSE forwarder so the event loop drains promptly.
+#[derive(Debug, Clone, Copy)]
+enum AppEvent {
+    Wake,
+}
+
+/// Open the desktop app. Blocks until the window closes (mirrors `tui::run`).
+pub async fn run(
+    state: Arc<server::AppState>,
+    addr: std::net::SocketAddr,
+    prompt: Option<String>,
+    boot_ms: u128,
+) -> Result<()> {
+    let session = state.db.create_session(NEW_CHAT, None)?;
+    let mut gs = GuiState::new();
+    gs.session = Some(session.id.clone());
+    gs.approval_timeout_secs = state.cfg.permissions.approval_timeout_secs;
+    gs.perm_mode = state.perm_mode();
+    refresh_sessions(&mut gs, &state);
+    tracing_boot(boot_ms, addr, &session.id);
+    if let Some(p) = prompt {
+        gs.input = p;
+    }
+
+    let rt = tokio::runtime::Handle::current();
+
+    let event_loop: EventLoop<AppEvent> =
+        tao::event_loop::EventLoopBuilder::<AppEvent>::with_user_event().build();
+    // No OS decorations: the page draws its own titlebar (drag region +
+    // min/max/close buttons over IPC). Start maximized so the composer is
+    // never shoved off-screen on small displays.
+    let window = WindowBuilder::new()
+        .with_title("Habi \u{2014} agent workspace")
+        .with_decorations(false)
+        .with_maximized(true)
+        .with_inner_size(LogicalSize::new(1280.0, 800.0))
+        .with_min_inner_size(LogicalSize::new(900.0, 560.0))
+        .build(&event_loop)
+        .map_err(|e| anyhow::anyhow!("creating the app window failed: {e}"))?;
+    // Breadcrumbs: a window that dies between these lines used to leave no
+    // trace at all (exit code 1, empty stderr). Now the last line printed says
+    // how far it got.
+    eprintln!("[gui] window created");
+
+    // Page -> Rust, plus preview-webview callbacks. One channel means one
+    // drain site in the event loop, so state never updates twice per frame.
+    let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiMsg>();
+    let ipc_proxy = event_loop.create_proxy();
+    let page_tx = ui_tx.clone();
+    let webview = wry::WebViewBuilder::new()
+        .with_background_color((7, 10, 18, 255))
+        .with_devtools(true)
+        .with_initialization_script(
+            "window.addEventListener('error', (e) => {\n\
+             \x20 try { window.ipc.postMessage(JSON.stringify({ type: 'page_error', msg: e.message })) } catch (_) {}\n\
+             \x20});",
+        )
+        .with_html(APP_HTML)
+        .with_ipc_handler(move |req: wry::http::Request<String>| {
+            if let Some(msg) = parse_ipc(req.body()) {
+                let _ = page_tx.send(UiMsg::Ipc(msg));
+                let _ = ipc_proxy.send_event(AppEvent::Wake);
+            } else {
+                eprintln!("[gui] IPC: {}", req.body());
+            }
+        })
+        .build(&window)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "opening the app window failed: {e}\n\
+                 On Windows this needs the Microsoft Edge WebView2 Runtime \
+                 (preinstalled on Windows 11; a small slice of Windows 10 \
+                 machines need the free 'WebView2 Runtime' download)."
+            )
+        })?;
+
+    // Goal A: a real second WebView2 for the preview panel. It is a *native
+    // child view*, not part of the page: it cannot be painted under HTML and
+    // CSS cannot clip it, so we own its bounds and visibility for its whole
+    // life (`show_browser`). Built hidden — nothing shows until the user
+    // opens the panel and it reports a usable rect.
+    gs.browser.home = state.cfg.browser.home_url.clone();
+    let browser_enabled = state.cfg.browser.enabled;
+    let browser_webview: Option<wry::WebView> = if browser_enabled {
+        let nav_tx = ui_tx.clone();
+        let nav_proxy = event_loop.create_proxy();
+        let eval_tx = ui_tx.clone();
+        let eval_proxy = event_loop.create_proxy();
+        let title_tx = ui_tx.clone();
+        let title_proxy = event_loop.create_proxy();
+        let load_tx = ui_tx.clone();
+        let load_proxy = event_loop.create_proxy();
+        let built = wry::WebViewBuilder::new()
+            .with_background_color((7, 10, 18, 255))
+            .with_visible(false)
+            .with_clipboard(true)
+            .with_bounds(PanelRect::fallback().to_wry())
+            // Goal B: the page-side primitives (snapshot/click/type/wait) and
+            // the channel their results come back on.
+            .with_initialization_script(crate::browser::RUNTIME_JS)
+            .with_ipc_handler(move |req: wry::http::Request<String>| {
+                let _ = eval_tx.send(UiMsg::Browser(BrowserEvt::Eval(req.body().clone())));
+                let _ = eval_proxy.send_event(AppEvent::Wake);
+            })
+            .with_navigation_handler(move |url: String| {
+                let allowed = is_allowed_scheme(&url);
+                if allowed {
+                    let _ = nav_tx.send(UiMsg::Browser(BrowserEvt::Url(url)));
+                } else {
+                    let _ = nav_tx.send(UiMsg::Browser(BrowserEvt::Blocked(url)));
+                }
+                let _ = nav_proxy.send_event(AppEvent::Wake);
+                allowed
+            })
+            .with_document_title_changed_handler(move |title: String| {
+                let _ = title_tx.send(UiMsg::Browser(BrowserEvt::Title(title)));
+                let _ = title_proxy.send_event(AppEvent::Wake);
+            })
+            .with_on_page_load_handler(move |ev: wry::PageLoadEvent, _url: String| {
+                let loading = matches!(ev, wry::PageLoadEvent::Started);
+                let _ = load_tx.send(UiMsg::Browser(BrowserEvt::Loading(loading)));
+                let _ = load_proxy.send_event(AppEvent::Wake);
+            })
+            .build_as_child(&window);
+        match built {
+            Ok(wv) => Some(wv),
+            Err(e) => {
+                // The chat must still work when the preview cannot be created.
+                eprintln!("[gui] preview panel unavailable: {e}");
+                gs.browser.fail(format!("Preview panel unavailable: {e}"));
+                None
+            }
+        }
+    } else {
+        eprintln!("[gui] preview panel disabled in config ([browser] enabled = false)");
+        None
+    };
+
+    // Goal B: publish a handle so agent tools can drive this webview. The
+    // waker is what turns a queued command into an event-loop wake-up.
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<crate::browser::Request>();
+    if browser_enabled {
+        let proxy = event_loop.create_proxy();
+        let waker: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+            let _ = proxy.send_event(AppEvent::Wake);
+        });
+        if let Ok(mut slot) = state.browser.lock() {
+            *slot = Some(crate::browser::Handle::new(cmd_tx, waker));
+        }
+    }
+    let mut bridge = Bridge::new();
+
+    // Rust -> page: server events wake the loop, then we drain + push.
+    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<ServerEvent>();
+    {
+        let proxy = event_loop.create_proxy();
+        let mut rx = state.events.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if evt_tx.send(ev).is_err() {
+                            break;
+                        }
+                        let _ = proxy.send_event(AppEvent::Wake);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    // Diagnostic hook: `OPENCODE_RUST_PREVIEW_SMOKE=<url>` opens the panel on
+    // that URL at boot and logs every webview callback. It exists because the
+    // child view can only be verified by a human clicking the window
+    // otherwise — this makes "does a real page actually render?" testable.
+    if let (Some(wv), Ok(url)) = (&browser_webview, std::env::var("OPENCODE_RUST_PREVIEW_SMOKE")) {
+        let rect = PanelRect { x: 800.0, y: 80.0, w: 440.0, h: 700.0 };
+        gs.browser.rect = Some(rect);
+        gs.browser.open(&url);
+        let _ = wv.set_bounds(rect.to_wry());
+        let _ = wv.set_visible(true);
+        let _ = wv.load_url(&url);
+        eprintln!("[preview-smoke] loading {url}");
+    }
+
+    // First paint (the page also asks for one via IpcMsg::Ready once loaded),
+    // then an optional prefilled prompt from the CLI.
+    paint(&webview, &gs);
+    if let Some(content) = submit_and_name(&mut gs, &state) {
+        eprintln!("[gui] run start (prefill): {}", clip(&content, 80));
+        let sid = gs.session.clone().unwrap_or_default();
+        paint(&webview, &gs);
+        let st0 = state.clone();
+        rt.spawn(async move {
+            st0.kick_run(sid, content).await;
+        });
+    }
+
+    eprintln!("[gui] entering the event loop");
+    let st = state.clone();
+    event_loop.run(move |event, _, control_flow| {
+        // While a modal countdown is on screen the loop has to wake up on its
+        // own; otherwise a heartbeat-less idle window freezes the timer.
+        // Never overwrite `Exit`: every callback starts here, so resetting it
+        // would strand a windowless process after the user closes the window.
+        if !matches!(*control_flow, ControlFlow::Exit) {
+            *control_flow = if gs.approval.is_some() || bridge.busy() {
+                ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(500))
+            } else {
+                ControlFlow::Wait
+            };
+        }
+        let mut changed = false;
+        match event {
+            Event::UserEvent(AppEvent::Wake) | Event::MainEventsCleared => {
+                while let Ok(ev) = evt_rx.try_recv() {
+                    gs.on_event(ev);
+                    changed = true;
+                }
+                while let Ok(msg) = ui_rx.try_recv() {
+                    match msg {
+                        UiMsg::Ipc(IpcMsg::Send(text)) => {
+                            gs.input = text;
+                            if let Some(content) = submit_and_name(&mut gs, &st) {
+                                eprintln!("[gui] run start: {}", clip(&content, 80));
+                                let sid = gs.session.clone().unwrap_or_default();
+                                let st = st.clone();
+                                rt.spawn(async move {
+                                    st.kick_run(sid, content).await;
+                                });
+                                changed = true;
+                            }
+                        }
+                        UiMsg::Ipc(IpcMsg::NewSession) => match st.db.create_session(NEW_CHAT, None) {
+                            Ok(s) => {
+                                gs.session = Some(s.id);
+                                gs.entries.clear();
+                                gs.busy = false;
+                                refresh_sessions(&mut gs, &st);
+                                changed = true;
+                            }
+                            Err(e) => {
+                                gs.push(EntryKind::Error, format!("new session failed: {e}"));
+                                changed = true;
+                            }
+                        },
+                        UiMsg::Ipc(IpcMsg::Load(id)) => {
+                            if gs.session.as_deref() != Some(id.as_str()) {
+                                load_session(&mut gs, &st, &id);
+                            }
+                            changed = true;
+                        }
+                        // The page just finished loading: give it the state.
+                        UiMsg::Ipc(IpcMsg::Ready) => changed = true,
+                        UiMsg::Ipc(IpcMsg::PageError(msg)) => {
+                            eprintln!("[gui] page error: {msg}");
+                        }
+                        UiMsg::Ipc(IpcMsg::Minimize) => window.set_minimized(true),
+                        UiMsg::Ipc(IpcMsg::MaximizeToggle) => {
+                            let maxed = window.is_maximized();
+                            window.set_maximized(!maxed);
+                        }
+                        UiMsg::Ipc(IpcMsg::Close) => *control_flow = ControlFlow::Exit,
+                        UiMsg::Ipc(IpcMsg::Approve { id, always }) => {
+                            let answered = st.decide(&id, true, always);
+                            settle_approval(&mut gs, &id, answered);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::Deny(id)) => {
+                            let answered = st.decide(&id, false, false);
+                            settle_approval(&mut gs, &id, answered);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::Mode(mode)) => {
+                            // The core owns the mode; the page just picks it.
+                            let granted = st.set_perm_mode(mode);
+                            gs.perm_mode = mode;
+                            // Switching to turbo answers whatever was blocking,
+                            // so the modal must not outlive the grant.
+                            let answered = gs
+                                .approval
+                                .as_ref()
+                                .is_some_and(|ap| granted.iter().any(|id| id == &ap.id));
+                            if answered {
+                                gs.approval = None;
+                            }
+                            eprintln!(
+                                "[gui] permission mode -> {} ({} prompt(s) released)",
+                                mode.as_str(),
+                                granted.len()
+                            );
+                            gs.push(EntryKind::System, mode.note());
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::Browse(raw)) => {
+                            match normalize_url(&raw) {
+                                // `allow_remote = false` makes this a dev-server-only
+                                // surface; refuse the rest instead of loading it.
+                                Ok(url) if !st.cfg.browser.allow_remote && !is_local_url(&url) => {
+                                    gs.browser.fail(format!(
+                                        "`{url}` is blocked: this panel is dev-server-only \
+                                         ([browser] allow_remote = false)."
+                                    ));
+                                    if let Some(wv) = &browser_webview {
+                                        show_browser(wv, &gs.browser);
+                                    }
+                                }
+                                Ok(url) => match &browser_webview {
+                                    Some(wv) => {
+                                        gs.browser.open(&url);
+                                        show_browser(wv, &gs.browser);
+                                        if let Err(e) = wv.load_url(&url) {
+                                            gs.browser.fail(format!("navigate failed: {e}"));
+                                            show_browser(wv, &gs.browser);
+                                        }
+                                    }
+                                    None => gs.browser.fail(if browser_enabled {
+                                        "Preview panel unavailable on this system."
+                                    } else {
+                                        "Preview panel is disabled in config ([browser] enabled = false)."
+                                    }),
+                                },
+                                Err(e) => {
+                                    gs.browser.fail(e);
+                                    if let Some(wv) = &browser_webview {
+                                        show_browser(wv, &gs.browser);
+                                    }
+                                }
+                            }
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::NavBack) => {
+                            if let Some(wv) = &browser_webview {
+                                let _ = wv.go_back();
+                                sync_history(wv, &mut gs.browser);
+                            }
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::NavFwd) => {
+                            if let Some(wv) = &browser_webview {
+                                let _ = wv.go_forward();
+                                sync_history(wv, &mut gs.browser);
+                            }
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::NavReload) => {
+                            if let Some(wv) = &browser_webview {
+                                let _ = wv.reload();
+                            }
+                            changed = true;
+                        }
+                        // Geometry/no-paint verbs: the page already knows its
+                        // own layout, so these must not trigger a full repaint.
+                        UiMsg::Ipc(IpcMsg::PanelRect(rect)) => {
+                            gs.browser.rect = Some(rect);
+                            if let Some(wv) = &browser_webview {
+                                show_browser(wv, &gs.browser);
+                            }
+                        }
+                        UiMsg::Ipc(IpcMsg::PanelVisible(visible)) => {
+                            gs.browser.visible = visible;
+                            if let Some(wv) = &browser_webview {
+                                show_browser(wv, &gs.browser);
+                            }
+                        }
+                        UiMsg::Ipc(IpcMsg::OpenDevServer(url)) => {
+                            let target = url
+                                .or_else(|| gs.dev_server.clone())
+                                .or_else(|| {
+                                    let home = gs.browser.home.clone();
+                                    if home.is_empty() { None } else { Some(home) }
+                                })
+                                .unwrap_or_else(|| "http://localhost:3000".into());
+                            match normalize_url(&target) {
+                                Ok(u) => {
+                                    if let Some(wv) = &browser_webview {
+                                        gs.browser.open(&u);
+                                        show_browser(wv, &gs.browser);
+                                        let _ = wv.load_url(&u);
+                                    } else {
+                                        gs.browser.fail(if browser_enabled {
+                                            "Preview panel unavailable on this system."
+                                        } else {
+                                            "Preview panel is disabled in config ([browser] enabled = false)."
+                                        });
+                                    }
+                                }
+                                Err(e) => gs.browser.fail(e),
+                            }
+                            changed = true;
+                        }
+                        UiMsg::Browser(BrowserEvt::Eval(raw)) => {
+                            // Page -> Rust result frame for an agent tool call.
+                            bridge.on_eval(&raw);
+                        }
+                        UiMsg::Browser(ev) => {
+                            if std::env::var_os("OPENCODE_RUST_PREVIEW_SMOKE").is_some() {
+                                eprintln!("[preview-smoke] {ev:?}");
+                            }
+                            let loaded = matches!(ev, BrowserEvt::Loading(false));
+                            gs.on_browser_event(ev);
+                            // A pending `browser_navigate` resolves on load.
+                            if loaded {
+                                bridge.on_loaded(&gs.browser);
+                            }
+                            if let Some(wv) = &browser_webview {
+                                sync_history(wv, &mut gs.browser);
+                                show_browser(wv, &gs.browser);
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                // Goal B: agent tools ask this loop to act on the webview.
+                while let Ok(req) = cmd_rx.try_recv() {
+                    bridge.start(
+                        &browser_webview,
+                        req,
+                        &mut gs.browser,
+                        st.cfg.browser.allow_remote,
+                    );
+                    changed = true;
+                }
+                // Requests that never get an answer must not hang the run.
+                bridge.expire();
+                // A live countdown forces a repaint on every timed wake.
+                if gs.approval.is_some() {
+                    changed = true;
+                }
+                if changed {
+                    paint(&webview, &gs);
+                }
+            }
+            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+                eprintln!("[gui] close requested");
+                *control_flow = ControlFlow::Exit;
+            }
+            // tao/winit signal a dead message loop this way; without it a
+            // closed window can leave the process running invisibly.
+            Event::LoopDestroyed => {
+                eprintln!("[gui] window closed — exiting");
+                *control_flow = ControlFlow::Exit;
+            }
+            _ => {}
+        }
+    })
+}
+
+/// Goal B: requests from agent tools that are waiting on this webview.
+///
+/// Every request has a deadline; a page that never answers (a hung script, a
+/// destroyed view) fails the tool instead of freezing the run.
+struct Bridge {
+    next_id: u64,
+    pending: HashMap<u64, (tokio::sync::oneshot::Sender<Result<String, String>>, Instant)>,
+    /// A navigation still waiting for its load event.
+    nav: Option<(tokio::sync::oneshot::Sender<Result<String, String>>, Instant)>,
+}
+
+impl Bridge {
+    fn new() -> Self {
+        Self { next_id: 1, pending: HashMap::new(), nav: None }
+    }
+
+    fn busy(&self) -> bool {
+        !self.pending.is_empty() || self.nav.is_some()
+    }
+
+    /// Dispatch one request. `None` webview = panel unavailable (config off).
+    fn start(
+        &mut self,
+        wv: &Option<wry::WebView>,
+        req: crate::browser::Request,
+        view: &mut BrowserView,
+        allow_remote: bool,
+    ) {
+        let Some(wv) = wv else {
+            let _ = req.reply.send(Err("the preview panel is not available".into()));
+            return;
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        let deadline = Instant::now() + Duration::from_secs(25);
+        match req.method.as_str() {
+            "navigate" => {
+                let raw = req.input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                match normalize_url(raw) {
+                    Ok(url) if allow_remote || is_local_url(&url) => {
+                        view.open(&url);
+                        show_browser(wv, view);
+                        if let Err(e) = wv.load_url(&url) {
+                            let _ = req.reply.send(Err(format!("navigate failed: {e}")));
+                            return;
+                        }
+                        // Resolved by the next Loading(false) event.
+                        self.nav = Some((req.reply, deadline));
+                    }
+                    Ok(url) => {
+                        let _ = req.reply.send(Err(format!(
+                            "`{url}` is blocked: the panel is dev-server-only \
+                             ([browser] allow_remote = false)"
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = req.reply.send(Err(e));
+                    }
+                }
+            }
+            "wait" => {
+                let selector = req.input.get("selector").and_then(|v| v.as_str());
+                let text = req.input.get("text").and_then(|v| v.as_str());
+                if selector.is_none() && text.is_none() {
+                    // Plain delay: no page interaction, no blocked UI thread.
+                    let ms = req
+                        .input
+                        .get("ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(500)
+                        .clamp(1, 30_000);
+                    let js = format!(
+                        "setTimeout(function(){{window.ipc.postMessage(JSON.stringify(\
+                         {{hab:{id},ok:true,result:{{\"slept_ms\":{ms}}}}}));}}, {ms});"
+                    );
+                    self.pending.insert(id, (req.reply, deadline));
+                    let _ = wv.evaluate_script(&js);
+                    return;
+                }
+                self.pending.insert(id, (req.reply, deadline));
+                let js = crate::browser::wait_script(id, selector, text, 8_000);
+                let _ = wv.evaluate_script(&js);
+            }
+            method => {
+                let Some(js) = crate::browser::eval_wrapper(method, &req.input, id) else {
+                    let _ = req.reply.send(Err(format!("unknown browser command `{method}`")));
+                    return;
+                };
+                self.pending.insert(id, (req.reply, deadline));
+                let _ = wv.evaluate_script(&js);
+            }
+        }
+    }
+
+    /// Answer a page frame. Returns true when it belonged to a live request.
+    fn on_eval(&mut self, raw: &str) -> bool {
+        let Some((id, res)) = crate::browser::parse_reply(raw) else {
+            return false;
+        };
+        match self.pending.remove(&id) {
+            Some((tx, _)) => {
+                let _ = tx.send(res);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A page finished loading: release a waiting `browser_navigate`.
+    fn on_loaded(&mut self, view: &BrowserView) -> bool {
+        let Some((tx, _)) = self.nav.take() else {
+            return false;
+        };
+        let out = serde_json::json!({
+            "ok": true,
+            "url": view.url,
+            "title": view.title,
+        });
+        let _ = tx.send(Ok(out.to_string()));
+        true
+    }
+
+    /// Fail anything past its deadline (called every timed wake).
+    fn expire(&mut self) {
+        let now = Instant::now();
+        let stale: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, d))| *d <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some((tx, _)) = self.pending.remove(&id) {
+                let _ = tx.send(Err("the page did not answer in time".into()));
+            }
+        }
+        if matches!(self.nav.as_ref(), Some((_, d)) if *d <= now) {
+            if let Some((tx, _)) = self.nav.take() {
+                let _ = tx.send(Err("navigation timed out".into()));
+            }
+        }
+    }
+}
+
+fn tracing_boot(boot_ms: u128, addr: std::net::SocketAddr, session: &str) {
+    eprintln!("[habi] ready in {boot_ms}ms \u{b7} core at http://{addr} \u{b7} session {session}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delta(text: &str) -> ServerEvent {
+        ServerEvent::AssistantDelta { session_id: "s".into(), text: text.into() }
+    }
+
+    #[tokio::test]
+    async fn prefill_names_the_chat_like_typed_sends() {
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
+            .await;
+        let s = st.db.create_session(NEW_CHAT, None).unwrap();
+        let mut g = GuiState::new();
+        g.session = Some(s.id.clone());
+        refresh_sessions(&mut g, &st);
+        // The CLI prefill submits the same way a typed message does…
+        g.input = "prefill repro marker one".into();
+        assert_eq!(
+            submit_and_name(&mut g, &st).as_deref(),
+            Some("prefill repro marker one")
+        );
+        // …and names the chat after it, instead of leaving it "New chat".
+        assert_eq!(g.title(), "prefill repro marker one");
+        // Later messages never rename an already-named chat.
+        g.input = "second message".into();
+        submit_and_name(&mut g, &st);
+        assert_eq!(g.title(), "prefill repro marker one");
+    }
+
+    #[test]
+    fn submit_sends_and_sets_busy() {
+        let mut g = GuiState::new();
+        g.input = "  hello  ".into();
+        assert_eq!(g.submit().as_deref(), Some("hello"));
+        assert!(g.busy);
+        assert!(g.entries.iter().any(|(k, t)| *k == EntryKind::User && t.contains("hello")));
+        assert_eq!(g.submit(), None, "empty input sends nothing");
+    }
+
+    #[test]
+    fn assistant_deltas_merge_into_one_bubble() {
+        let mut g = GuiState::new();
+        g.on_event(delta("Hel"));
+        g.on_event(delta("lo!"));
+        let assistant: Vec<_> = g
+            .entries
+            .iter()
+            .filter(|(k, _)| *k == EntryKind::Assistant)
+            .collect();
+        assert_eq!(assistant.len(), 1);
+        assert_eq!(assistant[0].1, "Hello!");
+    }
+
+    #[test]
+    fn reasoning_marker_once_then_merge() {
+        let mut g = GuiState::new();
+        g.on_event(ServerEvent::ReasoningDelta { session_id: "s".into(), text: "think".into() });
+        g.on_event(ServerEvent::ReasoningDelta { session_id: "s".into(), text: "ing".into() });
+        let thinking: Vec<_> = g.entries.iter().filter(|(k, _)| *k == EntryKind::Thinking).collect();
+        assert_eq!(thinking.len(), 1);
+        assert!(thinking[0].1.starts_with('\u{273b}'), "marker once: {}", thinking[0].1);
+        assert!(thinking[0].1.ends_with("thinking"));
+    }
+
+    #[test]
+    fn run_finished_clears_busy_and_reports() {
+        let mut g = GuiState::new();
+        g.busy = true;
+        g.on_event(ServerEvent::RunFinished {
+            session_id: "s".into(),
+            ok: true,
+            message: Some("done".into()),
+        });
+        assert!(!g.busy);
+        assert!(g.entries.iter().any(|(k, t)| *k == EntryKind::System && t == "done"));
+    }
+
+    #[test]
+    fn session_loaded_replays_transcript() {
+        let mut g = GuiState::new();
+        g.busy = true;
+        g.on_event(ServerEvent::SessionLoaded {
+            session_id: "ses_x".into(),
+            mode: "build".into(),
+            transcript: vec![
+                server::TranscriptLine { role: "user".into(), text: "hi".into() },
+                server::TranscriptLine { role: "assistant".into(), text: "hello".into() },
+            ],
+        });
+        assert_eq!(g.session.as_deref(), Some("ses_x"));
+        assert!(!g.busy);
+        assert_eq!(g.entries.len(), 2);
+        assert_eq!(g.entries[0].0, EntryKind::User);
+    }
+
+    #[test]
+    fn ipc_send_new_and_window_controls() {
+        assert_eq!(parse_ipc(r#"{"type":"send","text":" hi "}"#), Some(IpcMsg::Send("hi".into())));
+        assert_eq!(parse_ipc(r#"{"type":"send","text":"   "}"#), None, "blank sends are dropped");
+        assert_eq!(parse_ipc(r#"{"type":"new"}"#), Some(IpcMsg::NewSession));
+        assert_eq!(parse_ipc(r#"{"type":"load","id":"ses_9"}"#), Some(IpcMsg::Load("ses_9".into())));
+        assert_eq!(parse_ipc(r#"{"type":"load"}"#), None, "load without id is malformed");
+        assert_eq!(parse_ipc(r#"{"type":"ready"}"#), Some(IpcMsg::Ready));
+        assert_eq!(parse_ipc(r#"{"type":"min"}"#), Some(IpcMsg::Minimize));
+        assert_eq!(parse_ipc(r#"{"type":"max"}"#), Some(IpcMsg::MaximizeToggle));
+        assert_eq!(parse_ipc(r#"{"type":"close"}"#), Some(IpcMsg::Close));
+        assert_eq!(parse_ipc(r#"{"type":"wat"}"#), None);
+        assert_eq!(parse_ipc("not json"), None);
+    }
+
+    #[test]
+    fn ipc_mode_selector_parses_the_three_modes() {
+        assert_eq!(
+            parse_ipc(r#"{"type":"mode","mode":"default"}"#),
+            Some(IpcMsg::Mode(PermissionMode::Default))
+        );
+        assert_eq!(
+            parse_ipc(r#"{"type":"mode","mode":"manual"}"#),
+            Some(IpcMsg::Mode(PermissionMode::Manual))
+        );
+        assert_eq!(
+            parse_ipc(r#"{"type":"mode","mode":"turbo"}"#),
+            Some(IpcMsg::Mode(PermissionMode::Turbo))
+        );
+        assert_eq!(parse_ipc(r#"{"type":"mode","mode":"yolo"}"#), None, "unknown mode dropped");
+        assert_eq!(parse_ipc(r#"{"type":"mode"}"#), None, "mode without value dropped");
+    }
+
+    #[test]
+    fn payload_is_valid_json_with_classes() {
+        let mut g = GuiState::new();
+        g.session = Some("ses_1".into());
+        g.busy = true;
+        g.api = Some((true, 16));
+        g.push(EntryKind::User, "quote \" and \u{1f512}");
+        g.push(EntryKind::System, "</script> injection");
+        let v: serde_json::Value = serde_json::from_str(&g.payload()).expect("payload parses");
+        assert_eq!(v["session"], "ses_1");
+        assert_eq!(v["busy"], true);
+        assert_eq!(v["api"][1], 16);
+        assert_eq!(v["entries"][0]["k"], "u");
+        assert_eq!(v["entries"][1]["k"], "s");
+        assert!(v["entries"][1]["t"].as_str().unwrap().contains("</script>"));
+        assert_eq!(v["perm_mode"], "default", "selector starts in default mode");
+        g.perm_mode = PermissionMode::Turbo;
+        let v: serde_json::Value = serde_json::from_str(&g.payload()).unwrap();
+        assert_eq!(v["perm_mode"], "turbo");
+    }
+
+    #[test]
+    fn payload_carries_sessions_and_active_title() {
+        let mut g = GuiState::new();
+        g.sessions = vec![
+            ("ses_2".into(), "Second".into()),
+            ("ses_1".into(), "First".into()),
+        ];
+        g.session = Some("ses_1".into());
+        let v: serde_json::Value = serde_json::from_str(&g.payload()).unwrap();
+        assert_eq!(v["title"], "First", "header shows the active chat's title");
+        assert_eq!(v["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(v["sessions"][0]["active"], false);
+        assert_eq!(v["sessions"][1]["active"], true);
+        // No session selected yet: title falls back to the default.
+        let g2 = GuiState::new();
+        let v2: serde_json::Value = serde_json::from_str(&g2.payload()).unwrap();
+        assert_eq!(v2["title"], NEW_CHAT);
+    }
+
+    #[test]
+    fn entries_from_messages_maps_parts_to_bubbles() {
+        let msg = |role: &str, parts: Vec<Part>| Message {
+            id: "m".into(),
+            session_id: "s".into(),
+            role: role.into(),
+            parts,
+            created_at: 0,
+        };
+        let msgs = vec![
+            msg("user", vec![Part::Text { text: "hi".into() }]),
+            msg(
+                "assistant",
+                vec![
+                    Part::Reasoning { text: "thinking…".into() },
+                    Part::Text { text: "hello".into() },
+                    Part::ToolCall { id: "t1".into(), name: "bash".into(), input: serde_json::json!({"cmd":"ls"}) },
+                    Part::ToolResult { tool_id: "t1".into(), output: "file.rs".into(), is_error: false },
+                ],
+            ),
+        ];
+        let entries = entries_from_messages(&msgs);
+        assert_eq!(entries[0], (EntryKind::User, "hi".into()));
+        assert_eq!(entries[1].0, EntryKind::Thinking);
+        assert_eq!(entries[2], (EntryKind::Assistant, "hello".into()));
+        assert_eq!(entries[3].0, EntryKind::Tool);
+        assert!(entries[3].1.contains("bash"));
+        assert!(entries[4].1.contains('\u{2713}'));
+        // Long tool output is clipped, not dumped whole into a bubble.
+        let long = entries_from_messages(&[msg(
+            "assistant",
+            vec![Part::ToolResult { tool_id: "t".into(), output: "x".repeat(500), is_error: true }],
+        )]);
+        assert!(long[0].1.chars().count() < 200);
+        assert!(long[0].1.contains('\u{2717}'));
+    }
+
+    #[test]
+    fn clip_respects_char_boundary_and_budget() {
+        assert_eq!(clip("short", 10), "short");
+        assert_eq!(clip("hello world", 5), "hello\u{2026}");
+        assert_eq!(clip("\u{1f512}abc", 2), "\u{1f512}a\u{2026}");
+    }
+
+    /// A-F1: everything a person might paste into the URL bar has to turn into
+    /// something the engine will actually load.
+    #[test]
+    fn url_input_normalizes_to_a_loadable_url() {
+        assert_eq!(normalize_url("  https://example.com/a?b=1  ").unwrap(), "https://example.com/a?b=1");
+        assert_eq!(normalize_url("http://localhost:3000").unwrap(), "http://localhost:3000");
+        assert_eq!(normalize_url(":5173").unwrap(), "http://localhost:5173");
+        assert_eq!(normalize_url("localhost:3000").unwrap(), "http://localhost:3000");
+        assert_eq!(normalize_url("localhost").unwrap(), "http://localhost");
+        assert_eq!(normalize_url("127.0.0.1:8080/app").unwrap(), "http://127.0.0.1:8080/app");
+        assert_eq!(normalize_url("192.168.1.5:8000").unwrap(), "http://192.168.1.5:8000");
+        assert_eq!(normalize_url("news.ycombinator.com").unwrap(), "https://news.ycombinator.com");
+        assert_eq!(normalize_url("about:blank").unwrap(), "about:blank");
+        // Nonsense is reported, not silently dropped.
+        assert!(normalize_url("   ").is_err());
+        assert!(normalize_url("just-a-word").is_err());
+    }
+
+    /// A-B3: `file:` would read local disk, `javascript:` would run script
+    /// against whatever origin the panel happens to be on. Both refused.
+    #[test]
+    fn refused_schemes_are_reported_with_reasons() {
+        for bad in ["file:///C:/Windows/win.ini", "javascript:alert(1)", "data:text/html,hi"] {
+            let err = normalize_url(bad).expect_err(bad);
+            assert!(err.contains("blocked"), "{bad} -> {err}");
+        }
+        assert!(!is_allowed_scheme("file:///etc/passwd"));
+        assert!(!is_allowed_scheme("JavaScript:alert(1)"));
+        assert!(is_allowed_scheme("https://example.com"));
+        assert!(is_allowed_scheme("about:blank"));
+    }
+
+    /// A-B1: CSS pixels are logical pixels. `Rect` must not be pre-multiplied
+    /// by the scale factor or the child view lands off-panel on a 125% display.
+    #[test]
+    fn panel_rect_maps_css_pixels_to_logical_units() {
+        let r = PanelRect { x: 840.0, y: 38.0, w: 440.0, h: 762.0 };
+        assert!(r.is_usable());
+        let wr = r.to_wry();
+        match wr.position {
+            wry::dpi::Position::Logical(p) => {
+                assert_eq!(p.x, 840.0);
+                assert_eq!(p.y, 38.0);
+            }
+            other => panic!("expected logical position, got {other:?}"),
+        }
+        match wr.size {
+            wry::dpi::Size::Logical(s) => {
+                assert_eq!(s.width, 440.0);
+                assert_eq!(s.height, 762.0);
+            }
+            other => panic!("expected logical size, got {other:?}"),
+        }
+        // A collapsed panel reports w=0; that is not a rect to place a view at.
+        assert!(!PanelRect { x: 0.0, y: 0.0, w: 0.0, h: 400.0 }.is_usable());
+        assert!(!PanelRect { x: f64::NAN, y: 0.0, w: 10.0, h: 10.0 }.is_usable());
+    }
+
+    #[test]
+    fn ipc_parses_browser_verbs() {
+        assert_eq!(parse_ipc(r#"{"type":"browse","url":":3000"}"#), Some(IpcMsg::Browse(":3000".into())));
+        assert_eq!(parse_ipc(r#"{"type":"browse"}"#), None, "browse without a url is malformed");
+        assert_eq!(parse_ipc(r#"{"type":"nav_back"}"#), Some(IpcMsg::NavBack));
+        assert_eq!(parse_ipc(r#"{"type":"nav_fwd"}"#), Some(IpcMsg::NavFwd));
+        assert_eq!(parse_ipc(r#"{"type":"nav_reload"}"#), Some(IpcMsg::NavReload));
+        assert_eq!(
+            parse_ipc(r#"{"type":"panel_rect","x":840,"y":38,"w":440,"h":762}"#),
+            Some(IpcMsg::PanelRect(PanelRect { x: 840.0, y: 38.0, w: 440.0, h: 762.0 }))
+        );
+        assert_eq!(parse_ipc(r#"{"type":"panel_rect","x":1,"y":2,"w":3}"#), None, "missing h");
+        assert_eq!(
+            parse_ipc(r#"{"type":"panel_rect","x":0,"y":0,"w":0,"h":0}"#),
+            None,
+            "degenerate rect would place a view at zero size"
+        );
+        assert_eq!(parse_ipc(r#"{"type":"panel_rect","x":"a","y":2,"w":3,"h":4}"#), None);
+        assert_eq!(parse_ipc(r#"{"type":"panel_visible","visible":false}"#), Some(IpcMsg::PanelVisible(false)));
+        assert_eq!(parse_ipc(r#"{"type":"panel_visible"}"#), None);
+        assert_eq!(parse_ipc(r#"{"type":"open_dev_server"}"#), Some(IpcMsg::OpenDevServer(None)));
+        assert_eq!(
+            parse_ipc(r#"{"type":"open_dev_server","url":"http://localhost:5173"}"#),
+            Some(IpcMsg::OpenDevServer(Some("http://localhost:5173".into())))
+        );
+    }
+
+    /// The payload is the whole frontend contract: a missing key here means a
+    /// control that silently never enables.
+    #[test]
+    fn payload_carries_browser_state() {
+        let mut g = GuiState::new();
+        g.browser.open("http://localhost:3000");
+        g.browser.title = "Fixture".into();
+        g.browser.can_back = true;
+        g.dev_server = Some("http://localhost:5173".into());
+        let v: serde_json::Value = serde_json::from_str(&g.payload()).unwrap();
+        assert_eq!(v["browser"]["url"], "http://localhost:3000");
+        assert_eq!(v["browser"]["title"], "Fixture");
+        assert_eq!(v["browser"]["can_back"], true);
+        assert_eq!(v["browser"]["can_forward"], false);
+        assert_eq!(v["browser"]["loading"], true);
+        assert_eq!(v["browser"]["error"], serde_json::Value::Null);
+        assert_eq!(v["dev_server"], "http://localhost:5173");
+    }
+
+    #[test]
+    fn browser_events_track_the_view() {
+        let mut g = GuiState::new();
+        // The fresh webview's about:blank is not a page.
+        g.on_browser_event(BrowserEvt::Url("about:blank".into()));
+        assert_eq!(g.browser.url, "");
+        assert!(!g.browser.has_page());
+        g.on_browser_event(BrowserEvt::Url("https://example.com".into()));
+        g.on_browser_event(BrowserEvt::Loading(false));
+        assert!(g.browser.has_page());
+        assert!(!g.browser.loading);
+        assert!(g.browser.visible);
+        g.on_browser_event(BrowserEvt::Blocked("file:///etc/passwd".into()));
+        assert!(!g.browser.visible, "a native view over an error card is unreadable");
+        assert!(g.browser.error.unwrap().contains("Blocked"));
+    }
+
+    /// D1: an `ask` gate must reach the page as a modal — a dropped event is
+    /// a silent denial, which is exactly the hole this closes.
+    #[test]
+    fn approval_reaches_the_modal_and_clears_on_answer() {
+        let mut g = GuiState::new();
+        g.approval_timeout_secs = 300;
+        g.on_event(ServerEvent::ApprovalNeeded {
+            session_id: "s".into(),
+            approval_id: "apr_1".into(),
+            tool: "bash".into(),
+            detail: "rm -rf build".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&g.payload()).unwrap();
+        assert_eq!(v["approval"]["id"], "apr_1");
+        assert_eq!(v["approval"]["tool"], "bash");
+        assert_eq!(v["approval"]["detail"], "rm -rf build");
+        assert!(v["approval"]["secs_left"].as_u64().unwrap() <= 300);
+        assert!(g.browser.covered, "a native child view would paint over the modal");
+
+        settle_approval(&mut g, "apr_1", true);
+        let v: serde_json::Value = serde_json::from_str(&g.payload()).unwrap();
+        assert_eq!(v["approval"], serde_json::Value::Null);
+        assert!(!g.browser.covered, "the panel should come back after answering");
+
+        // A late answer for a request that is already gone must not clear a
+        // newer one.
+        g.on_event(ServerEvent::ApprovalNeeded {
+            session_id: "s".into(),
+            approval_id: "apr_2".into(),
+            tool: "write".into(),
+            detail: "src/main.rs".into(),
+        });
+        settle_approval(&mut g, "apr_1", true);
+        assert_eq!(g.approval.as_ref().map(|a| a.id.as_str()), Some("apr_2"));
+    }
+
+    #[test]
+    fn approval_and_denial_parse_from_the_page() {
+        assert_eq!(
+            parse_ipc(r#"{"type":"approve","id":"apr_1","always":true}"#),
+            Some(IpcMsg::Approve { id: "apr_1".into(), always: true })
+        );
+        assert_eq!(
+            parse_ipc(r#"{"type":"approve","id":"apr_1"}"#),
+            Some(IpcMsg::Approve { id: "apr_1".into(), always: false })
+        );
+        assert_eq!(parse_ipc(r#"{"type":"approve"}"#), None, "id is required");
+        assert_eq!(
+            parse_ipc(r#"{"type":"deny","id":"apr_1"}"#),
+            Some(IpcMsg::Deny("apr_1".into()))
+        );
+    }
+
+    /// A-B4: `allow_remote = false` must keep the panel on this machine.
+    #[test]
+    fn local_url_detection_covers_dev_servers() {
+        for u in [
+            "http://localhost:3000",
+            "http://127.0.0.1:5173/app",
+            "https://localhost",
+            "http://0.0.0.0:8080",
+            "http://[::1]:8080",
+            "about:blank",
+        ] {
+            assert!(is_local_url(u), "{u} should count as local");
+        }
+        for u in [
+            "https://example.com",
+            "http://192.168.1.5:3000",
+            "https://localhost.evil.example",
+            "file:///etc/passwd",
+        ] {
+            assert!(!is_local_url(u), "{u} should not count as local");
+        }
+    }
+
+    /// A-B5: dev servers announce themselves in log output; the chip and CTA
+    /// need the origin, not the sentence around it.
+    #[test]
+    fn dev_server_is_detected_in_tool_output() {
+        assert_eq!(
+            detect_dev_server("  VITE v5 ready\n  ➜  Local:   http://localhost:5173/\n").as_deref(),
+            Some("http://localhost:5173")
+        );
+        assert_eq!(
+            detect_dev_server("listening on http://127.0.0.1:8080").as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(detect_dev_server("http://localhost:"), None, "no port, no chip");
+        assert_eq!(detect_dev_server("https://localhost:3000 is tls"), None, "tls is not a dev server");
+        assert_eq!(detect_dev_server("compiled successfully"), None);
+    }
+}

@@ -1,0 +1,43 @@
+# opencode-rust configuration file
+# Place this at: ~/.config/opencode-rust/config.toml
+# Or set OPENCODE_RUST_CONFIG="path/to/config.toml"
+
+[provider]
+# OpenAI-compatible API endpoint:
+# Examples:
+#   OpenRouter: "https://openrouter.ai/api/v1"
+#   OpenAI:     "https://api.openai.com/v1"
+#   Groq:       "https://api.groq.com/openai/v1"
+#   Ollama:     "http://127.0.0.1:11434/v1"
+#   Gemini:     "https://generativelanguage.googleapis.com/v1beta/openai/"
+#   Local Mock: "http://127.0.0.1:18080/v1"
+base_url = "https://openrouter.ai/api/v1"
+
+# Your API key (can also be set via $env:OPENCODE_RUST_API_KEY):
+api_key = "your-api-key-here"
+
+# Model identifier:
+# Examples: "openai/gpt-4o", "anthropic/claude-3.5-sonnet", "llama3.1", "mock"
+model = "openai/gpt-4o"
+
+# Optional cheaper model for background tasks (compaction, planning)
+# small_model = "openai/gpt-4o-mini"
+request_timeout_secs = 600
+
+[agent]
+max_steps = 40
+ponytail = true
+auto_review = true
+reuse_gate = true
+
+[permissions]
+# Default action per tool: "allow" | "ask" | "deny"
+[permissions.defaults]
+read = "allow"
+list = "allow"
+glob = "allow"
+grep = "allow"
+bash = "ask"
+write = "ask"
+edit = "ask"
+webfetch = "ask"

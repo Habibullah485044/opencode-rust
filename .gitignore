@@ -1,0 +1,23 @@
+# Cargo build output
+target/
+separate_demo/target/
+
+# Logs and local run artifacts
+*.log
+
+# Compiled artifacts
+*.exe
+*.pdb
+*.dll
+*.o
+*.rlib
+
+# Python noise
+__pycache__/
+*.pyc
+
+# Local state / secrets
+.env
+*.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,2153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Habi Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --sky: #38bdf8;
+    --sky-glow: rgba(56, 189, 248, 0.30);
+    --sky-soft: rgba(56, 189, 248, 0.12);
+    --sky-hover: #0ea5e9;
+    --sky-gradient: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
+    --sky-border: rgba(56, 189, 248, 0.28);
+    
+    --bg-main: #070a12;
+    --bg-panel: #0b101c;
+    --bg-card: #0f172a;
+    --bg-card-hover: #131d35;
+    --bg-header: #090e18;
+    --bg-surface: #121a2d;
+    
+    --border-subtle: rgba(255, 255, 255, 0.08);
+    --border-line: rgba(56, 189, 248, 0.15);
+    
+    --text-primary: #f8fafc;
+    --text-soft: #cbd5e1;
+    --text-muted: #94a3b8;
+    --text-dim: #64748b;
+    
+    --success: #34d399;
+    --error: #f87171;
+    --warning: #fbbf24;
+    --thinking: #a78bfa;
+    --user-bubble: linear-gradient(135deg, rgba(14, 165, 233, 0.20), rgba(2, 132, 199, 0.12));
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  
+  html, body {
+    height: 100%;
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 13.5px;
+    line-height: 1.5;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  button, input, textarea {
+    font-family: inherit;
+    color: inherit;
+  }
+
+  /* Custom Scrollbar — wide and opaque enough to actually see on the dark theme */
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.04); }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.38);
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(56, 189, 248, 0.6);
+  }
+
+  #wrap {
+    display: grid;
+    grid-template-rows: 38px 1fr;
+    height: 100vh;
+    background: var(--bg-main);
+  }
+
+  /* ---- Custom Draggable Titlebar ---- */
+  #titlebar {
+    display: flex;
+    align-items: center;
+    background: var(--bg-header);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 0 0 0 14px;
+    -webkit-app-region: drag;
+    app-region: drag;
+    user-select: none;
+    z-index: 50;
+  }
+  
+  .tb-brand {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--text-primary);
+  }
+  
+  .tb-brand .brand-logo {
+    width: 14px;
+    height: 14px;
+    border-radius: 4px;
+    background: var(--sky-gradient);
+    box-shadow: 0 0 10px var(--sky-glow);
+    display: inline-block;
+  }
+  
+  .tb-brand .brand-tag {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--sky-soft);
+    color: var(--sky);
+    border: 1px solid var(--sky-border);
+    font-weight: 600;
+  }
+
+  #tb-title {
+    flex: 1;
+    text-align: center;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+    margin: 0 16px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .tb-btns {
+    display: flex;
+    height: 100%;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+  }
+
+  .tb {
+    width: 44px;
+    height: 100%;
+    background: transparent;
+    border: 0;
+    color: var(--text-dim);
+    font-size: 12px;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    transition: all 0.15s ease;
+  }
+  
+  .tb:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-primary);
+  }
+  
+  .tb.close:hover {
+    background: #ef4444;
+    color: #ffffff;
+  }
+
+  /* ---- Main App Layout (Sidebar + Chat + Collapsible Browser) ---- */
+  #app {
+    display: grid;
+    grid-template-columns: 240px minmax(0, 1fr) auto;
+    /* Cap the implicit row to the container height — without this the row
+       is content-sized, the columns grow with the transcript, and #entries
+       never scrolls (the chat just becomes unreachable). */
+    grid-template-rows: minmax(0, 1fr);
+    min-height: 0;
+    height: 100%;
+    transition: grid-template-columns 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  /* ---- Sidebar ---- */
+  #side {
+    background: var(--bg-panel);
+    border-right: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    padding: 12px 10px;
+    min-height: 0;
+    z-index: 20;
+  }
+
+  .newchat {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    background: var(--sky-gradient);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: #04101e;
+    font-weight: 600;
+    font-size: 13px;
+    border-radius: 9px;
+    padding: 9px 12px;
+    cursor: pointer;
+    box-shadow: 0 3px 12px var(--sky-glow);
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .newchat:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 5px 18px rgba(56, 189, 248, 0.4);
+    filter: brightness(1.05);
+  }
+
+  .newchat:active {
+    transform: translateY(0);
+  }
+
+  .newchat svg {
+    width: 15px;
+    height: 15px;
+    stroke: currentColor;
+    stroke-width: 2.4;
+  }
+
+  .seclabel {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin: 16px 8px 8px;
+  }
+
+  #sesslist {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding-right: 2px;
+  }
+
+  .sess {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    text-align: left;
+    width: 100%;
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--text-muted);
+    font-size: 12.8px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .sess .sess-icon {
+    flex: none;
+    width: 14px;
+    height: 14px;
+    opacity: 0.55;
+    transition: opacity 0.15s;
+  }
+
+  .sess span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+  }
+
+  .sess:hover {
+    background: var(--bg-card);
+    color: var(--text-primary);
+  }
+
+  .sess:hover .sess-icon {
+    opacity: 0.9;
+    color: var(--sky);
+  }
+
+  .sess.active {
+    background: var(--sky-soft);
+    border-color: var(--sky-border);
+    color: #ffffff;
+    font-weight: 500;
+  }
+
+  .sess.active .sess-icon {
+    opacity: 1;
+    color: var(--sky);
+  }
+
+  #foot {
+    border-top: 1px solid var(--border-subtle);
+    padding-top: 10px;
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .api {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    padding: 4px 6px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.02);
+  }
+
+  .api .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    transition: all 0.2s;
+  }
+
+  .api.ok {
+    color: #7dd3fc;
+  }
+  
+  .api.ok .dot {
+    background: var(--sky);
+    box-shadow: 0 0 8px var(--sky);
+  }
+
+  .api.down {
+    color: #fca5a5;
+  }
+  
+  .api.down .dot {
+    background: var(--error);
+    box-shadow: 0 0 8px var(--error);
+  }
+
+  .ver-badge {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 10.5px;
+    color: var(--text-dim);
+    padding: 0 6px;
+  }
+
+  /* ---- Center Chat Area ---- */
+  #chat {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-main);
+    min-width: 0;
+    position: relative;
+    height: 100%;
+  }
+
+  /* Chat Top Header */
+  #chead {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 48px;
+    padding: 0 20px;
+    border-bottom: 1px solid var(--border-subtle);
+    background: rgba(7, 10, 18, 0.7);
+    backdrop-filter: blur(10px);
+    z-index: 10;
+  }
+
+  .chead-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+  }
+
+  #ctitle {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .chead-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: none;
+  }
+
+  #cstatus {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--text-dim);
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    padding: 4px 10px;
+    border-radius: 999px;
+  }
+
+  #cstatus.working {
+    border-color: var(--sky-border);
+    color: var(--sky);
+  }
+
+  #spin {
+    width: 12px;
+    height: 12px;
+    border: 2px solid rgba(56, 189, 248, 0.2);
+    border-top-color: var(--sky);
+    border-radius: 50%;
+    animation: sp 0.8s linear infinite;
+  }
+  @keyframes sp { to { transform: rotate(360deg); } }
+
+  .header-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-soft);
+    font-size: 12px;
+    padding: 5px 10px;
+    border-radius: 7px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .header-btn:hover {
+    background: var(--bg-card-hover);
+    border-color: var(--sky-border);
+    color: var(--text-primary);
+  }
+
+  .header-btn.active {
+    background: var(--sky-soft);
+    border-color: var(--sky-border);
+    color: var(--sky);
+  }
+
+  /* Chat Messages Stream */
+  #entries {
+    flex: 1;
+    overflow-y: auto;
+    position: relative;
+    min-height: 0;
+    padding: 0;
+    scroll-behavior: smooth;
+  }
+
+  #log {
+    padding: 24px 28px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    max-width: 900px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  /* Single Message Item */
+  .e-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: 100%;
+    animation: fadeInUp 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* User Message */
+  .e-row.u {
+    align-items: flex-end;
+  }
+
+  .e-bubble-u {
+    max-width: 82%;
+    background: var(--user-bubble);
+    border: 1px solid var(--sky-border);
+    color: #f0f9ff;
+    padding: 11px 16px;
+    border-radius: 16px 16px 4px 16px;
+    font-size: 13.5px;
+    line-height: 1.5;
+    word-break: break-word;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2);
+  }
+
+  /* Assistant Message */
+  .e-row.a {
+    align-items: flex-start;
+  }
+
+  .assistant-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 3px;
+  }
+
+  .assistant-avatar {
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+    background: var(--sky-gradient);
+    display: grid;
+    place-items: center;
+    font-size: 10.5px;
+    font-weight: 700;
+    color: #04101e;
+    box-shadow: 0 0 8px var(--sky-glow);
+  }
+
+  .assistant-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-soft);
+  }
+
+  .e-bubble-a {
+    max-width: 94%;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    padding: 14px 18px;
+    border-radius: 4px 16px 16px 16px;
+    font-size: 13.5px;
+    line-height: 1.6;
+    word-break: break-word;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  }
+
+  .e-bubble-a h1, .e-bubble-a h2, .e-bubble-a h3 {
+    margin: 14px 0 8px;
+    font-weight: 600;
+    color: #ffffff;
+    line-height: 1.3;
+  }
+  .e-bubble-a h1 { font-size: 16.5px; border-bottom: 1px solid var(--border-subtle); padding-bottom: 4px; }
+  .e-bubble-a h2 { font-size: 15px; }
+  .e-bubble-a h3 { font-size: 14px; }
+  .e-bubble-a p { margin: 6px 0; }
+  .e-bubble-a ul, .e-bubble-a ol { margin: 8px 0 8px 20px; }
+  .e-bubble-a li { margin: 3px 0; }
+  .e-bubble-a strong { color: #ffffff; font-weight: 600; }
+  
+  .inline-code {
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 12.5px;
+    background: var(--sky-soft);
+    color: var(--sky);
+    border: 1px solid var(--sky-border);
+    padding: 1.5px 5px;
+    border-radius: 4px;
+  }
+
+  /* Code Blocks */
+  .code-block {
+    margin: 12px 0;
+    border-radius: 8px;
+    background: #090e18;
+    border: 1px solid var(--sky-border);
+    overflow: hidden;
+  }
+
+  .code-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #0d1422;
+    padding: 6px 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+  }
+
+  .copy-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-soft);
+    border-radius: 4px;
+    font-size: 11px;
+    padding: 2px 7px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .copy-btn:hover {
+    background: var(--sky-soft);
+    border-color: var(--sky-border);
+    color: var(--sky);
+  }
+
+  .code-content {
+    padding: 12px 14px;
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: #e2e8f0;
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  /* Thinking / Reasoning Box (Collapsible) */
+  .thinking-box {
+    margin: 4px 0 8px;
+    border-radius: 8px;
+    background: rgba(167, 139, 250, 0.06);
+    border: 1px solid rgba(167, 139, 250, 0.2);
+    overflow: hidden;
+    max-width: 92%;
+  }
+
+  .thinking-box summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    color: #c4b5fd;
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    transition: background 0.15s;
+  }
+
+  .thinking-box summary::-webkit-details-marker { display: none; }
+  .thinking-box summary:hover { background: rgba(167, 139, 250, 0.1); }
+
+  .thinking-pulse {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #a78bfa;
+    box-shadow: 0 0 6px #a78bfa;
+  }
+
+  .thinking-content {
+    padding: 8px 14px 10px;
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 12px;
+    color: #94a3b8;
+    line-height: 1.5;
+    border-top: 1px dashed rgba(167, 139, 250, 0.15);
+    white-space: pre-wrap;
+    max-height: 320px;
+    overflow-y: auto;
+  }
+
+  /* Tool Execution Card */
+  .tool-card {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    background: #090e18;
+    border: 1px solid var(--border-line);
+    border-left: 3px solid var(--sky);
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-soft);
+    max-width: 92%;
+  }
+
+  .tool-card .t-icon {
+    color: var(--sky);
+    font-size: 13px;
+  }
+
+  /* System Note */
+  .e-sys {
+    align-self: center;
+    font-size: 11.5px;
+    color: var(--text-dim);
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-subtle);
+    padding: 3px 12px;
+    border-radius: 999px;
+    margin: 2px 0;
+  }
+
+  /* Error Box */
+  .e-err {
+    align-self: flex-start;
+    max-width: 92%;
+    background: rgba(248, 113, 113, 0.08);
+    border: 1px solid rgba(248, 113, 113, 0.3);
+    border-left: 3px solid var(--error);
+    color: #fca5a5;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+  }
+
+  /* Empty Welcome State */
+  #empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding: 20px;
+    pointer-events: none;
+    z-index: 5;
+  }
+
+  .empty-brand-wrap {
+    position: relative;
+    width: 64px;
+    height: 64px;
+    display: grid;
+    place-items: center;
+  }
+
+  .empty-pulse-ring {
+    position: absolute;
+    inset: -6px;
+    border-radius: 22px;
+    border: 1px solid var(--sky);
+    opacity: 0.35;
+    animation: pulseRing 3s ease-out infinite;
+  }
+  @keyframes pulseRing {
+    0% { transform: scale(0.95); opacity: 0.5; }
+    50% { transform: scale(1.15); opacity: 0.15; }
+    100% { transform: scale(0.95); opacity: 0.5; }
+  }
+
+  .empty-logo {
+    width: 58px;
+    height: 58px;
+    border-radius: 18px;
+    background: var(--sky-gradient);
+    box-shadow: 0 0 28px var(--sky-glow);
+    display: grid;
+    place-items: center;
+    color: #04101e;
+    font-weight: 800;
+    font-size: 26px;
+  }
+
+  #empty h1 {
+    font-size: 22px;
+    font-weight: 700;
+    color: #ffffff;
+    letter-spacing: -0.02em;
+    text-align: center;
+  }
+
+  #empty p {
+    font-size: 13.5px;
+    color: var(--text-muted);
+    max-width: 440px;
+    text-align: center;
+    line-height: 1.5;
+  }
+
+  #empty .chips {
+    display: flex;
+    gap: 10px;
+    margin-top: 6px;
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: 580px;
+  }
+
+  .chip {
+    pointer-events: auto;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-soft);
+    border-radius: 10px;
+    padding: 9px 15px;
+    font-size: 12.8px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.2);
+    transition: all 0.2s ease;
+  }
+
+  .chip:hover {
+    border-color: var(--sky-border);
+    background: var(--bg-card-hover);
+    color: #ffffff;
+    transform: translateY(-2px);
+    box-shadow: 0 6px 18px var(--sky-glow);
+  }
+
+  .chip svg {
+    color: var(--sky);
+  }
+
+  /* ---- Floating Composer Dock ---- */
+  #compwrap {
+    padding: 12px 24px 16px;
+    max-width: 900px;
+    width: 100%;
+    margin: 0 auto;
+    position: relative;
+    z-index: 20;
+  }
+
+  #comp {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-card);
+    border: 1px solid var(--border-line);
+    border-radius: 14px;
+    padding: 10px 14px 10px 16px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  #comp:focus-within {
+    border-color: var(--sky);
+    box-shadow: 0 8px 30px var(--sky-glow);
+  }
+
+  #input {
+    width: 100%;
+    background: transparent;
+    border: 0;
+    outline: 0;
+    color: var(--text-primary);
+    font-size: 14px;
+    line-height: 1.5;
+    padding: 4px 0 6px;
+  }
+
+  #input::placeholder {
+    color: var(--text-dim);
+  }
+
+  .comp-bottom-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+  }
+
+  /* ---- Permission mode selector (Default / Manual / Turbo) ---- */
+  .mode-switch {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.04);
+    user-select: none;
+    flex: 0 0 auto;
+  }
+
+  .mode-btn {
+    border: 0;
+    background: transparent;
+    border-radius: 6px;
+    padding: 3px 9px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .mode-btn:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .mode-btn:focus-visible {
+    outline: 1px solid var(--sky);
+    outline-offset: 1px;
+  }
+
+  .mode-btn.on {
+    background: var(--sky-soft);
+    color: var(--sky);
+    box-shadow: inset 0 0 0 1px var(--sky-border);
+  }
+
+  .mode-btn.manual.on {
+    background: rgba(167, 139, 250, 0.16);
+    color: #c4b5fd;
+    box-shadow: inset 0 0 0 1px rgba(167, 139, 250, 0.4);
+  }
+
+  .mode-btn.turbo.on {
+    background: rgba(245, 158, 11, 0.18);
+    color: #fbbf24;
+    box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.45);
+  }
+
+  /* Turbo grants blanket access, so the composer itself says so. */
+  #comp.turbo {
+    border-color: rgba(245, 158, 11, 0.55);
+    box-shadow: 0 8px 30px rgba(245, 158, 11, 0.16);
+  }
+
+  #comp.turbo:focus-within {
+    border-color: #f59e0b;
+    box-shadow: 0 8px 30px rgba(245, 158, 11, 0.22);
+  }
+
+  .comp-hints {
+    font-size: 11px;
+    color: var(--text-dim);
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-left: auto;
+    user-select: none;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .comp-hints .mode-hint {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .comp-hints .mode-hint.turbo { color: #fbbf24; }
+  .comp-hints .mode-hint.manual { color: #c4b5fd; }
+
+  .comp-hints kbd {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 3px;
+    padding: 1px 4px;
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+
+  #send {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: 0;
+    background: #182234;
+    color: var(--text-dim);
+    cursor: default;
+    display: grid;
+    place-items: center;
+    transition: all 0.2s ease;
+  }
+
+  #send.on {
+    background: var(--sky-gradient) !important;
+    color: #04101e !important;
+    cursor: pointer !important;
+    box-shadow: 0 2px 12px var(--sky-glow) !important;
+    transform: scale(1.04);
+  }
+
+  #send.on:hover {
+    transform: scale(1.1);
+    box-shadow: 0 4px 16px rgba(56, 189, 248, 0.5) !important;
+  }
+
+  /* ---- Collapsible Webview / Browser Panel ---- */
+  #browser {
+    width: 440px;
+    max-width: 50vw;
+    background: var(--bg-panel);
+    border-left: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    transition: width 0.25s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s;
+    overflow: hidden;
+  }
+
+  #browser.collapsed {
+    width: 0px !important;
+    border-left: 0 !important;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  #tabs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px 0;
+    background: var(--bg-header);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg-card);
+    border-radius: 8px 8px 0 0;
+    padding: 6px 12px;
+    font-size: 12px;
+    color: var(--text-primary);
+    border-top: 2px solid var(--sky);
+  }
+
+  .tab .fav {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--sky);
+    box-shadow: 0 0 6px var(--sky);
+  }
+
+  .tabx {
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 13px;
+    margin-left: 4px;
+  }
+  .tabx:hover { color: #ffffff; }
+
+  #tabs .spacer { flex: 1; }
+
+  .b-close-btn {
+    background: none;
+    border: 0;
+    color: var(--text-dim);
+    cursor: pointer;
+    padding: 4px 8px;
+    font-size: 14px;
+    border-radius: 4px;
+  }
+  .b-close-btn:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
+
+  #urlrow {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 7px 10px;
+    background: var(--bg-header);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .nb {
+    flex: none;
+    width: 26px;
+    height: 26px;
+    background: none;
+    border: 0;
+    border-radius: 6px;
+    color: var(--text-muted);
+    font-size: 13px;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    transition: all 0.15s;
+  }
+  .nb:hover {
+    background: var(--bg-card);
+    color: #ffffff;
+  }
+
+  /* A real <input>: the old <div> could not be focused, so pasting a link
+     was impossible by construction. */
+  #url {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg-main);
+    border: 1px solid var(--border-subtle);
+    border-radius: 20px;
+    padding: 5px 12px;
+    color: var(--text-primary);
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    user-select: text;
+  }
+  #url::placeholder { color: var(--text-dim); }
+  #url:focus {
+    border-color: var(--sky-border);
+    box-shadow: 0 0 0 3px var(--sky-soft);
+  }
+  #url.bad { border-color: #ef4444; }
+
+  .nb:disabled { opacity: 0.3; cursor: default; }
+  .nb:disabled:hover { background: none; color: var(--text-muted); }
+  .nb.spin { animation: sp 0.9s linear infinite; }
+
+  #bcontent {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    /* The page itself is a native child view drawn on top of this box; this
+       background only shows while there is no view (empty/error states). */
+    background: var(--bg-main);
+  }
+
+  .b-empty,
+  .b-error {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 24px;
+    text-align: center;
+  }
+
+  .b-empty[hidden],
+  .b-error[hidden] { display: none; }
+
+  .b-error .b-error-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: #f87171;
+  }
+
+  .b-error .b-error-msg {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    max-width: 300px;
+    word-break: break-word;
+  }
+
+  .browser-globe {
+    width: 52px;
+    height: 52px;
+    border-radius: 16px;
+    background: var(--sky-soft);
+    border: 1px solid var(--sky-border);
+    display: grid;
+    place-items: center;
+    color: var(--sky);
+    font-size: 24px;
+  }
+
+  #bcontent b {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  #bcontent .sub {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    max-width: 260px;
+  }
+
+  #bcontent .cta {
+    margin-top: 4px;
+    background: var(--sky-soft);
+    border: 1px solid var(--sky-border);
+    color: var(--sky);
+    font-weight: 600;
+    font-size: 12.5px;
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  #bcontent .cta:hover {
+    background: var(--sky-gradient);
+    color: #04101e;
+    box-shadow: 0 4px 14px var(--sky-glow);
+  }
+
+  /* ---- D1: approval modal ----
+     The engine blocks the tool call until this is answered. The native preview
+     view ignores z-index, so the backend hides it while this is open. */
+  #approval {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: rgba(3, 6, 12, 0.62);
+    backdrop-filter: blur(3px);
+  }
+  #approval[hidden] { display: none; }
+
+  .ap-card {
+    width: min(520px, 100%);
+    background: var(--bg-panel);
+    border: 1px solid var(--sky-border);
+    border-radius: 14px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+    padding: 18px 18px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .ap-head { display: flex; align-items: center; gap: 8px; }
+
+  .ap-badge {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--sky-soft);
+    border: 1px solid var(--sky-border);
+    color: var(--sky);
+  }
+
+  .ap-count {
+    margin-left: auto;
+    font-size: 11.5px;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .ap-title { font-size: 14px; font-weight: 600; color: var(--text-primary); }
+
+  .ap-detail {
+    margin: 0;
+    max-height: 180px;
+    overflow: auto;
+    background: var(--bg-main);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+    white-space: pre-wrap;
+    word-break: break-word;
+    user-select: text;
+  }
+
+  .ap-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 2px; }
+
+  .ap-btn {
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 8px 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .ap-btn kbd { margin-left: 6px; opacity: 0.55; font-size: 10px; }
+  .ap-btn:hover { filter: brightness(1.12); }
+  .ap-btn.allow { background: var(--sky-gradient); color: #04101e; border-color: transparent; }
+  .ap-btn.deny:hover { background: #ef4444; color: #ffffff; border-color: transparent; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <!-- Window Drag Titlebar -->
+  <div id="titlebar">
+    <div class="tb-brand">
+      <span class="brand-logo"></span>
+      <span>HABI STUDIO</span>
+      <span class="brand-tag">RUST CORE</span>
+    </div>
+    <div id="tb-title">New chat</div>
+    <div class="tb-btns">
+      <button class="tb" data-a="min" title="Minimize">&#x2500;</button>
+      <button class="tb" data-a="max" title="Maximize">&#x25A1;</button>
+      <button class="tb close" data-a="close" title="Close">&#x2715;</button>
+    </div>
+  </div>
+
+  <div id="app">
+    <!-- Left Sidebar -->
+    <aside id="side">
+      <button class="newchat" id="new-chat-btn">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+        New Chat
+      </button>
+      
+      <div class="seclabel">
+        <span>Conversations</span>
+      </div>
+      
+      <div id="sesslist"></div>
+      
+      <div id="foot">
+        <div class="api" id="api">
+          <span class="dot"></span>
+          <span id="apitxt">connecting…</span>
+        </div>
+        <div class="ver-badge">
+          <span>Desktop Shell</span>
+          <span style="color: var(--sky); font-weight:600;">M8</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Center Chat Area -->
+    <main id="chat">
+      <div id="chead">
+        <div class="chead-left">
+          <div id="ctitle">New chat</div>
+        </div>
+        <div class="chead-right">
+          <div id="cstatus">
+            <span>Ready</span>
+          </div>
+          <button class="header-btn" id="toggle-browser-btn" title="Toggle embedded preview browser">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+            Preview
+          </button>
+        </div>
+      </div>
+
+      <div id="entries">
+        <div id="log"></div>
+        
+        <!-- Empty State Screen -->
+        <div id="empty">
+          <div class="empty-brand-wrap">
+            <div class="empty-pulse-ring"></div>
+            <div class="empty-logo">H</div>
+          </div>
+          <h1>What would you like to build?</h1>
+          <p>Habi reads and edits code, runs commands, verifies git snapshots, and coordinates subagents.</p>
+          <div class="chips">
+            <button class="chip" data-s="Summarize this repository architecture and active files">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/></svg>
+              Summarize this repo
+            </button>
+            <button class="chip" data-s="Inspect git status and run tests to find issues">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+              Find & fix a bug
+            </button>
+            <button class="chip" data-s="Explain how the subagent team orchestration works">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+              Explore Agent Team
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Floating Composer Dock -->
+      <div id="compwrap">
+        <div id="comp">
+          <input id="input" placeholder="Message Habi or ask a question…" autocomplete="off" spellcheck="false">
+          <div class="comp-bottom-row">
+            <div class="mode-switch" id="mode-switch" role="radiogroup" aria-label="Permission mode">
+              <button type="button" class="mode-btn on" data-mode="default" role="radio" aria-checked="true"
+                      title="Default: safe reads run, anything that writes or runs a command asks first">Default</button>
+              <button type="button" class="mode-btn manual" data-mode="manual" role="radio" aria-checked="false"
+                      title="Manual: every tool call waits for your approval">Manual</button>
+              <button type="button" class="mode-btn turbo" data-mode="turbo" role="radio" aria-checked="false"
+                      title="Turbo: full access, no approval prompts, and the agent keeps working on its own">Turbo</button>
+            </div>
+            <div class="comp-hints">
+              <span class="mode-hint" id="mode-hint">Approvals on · writes and commands ask first</span>
+              <span>·</span>
+              <span><kbd>Enter</kbd> to send</span>
+            </div>
+            <button id="send" title="Send (Enter)">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Collapsible Browser Panel -->
+    <section id="browser">
+      <div id="tabs">
+        <span class="tab">
+          <span class="fav"></span>
+          <span id="b-tab-title">Preview</span>
+          <span class="tabx" id="b-tab-close" title="Close preview">&times;</span>
+        </span>
+        <span class="spacer"></span>
+        <button class="b-close-btn" id="close-browser-btn" title="Close Preview Panel">&times;</button>
+      </div>
+      <div id="urlrow">
+        <button class="nb" id="nav-back" title="Back" disabled>&#x2190;</button>
+        <button class="nb" id="nav-fwd" title="Forward" disabled>&#x2192;</button>
+        <button class="nb" id="nav-reload" title="Reload">&#x27F3;</button>
+        <input id="url" type="text" spellcheck="false" autocomplete="off" placeholder="Paste a link or localhost:3000" />
+        <button class="nb" id="nav-go" title="Go">&#x27A4;</button>
+      </div>
+      <div id="bcontent">
+        <div class="b-empty" id="b-empty">
+          <div class="browser-globe">&#127760;</div>
+          <b>Embedded Browser</b>
+          <span class="sub">Paste a link above, or open a local dev server. Pages run in a real Chromium view, not an iframe.</span>
+          <button class="cta" id="cta-dev-server">Open Dev Server</button>
+        </div>
+        <div class="b-error" id="b-error" hidden>
+          <div class="b-error-title">That page didn&#39;t open</div>
+          <div class="b-error-msg" id="b-error-msg"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- D1: tool-approval modal. Not part of #app so it can sit above everything. -->
+<div id="approval" hidden>
+  <div class="ap-card" role="dialog" aria-modal="true" aria-labelledby="ap-title">
+    <div class="ap-head">
+      <span class="ap-badge" id="ap-tool">tool</span>
+      <span class="ap-count" id="ap-count"></span>
+    </div>
+    <div class="ap-title" id="ap-title">Habi needs your permission</div>
+    <pre class="ap-detail" id="ap-detail"></pre>
+    <div class="ap-actions">
+      <button class="ap-btn deny" id="ap-deny">Deny <kbd>n</kbd></button>
+      <button class="ap-btn" id="ap-always">Always allow <kbd>a</kbd></button>
+      <button class="ap-btn allow" id="ap-allow">Allow once <kbd>y</kbd></button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- Preview panel state, shared by render() and the init wiring ----
+  var curUrl = "";
+  var devServerUrl = "";
+  var panelOpen = false;
+  var lastRectSig = "";
+  var rectQueued = false;
+  var currentApproval = null;
+  // Set by initApp; render() uses it to surface the panel when an agent
+  // navigates (a browser action must not happen invisibly).
+  var panelApi = null;
+
+  // What the active permission mode means, in one line each. Rust owns the
+  // behaviour; these strings only say what it is doing.
+  var MODE_HINTS = {
+    "default": "Approvals on · writes and commands ask first",
+    "manual": "Manual · every tool call asks first",
+    "turbo": "Turbo · full access, no prompts"
+  };
+
+  function postToRust(msg) {
+    try {
+      if (window.ipc && window.ipc.postMessage) {
+        window.ipc.postMessage(JSON.stringify(msg));
+      } else {
+        console.warn("window.ipc not ready yet, msg:", msg);
+      }
+    } catch (e) {
+      console.warn("IPC postMessage error:", e);
+    }
+  }
+
+  // Escape HTML to prevent injection
+  function esc(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  // Lightweight Markdown & Code Block Formatter
+  function renderMarkdown(raw) {
+    if (!raw) return "";
+
+    var lines = raw.split("\n");
+    var out = [];
+    var inCode = false;
+    var codeLang = "";
+    var codeBuf = [];
+    var inList = false;
+
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+
+      // Code block start / end
+      if (line.trim().indexOf("```") === 0) {
+        if (!inCode) {
+          if (inList) { out.push("</ul>"); inList = false; }
+          inCode = true;
+          codeLang = line.trim().substring(3).trim();
+          codeBuf = [];
+        } else {
+          inCode = false;
+          var langTag = (codeLang || "code").toUpperCase();
+          var id = "cb_" + Math.random().toString(36).substring(2, 9);
+          out.push(
+            '<div class="code-block">' +
+              '<div class="code-header">' +
+                '<span>' + esc(langTag) + '</span>' +
+                '<button class="copy-btn" onclick="copyCode(\'' + id + '\', this)">Copy</button>' +
+              '</div>' +
+              '<pre class="code-content"><code id="' + id + '">' + esc(codeBuf.join("\n")) + '</code></pre>' +
+            '</div>'
+          );
+        }
+        continue;
+      }
+
+      if (inCode) {
+        codeBuf.push(line);
+        continue;
+      }
+
+      // Headers
+      if (/^### (.*$)/.test(line)) {
+        if (inList) { out.push("</ul>"); inList = false; }
+        out.push("<h3>" + formatInline(line.substring(4)) + "</h3>");
+      } else if (/^## (.*$)/.test(line)) {
+        if (inList) { out.push("</ul>"); inList = false; }
+        out.push("<h2>" + formatInline(line.substring(3)) + "</h2>");
+      } else if (/^# (.*$)/.test(line)) {
+        if (inList) { out.push("</ul>"); inList = false; }
+        out.push("<h1>" + formatInline(line.substring(2)) + "</h1>");
+      }
+      // Unordered lists
+      else if (/^[*-] (.*$)/.test(line)) {
+        if (!inList) { out.push("<ul>"); inList = true; }
+        out.push("<li>" + formatInline(line.substring(2)) + "</li>");
+      }
+      // Blank lines
+      else if (!line.trim()) {
+        if (inList) { out.push("</ul>"); inList = false; }
+        out.push("<br>");
+      }
+      // Normal paragraphs
+      else {
+        if (inList) { out.push("</ul>"); inList = false; }
+        out.push("<p>" + formatInline(line) + "</p>");
+      }
+    }
+
+    if (inCode) {
+      out.push('<pre class="code-content"><code>' + esc(codeBuf.join("\n")) + '</code></pre>');
+    }
+    if (inList) out.push("</ul>");
+    return out.join("");
+  }
+
+  function formatInline(str) {
+    var s = esc(str);
+    s = s.replace(/`([^`]+)`/g, '<span class="inline-code">$1</span>');
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    return s;
+  }
+
+  window.copyCode = function (id, btn) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    var text = el.textContent || "";
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text);
+    }
+    var orig = btn.textContent;
+    btn.textContent = "Copied!";
+    btn.style.color = "var(--sky)";
+    setTimeout(function () {
+      btn.textContent = orig;
+      btn.style.color = "";
+    }, 1600);
+  };
+
+  // Called by Rust: window.render(d)
+  window.render = function (d) {
+    if (!d) return;
+
+    // Window and header title
+    var title = d.title || "New chat";
+    var ctitle = document.getElementById("ctitle");
+    var tbtitle = document.getElementById("tb-title");
+    if (ctitle) ctitle.textContent = title;
+    if (tbtitle) tbtitle.textContent = title;
+    document.title = "Habi Studio — " + title;
+
+    // Sidebar sessions list
+    var list = document.getElementById("sesslist");
+    if (list) {
+      list.textContent = "";
+      if (d.sessions && d.sessions.length) {
+        for (var i = 0; i < d.sessions.length; i++) {
+          var s = d.sessions[i];
+          var btn = document.createElement("button");
+          btn.className = "sess" + (s.active ? " active" : "");
+          btn.title = s.title || "New chat";
+
+          var iconSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+          iconSvg.setAttribute("class", "sess-icon");
+          iconSvg.setAttribute("viewBox", "0 0 24 24");
+          iconSvg.setAttribute("fill", "none");
+          iconSvg.setAttribute("stroke", "currentColor");
+          iconSvg.setAttribute("stroke-width", "2");
+          iconSvg.innerHTML = '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>';
+
+          var span = document.createElement("span");
+          span.textContent = s.title || "New chat";
+
+          btn.appendChild(iconSvg);
+          btn.appendChild(span);
+
+          (function (id) {
+            btn.addEventListener("click", function () {
+              postToRust({ type: "load", id: id });
+            });
+          })(s.id);
+
+          list.appendChild(btn);
+        }
+      }
+    }
+
+    // API connectivity pill
+    var api = document.getElementById("api");
+    var apitxt = document.getElementById("apitxt");
+    if (api && apitxt) {
+      if (d.api === null || d.api === undefined) {
+        api.className = "api";
+        apitxt.textContent = "Connecting…";
+      } else if (d.api[0]) {
+        api.className = "api ok";
+        apitxt.textContent = "API Connected · " + d.api[1] + "ms";
+      } else {
+        api.className = "api down";
+        apitxt.textContent = "API Offline";
+      }
+    }
+
+    // Status indicator
+    var cstatus = document.getElementById("cstatus");
+    if (cstatus) {
+      cstatus.textContent = "";
+      if (d.busy) {
+        cstatus.className = "working";
+        var spin = document.createElement("span");
+        spin.id = "spin";
+        cstatus.appendChild(spin);
+        cstatus.appendChild(document.createTextNode("Thinking…"));
+      } else {
+        cstatus.className = "";
+        cstatus.appendChild(document.createTextNode("Ready"));
+      }
+    }
+
+    // ---- Permission mode selector (default / manual / turbo) ----
+    var permMode = d.perm_mode || "default";
+    var modeBtns = document.querySelectorAll(".mode-btn");
+    for (var mi = 0; mi < modeBtns.length; mi++) {
+      var modeOn = modeBtns[mi].getAttribute("data-mode") === permMode;
+      modeBtns[mi].classList.toggle("on", modeOn);
+      modeBtns[mi].setAttribute("aria-checked", modeOn ? "true" : "false");
+    }
+    var compEl = document.getElementById("comp");
+    if (compEl) compEl.classList.toggle("turbo", permMode === "turbo");
+    var modeHint = document.getElementById("mode-hint");
+    if (modeHint) {
+      modeHint.textContent = MODE_HINTS[permMode] || MODE_HINTS["default"];
+      modeHint.classList.toggle("turbo", permMode === "turbo");
+      modeHint.classList.toggle("manual", permMode === "manual");
+    }
+
+    // Render Transcript Entries — rebuild only when they changed, and keep
+    // the reader's place: auto-scroll only when they were already at the
+    // bottom, so a heartbeat repaint can't yank them back down mid-read.
+    var log = document.getElementById("log");
+    var entries = document.getElementById("entries");
+    var sig = JSON.stringify(d.entries || []) + "\u0000" + (d.session || "");
+    if (log && log._sig !== sig) {
+      var stick = true;
+      if (entries && log._sig !== undefined && log._session === (d.session || "")) {
+        stick = entries.scrollHeight - entries.scrollTop - entries.clientHeight < 60;
+      }
+      var saved = entries ? entries.scrollTop : 0;
+      log._sig = sig;
+      log._session = d.session || "";
+      log.textContent = "";
+
+      if (d.entries && d.entries.length) {
+        for (var j = 0; j < d.entries.length; j++) {
+          var e = d.entries[j];
+          var text = e.t || "";
+          var row = document.createElement("div");
+
+          if (e.k === "u") {
+            row.className = "e-row u";
+            var ub = document.createElement("div");
+            ub.className = "e-bubble-u";
+            ub.textContent = text.replace(/^›\s*/, "");
+            row.appendChild(ub);
+          } else if (e.k === "a") {
+            row.className = "e-row a";
+            var head = document.createElement("div");
+            head.className = "assistant-header";
+            head.innerHTML = '<span class="assistant-avatar">H</span><span class="assistant-name">Habi</span>';
+            
+            var ab = document.createElement("div");
+            ab.className = "e-bubble-a";
+            ab.innerHTML = renderMarkdown(text);
+
+            row.appendChild(head);
+            row.appendChild(ab);
+          } else if (e.k === "t") {
+            row.className = "e-row";
+            var details = document.createElement("details");
+            details.className = "thinking-box";
+            details.open = false;
+            
+            var summary = document.createElement("summary");
+            summary.innerHTML = '<span class="thinking-pulse"></span><span>Reasoning Process</span>';
+            
+            var body = document.createElement("div");
+            body.className = "thinking-content";
+            body.textContent = text.replace(/^[✻\s]*/, "");
+
+            details.appendChild(summary);
+            details.appendChild(body);
+            row.appendChild(details);
+          } else if (e.k === "w") {
+            row.className = "e-row";
+            var toolCard = document.createElement("div");
+            toolCard.className = "tool-card";
+            toolCard.innerHTML = '<span class="t-icon">⚡</span><span>' + esc(text) + '</span>';
+            row.appendChild(toolCard);
+          } else if (e.k === "x") {
+            row.className = "e-row";
+            var errDiv = document.createElement("div");
+            errDiv.className = "e-err";
+            errDiv.textContent = text;
+            row.appendChild(errDiv);
+          } else {
+            row.className = "e-row";
+            var sysDiv = document.createElement("div");
+            sysDiv.className = "e-sys";
+            sysDiv.textContent = text;
+            row.appendChild(sysDiv);
+          }
+
+          log.appendChild(row);
+        }
+      }
+
+      if (entries) {
+        if (stick) {
+          entries.scrollTop = entries.scrollHeight;
+        } else {
+          // Restore the reading position instantly (no smooth animation).
+          entries.style.scrollBehavior = "auto";
+          entries.scrollTop = saved;
+          entries.style.scrollBehavior = "";
+        }
+      }
+    }
+
+    // ---- Preview panel chrome (A-F1 / A-F2 / A-F4) ----
+    // Goal A: the panel is a native child webview, so this block only keeps the
+    // *chrome* honest — URL, title, history flags, spinner, error state.
+    var b = (d && d.browser) || {};
+    curUrl = b.url || "";
+    devServerUrl = d.dev_server || "";
+
+    var urlBar = document.getElementById("url");
+    if (urlBar) {
+      if (document.activeElement !== urlBar) {
+        urlBar.value = curUrl;
+      }
+      urlBar.classList.toggle("bad", !!b.error);
+      urlBar.title = curUrl;
+    }
+
+    var tabTitle = document.getElementById("b-tab-title");
+    if (tabTitle) tabTitle.textContent = b.title || "Preview";
+
+    var navBack = document.getElementById("nav-back");
+    if (navBack) navBack.disabled = !b.can_back;
+    var navFwd = document.getElementById("nav-fwd");
+    if (navFwd) navFwd.disabled = !b.can_forward;
+    var navReload = document.getElementById("nav-reload");
+    if (navReload) navReload.classList.toggle("spin", !!b.loading);
+
+    var bEmpty = document.getElementById("b-empty");
+    if (bEmpty) bEmpty.hidden = !!curUrl || !!b.error;
+    var bError = document.getElementById("b-error");
+    if (bError) bError.hidden = !b.error;
+    var bErrorMsg = document.getElementById("b-error-msg");
+    if (bErrorMsg && b.error) bErrorMsg.textContent = b.error;
+
+    // Goal B: the agent opened a page — show it instead of browsing offscreen.
+    var panelEl = document.getElementById("browser");
+    if (b.visible && curUrl && panelApi && panelEl && panelEl.classList.contains("collapsed")) {
+      panelApi(true);
+    }
+
+    // ---- D1: approval modal ----
+    // The run is blocked on this; it must survive every repaint intact.
+    var ap = d.approval || null;
+    currentApproval = ap;
+    var apEl = document.getElementById("approval");
+    if (apEl) {
+      if (ap) {
+        var apTool = document.getElementById("ap-tool");
+        if (apTool) apTool.textContent = ap.tool || "tool";
+        var apDetail = document.getElementById("ap-detail");
+        if (apDetail) apDetail.textContent = ap.detail || "";
+        var apCount = document.getElementById("ap-count");
+        if (apCount) apCount.textContent = (ap.secs_left | 0) + "s";
+        apEl.hidden = false;
+      } else {
+        apEl.hidden = true;
+      }
+    }
+
+    var empty = document.getElementById("empty");
+    if (empty) {
+      empty.style.display = (d.entries && d.entries.length) ? "none" : "";
+    }
+  };
+
+  // Immediate and robust initialization
+  function initApp() {
+    var input = document.getElementById("input");
+    var send = document.getElementById("send");
+    var modeSwitch = document.getElementById("mode-switch");
+    var browserPanel = document.getElementById("browser");
+    var toggleBrowserBtn = document.getElementById("toggle-browser-btn");
+    var closeBrowserBtn = document.getElementById("close-browser-btn");
+    var newChatBtn = document.getElementById("new-chat-btn");
+    var ctaDevServer = document.getElementById("cta-dev-server");
+    var urlBar = document.getElementById("url");
+    var bcontent = document.getElementById("bcontent");
+    var navBack = document.getElementById("nav-back");
+    var navFwd = document.getElementById("nav-fwd");
+    var navReload = document.getElementById("nav-reload");
+    var navGo = document.getElementById("nav-go");
+    var tabCloseBtn = document.getElementById("b-tab-close");
+
+    // ---- Preview panel plumbing (A-F1 / A-F2 / A-F3) ----
+    // UI-side sugar only: Rust re-validates every URL before it reaches the
+    // engine (scheme allow-list), so this can stay forgiving.
+    function normalizeInput(v) {
+      v = String(v == null ? "" : v).trim();
+      if (!v) return "";
+      // Host shorthands first: `localhost:3000` looks like a `scheme:` to a
+      // naive regex, and would otherwise be pasted in un-navigable.
+      if (/^:\d+(\/|$)/.test(v)) return "http://localhost" + v;
+      if (/^(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(v)) return "http://" + v;
+      if (/^\d{1,3}(\.\d{1,3}){3}(:\d+)?(\/|$)/.test(v)) return "http://" + v;
+      // Explicit schemes pass through; Rust refuses the dangerous ones with a
+      // real message instead of us silently rewriting them.
+      if (/^[a-z][a-z0-9+.-]*:/i.test(v)) return v;
+      return "https://" + v;
+    }
+
+    function browse(raw) {
+      var url = normalizeInput(raw);
+      if (!url) return;
+      if (urlBar) {
+        urlBar.value = url;
+        urlBar.classList.remove("bad");
+        urlBar.blur();
+      }
+      postToRust({ type: "browse", url: url });
+    }
+
+    function sendRect() {
+      rectQueued = false;
+      if (!bcontent) return;
+      var r = bcontent.getBoundingClientRect();
+      var x = Math.round(r.left);
+      var y = Math.round(r.top);
+      var w = Math.round(r.width);
+      var h = Math.round(r.height);
+      if (w <= 0 || h <= 0) {
+        // Collapsed: nothing to place a native view at.
+        lastRectSig = "";
+        return;
+      }
+      var sig = x + "," + y + "," + w + "," + h;
+      if (sig === lastRectSig) return;
+      lastRectSig = sig;
+      postToRust({ type: "panel_rect", x: x, y: y, w: w, h: h });
+    }
+
+    function queueRect() {
+      if (rectQueued) return;
+      rectQueued = true;
+      requestAnimationFrame(sendRect);
+    }
+
+    function sendVisible(v) {
+      if (panelOpen === v) return;
+      panelOpen = v;
+      postToRust({ type: "panel_visible", visible: v });
+    }
+
+    function setPanel(open) {
+      if (!browserPanel) return;
+      browserPanel.classList.toggle("collapsed", !open);
+      if (toggleBrowserBtn) toggleBrowserBtn.classList.toggle("active", open);
+      if (!open) {
+        // Hide first: a native view left alone during the collapse animation
+        // stays painted on top of the chat.
+        sendVisible(false);
+        return;
+      }
+      sendRect();
+      // CSS cannot clip a native child view, so reveal it only once the width
+      // transition has finished, at the final rect.
+      setTimeout(function () {
+        if (browserPanel.classList.contains("collapsed")) return;
+        sendRect();
+        sendVisible(true);
+        if (urlBar && !curUrl) urlBar.focus();
+      }, 300);
+    }
+
+    function refreshSend() {
+      if (!input || !send) return;
+      var hasText = input.value.trim().length > 0;
+      if (hasText) {
+        send.classList.add("on");
+      } else {
+        send.classList.remove("on");
+      }
+    }
+
+    function submitMessage() {
+      if (!input) return;
+      var v = input.value.trim();
+      if (!v) return;
+      postToRust({ type: "send", text: input.value });
+      input.value = "";
+      refreshSend();
+      input.focus();
+    }
+
+    if (input) {
+      input.addEventListener("input", refreshSend);
+      input.addEventListener("keyup", refreshSend);
+      input.addEventListener("change", refreshSend);
+      input.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" && !ev.shiftKey) {
+          ev.preventDefault();
+          submitMessage();
+        }
+      });
+      input.focus();
+    }
+
+    if (send) {
+      send.addEventListener("click", function (ev) {
+        ev.preventDefault();
+        submitMessage();
+      });
+    }
+
+    // Permission mode: Rust is the authority, so just post the pick. It answers
+    // any prompt already on screen and repaints with the new state.
+    if (modeSwitch) {
+      modeSwitch.addEventListener("click", function (ev) {
+        var btn = ev.target && ev.target.closest ? ev.target.closest(".mode-btn") : null;
+        if (!btn) return;
+        var mode = btn.getAttribute("data-mode");
+        if (!mode) return;
+        ev.preventDefault();
+        postToRust({ type: "mode", mode: mode });
+      });
+    }
+
+    if (newChatBtn) {
+      newChatBtn.addEventListener("click", function () {
+        postToRust({ type: "new" });
+      });
+    }
+
+    if (ctaDevServer) {
+      ctaDevServer.addEventListener("click", function () {
+        // A detected dev server is one click away; otherwise let Rust fall back
+        // to localhost:3000 (and the agent can start one for real).
+        if (devServerUrl) {
+          browse(devServerUrl);
+          return;
+        }
+        postToRust({ type: "open_dev_server" });
+      });
+    }
+
+    if (urlBar) {
+      urlBar.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          browse(urlBar.value);
+        } else if (ev.key === "Escape") {
+          ev.preventDefault();
+          urlBar.value = curUrl;
+          urlBar.blur();
+        }
+        // Keep plain typing local, but let Ctrl/Cmd shortcuts reach the app
+        // (Ctrl+L while already focused should still select the address).
+        if (!ev.ctrlKey && !ev.metaKey) ev.stopPropagation();
+      });
+      urlBar.addEventListener("focus", function () {
+        urlBar.select();
+      });
+      // Pasting a link (with surrounding text) should navigate, not litter the
+      // field with "check this out https://…". Plain text pastes natively.
+      urlBar.addEventListener("paste", function (ev) {
+        if (!ev.clipboardData) return;
+        var text = ev.clipboardData.getData("text") || "";
+        var m = text.match(/https?:\/\/\S+/i);
+        if (!m) return;
+        ev.preventDefault();
+        browse(m[0]);
+      });
+    }
+
+    if (navBack) {
+      navBack.addEventListener("click", function () {
+        if (navBack.disabled) return;
+        postToRust({ type: "nav_back" });
+      });
+    }
+    if (navFwd) {
+      navFwd.addEventListener("click", function () {
+        if (navFwd.disabled) return;
+        postToRust({ type: "nav_fwd" });
+      });
+    }
+    if (navReload) {
+      navReload.addEventListener("click", function () {
+        if (navReload.disabled) return;
+        if (curUrl) postToRust({ type: "nav_reload" });
+        else if (urlBar) urlBar.focus();
+      });
+    }
+    if (navGo) navGo.addEventListener("click", function () { browse(urlBar ? urlBar.value : curUrl); });
+
+    // Keep the native view glued to the panel: layout changes, window resizes
+    // and browser zoom all move/resize it.
+    if (bcontent && typeof ResizeObserver === "function") {
+      new ResizeObserver(queueRect).observe(bcontent);
+    }
+    window.addEventListener("resize", queueRect);
+    window.addEventListener("wheel", function (ev) { if (ev.ctrlKey) queueRect(); }, { passive: true });
+
+    // Ctrl/Cmd+L focuses the address bar, like a real browser.
+    document.addEventListener("keydown", function (ev) {
+      if ((ev.ctrlKey || ev.metaKey) && (ev.key === "l" || ev.key === "L")) {
+        ev.preventDefault();
+        var collapsed = browserPanel && browserPanel.classList.contains("collapsed");
+        if (collapsed) setPanel(true);
+        setTimeout(function () {
+          if (urlBar) { urlBar.focus(); urlBar.select(); }
+        }, collapsed ? 320 : 0);
+      }
+    });
+
+    // Starter Prompt Chips
+    var chips = document.querySelectorAll(".chip");
+    for (var i = 0; i < chips.length; i++) {
+      chips[i].addEventListener("click", function () {
+        if (!input) return;
+        input.value = this.getAttribute("data-s") || "";
+        refreshSend();
+        input.focus();
+      });
+    }
+
+    // Window Control Buttons (Minimize, Maximize, Close)
+    var tbs = document.querySelectorAll(".tb");
+    for (var j = 0; j < tbs.length; j++) {
+      tbs[j].addEventListener("click", function () {
+        postToRust({ type: this.getAttribute("data-a") });
+      });
+    }
+
+    panelApi = setPanel;
+
+    // ---- D1: answer the blocking approval ----
+    // Cleared locally first so a double click cannot post twice; the backend
+    // clears the modal for real on the next paint.
+    function answerApproval(allow, always) {
+      if (!currentApproval) return;
+      var id = currentApproval.id;
+      currentApproval = null;
+      postToRust(allow
+        ? { type: "approve", id: id, always: !!always }
+        : { type: "deny", id: id });
+    }
+    var apAllow = document.getElementById("ap-allow");
+    if (apAllow) apAllow.addEventListener("click", function () { answerApproval(true, false); });
+    var apAlways = document.getElementById("ap-always");
+    if (apAlways) apAlways.addEventListener("click", function () { answerApproval(true, true); });
+    var apDeny = document.getElementById("ap-deny");
+    if (apDeny) apDeny.addEventListener("click", function () { answerApproval(false, false); });
+    document.addEventListener("keydown", function (ev) {
+      if (!currentApproval) return;
+      var t = ev.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      var k = String(ev.key || "").toLowerCase();
+      if (k === "y") { ev.preventDefault(); answerApproval(true, false); }
+      else if (k === "a") { ev.preventDefault(); answerApproval(true, true); }
+      else if (k === "n") { ev.preventDefault(); answerApproval(false, false); }
+    });
+
+    // Toggle Collapsible Browser Panel. Start collapsed — `panelOpen` already
+    // matches that, so init costs no IPC traffic.
+    if (browserPanel) browserPanel.classList.add("collapsed");
+
+    if (toggleBrowserBtn) {
+      toggleBrowserBtn.addEventListener("click", function () {
+        setPanel(browserPanel ? browserPanel.classList.contains("collapsed") : true);
+      });
+    }
+    if (closeBrowserBtn) {
+      closeBrowserBtn.addEventListener("click", function () { setPanel(false); });
+    }
+    if (tabCloseBtn) {
+      tabCloseBtn.addEventListener("click", function () { setPanel(false); });
+    }
+
+    // Signal to Rust backend that frontend is ready for the initial state paint
+    postToRust({ type: "ready" });
+  }
+
+  // Support both DOMContentLoaded and immediate ready execution
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initApp);
+  } else {
+    initApp();
+  }
+})();
+</script>
+</body>
+</html>
