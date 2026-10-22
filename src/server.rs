@@ -626,6 +626,9 @@ pub const TURBO_CONTINUE_PREFIX: &str = "TURBO-CONTINUE:";
 /// Safety cap: how many back-to-back turbo continuations may run without a
 /// real user message. Bounds runaway loops while still being "non-stop".
 pub const TURBO_MAX_CONTINUATIONS: u32 = 8;
+/// New (B-24): start of the prompt that `run_review` stores as a "user"
+/// message. It is not the user talking, so `turbo_streak` skips it.
+const AUTO_REVIEW_PROMPT_START: &str = "Review the current uncommitted changes";
 
 /// Trailing run of `[TURBO-CONTINUE]` user messages (non-user messages in
 /// between don't break the streak; a real user message does).
@@ -634,6 +637,15 @@ fn turbo_streak(st: &Shared, session_id: &str) -> u32 {
     let mut streak = 0;
     for m in msgs.iter().rev() {
         if m.role != "user" {
+            continue;
+        }
+        // New (B-24): the automatic review adds its own "user" prompt after
+        // every run that changed files. It must neither count nor break the
+        // streak, or the cap never holds.
+        let is_review = m.parts.iter().any(|p| {
+            matches!(p, Part::Text { text } if text.starts_with(AUTO_REVIEW_PROMPT_START))
+        });
+        if is_review {
             continue;
         }
         let is_continue = m.parts.iter().any(|p| {
@@ -656,13 +668,35 @@ fn todos_open(st: &Shared, session_id: &str) -> bool {
     )
 }
 
-/// Fire-and-forget wrapper around [`AppState::kick_run`]. Deliberately NOT
-/// async: `run_agent` → `kick_run` → `run_agent` would otherwise make their
-/// future types recursive (E0391). A sync call keeps the cycle broken.
-fn spawn_kick_run(st: Shared, session_id: String, user_content: String) {
+/// Fire-and-forget start of a run whose `busy` slot is already claimed
+/// (`flag`). Deliberately NOT async: `run_agent` → spawn → `run_agent` would
+/// otherwise make their future types recursive (E0391). A sync call keeps
+/// the cycle broken. New (B-24): replaces `spawn_kick_run`.
+fn spawn_claimed_run(st: Shared, session_id: String, user_content: String, flag: Arc<AtomicBool>) {
     tokio::spawn(async move {
-        st.kick_run(session_id, user_content).await;
+        run_agent(&st, &session_id, &user_content, flag.clone()).await;
+        st.release_run(&session_id, &flag).await;
     });
+}
+
+/// New (B-24): the prompt for a turbo continuation when this run should go
+/// on by itself (turbo on, run ok and not aborted, open todos, streak below
+/// the cap), else None. A trailing "?" in the answer does NOT count as more
+/// work: asking is the one thing turbo must respect. The model is blocked
+/// on the user, and pushing it to "decide for yourself" produces guesses.
+fn turbo_continuation(st: &Shared, session_id: &str, result: &Result<String>) -> Option<String> {
+    let aborted = matches!(result.as_deref(), Ok("aborted"));
+    if !st.turbo() || result.is_err() || aborted {
+        return None;
+    }
+    if !todos_open(st, session_id) || turbo_streak(st, session_id) >= TURBO_MAX_CONTINUATIONS {
+        return None;
+    }
+    Some(format!(
+        "{TURBO_CONTINUE_PREFIX} you have full access and must not ask the \
+         user anything. Make the most reasonable decision yourself, keep \
+         working on the remaining todos until none are open, and finish the job."
+    ))
 }
 
 /// The agent loop entry for a user prompt: records a git snapshot first
@@ -714,37 +748,24 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
                 });
             }
         }
+        // New (B-24): a turbo continuation is part of the same run. Register
+        // it BEFORE this run returns and announce no RunFinished in between:
+        // every client (headless, TUI, GUI) sees one run that ends when the
+        // last continuation ends.
+        if let Some(next) = turbo_continuation(st, session_id, &result) {
+            let _ = st.events.send(ServerEvent::Note {
+                session_id: session_id.to_string(),
+                text: "turbo: continuing on my own — no questions, no waiting".into(),
+            });
+            let flag = st.claim_run(session_id).await;
+            spawn_claimed_run(st.clone(), session_id.to_string(), next, flag);
+            return;
+        }
         let _ = st.events.send(ServerEvent::RunFinished {
             session_id: session_id.to_string(),
             ok,
             message,
         });
-    }
-    // Turbo: work independently, non-stop. Continue on our own while the todo
-    // list still has open work — bounded by TURBO_MAX_CONTINUATIONS.
-    //
-    // A trailing "?" used to count as more work, which turned every greeting
-    // ("Hi! What can I help you with?") into a self-starting run. Asking is the
-    // one thing turbo must respect: the model is blocked on the user, and
-    // pushing it to "decide for yourself" produces guesses, not progress.
-    if !superseded && ok && st.turbo() {
-        let aborted = matches!(result.as_deref(), Ok("aborted"));
-        let more_work = !aborted && todos_open(st, session_id);
-        if more_work && turbo_streak(st, session_id) < TURBO_MAX_CONTINUATIONS {
-            let _ = st.events.send(ServerEvent::Note {
-                session_id: session_id.to_string(),
-                text: "turbo: continuing on my own — no questions, no waiting".into(),
-            });
-            spawn_kick_run(
-                st.clone(),
-                session_id.to_string(),
-                format!(
-                    "{TURBO_CONTINUE_PREFIX} you have full access and must not ask the \
-                     user anything. Make the most reasonable decision yourself, keep \
-                     working on the remaining todos until none are open, and finish the job."
-                ),
-            );
-        }
     }
 }
 
@@ -2283,6 +2304,69 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// B-24: the automatic review prompt neither counts nor breaks the streak.
+    #[tokio::test]
+    async fn turbo_streak_ignores_the_review_prompt() {
+        let st =
+            build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let s = st.db.create_session("streak-review", None).unwrap();
+        for i in 0..2 {
+            let cont = format!("{TURBO_CONTINUE_PREFIX} keep going {i}");
+            st.db.add_message(&s.id, "user", &[Part::Text { text: cont }]).unwrap();
+            let review = format!("{AUTO_REVIEW_PROMPT_START} in this workspace (ponytail-review).");
+            st.db.add_message(&s.id, "user", &[Part::Text { text: review }]).unwrap();
+        }
+        assert_eq!(turbo_streak(&st, &s.id), 2);
+    }
+
+    /// B-24: a turbo chain is ONE run for clients: the capped continuations
+    /// run, and exactly one RunFinished arrives, at the very end.
+    #[tokio::test]
+    async fn turbo_chain_finishes_once() {
+        let dir = std::env::temp_dir().join(format!("ocrs-b24-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = mock_text_llm().await;
+        cfg.provider.model = "stub".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("turbo", None).unwrap();
+        st.todo_store.exec(&s.id, TodoOp::Add { content: "never done".into() });
+        st.set_perm_mode(PermissionMode::Turbo);
+        let mut rx = st.events.subscribe();
+
+        st.kick_run(s.id.clone(), "start".into()).await;
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                match rx.recv().await {
+                    Ok(ServerEvent::RunFinished { .. }) => return,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the chain ends");
+        let continues = st
+            .db
+            .messages(&s.id)
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.parts.iter().any(
+                        |p| matches!(p, Part::Text { text } if text.starts_with(TURBO_CONTINUE_PREFIX)),
+                    )
+            })
+            .count();
+        assert_eq!(continues, TURBO_MAX_CONTINUATIONS as usize, "the cap holds");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        while let Ok(ev) = rx.try_recv() {
+            assert!(!matches!(ev, ServerEvent::RunFinished { .. }), "only one RunFinished");
+        }
+        assert!(!st.run_active(&s.id).await, "nothing left running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// B-22: write/edit previews show the change; other tools get none.
     #[test]
