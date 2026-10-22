@@ -736,6 +736,11 @@ async fn tui_run(
         format!("[boot] {boot_ms}ms · core at http://{addr} · session {}", session.id),
     );
 
+    // New (B-23): subscribe to the event bus BEFORE the first run starts,
+    // so its first events (even a fast failure) reach the TUI. The
+    // broadcast receiver keeps them until the forwarder below reads them.
+    let early_rx = state.events.subscribe();
+
     // If a prompt was passed on the CLI, pre-fill and send. (kick_run
     // registers the run so a later prompt can abort/replace it.)
     if let Some(p) = prompt {
@@ -750,7 +755,7 @@ async fn tui_run(
 
     // SSE forwarder task.
     {
-        let mut rx = state.events.subscribe();
+        let mut rx = early_rx;
         let st_fwd = state.clone();
         tokio::spawn(async move {
             loop {
