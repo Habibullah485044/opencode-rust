@@ -21,7 +21,7 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "read",
-            "Read a text file. Returns numbered lines. For directories, use list instead.",
+            "Read a text file. Returns numbered lines. offset = first line number to show (1-based, as printed); limit = how many lines (default 2000). For directories, use list instead.",
             json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}),
         ),
         spec(
@@ -329,25 +329,63 @@ fn read_file(workspace: &Path, path: &str, offset: i64, limit: i64) -> Result<St
     if abs.is_dir() {
         bail!("{path} is a directory — use the list tool to see its contents");
     }
-    let text = std::fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
-    if text.bytes().any(|b| b == 0) {
-        return Ok(format!("(binary file: {path})"));
+    // B-30: refuse huge files before loading them.
+    let size = std::fs::metadata(&abs).with_context(|| format!("reading {}", abs.display()))?.len();
+    if size > READ_MAX_BYTES {
+        bail!(
+            "{path} is {size} bytes, too big for the read tool (limit {READ_MAX_BYTES}). \
+             Use grep to find the part you need, or bash with head/tail."
+        );
     }
+    let bytes = std::fs::read(&abs).with_context(|| format!("reading {}", abs.display()))?;
+    // B-30: a NUL byte near the start means binary. Other text is shown even
+    // when it is not valid UTF-8 (bad bytes become the � character).
+    if bytes.iter().take(8192).any(|&b| b == 0) {
+        return Ok(format!("(binary file: {path}, {size} bytes)"));
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let note = if matches!(text, std::borrow::Cow::Owned(_)) {
+        "\n… [note: this file is not valid UTF-8; bad bytes are shown as �. The edit tool cannot change it.]"
+    } else {
+        ""
+    };
     let limit = limit.clamp(1, 10_000) as usize;
-    let offset = offset.max(0) as usize;
+    // B-30: `offset` is the first line shown, 1-based like the printed
+    // numbers; 0 and 1 both mean "from the top".
+    let skip = (offset.max(1) - 1) as usize;
     let lines: Vec<&str> = text.lines().collect();
     let slice: Vec<String> = lines
         .iter()
-        .skip(offset)
+        .skip(skip)
         .take(limit)
         .enumerate()
-        .map(|(i, l)| format!("{:>6}\t{}", offset + i + 1, l))
+        .map(|(i, l)| format!("{:>6}\t{}", skip + i + 1, cap_line(l)))
         .collect();
     let mut out = slice.join("\n");
-    if offset + limit < lines.len() {
-        out.push_str(&format!("\n… [{} more lines]", lines.len() - offset - limit));
+    if skip + limit < lines.len() {
+        out.push_str(&format!(
+            "\n… [{} more lines; continue with offset {}]",
+            lines.len() - skip - limit,
+            skip + limit + 1
+        ));
     }
+    out.push_str(note);
     Ok(out)
+}
+
+/// Largest file the read tool loads, in bytes (B-30).
+const READ_MAX_BYTES: u64 = 20_000_000;
+/// Longest line the read tool shows, in characters (B-30).
+const READ_MAX_LINE_CHARS: usize = 2000;
+
+/// Cut one very long line, for example in a minified file (B-30).
+fn cap_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.chars().count() <= READ_MAX_LINE_CHARS {
+        std::borrow::Cow::Borrowed(line)
+    } else {
+        let head: String = line.chars().take(READ_MAX_LINE_CHARS).collect();
+        std::borrow::Cow::Owned(format!("{head}… [line cut at {READ_MAX_LINE_CHARS} characters]"))
+    }
 }
 
 fn write_file(workspace: &Path, path: &str, content: &str) -> Result<String> {
@@ -1084,5 +1122,51 @@ mod s05_tests {
         assert!(out.contains("CLEAN"), "{out}");
         assert!(!out.contains("LEAKED"), "{out}");
         assert!(!out.contains("s05-test-secret"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod b30_tests {
+    use super::*;
+
+    fn ws(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ocrs-b30-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn offset_is_the_first_line_shown() {
+        let ws = ws("offset");
+        std::fs::write(ws.join("f.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let out = read_file(&ws, "f.txt", 2, 2).unwrap();
+        assert!(out.starts_with("     2\ttwo"), "{out}");
+        assert!(out.contains("     3\tthree"), "{out}");
+        assert!(out.contains("continue with offset 4"), "{out}");
+        assert_eq!(read_file(&ws, "f.txt", 0, 1).unwrap(), read_file(&ws, "f.txt", 1, 1).unwrap());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn binary_and_non_utf8_files() {
+        let ws = ws("bin");
+        std::fs::write(ws.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
+        assert!(read_file(&ws, "bin.dat", 0, 10).unwrap().starts_with("(binary file"));
+        std::fs::write(ws.join("latin1.txt"), b"caf\xe9\n").unwrap();
+        let out = read_file(&ws, "latin1.txt", 0, 10).unwrap();
+        assert!(out.contains("caf\u{FFFD}"), "{out}");
+        assert!(out.contains("not valid UTF-8"), "{out}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn very_long_lines_are_cut() {
+        let ws = ws("long");
+        std::fs::write(ws.join("min.js"), "x".repeat(10_000)).unwrap();
+        let out = read_file(&ws, "min.js", 0, 10).unwrap();
+        assert!(out.contains("line cut at 2000 characters"), "{}", out.len());
+        assert!(out.len() < 3000, "{}", out.len());
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }
