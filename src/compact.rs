@@ -3,7 +3,6 @@
 //! ordering, so the summary slots in right before the kept messages).
 
 use crate::server::{Shared, ServerEvent};
-use crate::sessions::flatten_msg;
 use crate::provider::{ChatMsg, StreamEvent};
 use anyhow::{bail, Result};
 use futures::StreamExt;
@@ -46,6 +45,56 @@ pub fn render_transcript(lines: &[String]) -> String {
 }
 
 pub const SUMMARY_MARKER: &str = "[context compacted]";
+
+/// Like [`split_at`], but the kept tail never starts with a `tool` message:
+/// the assistant message that asked for those tool calls must stay in front
+/// of its results (providers reject a tool result without its call). The
+/// split moves earlier (keeping more) when it can, otherwise later.
+pub fn safe_split(msgs: &[crate::db::Message]) -> Option<usize> {
+    let start = split_at(msgs.len())?;
+    let is_tool = |i: usize| msgs.get(i).is_some_and(|m| m.role == "tool");
+    let mut s = start;
+    while s > 0 && is_tool(s) {
+        s -= 1;
+    }
+    if s >= MIN_COMPRESS && !is_tool(s) {
+        return Some(s);
+    }
+    let mut s = start;
+    while s < msgs.len() && is_tool(s) {
+        s += 1;
+    }
+    (s < msgs.len()).then_some(s)
+}
+
+/// Limits for the summarizer's transcript: long enough to keep real detail.
+pub const COMPACT_LIMITS: crate::sessions::FlattenLimits =
+    crate::sessions::FlattenLimits { text: 4000, reasoning: 0, tool_args: 1000, tool_result: 1500 };
+
+/// One transcript line per message for the summarizer: `role: text`. An
+/// earlier summary is kept whole, so a second `/compact` does not cut the
+/// first summary down.
+pub fn transcript_lines(msgs: &[crate::db::Message]) -> Vec<String> {
+    msgs.iter()
+        .map(|m| {
+            let texts: Vec<&str> = m
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    crate::db::Part::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let earlier_summary =
+                m.role == "system" && texts.iter().any(|t| t.starts_with(SUMMARY_MARKER));
+            if earlier_summary {
+                format!("system: {}", texts.join("\n"))
+            } else {
+                format!("{}: {}", m.role, crate::sessions::flatten_msg_with(m, COMPACT_LIMITS))
+            }
+        })
+        .collect()
+}
 
 async fn summarize(st: &Shared, transcript: &str, abort: &AtomicBool) -> Result<String> {
     let msgs = vec![
@@ -109,25 +158,26 @@ pub async fn compact(
     abort: &AtomicBool,
 ) -> Result<CompactOutcome> {
     let msgs = st.db.messages(session_id)?;
-    let Some(split) = split_at(msgs.len()) else {
+    let Some(split) = safe_split(&msgs) else {
         bail!(
-            "nothing to compact — only {} message(s) (need > {})",
+            "nothing to compact — only {} message(s) (need > {}), or no safe split point",
             msgs.len(),
             KEEP_TAIL + MIN_COMPRESS
         );
     };
     let prefix: Vec<_> = msgs[..split].to_vec();
     let tail = &msgs[split..];
-    let kept_ids: Vec<String> = tail.iter().map(|m| m.id.clone()).collect();
+    // Only these are deleted later; anything newer survives.
+    let summarized_ids: Vec<String> = prefix.iter().map(|m| m.id.clone()).collect();
 
-    let lines: Vec<String> = prefix.iter().map(flatten_msg).collect();
+    let lines = transcript_lines(&prefix);
     let transcript = render_transcript(&lines);
     let summary = summarize(st, &transcript, abort).await?;
     if summary.is_empty() {
         bail!("summarizer returned an empty summary — compaction cancelled");
     }
     let wrapped = format!("{SUMMARY_MARKER} ({} earlier messages summarized)\n{summary}", prefix.len());
-    st.db.apply_compaction(session_id, &kept_ids, &wrapped)?;
+    st.db.replace_with_summary(session_id, &summarized_ids, &wrapped)?;
     let _ = st.events.send(ServerEvent::AssistantDelta {
         session_id: session_id.to_string(),
         text: String::new(), // no streaming text; the caller reports the outcome
@@ -145,6 +195,51 @@ mod tests {
         assert_eq!(split_at(10), None); // 6 tail + 4 min
         assert_eq!(split_at(11), Some(5));
         assert_eq!(split_at(30), Some(24));
+    }
+
+    fn msg(role: &str, text: &str) -> crate::db::Message {
+        crate::db::Message {
+            id: format!("m-{role}-{}", text.len()),
+            session_id: "s".into(),
+            role: role.into(),
+            parts: vec![crate::db::Part::Text { text: text.into() }],
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn kept_tail_never_starts_with_a_tool_result() {
+        // 12 messages; plain split_at would start the tail at index 6.
+        let mut msgs: Vec<crate::db::Message> = (0..12).map(|i| msg("user", &format!("u{i}"))).collect();
+        msgs[5] = msg("assistant", "calls two tools");
+        msgs[6] = msg("tool", "result 1");
+        msgs[7] = msg("tool", "result 2");
+        assert_eq!(split_at(msgs.len()), Some(6));
+        assert_eq!(safe_split(&msgs), Some(5), "the tool call stays with its results");
+
+        // No room to move back: move forward past the tool results instead.
+        let mut short: Vec<crate::db::Message> = (0..11).map(|i| msg("user", &format!("u{i}"))).collect();
+        short[0] = msg("assistant", "calls five tools");
+        for m in short.iter_mut().take(6).skip(1) {
+            *m = msg("tool", "r");
+        }
+        assert_eq!(safe_split(&short), Some(6));
+    }
+
+    #[test]
+    fn transcript_has_roles_and_keeps_an_earlier_summary_whole() {
+        let earlier = format!("{SUMMARY_MARKER} (5 earlier messages summarized)
+{}", "fact ".repeat(200));
+        let msgs = vec![
+            msg("system", &earlier),
+            msg("user", "please refactor the parser"),
+            msg("assistant", "done"),
+        ];
+        let lines = transcript_lines(&msgs);
+        assert!(lines[0].starts_with("system: [context compacted]"), "{}", lines[0]);
+        assert!(lines[0].len() > 1000, "earlier summary not cut to 400 characters");
+        assert_eq!(lines[1], "user: please refactor the parser");
+        assert_eq!(lines[2], "assistant: done");
     }
 
     #[test]

@@ -52,18 +52,41 @@ pub fn flatten(msgs: &[Message]) -> Vec<String> {
 
 /// The diffable display text for a single message (no role prefix).
 pub fn flatten_msg(m: &Message) -> String {
+    flatten_msg_with(m, DIFF_LIMITS)
+}
+
+/// Per-part character limits for [`flatten_msg_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct FlattenLimits {
+    pub text: usize,
+    /// 0 = leave reasoning out.
+    pub reasoning: usize,
+    pub tool_args: usize,
+    pub tool_result: usize,
+}
+
+/// The short limits `/diff` uses, so diffs stay readable.
+pub const DIFF_LIMITS: FlattenLimits =
+    FlattenLimits { text: 400, reasoning: 300, tool_args: 200, tool_result: 300 };
+
+/// [`flatten_msg`] with explicit limits.
+pub fn flatten_msg_with(m: &Message, lim: FlattenLimits) -> String {
     let mut parts = Vec::new();
     for p in &m.parts {
         match p {
-            Part::Text { text } => parts.push(collapse(text, 400)),
-            Part::Reasoning { text } => parts.push(format!("✻ {}", collapse(text, 300))),
+            Part::Text { text } => parts.push(collapse(text, lim.text)),
+            Part::Reasoning { text } => {
+                if lim.reasoning > 0 {
+                    parts.push(format!("✻ {}", collapse(text, lim.reasoning)));
+                }
+            }
             Part::ToolCall { name, input, .. } => {
-                let args = collapse(&input.to_string(), 200);
+                let args = collapse(&input.to_string(), lim.tool_args);
                 parts.push(format!("[call {name} {args}]"));
             }
             Part::ToolResult { output, is_error, .. } => {
                 let tag = if *is_error { "err" } else { "ok" };
-                parts.push(format!("[result {tag} {}]", collapse(output, 300)));
+                parts.push(format!("[result {tag} {}]", collapse(output, lim.tool_result)));
             }
         }
     }

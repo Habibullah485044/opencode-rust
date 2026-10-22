@@ -275,28 +275,44 @@ impl Db {
     /// Compaction: delete every message not in `kept_ids` and insert
     /// `summary` as a system message positioned where the removed history
     /// began (timestamp minus 1ms so ordering survives).
-    pub fn apply_compaction(&self, session_id: &str, kept_ids: &[String], summary: &str) -> Result<()> {
-        let msgs = self.messages(session_id)?;
-        let kept: std::collections::HashSet<&str> =
-            kept_ids.iter().map(String::as_str).collect();
-        let removed: Vec<&Message> = msgs
-            .iter()
-            .filter(|m| !kept.contains(m.id.as_str()))
-            .collect();
-        let first_at = removed.first().map(|m| m.created_at).unwrap_or_else(now_ms);
+    /// Compaction: delete exactly the messages in `summarized_ids` and insert
+    /// `summary` as one system message just before the oldest of them
+    /// (timestamp minus 1 ms, so it sorts first). Everything happens in one
+    /// transaction. Messages that arrived while the summary was being
+    /// written are not in `summarized_ids`, so they are kept.
+    pub fn replace_with_summary(
+        &self,
+        session_id: &str,
+        summarized_ids: &[String],
+        summary: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut first_at: Option<i64> = None;
         {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare("DELETE FROM messages WHERE id=?1")?;
-            for m in &removed {
-                stmt.execute(params![m.id])?;
+            let mut find =
+                tx.prepare("SELECT created_at FROM messages WHERE id=?1 AND session_id=?2")?;
+            let mut del = tx.prepare("DELETE FROM messages WHERE id=?1 AND session_id=?2")?;
+            for id in summarized_ids {
+                let at: Option<i64> =
+                    find.query_row(params![id, session_id], |r| r.get(0)).optional()?;
+                if let Some(at) = at {
+                    first_at = Some(first_at.map_or(at, |f| f.min(at)));
+                    del.execute(params![id, session_id])?;
+                }
             }
         }
-        self.insert_message(
-            session_id,
-            "system",
-            &[Part::Text { text: summary.to_string() }],
-            first_at.saturating_sub(1),
+        let Some(first_at) = first_at else {
+            // Nothing left to replace (another compaction ran): change nothing.
+            anyhow::bail!("the messages to compact no longer exist — nothing changed");
+        };
+        let parts = serde_json::to_string(&[Part::Text { text: summary.to_string() }])?;
+        tx.execute(
+            "INSERT INTO messages (id, session_id, role, parts, created_at) VALUES (?1,?2,'system',?3,?4)",
+            params![new_id("msg"), session_id, parts, first_at.saturating_sub(1)],
         )?;
+        tx.execute("UPDATE sessions SET updated_at=?1 WHERE id=?2", params![now_ms(), session_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -414,7 +430,8 @@ mod tests {
         }
         let all = db.messages(&s.id).unwrap();
         let kept: Vec<String> = all[4..].iter().map(|m| m.id.clone()).collect();
-        db.apply_compaction(&s.id, &kept, "[compacted] summary here").unwrap();
+        let summarized: Vec<String> = all[..4].iter().map(|m| m.id.clone()).collect();
+        db.replace_with_summary(&s.id, &summarized, "[compacted] summary here").unwrap();
 
         let after = db.messages(&s.id).unwrap();
         assert_eq!(after.len(), 3);
@@ -506,6 +523,39 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[test]
+    fn compaction_keeps_messages_that_arrive_meanwhile() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("c", None).unwrap();
+        for i in 0..4 {
+            db.add_message(&s.id, "user", &[Part::Text { text: format!("m{i}") }]).unwrap();
+        }
+        let summarized: Vec<String> =
+            db.messages(&s.id).unwrap()[..2].iter().map(|m| m.id.clone()).collect();
+        // A new message lands while the summary is being written.
+        db.add_message(&s.id, "user", &[Part::Text { text: "late".into() }]).unwrap();
+        db.replace_with_summary(&s.id, &summarized, "[context compacted] s").unwrap();
+        let texts: Vec<String> = db
+            .messages(&s.id)
+            .unwrap()
+            .iter()
+            .map(|m| match &m.parts[0] {
+                Part::Text { text } => text.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(texts, ["[context compacted] s", "m2", "m3", "late"]);
+    }
+
+    #[test]
+    fn compaction_of_vanished_messages_changes_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("c", None).unwrap();
+        db.add_message(&s.id, "user", &[Part::Text { text: "hi".into() }]).unwrap();
+        assert!(db.replace_with_summary(&s.id, &["msg_gone".to_string()], "x").is_err());
+        assert_eq!(db.messages(&s.id).unwrap().len(), 1);
     }
 
     #[test]
