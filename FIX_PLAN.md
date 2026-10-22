@@ -28,14 +28,14 @@ written so a coding AI can follow it one task at a time.
 
 ## Progress status
 
-*Updated 23 Oct 2026, checked against the code in `opencode-rust/` (git `44252a8`).*
+*Updated 23 Oct 2026, checked against the code in `opencode-rust/` (git `523866a`).*
 
-**68 of 92 tasks done (74%).** Each finished task has its own commit; its code
+**76 of 92 tasks done (83%).** Each finished task has its own commit; its code
 changes and new tests are in the code.
 
 - **Build:** `cargo build` gives 0 warnings (Windows), with and without the `gui` feature.
-- **Tests:** `cargo test` gives **345 passed, 0 failed** on Windows (338 library + 7 binary); 303 with `--no-default-features`. `tests/gui/run.sh` (Edge) gives 0 FAIL (94 + 16 assertions). `cargo build --release` is clean. Seven new tests are Unix-only and do not run here.
-- **Next task:** `F-09` (Loop guard: refuse the third identical tool call in a row), then `F-08` → `F-07` → `F-02` …
+- **Tests:** `cargo test` gives **373 passed, 0 failed** on Windows (366 library + 7 binary); 330 with `--no-default-features`. `tests/gui/run.sh` (Edge) gives 0 FAIL (94 + 16 assertions). Seven new tests are Unix-only and do not run here.
+- **Next task:** `P-04` (Reuse gate: fewer false hints, one walk, honest comment), then `B-41` → `B-42` → `B-43` …
 - **Not checked yet:** the manual checks in finished tasks that need a real terminal, the
   desktop window, MCP servers, Kaggle or real model APIs. Headless checks were run on the
   real binary against local mock servers where a task allowed it. CI (H-03) has not run on
@@ -43,6 +43,9 @@ changes and new tests are in the code.
 - **Timing-sensitive test:** `mcp::b19_startup_tests::servers_start_at_the_same_time` (B-19)
   failed once while the whole suite ran on this machine (2.83 s against a 2.7 s limit) and
   passed every time on its own and in later full runs.
+- **Branches:** earlier sessions made one chained `task/…` branch per task. `main` stops at
+  H-03; all later work is on the checked-out branch `task/b-06`, which `main` can
+  fast-forward to. Nothing was pushed.
 - **Change from the plan:** S-14's test repo sets `core.autocrlf=false`, because Git for
   Windows checks files out with CRLF and two byte-exact asserts failed. The product code is
   as written in the plan.
@@ -54,7 +57,7 @@ changes and new tests are in the code.
 | Phase 1 — Safety and quick wins (do these first) | 14 / 14 | done |
 | Phase 2 — Stop losing work, make runs reliable | 28 / 28 | done |
 | Phase 3 — Quality: remaining bugs and ponytail fixes | 26 / 26 | done |
-| Phase 4 — New features | 0 / 8 | not started |
+| Phase 4 — New features | 8 / 8 | done |
 | Phase 5 — Polish | 0 / 16 | not started |
 
 The **Status** column in 2.2 lists every task, with the commit that did it.
@@ -541,18 +544,18 @@ Do the phases in order. Inside a phase, go left to right. A task's
 | P-01 | Laziness meter counts only successful calls (and reads the right edit keys) | P2 | S | — | ✅ done (`831134b`) |
 | P-02 | Automatic review only when files really changed | P2 | M | — | ✅ done (`d3f0541`) |
 | P-03 | No automatic review after an abort | P2 | S | — | ✅ done (`4f39520`) |
-| P-04 | Reuse gate: fewer false hints, one walk, honest comment | P3 | M | — | ⬜ to do |
+| P-04 | Reuse gate: fewer false hints, one walk, honest comment | P3 | M | — | ⏭️ next |
 | P-05 | Add the `/ponytail lite\|full\|ultra\|off` command the prompt promises | P2 | M | B-27 (order only: B-27 edits the same lines in `src/subagent.rs`; apply it first if you do it) | ✅ done (`94119f1`) |
 | F-01 | Retry the provider request with backoff (429 / 5xx / connection errors) | P1 | M | — | ✅ done (`5bb6ae7`) |
-| F-02 | Native Anthropic Messages API provider | P2 | L | F-01 (`send_with_retry`, `from_cfg`), B-08 (Stage 4 edits its heartbeat code); B-04 recommended first | ⬜ to do |
-| F-03 | MCP servers over Streamable HTTP | P2 | L | B-19, B-20 (uses B-19's `cap_result` and `tool_fn_name`, and B-20's `Live` struct) | ⬜ to do |
-| F-04 | `browser_screenshot` tool | P2 | M | H-02 (makes `tao`/`wry` optional and adds the `gui` feature; this task adds two Windows-only crates to that feature) | ⬜ to do |
-| F-05 | Git-worktree isolation for worker subagents and team workers | P2 | L | B-06 (one call passes B-06's abort flag; see the note in step 9) | ⬜ to do |
+| F-02 | Native Anthropic Messages API provider | P2 | L | F-01 (`send_with_retry`, `from_cfg`), B-08 (Stage 4 edits its heartbeat code); B-04 recommended first | ✅ done (`c8887db`) |
+| F-03 | MCP servers over Streamable HTTP | P2 | L | B-19, B-20 (uses B-19's `cap_result` and `tool_fn_name`, and B-20's `Live` struct) | ✅ done (`86cbf33`) |
+| F-04 | `browser_screenshot` tool | P2 | M | H-02 (makes `tao`/`wry` optional and adds the `gui` feature; this task adds two Windows-only crates to that feature) | ✅ done (`e3e172e`) |
+| F-05 | Git-worktree isolation for worker subagents and team workers | P2 | L | B-06 (one call passes B-06's abort flag; see the note in step 9) | ✅ done (`72deaf5`) |
 | F-06 | GUI: Stop button, multiline composer, IME guard | P1 | M | — | ✅ done (`b6df206`) |
-| F-07 | Automatic compaction near the context limit | P2 | M | B-05 (safe compaction; this task calls `compact::compact` from the agent loop and edits a line B-05 wrote) | ⬜ to do |
-| F-08 | Verification loop (`agent.verify_command`) | P2 | M | — | ⬜ to do |
-| F-09 | Loop guard: refuse the third identical tool call in a row | P2 | M | — | ⏭️ next |
-| F-10 | Context7 + ast-grep MCP setup (config, docs, skill), Serena note | P3 | S | B-19 (start-up time limits, provider-safe tool names), B-20 (parallel MCP calls) | ⬜ to do |
+| F-07 | Automatic compaction near the context limit | P2 | M | B-05 (safe compaction; this task calls `compact::compact` from the agent loop and edits a line B-05 wrote) | ✅ done (`b29f09b`) |
+| F-08 | Verification loop (`agent.verify_command`) | P2 | M | — | ✅ done (`c4bf79f`) |
+| F-09 | Loop guard: refuse the third identical tool call in a row | P2 | M | — | ✅ done (`c134ce5`) |
+| F-10 | Context7 + ast-grep MCP setup (config, docs, skill), Serena note | P3 | S | B-19 (start-up time limits, provider-safe tool names), B-20 (parallel MCP calls) | ✅ done (`523866a`) |
 | F-11 | Persist todos in SQLite | P3 | M | — | ⬜ to do |
 | F-12 | HTTP API parity: mode, model, permission mode, approvals list, rename/delete | P3 | M | S-01, B-06, B-09 | ⬜ to do |
 | F-13 | GUI release polish: WebView2-missing dialog, single-instance guard | P3 | S | F-04 (only its `Cargo.toml` step: the Windows-only `windows` dependency with the `Win32_UI_WindowsAndMessaging` feature) | ⬜ to do |
