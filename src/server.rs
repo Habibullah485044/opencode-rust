@@ -435,10 +435,12 @@ impl AppState {
                 let t0 = std::time::Instant::now();
                 // Require 2xx: Cloudflare error pages (530/1030/1033) arrive
                 // fine at the transport level and must count as DOWN.
-                let mut req = http.get(format!("{base}/models"));
-                if !key.is_empty() {
-                    req = req.bearer_auth(&key);
-                }
+                // F-02: Bearer for OpenAI-style servers, x-api-key for Anthropic.
+                let req = crate::provider::with_auth(
+                    http.get(format!("{base}/models")),
+                    st.cfg.provider.api,
+                    &key,
+                );
                 let ok = req
                     .send()
                     .await

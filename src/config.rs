@@ -78,6 +78,17 @@ impl Default for McpServerCfg {
     }
 }
 
+/// Which wire protocol the provider speaks (`provider.api`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderApi {
+    /// OpenAI-compatible `POST {base_url}/chat/completions`. The default.
+    #[default]
+    OpenAi,
+    /// Anthropic Messages API: `POST {base_url}/messages`.
+    Anthropic,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProviderCfg {
@@ -86,6 +97,10 @@ pub struct ProviderCfg {
     /// Can also come from $OPENCODE_RUST_API_KEY (never stored in the file if set there).
     pub api_key: String,
     pub model: String,
+    /// "openai" (default) or "anthropic".
+    pub api: ProviderApi,
+    /// Longest reply in tokens. Anthropic requires it; "openai" ignores it.
+    pub max_tokens: u32,
     /// Optional cheaper model for hidden tasks (compaction, planning).
     pub small_model: Option<String>,
     pub request_timeout_secs: u64,
@@ -100,6 +115,8 @@ impl Default for ProviderCfg {
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
+            api: ProviderApi::OpenAi,
+            max_tokens: 8192,
             small_model: None,
             request_timeout_secs: 600,
             max_retries: 3,
@@ -429,5 +446,19 @@ mod f01_tests {
         assert_eq!(c.provider.max_retries, 0);
         let c: Config = toml::from_str("[provider]\nmodel = 'm'\n").unwrap();
         assert_eq!(c.provider.max_retries, 3, "a missing key keeps the default");
+    }
+}
+
+#[cfg(test)]
+mod f02_tests {
+    use super::*;
+
+    #[test]
+    fn provider_api_and_max_tokens() {
+        let c = Config::default();
+        assert_eq!((c.provider.api, c.provider.max_tokens), (ProviderApi::OpenAi, 8192));
+        let c: Config = toml::from_str("[provider]\napi = 'anthropic'\nmax_tokens = 4096\n").unwrap();
+        assert_eq!((c.provider.api, c.provider.max_tokens), (ProviderApi::Anthropic, 4096));
+        assert!(toml::from_str::<Config>("[provider]\napi = 'gemini'\n").is_err());
     }
 }

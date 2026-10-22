@@ -3,6 +3,9 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+// F-02: the Anthropic Messages API lives in `src/provider/anthropic.rs`.
+mod anthropic;
+
 /// OpenAI-compatible chat client (works with OpenRouter, Ollama, vLLM,
 /// the user's Cloudflare-tunnel endpoint, etc). Streaming via SSE.
 /// Cheap to clone (B-29): the inner reqwest client shares its pool.
@@ -12,6 +15,13 @@ pub struct Client {
     base_url: String,
     api_key: String,
     pub model: String,
+    /// Wire protocol (`provider.api`).
+    api: ProviderApi,
+    /// `max_tokens` for Anthropic requests (`provider.max_tokens`).
+    max_tokens: u32,
+    /// Anthropic only: recent tool-calling replies with their thinking
+    /// blocks (F-02). Shared by all clones of this client.
+    turns: anthropic::TurnCache,
     /// Max silence allowed between SSE reads before the stream errors out.
     /// Without it a wedged provider (dead tunnel, stuck backend) freezes the
     /// agent loop until the total request timeout fires — or forever.
@@ -132,6 +142,9 @@ impl Client {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
+            api: ProviderApi::OpenAi,
+            max_tokens: 8192,
+            turns: Default::default(),
             stall,
             max_retries: 0,
             retry_base: std::time::Duration::from_secs(1),
@@ -142,6 +155,8 @@ impl Client {
     pub fn from_cfg(base_url: &str, p: &crate::config::ProviderCfg) -> Result<Self> {
         let mut c = Self::new(base_url, &p.api_key, &p.model, p.request_timeout_secs)?;
         c.max_retries = p.max_retries;
+        c.api = p.api;
+        c.max_tokens = p.max_tokens;
         Ok(c)
     }
 
@@ -209,6 +224,9 @@ impl Client {
         messages: &[ChatMsg],
         tools: &[ToolSpec],
     ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent>>> {
+        if self.api == ProviderApi::Anthropic {
+            return self.stream_anthropic(model, messages, tools).await;
+        }
         let mut body = json!({ "model": model, "messages": messages, "stream": true });
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)?;
@@ -240,10 +258,7 @@ impl Client {
     /// endpoints that do not implement it (or answer with a different shape)
     /// simply yield an empty list instead of erroring the caller.
     pub async fn list_models(&self) -> Result<Vec<String>> {
-        let mut req = self.http.get(format!("{}/models", self.base_url));
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
-        }
+        let req = with_auth(self.http.get(format!("{}/models", self.base_url)), self.api, &self.api_key);
         let resp = req.send().await?;
         if !resp.status().is_success() {
             return Ok(Vec::new());
@@ -532,6 +547,29 @@ fn jitter() -> std::time::Duration {
     use std::hash::BuildHasher;
     let n = std::collections::hash_map::RandomState::new().hash_one(std::time::SystemTime::now());
     std::time::Duration::from_millis(n % 250)
+}
+
+use crate::config::ProviderApi;
+
+/// Value of the `anthropic-version` header.
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Put the API key on a request the way the configured API expects it.
+/// OpenAI-compatible: `Authorization: Bearer <key>` (skipped for an empty
+/// key, e.g. local Ollama). Anthropic: `x-api-key` plus `anthropic-version`.
+pub fn with_auth(req: reqwest::RequestBuilder, api: ProviderApi, api_key: &str) -> reqwest::RequestBuilder {
+    match api {
+        ProviderApi::OpenAi if api_key.is_empty() => req,
+        ProviderApi::OpenAi => req.bearer_auth(api_key),
+        ProviderApi::Anthropic => {
+            let req = req.header("anthropic-version", ANTHROPIC_VERSION);
+            if api_key.is_empty() {
+                req
+            } else {
+                req.header("x-api-key", api_key)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

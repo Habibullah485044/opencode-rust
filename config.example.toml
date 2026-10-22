@@ -13,6 +13,17 @@
 #   Local Mock: "http://127.0.0.1:18080/v1"
 base_url = "https://openrouter.ai/api/v1"
 
+# Wire protocol: "openai" (default; any OpenAI-compatible server) or
+# "anthropic" (Anthropic's own API). For Anthropic set
+# base_url = "https://api.anthropic.com/v1", api = "anthropic",
+# model = "claude-sonnet-5-5".
+# api = "openai"
+
+# Longest reply in tokens. Required by "anthropic", ignored by "openai".
+# Claude's thinking counts toward it; raise it (e.g. 32000) if long file
+# writes get cut off.
+# max_tokens = 8192
+
 # Your API key (can also be set via $env:OPENCODE_RUST_API_KEY):
 api_key = "your-api-key-here"
 
