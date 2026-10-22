@@ -1113,9 +1113,9 @@ async fn tui_run(
                         let _ = st.decide(&id, false, false);
                     }
                     tui::InputAction::Edit { path, instruction } => {
-                        let st2 = st.clone();
-                        let sid2 = sid.clone();
-                        tokio::spawn(async move {
+                        // B-49: registered like /team, so the next message (or
+                        // an abort) cancels a slow /edit.
+                        st.kick_task(sid.clone(), move |st2, sid2, abort| async move {
                             if st2.mode_for(&sid2) == AgentMode::Plan {
                                 let _ = st2.events.send(server::ServerEvent::RunFinished {
                                     session_id: sid2,
@@ -1127,10 +1127,15 @@ async fn tui_run(
                                 });
                                 return;
                             }
-                            let abort = Arc::new(AtomicBool::new(false));
-                            match opencode_rust::inline_edit::propose(&st2, &path, &instruction, &abort)
-                                .await
-                            {
+                            let result =
+                                opencode_rust::inline_edit::propose(&st2, &path, &instruction, &abort)
+                                    .await;
+                            // A newer run took the slot: this edit was cancelled,
+                            // and its events must not end that run's busy state.
+                            if st2.is_superseded(&sid2, &abort).await {
+                                return;
+                            }
+                            match result {
                                 Ok(p) => {
                                     let _ = st2.events.send(server::ServerEvent::EditPreview {
                                         session_id: sid2,
@@ -1149,7 +1154,8 @@ async fn tui_run(
                                     });
                                 }
                             }
-                        });
+                        })
+                        .await;
                     }
                     tui::InputAction::ApplyEdit { path, old, new, line } => {
                         let st2 = st.clone();

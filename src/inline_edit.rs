@@ -78,13 +78,16 @@ pub async fn propose(
     }
     let abs = resolve_in_workspace(&st.workspace, path)?;
     check_edit_allowed(st, path)?;
-    let old = std::fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
-    if old.len() > MAX_EDIT_BYTES {
-        bail!("file is {} bytes; inline /edit caps at {MAX_EDIT_BYTES} bytes", old.len());
+    // B-49: check the size before reading, so a huge file is refused at once.
+    let size = std::fs::metadata(&abs).with_context(|| format!("reading {}", abs.display()))?.len();
+    if size > MAX_EDIT_BYTES as u64 {
+        bail!("file is {size} bytes; inline /edit caps at {MAX_EDIT_BYTES} bytes");
     }
+    let old = std::fs::read_to_string(&abs)
+        .with_context(|| format!("reading {} (not UTF-8 text?)", abs.display()))?;
     let user = format!("FILE: {path}\n\n<file>\n{old}\n</file>\n\nINSTRUCTION: {instruction}");
     let raw = one_shot(st, SYSTEM, &user, abort, false).await?;
-    let new = match_trailing_newline(&strip_fences(&raw, &old), &old);
+    let new = finish_reply(&raw, &old);
     if new == old {
         bail!("model returned the file unchanged");
     }
@@ -96,6 +99,18 @@ pub async fn propose(
     );
     let line = first_changed_line(&old_lines, &new_lines);
     Ok(EditProposal { path: path.to_string(), abs, old, new, line, diff })
+}
+
+/// Turn the model's reply into the new file content: unwrap a fence, keep
+/// the old file's final newline, and (B-49) keep its CRLF line endings, so
+/// a one-line edit does not rewrite every line ending.
+fn finish_reply(raw: &str, old: &str) -> String {
+    let new = match_trailing_newline(&strip_fences(raw, old), old);
+    if old.contains("\r\n") {
+        new.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        new
+    }
 }
 
 /// Apply an accepted preview — but only if the file is still exactly what
@@ -412,8 +427,18 @@ mod tests {
     }
 
     #[test]
+    fn finish_reply_keeps_crlf_line_endings() {
+        assert_eq!(finish_reply("a\nB", "a\r\nb\r\n"), "a\r\nB\r\n");
+        // An LF file stays LF.
+        assert_eq!(finish_reply("a\nB", "a\nb\n"), "a\nB\n");
+    }
+
+    #[test]
     fn apply_writes_and_guards_races() {
-        let dir = std::env::temp_dir().join(format!("ocrs-edit-{}", std::process::id()));
+        // B-49: a folder per test, cleared first in case a crashed run left it.
+        let dir = std::env::temp_dir()
+            .join(format!("ocrs-edit-{}-apply_writes_and_guards_races", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("x.txt");
         std::fs::write(&f, "old").unwrap();
@@ -435,7 +460,11 @@ mod tests {
         use axum::{routing::post, Router};
         use serde_json::Value;
 
-        let dir = std::env::temp_dir().join(format!("ocrs-edit-e2e-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ocrs-edit-{}-propose_end_to_end_with_mock_provider",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("app.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
 
