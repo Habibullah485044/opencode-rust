@@ -20,7 +20,7 @@ pub enum Part {
 pub struct Message {
     pub id: String,
     pub session_id: String,
-    pub role: String, // system | user | assistant
+    pub role: String, // system | user | assistant | tool
     pub parts: Vec<Part>,
     pub created_at: i64,
 }
@@ -46,22 +46,20 @@ fn now_ms() -> i64 {
 }
 
 pub fn new_id(prefix: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    now_ms().hash(&mut h);
-    std::thread::current().id().hash(&mut h);
+    use std::hash::{BuildHasher, Hash, Hasher};
+    // `RandomState` is seeded randomly per process, so two processes that
+    // start in the same instant still get different ids; time plus a counter
+    // keeps ids unique inside one process. Ids are unique, not secret.
+    static SEED: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut h = SEED.get_or_init(std::collections::hash_map::RandomState::new).build_hasher();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     nanos.hash(&mut h);
-    let mut buf = [0u8; 8];
-    // Cheap per-process randomness for ids: hash + atomic counter.
-    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    n.hash(&mut h);
-    h.write(&mut buf);
+    CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed).hash(&mut h);
     format!("{prefix}_{:016x}", h.finish())
 }
 
@@ -121,6 +119,8 @@ impl Db {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // SQLite ignores REFERENCES / ON DELETE CASCADE unless this is on.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
@@ -144,7 +144,8 @@ impl Db {
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        // reuse schema via a temp file path? simplest: run the same batch
+        // Same rules and schema as the file database.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
@@ -155,7 +156,7 @@ impl Db {
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 role TEXT NOT NULL,
                 parts TEXT NOT NULL,
                 created_at INTEGER NOT NULL
@@ -247,16 +248,19 @@ impl Db {
             parts: parts.to_vec(),
             created_at,
         };
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let json = serde_json::to_string(&m.parts)?;
-        conn.execute(
+        // The message and the session's timestamp change together or not at all.
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO messages (id, session_id, role, parts, created_at) VALUES (?1,?2,?3,?4,?5)",
             params![m.id, m.session_id, m.role, json, m.created_at],
         )?;
-        conn.execute(
+        tx.execute(
             "UPDATE sessions SET updated_at=?1 WHERE id=?2",
             params![std::cmp::max(m.created_at, now_ms()), session_id],
         )?;
+        tx.commit()?;
         Ok(m)
     }
 
@@ -265,10 +269,32 @@ impl Db {
         let parent = self
             .get_session(id)?
             .with_context(|| format!("no session `{id}`"))?;
-        let new = self.create_session(title, Some(&parent.id))?;
-        for m in self.messages(&parent.id)? {
-            self.insert_message(&new.id, &m.role, &m.parts, m.created_at)?;
+        let msgs = self.messages(&parent.id)?;
+        let now = now_ms();
+        let new = Session {
+            id: new_id("ses"),
+            title: title.to_string(),
+            parent_id: Some(parent.id.clone()),
+            created_at: now,
+            updated_at: now,
+        };
+        // One transaction: a failed fork leaves no half-copied session.
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO sessions (id, title, parent_id, created_at, updated_at) VALUES (?1,?2,?3,?4,?5)",
+            params![new.id, new.title, new.parent_id, new.created_at, new.updated_at],
+        )?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO messages (id, session_id, role, parts, created_at) VALUES (?1,?2,?3,?4,?5)",
+            )?;
+            for m in &msgs {
+                let json = serde_json::to_string(&m.parts)?;
+                ins.execute(params![new_id("msg"), new.id, m.role, json, m.created_at])?;
+            }
         }
+        tx.commit()?;
         Ok(new)
     }
 
@@ -331,7 +357,10 @@ impl Db {
         let mut out = Vec::new();
         for row in rows {
             let (id, role, parts_json, created_at) = row?;
-            let parts: Vec<Part> = serde_json::from_str(&parts_json).unwrap_or_default();
+            // A row we cannot read is shown, never silently emptied.
+            let parts: Vec<Part> = serde_json::from_str(&parts_json).unwrap_or_else(|e| {
+                vec![Part::Text { text: format!("[unreadable message parts: {e}]") }]
+            });
             out.push(Message { id, session_id: session_id.to_string(), role, parts, created_at });
         }
         Ok(out)
@@ -562,5 +591,59 @@ mod tests {
     fn workspace_key_is_the_same_for_two_spellings() {
         let dir = std::env::temp_dir();
         assert_eq!(workspace_key(&dir), workspace_key(&dir.join(".")));
+    }
+
+    #[test]
+    fn messages_need_an_existing_session() {
+        let db = Db::open_in_memory().unwrap();
+        let err = db.add_message("ses_missing", "user", &[Part::Text { text: "hi".into() }]);
+        assert!(err.is_err(), "foreign keys are enforced");
+    }
+
+    #[test]
+    fn unreadable_parts_are_shown_not_dropped() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("c", None).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO messages (id, session_id, role, parts, created_at) VALUES ('m1', ?1, 'user', 'not json', 1)",
+                params![s.id],
+            )
+            .unwrap();
+        let msgs = db.messages(&s.id).unwrap();
+        assert!(
+            matches!(&msgs[0].parts[0], Part::Text { text } if text.starts_with("[unreadable")),
+            "{:?}",
+            msgs[0].parts
+        );
+    }
+
+    #[test]
+    fn in_memory_schema_matches_the_file_schema() {
+        let path = std::env::temp_dir().join(format!("ocrs-schema-{}-{}.db", std::process::id(), now_ms()));
+        let file = Db::open(&path).unwrap();
+        let mem = Db::open_in_memory().unwrap();
+        let sql = |db: &Db| -> String {
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT sql FROM sqlite_master WHERE name='messages'", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(sql(&file), sql(&mem));
+        drop(file);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn ids_are_unique_and_well_formed() {
+        let ids: std::collections::HashSet<String> = (0..10_000).map(|_| new_id("ses")).collect();
+        assert_eq!(ids.len(), 10_000);
+        let one = new_id("msg");
+        assert!(one.starts_with("msg_") && one.len() == 20, "{one}");
     }
 }
