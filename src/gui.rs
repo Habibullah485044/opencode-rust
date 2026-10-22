@@ -915,6 +915,41 @@ fn load_session(gs: &mut GuiState, st: &server::AppState, id: &str) {
     gs.busy = gs.running.contains(id);
 }
 
+/// New (F-13): hold an exclusive lock on `<state_dir>/gui.lock` while the
+/// window is open. The OS drops it when the process ends, even after a crash.
+/// Needs Rust 1.89 or newer (`File::try_lock`).
+fn single_instance_lock(state_dir: &std::path::Path) -> std::result::Result<std::fs::File, String> {
+    let _ = std::fs::create_dir_all(state_dir);
+    let path = state_dir.join("gui.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err("Another Habi window is already open. Use that one, or close it first.".to_string())
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("cannot lock {}: {e}", path.display())),
+    }
+}
+
+/// New (F-13): show a fatal error to a user who may have no console window.
+fn show_fatal_dialog(title: &str, msg: &str) {
+    eprintln!("[gui] {title}: {msg}");
+    #[cfg(windows)]
+    {
+        use windows::core::HSTRING;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        // SAFETY: a plain Win32 call with valid wide strings that outlive it.
+        unsafe {
+            MessageBoxW(None, &HSTRING::from(msg), &HSTRING::from(title), MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
 /// Submit the composer and name the chat after its first message. Shared by
 /// the CLI prefill and the typed-send path so a prefilled launch names its
 /// chat identically (it used to skip this and stay "New chat"). Returns the
@@ -959,6 +994,24 @@ pub async fn run(
     prompt: Option<String>,
     boot_ms: u128,
 ) -> Result<()> {
+    // F-13: one desktop window per state directory (two would write the same
+    // database), and a readable message when WebView2 is missing.
+    let _instance_lock = match single_instance_lock(&state.state_dir) {
+        Ok(lock) => lock,
+        Err(msg) => {
+            show_fatal_dialog("Habi is already running", &msg);
+            anyhow::bail!(msg);
+        }
+    };
+    if let Err(e) = wry::webview_version() {
+        let msg = format!(
+            "Habi needs the Microsoft Edge WebView2 Runtime, and it was not found ({e}).\n\n\
+             Install it from https://developer.microsoft.com/microsoft-edge/webview2/ \
+             and start Habi again."
+        );
+        show_fatal_dialog("WebView2 Runtime missing", &msg);
+        anyhow::bail!(msg);
+    }
     // B-42: reuse the newest chat while it is still empty.
     let session = match newest_empty_session(&state) {
         Some(s) => s,
@@ -1873,6 +1926,17 @@ mod tests {
         assert!(g.busy);
         assert!(g.entries.iter().any(|(k, t)| *k == EntryKind::User && t.contains("hello")));
         assert_eq!(g.submit(), None, "empty input sends nothing");
+    }
+
+    /// F-13: a second window on the same state directory is refused.
+    #[test]
+    fn only_one_window_per_state_dir() {
+        let dir = std::env::temp_dir().join(format!("habi-lock-test-{}", std::process::id()));
+        let first = single_instance_lock(&dir).expect("the first window gets the lock");
+        assert!(single_instance_lock(&dir).is_err(), "a second window is refused");
+        drop(first);
+        assert!(single_instance_lock(&dir).is_ok(), "free again after the first closes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
