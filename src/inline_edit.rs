@@ -210,7 +210,14 @@ mod tests {
         let ws = Path::new("/ws");
         assert!(resolve_in_workspace(ws, "src/main.rs").is_ok());
         assert!(resolve_in_workspace(ws, "").is_err());
-        assert!(resolve_in_workspace(ws, "..\\evil.rs").is_err());
+        // `\` separates path parts only on Windows. On Linux/macOS
+        // `..\evil.rs` is one ordinary file name: it may be refused, or
+        // resolved to that one name inside the workspace — never outside.
+        if cfg!(windows) {
+            assert!(resolve_in_workspace(ws, "..\\evil.rs").is_err());
+        } else if let Ok(p) = resolve_in_workspace(ws, "..\\evil.rs") {
+            assert_eq!(p.file_name().and_then(|n| n.to_str()), Some("..\\evil.rs"));
+        }
         assert!(resolve_in_workspace(ws, "a/../b.rs").is_err(), "even contained .. is rejected");
         // Absolute paths: both unix and windows forms fail on either OS
         // (windows drive paths are absolute only on windows, so test that
