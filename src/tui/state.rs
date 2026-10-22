@@ -145,6 +145,21 @@ impl TeamState {
         self.pending = rest;
     }
 
+    /// B-34: the team run is over (`RunFinished`). Show "done" even if no
+    /// `results for:` line was streamed; on failure, workers that never
+    /// reported are marked failed.
+    pub fn finish(&mut self, ok: bool) {
+        self.phase = TeamPhase::Done;
+        self.sealed = true;
+        if !ok {
+            for a in &mut self.agents {
+                if a.status == TeamStatus::Working {
+                    a.status = TeamStatus::Failed;
+                }
+            }
+        }
+    }
+
     fn feed_line(&mut self, line: &str) {
         // Plan items look like `  2. Builder — create the modules…`.
         if !line.starts_with("[team]") {
@@ -161,7 +176,11 @@ impl TeamState {
         } else if body.starts_with("plan:") {
             self.phase = TeamPhase::Working;
         } else if let Some(v) = body.strip_prefix("reviewer:") {
-            self.phase = TeamPhase::Reviewing;
+            // B-34: the synthesis repeats this line after `results for:`;
+            // it must not move a finished team back to "reviewing".
+            if self.phase != TeamPhase::Done {
+                self.phase = TeamPhase::Reviewing;
+            }
             self.verdict = Some(v.trim().to_string());
             self.sealed = true;
         } else if body.starts_with("results for:") {
@@ -208,13 +227,13 @@ fn parse_plan_item(line: &str) -> Option<TeamAgent> {
 
 /// `0 (sub) done` / `1 (sub) failed: …` → (index, status).
 fn parse_worker_line(rest: &str) -> Option<(usize, TeamStatus)> {
-    let (head, outcome) = rest.rsplit_once(") ")?;
-    let (idx, _title) = head.split_once(" (")?;
+    let (idx, tail) = rest.split_once(" (")?;
     let idx = idx.trim().parse::<usize>().ok()?;
-    let status = if outcome == "done" {
-        TeamStatus::Done
-    } else if outcome.starts_with("failed") {
+    // B-34: the error text after `failed:` may contain ") " itself.
+    let status = if tail.contains(") failed: ") || tail.ends_with(") failed") {
         TeamStatus::Failed
+    } else if tail.ends_with(") done") {
+        TeamStatus::Done
     } else {
         return None;
     };
@@ -865,7 +884,9 @@ impl App {
         match ev {
             ServerEvent::AssistantDelta { text, .. } => {
                 // Team panel listens on the same stream the transcript shows.
-                if text.contains("[team]") || self.team.is_some() {
+                // B-34: only a real team start opens the panel, not any text
+                // that happens to mention "[team]".
+                if text.contains("[team] decomposing goal:") || self.team.is_some() {
                     let team = self.team.get_or_insert_with(TeamState::default);
                     team.feed(&text);
                 }
@@ -900,6 +921,12 @@ impl App {
             }
             ServerEvent::RunFinished { ok, message, .. } => {
                 self.busy = false;
+                // B-34: a team run that is still on screen ends here.
+                if let Some(team) = self.team.as_mut() {
+                    if team.phase != TeamPhase::Done {
+                        team.finish(ok);
+                    }
+                }
                 if !ok {
                     if let Some(m) = message {
                         self.push(EntryKind::Error, m);

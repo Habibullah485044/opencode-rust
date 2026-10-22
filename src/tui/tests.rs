@@ -944,3 +944,53 @@
         assert!(matches!(app.on_key(key(KeyCode::Enter)), Some(InputAction::Mission(_))));
         assert!(app.busy);
     }
+
+    // ---- B-34: team panel end state ----
+
+    #[test]
+    fn team_panel_reaches_done_when_the_run_finishes() {
+        let mut app = App::new();
+        type_line(&mut app, "/team ship the feature");
+        app.on_key(key(KeyCode::Enter));
+        for line in [
+            "[team] decomposing goal: ship the feature\n",
+            "[team] plan: 2 subtask(s)\n",
+            "  1. Builder — create the modules\n",
+            "  2. Tester — run the test suite\n",
+            "[team] worker 0 (Builder) done\n",
+            "[team] worker 1 (Tester) failed: tool (bash) crashed\n",
+            "[team] reviewer: VERDICT: PASS\n",
+        ] {
+            app.on_event(ServerEvent::AssistantDelta { session_id: "s".into(), text: line.into() });
+        }
+        let team = app.team.as_ref().unwrap();
+        assert_eq!(team.phase, TeamPhase::Reviewing);
+        assert_eq!(team.agents[1].status, TeamStatus::Failed, "\") \" inside the error text");
+        app.on_event(ServerEvent::RunFinished {
+            session_id: "s".into(),
+            ok: true,
+            message: Some("team done".into()),
+        });
+        assert_eq!(app.team.as_ref().unwrap().phase, TeamPhase::Done);
+    }
+
+    #[test]
+    fn synthesis_reviewer_line_does_not_reopen_a_done_team() {
+        let mut app = App::new();
+        feed_team_run(&mut app); // ends with `[team] results for:`
+        app.on_event(ServerEvent::AssistantDelta {
+            session_id: "s".into(),
+            text: "[team] reviewer: PASS — looks good\n".into(),
+        });
+        assert_eq!(app.team.as_ref().unwrap().phase, TeamPhase::Done);
+    }
+
+    #[test]
+    fn plain_text_mentioning_team_does_not_open_the_panel() {
+        let mut app = App::new();
+        app.on_event(ServerEvent::AssistantDelta {
+            session_id: "s".into(),
+            text: "lines start with [team] in team mode\n".into(),
+        });
+        assert!(app.team.is_none());
+    }

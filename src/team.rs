@@ -122,6 +122,12 @@ pub async fn run_team(
         summary.push_str(&format!("- [{}] {}: {}\n", r.outcome, r.subtask, r.summary));
     }
     st.db.add_message(session_id, "assistant", &[Part::Text { text: summary.clone() }])?;
+    // B-34: stream the synthesis too. Clients see the per-worker results,
+    // and the TUI team panel reaches "done" on its `[team] results for:` line.
+    let _ = st.events.send(ServerEvent::AssistantDelta {
+        session_id: session_id.to_string(),
+        text: summary.clone(),
+    });
     Ok(summary)
 }
 
