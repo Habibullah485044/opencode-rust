@@ -115,6 +115,43 @@ pub fn subagent_index(defs: &[SubagentDef]) -> String {
         .join("\n")
 }
 
+/// P-05: how strongly the Ponytail rules apply in one session. `Full` is
+/// the vendored default; `Off` leaves the rules out of the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PonytailLevel {
+    Off,
+    Lite,
+    Full,
+    Ultra,
+}
+
+impl PonytailLevel {
+    /// `off` / `lite` / `full` / `ultra`, any case.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "lite" => Some(Self::Lite),
+            "full" => Some(Self::Full),
+            "ultra" => Some(Self::Ultra),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Lite => "lite",
+            Self::Full => "full",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    /// The level a session starts with: config `agent.ponytail` on = full.
+    pub fn from_config(enabled: bool) -> Self {
+        if enabled { Self::Full } else { Self::Off }
+    }
+}
+
 /// Inputs for [`compose_system`].
 pub struct PromptInputs<'a> {
     pub workspace: &'a Path,
@@ -125,8 +162,9 @@ pub struct PromptInputs<'a> {
     pub agents_md: Option<&'a str>,
     pub skills: &'a [skills::Doc],
     pub subagents: &'a [SubagentDef],
-    /// Embed the Ponytail (lazy senior dev) discipline in the system prompt.
-    pub ponytail: bool,
+    /// Ponytail rules level (P-05): `Off` leaves them out, `Lite`/`Ultra`
+    /// add a one-line level note after them.
+    pub ponytail: PonytailLevel,
     /// Installed skills that passed vetting — embedded in full ("baked in"),
     /// same idea as the vendored ponytail rules.
     pub baked: &'a [skills::Doc],
@@ -145,6 +183,21 @@ pub fn ponytail_rules() -> &'static str {
 /// MIT License, Copyright (c) DietrichGebert.
 pub fn ponytail_review_rules() -> &'static str {
     include_str!("prompts/ponytail-review.md")
+}
+
+/// P-05: the Ponytail block of a system prompt — empty for `Off`, the
+/// vendored rules for `Full`, rules plus one level line otherwise (the
+/// vendored "Levels" table says what each level means).
+pub fn ponytail_section(level: PonytailLevel) -> String {
+    if level == PonytailLevel::Off {
+        return String::new();
+    }
+    let mut out = String::from("\n\n## Ponytail — lazy senior dev discipline\n\n");
+    out.push_str(ponytail_rules().trim());
+    if level != PonytailLevel::Full {
+        out.push_str(&format!("\n\nPonytail level: {}", level.as_str()));
+    }
+    out
 }
 
 /// Compose the system prompt: base + AGENTS.md + skills index + subagent
@@ -196,10 +249,7 @@ pub fn compose_system(p: PromptInputs<'_>) -> String {
         out.push_str("\n\n## Subagents\n\nAvailable subagents (use the spawn tool):\n");
         out.push_str(&subagent_index(p.subagents));
     }
-    if p.ponytail {
-        out.push_str("\n\n## Ponytail — lazy senior dev discipline\n\n");
-        out.push_str(ponytail_rules().trim());
-    }
+    out.push_str(&ponytail_section(p.ponytail));
     for s in p.baked {
         out.push_str(&format!("\n\n## Skill: {} — always active\n\n", s.name));
         out.push_str(s.body.trim());
@@ -215,6 +265,43 @@ pub fn compose_system(p: PromptInputs<'_>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ponytail_level_controls_the_rules() {
+        let text = |level| {
+            compose_system(PromptInputs {
+                workspace: Path::new("/ws"),
+                mode: AgentMode::Build,
+                configured: None,
+                agents_md: None,
+                skills: &[],
+                subagents: &[],
+                ponytail: level,
+                baked: &[],
+            })
+        };
+        assert!(!text(PonytailLevel::Off).contains("lazy senior developer"), "off drops the rules");
+        let full = text(PonytailLevel::Full);
+        assert!(full.contains("lazy senior developer") && !full.contains("Ponytail level:"));
+        assert!(text(PonytailLevel::Lite).contains("Ponytail level: lite"));
+        assert!(text(PonytailLevel::Ultra).contains("Ponytail level: ultra"));
+        assert_eq!(PonytailLevel::parse(" Ultra "), Some(PonytailLevel::Ultra));
+        assert_eq!(PonytailLevel::parse("max"), None);
+    }
+
+    #[tokio::test]
+    async fn session_ponytail_level_reaches_the_system_prompt() {
+        let ws = std::env::temp_dir().join(format!("ocrs-ponytail-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let st = crate::server::build_state_ephemeral(crate::config::Config::default(), ws.clone()).await;
+        assert_eq!(st.ponytail_level("s1"), PonytailLevel::Full, "config default: on");
+        st.set_ponytail_level("s1", PonytailLevel::Ultra);
+        assert!(st.composed_system("s1").contains("Ponytail level: ultra"));
+        assert!(!st.composed_system("s2").contains("Ponytail level:"), "other sessions keep the default");
+        st.set_ponytail_level("s1", PonytailLevel::Off);
+        assert!(!st.composed_system("s1").contains("lazy senior developer"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 
     fn spec(name: &str) -> ToolSpec {
         ToolSpec {
@@ -268,7 +355,7 @@ mod tests {
             agents_md: Some("Always run fmt."),
             skills: &skills,
             subagents: &builtin_subagents(),
-            ponytail: false,
+            ponytail: PonytailLevel::Off,
             baked: &[],
         });
         assert!(text.contains("opencode-rust"), "default base");
@@ -290,7 +377,7 @@ mod tests {
             agents_md: None,
             skills: &[],
             subagents: &[],
-            ponytail: true,
+            ponytail: PonytailLevel::Full,
             baked: &[],
         });
         assert!(
@@ -325,7 +412,7 @@ mod tests {
                 path: "deploy.md".into(),
             }],
             subagents: &[],
-            ponytail: true,
+            ponytail: PonytailLevel::Full,
             baked: &[],
         });
         assert!(
@@ -348,7 +435,7 @@ mod tests {
             agents_md: None,
             skills: &[],
             subagents: &[],
-            ponytail: false,
+            ponytail: PonytailLevel::Off,
             baked: &[],
         });
         assert!(text.contains("no tool calls"), "explicit no-tools rule");
@@ -370,7 +457,7 @@ mod tests {
             agents_md: None,
             skills: &[],
             subagents: &[],
-            ponytail: false,
+            ponytail: PonytailLevel::Off,
             baked: &baked,
         });
         assert!(

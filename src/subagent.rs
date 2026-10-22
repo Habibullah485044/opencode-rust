@@ -114,7 +114,7 @@ pub async fn spawn_subagent(
         agents_md: agents_md.as_deref(),
         skills: &[],
         subagents: &[],
-        ponytail: st.cfg.agent.ponytail,
+        ponytail: st.ponytail_level(parent_session_id), // P-05: parent's level
         baked: &crate::skills::load_baked(&st.skill_base),
     });
     // B-27: the shared prompt says "ask when unclear"; a child has nobody to ask.

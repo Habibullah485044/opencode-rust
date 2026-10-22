@@ -263,10 +263,10 @@ async fn run_worker_agent(
         system.push_str("\n\n## Project instructions (AGENTS.md)\n\n");
         system.push_str(md.trim());
     }
-    if st.cfg.agent.ponytail {
-        system.push_str("\n\n## Ponytail — lazy senior dev discipline\n\n");
-        system.push_str(crate::agents::ponytail_rules().trim());
-    }
+    // P-05: a team worker follows its parent session's ponytail level.
+    let parent = st.db.get_session(session_id).ok().flatten().and_then(|s| s.parent_id);
+    let level = st.ponytail_level(parent.as_deref().unwrap_or(session_id));
+    system.push_str(&crate::agents::ponytail_section(level));
     for s in crate::skills::load_baked(&st.skill_base) {
         system.push_str(&format!("\n\n## Skill: {} — always active\n\n", s.name));
         system.push_str(s.body.trim());

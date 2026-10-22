@@ -53,6 +53,8 @@ pub enum Command {
     New,
     /// M6: create a starter AGENTS.md when the repo has none.
     Init,
+    /// P-05: show the ponytail level (None) or set it (Some).
+    Ponytail(Option<crate::agents::PonytailLevel>),
 }
 
 /// One registered command: how it is typed, what it takes, what it does.
@@ -96,6 +98,7 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "new", args: "", help: "Start a fresh session" },
         Builtin { name: "parallel", args: "<task>", help: "Run one task in two isolated worktrees" },
         Builtin { name: "plan", args: "", help: "Read-only plan mode (no writes)" },
+        Builtin { name: "ponytail", args: "[level]", help: "Ponytail rules: show or set lite / full / ultra / off" },
         Builtin { name: "quit", args: "", help: "Exit" },
         Builtin { name: "redo", args: "", help: "Re-apply the last undone snapshot" },
         Builtin { name: "resume", args: "<id|n>", help: "Switch to another session" },
@@ -186,6 +189,9 @@ pub fn classify(input: &str) -> Option<Command> {
         "turbo" => Some(Command::Turbo {
             prompt: if arg.is_empty() { None } else { Some(arg.to_string()) },
         }),
+        // P-05: bare `/ponytail` shows the level; an unknown level is a usage error.
+        "ponytail" if arg.is_empty() => Some(Command::Ponytail(None)),
+        "ponytail" => crate::agents::PonytailLevel::parse(arg).map(|l| Command::Ponytail(Some(l))),
         "skill" => {
             // `/skill install <path|url>` — the only subcommand.
             let src = arg.strip_prefix("install ")?.trim();
@@ -328,6 +334,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_ponytail_levels() {
+        use crate::agents::PonytailLevel;
+        assert_eq!(classify("/ponytail"), Some(Command::Ponytail(None)));
+        assert_eq!(classify("/ponytail ultra"), Some(Command::Ponytail(Some(PonytailLevel::Ultra))));
+        assert_eq!(classify("/ponytail OFF"), Some(Command::Ponytail(Some(PonytailLevel::Off))));
+        assert_eq!(classify("/ponytail max"), None, "unknown level");
+    }
+
+    #[test]
     fn every_builtin_verb_is_classified_or_arg_gated() {
         // The registry and the parser must not drift apart: a registered
         // command must either parse on its own, or parse once given args.
@@ -336,6 +351,7 @@ mod tests {
                 // Two-part arguments need a real sample, not a single token.
                 "edit" => "/edit src/lib.rs add a log line".to_string(),
                 "skill" => "/skill install ./skills/x.md".to_string(),
+                "ponytail" => "/ponytail lite".to_string(),
                 _ if b.args.is_empty() => format!("/{}", b.name),
                 _ => format!("/{} x", b.name),
             };

@@ -531,6 +531,11 @@ async fn headless_run(
                 println!("{}", state.debt_report(&session.id));
                 return Ok(());
             }
+            Cmd::Ponytail(_) => {
+                // P-05: a level lives in one session; set agent.ponytail for headless.
+                println!("[ponytail] level: {}", state.ponytail_level(&session.id).as_str());
+                return Ok(());
+            }
             Cmd::Parallel(task) => {
                 state.kick_parallel(session.id.clone(), task).await;
                 team_spawned = true;
@@ -987,6 +992,19 @@ async fn tui_run(
                     }
                     tui::InputAction::Review => {
                         st.kick_review(sid.clone()).await;
+                    }
+                    tui::InputAction::Ponytail(level) => {
+                        // P-05: the next run of this session uses the new level.
+                        if let Some(l) = level {
+                            st.set_ponytail_level(&sid, l);
+                        }
+                        let _ = st.events.send(server::ServerEvent::Note {
+                            session_id: sid.clone(),
+                            text: format!(
+                                "ponytail level: {} — choose with /ponytail lite | full | ultra | off",
+                                st.ponytail_level(&sid).as_str()
+                            ),
+                        });
                     }
                     tui::InputAction::Debt => {
                         let report = st.debt_report(&sid);

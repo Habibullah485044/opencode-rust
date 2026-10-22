@@ -209,6 +209,8 @@ pub struct AppState {
     pub client: AsyncMutex<Client>,
     /// M2: per-session plan/build mode (in-memory; resets on restart).
     pub modes: Mutex<HashMap<String, AgentMode>>,
+    /// P-05: per-session ponytail level (in-memory; default from config).
+    pub ponytail_levels: Mutex<HashMap<String, agents::PonytailLevel>>,
     /// M5: per-session todo lists (in-memory).
     pub todo_store: TodoStore,
     /// Runtime autonomy mode (not per-session): the composer selector and
@@ -262,6 +264,7 @@ pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
         workspace,
         state_dir,
         modes: Mutex::new(HashMap::new()),
+        ponytail_levels: Mutex::new(HashMap::new()),
         client: AsyncMutex::new(client),
         todo_store: TodoStore::default(),
         perm_mode: AtomicU8::new(PermissionMode::Default as u8),
@@ -310,6 +313,7 @@ pub async fn build_state_ephemeral_skills(
             crate::config::default_state_dir()
         },
         modes: Mutex::new(HashMap::new()),
+        ponytail_levels: Mutex::new(HashMap::new()),
         client: AsyncMutex::new(client),
         todo_store: TodoStore::default(),
         perm_mode: AtomicU8::new(PermissionMode::Default as u8),
@@ -351,6 +355,22 @@ impl AppState {
     pub fn set_mode(&self, session_id: &str, mode: AgentMode) {
         if let Ok(mut m) = self.modes.lock() {
             m.insert(session_id.to_string(), mode);
+        }
+    }
+
+    /// P-05: this session's ponytail level (default: config `agent.ponytail`).
+    pub fn ponytail_level(&self, session_id: &str) -> agents::PonytailLevel {
+        self.ponytail_levels
+            .lock()
+            .ok()
+            .and_then(|m| m.get(session_id).copied())
+            .unwrap_or_else(|| agents::PonytailLevel::from_config(self.cfg.agent.ponytail))
+    }
+
+    /// P-05: `/ponytail <level>` for one session (in-memory, like the mode).
+    pub fn set_ponytail_level(&self, session_id: &str, level: agents::PonytailLevel) {
+        if let Ok(mut m) = self.ponytail_levels.lock() {
+            m.insert(session_id.to_string(), level);
         }
     }
 
@@ -1115,7 +1135,7 @@ impl AppState {
             agents_md: agents_md.as_deref(),
             skills: &skills_list,
             subagents: &agents::builtin_subagents(),
-            ponytail: self.cfg.agent.ponytail,
+            ponytail: self.ponytail_level(session_id),
             baked: &baked,
         })
     }

@@ -611,6 +611,7 @@ impl App {
                     Some(Command::Init) => (Some(InputAction::Init), false),
                     Some(Command::Model(m)) => (Some(InputAction::Model(m)), false),
                     Some(Command::Export(p)) => (Some(InputAction::Export(p)), false),
+                    Some(Command::Ponytail(level)) => (Some(InputAction::Ponytail(level)), false),
                     Some(Command::Quit) => unreachable!("handled above"),
                     None => {
                         // A builtin verb with missing/invalid args (bare
@@ -1167,4 +1168,6 @@ pub enum InputAction {
     NewSession,
     /// M6: create a starter AGENTS.md when the repo has none.
     Init,
+    /// P-05: show (None) or set (Some) this session's ponytail level.
+    Ponytail(Option<crate::agents::PonytailLevel>),
 }
