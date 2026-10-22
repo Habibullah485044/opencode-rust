@@ -66,7 +66,7 @@ pub async fn propose(
     }
     let user = format!("FILE: {path}\n\n<file>\n{old}\n</file>\n\nINSTRUCTION: {instruction}");
     let raw = one_shot(st, SYSTEM, &user, abort, false).await?;
-    let new = strip_fences(&raw);
+    let new = match_trailing_newline(&strip_fences(&raw, &old), &old);
     if new == old {
         bail!("model returned the file unchanged");
     }
@@ -93,22 +93,55 @@ pub fn apply(abs: &Path, expected_old: &str, new: &str) -> Result<()> {
     Ok(())
 }
 
-/// Strip a markdown code fence the model wrapped its answer in, while
-/// leaving a raw file that merely *contains* fences alone.
-pub fn strip_fences(s: &str) -> String {
-    let t = s.trim();
-    let Some(first) = t.find("```") else { return s.to_string() };
-    // Only treat leading text as preamble if it is short (a file that
-    // starts with or contains ``` deep inside keeps its content intact).
-    if t[..first].trim().len() > 100 {
-        return s.to_string();
+/// Strip ONE markdown fence that wraps the model's whole reply, while
+/// leaving a file that merely *contains* fences alone (B-02).
+///
+/// The reply is unwrapped only when all of these hold:
+/// - an opening fence line (3+ backticks, optional language) starts the
+///   reply, or follows a short preamble (at most 100 chars) that is not
+///   the first line of the old file;
+/// - the last non-empty line is a closing fence with the same backticks;
+/// - the old file does not itself start with a fence line.
+/// Fences between the first and the last line are kept as they are.
+pub fn strip_fences(reply: &str, old: &str) -> String {
+    let lines: Vec<&str> = reply.lines().collect();
+    let Some(open) = lines.iter().position(|l| l.trim_start().starts_with("```")) else {
+        return reply.to_string();
+    };
+    let Some(close) = lines.iter().rposition(|l| !l.trim().is_empty()) else {
+        return reply.to_string();
+    };
+    if close <= open {
+        return reply.to_string();
     }
-    let Some(nl) = t[first..].find('\n') else { return s.to_string() };
-    let body_start = first + nl + 1;
-    match t[body_start..].rfind("\n```") {
-        Some(end) => t[body_start..][..end].to_string(),
-        None => s.to_string(),
+    let ticks = lines[open].trim_start().chars().take_while(|c| *c == '`').count();
+    if lines[close].trim() != "`".repeat(ticks) {
+        return reply.to_string();
     }
+    let old_start = old.trim_start();
+    if old_start.starts_with("```") {
+        return reply.to_string(); // the file itself starts with a fence
+    }
+    let preamble = lines[..open].join("\n");
+    let preamble = preamble.trim();
+    if preamble.len() > 100 {
+        return reply.to_string();
+    }
+    if let Some(first) = preamble.lines().next() {
+        if old_start.starts_with(first.trim()) {
+            return reply.to_string(); // the "preamble" is the file's own first line
+        }
+    }
+    lines[open + 1..close].join("\n")
+}
+
+/// Give `new` the same line ending at the end of the file as `old` (B-02).
+/// Models often drop the final newline; keeping the old ending avoids a
+/// "no newline at end of file" change the diff preview cannot show.
+pub fn match_trailing_newline(new: &str, old: &str) -> String {
+    let old_body = old.trim_end_matches(['\r', '\n']);
+    let old_tail = &old[old_body.len()..];
+    format!("{}{old_tail}", new.trim_end_matches(['\r', '\n']))
 }
 
 /// 1-based line number of the first difference (the hunk the Tab jump
@@ -238,14 +271,43 @@ mod tests {
 
     #[test]
     fn strips_model_fence_wrapping() {
-        assert_eq!(strip_fences("```rust\nfn a() {}\n```"), "fn a() {}");
-        assert_eq!(strip_fences("Sure!\n```rust\nfn a() {}\n```"), "fn a() {}");
-        assert_eq!(strip_fences("plain content"), "plain content");
+        let old = "fn a() {}\n";
+        assert_eq!(strip_fences("```rust\nfn a() {}\n```", old), "fn a() {}");
+        assert_eq!(strip_fences("Sure!\n```rust\nfn a() {}\n```", old), "fn a() {}");
+        assert_eq!(strip_fences("plain content", old), "plain content");
         // A raw file containing fences but with a long preamble stays intact.
         let raw = format!("{}\n```\ncode\n```", "x".repeat(150));
-        assert_eq!(strip_fences(&raw), raw);
+        assert_eq!(strip_fences(&raw, old), raw);
         // Fence with no closing → return untouched.
-        assert_eq!(strip_fences("```rust\nunclosed"), "```rust\nunclosed");
+        assert_eq!(strip_fences("```rust\nunclosed", old), "```rust\nunclosed");
+    }
+
+    #[test]
+    fn keeps_markdown_files_that_contain_fences() {
+        // The model returned a README as it is: nothing may be removed.
+        let readme = "# Title\n\n```bash\nnpm i\n```\n\nMore docs here.\n";
+        assert_eq!(strip_fences(readme, readme), readme);
+        // Starts with a short heading and ends with a code block: intact.
+        let usage = "# Usage\n\n```bash\nrun it\n```\n";
+        assert_eq!(strip_fences(usage, usage), usage);
+        // The file itself starts with a fence.
+        let snippet = "```bash\nnpm i\n```\n";
+        assert_eq!(strip_fences(snippet, snippet), snippet);
+    }
+
+    #[test]
+    fn unwraps_an_outer_fence_and_keeps_inner_ones() {
+        let old = "# Title\n\nold text\n";
+        let reply = "````markdown\n# Title\n\n```bash\nnpm i\n```\n````";
+        assert_eq!(strip_fences(reply, old), "# Title\n\n```bash\nnpm i\n```");
+    }
+
+    #[test]
+    fn trailing_newline_follows_the_old_file() {
+        assert_eq!(match_trailing_newline("a\nb", "x\n"), "a\nb\n");
+        assert_eq!(match_trailing_newline("a\nb\n\n", "x"), "a\nb");
+        assert_eq!(match_trailing_newline("a", "x\r\n"), "a\r\n");
+        assert_eq!(match_trailing_newline("a\n", "x\n\n"), "a\n\n");
     }
 
     #[test]
@@ -361,6 +423,7 @@ mod tests {
         assert_eq!(p.path, "app.rs");
         assert!(p.new.contains("println!"), "fence stripped, new content present");
         assert!(!p.new.contains("```"));
+        assert!(p.new.ends_with("}\n"), "final newline kept like the old file");
         assert_eq!(p.line, 3, "first changed line is inside main");
         assert!(p.diff.iter().any(|l| l.starts_with('+') && l.contains("println!")));
         assert!(p.diff.iter().any(|l| l.starts_with(' ')), "context lines kept");
