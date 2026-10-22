@@ -121,6 +121,8 @@ fn run() -> Result<()> {
         let addr = server::serve(state.clone(), port).await?;
         state.start_heartbeat(); // M5: endpoint health + tunnel keepalive
         let boot_ms = t0.elapsed().as_millis();
+        // New (S-01): say where the HTTP API token is (never the token).
+        eprintln!("[api] {}", server::api_token_note(&state.state_dir));
 
         if headless {
             return headless_run(state, addr, prompt, boot_ms).await;
@@ -184,6 +186,8 @@ OPTIONS:
 CONFIG:
   ~/.config/opencode-rust/config.toml  (or $OPENCODE_RUST_CONFIG)
   Env: OPENCODE_RUST_BASE_URL, OPENCODE_RUST_MODEL, OPENCODE_RUST_API_KEY
+  HTTP API: send Authorization: Bearer <token>. Token = $OPENCODE_RUST_API_TOKEN,
+            else a new random one per start (its file is printed at start).
   Headless approvals: denied unless --yes or OPENCODE_RUST_AUTO_APPROVE=1;
        OPENCODE_RUST_AUTO_DENY=1 always forces deny
 

@@ -1753,11 +1753,160 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }))
 }
 
+/// New (S-01): environment variable that fixes the API token. When it is
+/// not set, every start makes a new random token (see `resolve_api_token`).
+pub const API_TOKEN_ENV: &str = "OPENCODE_RUST_API_TOKEN";
+
+/// New (S-01): what every HTTP request must match (built once in `serve`).
+struct ApiGuard {
+    /// Expected value after `Authorization: Bearer `.
+    token: String,
+    /// The port we listen on; the `Host` header must name it.
+    port: u16,
+}
+
+/// New (S-01): where a generated token is written: `<state_dir>/api-token`.
+pub fn api_token_path(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("api-token")
+}
+
+/// New (S-01): one line for the startup output that says where the token
+/// is. It never contains the token itself.
+pub fn api_token_note(state_dir: &std::path::Path) -> String {
+    match std::env::var(API_TOKEN_ENV) {
+        Ok(v) if !v.trim().is_empty() => format!("API token: from ${API_TOKEN_ENV}"),
+        _ => format!("API token file: {}", api_token_path(state_dir).display()),
+    }
+}
+
+/// New (S-01): the token for this start: `$OPENCODE_RUST_API_TOKEN` when
+/// set, else a fresh random token written to `<state_dir>/api-token`
+/// (on Linux/macOS only your user can read that file).
+fn resolve_api_token(state_dir: &std::path::Path) -> Result<String> {
+    if let Ok(v) = std::env::var(API_TOKEN_ENV) {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Ok(v);
+        }
+    }
+    let token = random_token();
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("creating {}", state_dir.display()))?;
+    let path = api_token_path(state_dir);
+    // Remove the old file first: on Unix the mode below only applies to a
+    // file that is newly created.
+    let _ = std::fs::remove_file(&path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    std::io::Write::write_all(&mut file, token.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(token)
+}
+
+/// New (S-01): a 256-bit random token as 64 hex characters. `RandomState`
+/// is seeded from the operating system's random source once per process;
+/// hashing it with the time, the process id and a counter is good enough
+/// for a local-only secret (it is not a general-purpose crypto RNG).
+fn random_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut out = String::with_capacity(64);
+    for i in 0..4u64 {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(i);
+        h.write_u128(nanos);
+        h.write_u32(std::process::id());
+        out.push_str(&format!("{:016x}", h.finish()));
+    }
+    out
+}
+
+/// New (S-01): the `Host` header must be `127.0.0.1:<port>` or
+/// `localhost:<port>`. A web page from another site that points its own
+/// domain name at 127.0.0.1 still sends that domain name, so it is refused.
+fn host_allowed(headers: &axum::http::HeaderMap, port: u16) -> bool {
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let host = host.trim().to_ascii_lowercase();
+    let (name, host_port) = match host.rsplit_once(':') {
+        Some((name, p)) => (name.to_string(), p.parse::<u16>().ok()),
+        None => (host.clone(), Some(80)),
+    };
+    (name == "127.0.0.1" || name == "localhost") && host_port == Some(port)
+}
+
+/// New (S-01): compare two secrets without stopping at the first
+/// difference (the time taken does not reveal how much matched).
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// New (S-01): middleware in front of every route (see `serve`).
+async fn require_token(
+    State(guard): State<Arc<ApiGuard>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !host_allowed(req.headers(), guard.port) {
+        return (StatusCode::FORBIDDEN, "forbidden: unexpected Host header").into_response();
+    }
+    if req.uri().path() != "/api/health" {
+        let presented = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("")
+            .trim();
+        if !same_secret(presented.as_bytes(), guard.token.as_bytes()) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+                "unauthorized: send the header Authorization: Bearer <token>",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
 /// Bind and serve. Returns the actual address (useful with port 0).
+/// New (S-01): every route except `/api/health` needs the header
+/// `Authorization: Bearer <token>`, and every request must be addressed to
+/// `127.0.0.1:<port>` or `localhost:<port>` (the `Host` header).
 pub async fn serve(state: Shared, port: u16) -> Result<std::net::SocketAddr> {
-    let app = router(state).route("/api/health", get(health));
+    let token = resolve_api_token(&state.state_dir)?;
+    serve_with_token(state, port, token).await
+}
+
+/// New (S-01): `serve` with a token you choose (tests use this).
+pub async fn serve_with_token(
+    state: Shared,
+    port: u16,
+    token: String,
+) -> Result<std::net::SocketAddr> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
+    let guard = Arc::new(ApiGuard { token, port: addr.port() });
+    let app = router(state)
+        .route("/api/health", get(health))
+        .layer(axum::middleware::from_fn_with_state(guard, require_token));
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -1768,6 +1917,56 @@ pub async fn serve(state: Shared, port: u16) -> Result<std::net::SocketAddr> {
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// S-01: the HTTP API needs the bearer token and a local Host header;
+    /// /api/health needs no token.
+    #[tokio::test]
+    async fn api_requires_token_and_local_host() {
+        let st =
+            build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let addr = serve_with_token(st, 0, "test-token".into()).await.unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = |p: &str| format!("http://{addr}{p}");
+
+        let r = http.get(url("/api/health")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200, "health stays open");
+        let r = http.get(url("/api/sessions")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 401, "no token");
+        let r = http.get(url("/api/sessions")).bearer_auth("wrong").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 401, "wrong token");
+        let r = http.get(url("/api/sessions")).bearer_auth("test-token").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200, "right token");
+        let r = http
+            .get(url("/api/sessions"))
+            .bearer_auth("test-token")
+            .header("Host", "example.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "foreign Host header");
+    }
+
+    /// S-01: Host check, token shape and secret comparison.
+    #[test]
+    fn host_check_and_token_helpers() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::HOST, "127.0.0.1:4000".parse().unwrap());
+        assert!(host_allowed(&h, 4000));
+        assert!(!host_allowed(&h, 4001), "port must match");
+        h.insert(axum::http::header::HOST, "LOCALHOST:4000".parse().unwrap());
+        assert!(host_allowed(&h, 4000));
+        h.insert(axum::http::header::HOST, "evil.example:4000".parse().unwrap());
+        assert!(!host_allowed(&h, 4000));
+        assert!(!host_allowed(&axum::http::HeaderMap::new(), 4000), "no Host header");
+
+        let (a, b) = (random_token(), random_token());
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "every token is new");
+        assert!(same_secret(b"abc", b"abc"));
+        assert!(!same_secret(b"abc", b"abd"));
+        assert!(!same_secret(b"abc", b"ab"));
+    }
 
     /// M6: `/sessions`, `/model`, `/export` and `/todos` all read the same
     /// state the TUI renders — verify them against a real (ephemeral) state.
