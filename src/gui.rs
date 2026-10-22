@@ -1299,6 +1299,13 @@ pub async fn run(
                                 eprintln!("[preview-smoke] {ev:?}");
                             }
                             let loaded = matches!(ev, BrowserEvt::Loading(false));
+                            // B-36: track the start of a load, and refusals.
+                            if matches!(ev, BrowserEvt::Loading(true)) {
+                                bridge.on_load_started();
+                            }
+                            if let BrowserEvt::Blocked(msg) = &ev {
+                                bridge.on_blocked(msg);
+                            }
                             gs.on_browser_event(ev);
                             // A pending `browser_navigate` resolves on load.
                             if loaded {
@@ -1371,8 +1378,21 @@ struct Bridge {
     next_id: u64,
     pending: HashMap<u64, (tokio::sync::oneshot::Sender<Result<String, String>>, Instant)>,
     /// A navigation still waiting for its load event.
-    nav: Option<(tokio::sync::oneshot::Sender<Result<String, String>>, Instant)>,
+    nav: Option<NavWait>,
 }
+
+/// New (B-36): one `browser_navigate` waiting for its page to load.
+struct NavWait {
+    reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    deadline: Instant,
+    /// Set once the new page starts loading. A "finished" event that comes
+    /// before that belongs to the page we are leaving and must not answer.
+    started: bool,
+}
+
+/// New (B-36): longest `browser_wait` we run. It must stay below the 25 s
+/// request deadline in `Bridge::start`, or the deadline fires first.
+const MAX_WAIT_MS: u64 = 20_000;
 
 impl Bridge {
     fn new() -> Self {
@@ -1412,8 +1432,13 @@ impl Bridge {
                             let _ = req.reply.send(Err(format!("navigate failed: {e}")));
                             return;
                         }
-                        // Resolved by the next Loading(false) event.
-                        self.nav = Some((req.reply, deadline));
+                        // B-36: a newer navigation replaces an older one, so
+                        // tell the older caller instead of dropping it.
+                        if let Some(old) = self.nav.take() {
+                            let _ = old.reply.send(Err("replaced by a newer navigation".into()));
+                        }
+                        // Resolved by the first Loading(false) after Loading(true).
+                        self.nav = Some(NavWait { reply: req.reply, deadline, started: false });
                     }
                     Err(e) => {
                         let _ = req.reply.send(Err(e));
@@ -1430,7 +1455,7 @@ impl Bridge {
                         .get("ms")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(500)
-                        .clamp(1, 30_000);
+                        .clamp(1, MAX_WAIT_MS);
                     let js = format!(
                         "setTimeout(function(){{window.ipc.postMessage(JSON.stringify(\
                          {{hab:{id},ok:true,result:{{\"slept_ms\":{ms}}}}}));}}, {ms});"
@@ -1440,7 +1465,14 @@ impl Bridge {
                     return;
                 }
                 self.pending.insert(id, (req.reply, deadline));
-                let js = crate::browser::wait_script(id, selector, text, 8_000);
+                // B-36: `ms` (when given) is how long to wait for the condition.
+                let budget = req
+                    .input
+                    .get("ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(8_000)
+                    .clamp(250, MAX_WAIT_MS);
+                let js = crate::browser::wait_script(id, selector, text, budget);
                 let _ = wv.evaluate_script(&js);
             }
             method => {
@@ -1468,9 +1500,30 @@ impl Bridge {
         }
     }
 
+    /// New (B-36): the panel started loading a page.
+    fn on_load_started(&mut self) {
+        if let Some(nav) = self.nav.as_mut() {
+            nav.started = true;
+        }
+    }
+
+    /// New (B-36): the panel refused a navigation. A waiting
+    /// `browser_navigate` gets the reason now instead of a timeout later.
+    fn on_blocked(&mut self, msg: &str) -> bool {
+        let Some(nav) = self.nav.take() else {
+            return false;
+        };
+        let _ = nav.reply.send(Err(msg.to_string()));
+        true
+    }
+
     /// A page finished loading: release a waiting `browser_navigate`.
     fn on_loaded(&mut self, view: &BrowserView) -> bool {
-        let Some((tx, _)) = self.nav.take() else {
+        // B-36: ignore a "finished" that belongs to the page we are leaving.
+        if !self.nav.as_ref().is_some_and(|n| n.started) {
+            return false;
+        }
+        let Some(NavWait { reply: tx, .. }) = self.nav.take() else {
             return false;
         };
         let out = serde_json::json!({
@@ -1496,9 +1549,9 @@ impl Bridge {
                 let _ = tx.send(Err("the page did not answer in time".into()));
             }
         }
-        if matches!(self.nav.as_ref(), Some((_, d)) if *d <= now) {
-            if let Some((tx, _)) = self.nav.take() {
-                let _ = tx.send(Err("navigation timed out".into()));
+        if self.nav.as_ref().is_some_and(|n| n.deadline <= now) {
+            if let Some(nav) = self.nav.take() {
+                let _ = nav.reply.send(Err("navigation timed out".into()));
             }
         }
     }
@@ -1944,6 +1997,45 @@ mod tests {
         assert_eq!(v["browser"]["loading"], true);
         assert_eq!(v["browser"]["error"], serde_json::Value::Null);
         assert_eq!(v["dev_server"], "http://localhost:5173");
+    }
+
+    fn waiting_navigation() -> (Bridge, tokio::sync::oneshot::Receiver<Result<String, String>>) {
+        let mut bridge = Bridge::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        bridge.nav = Some(NavWait {
+            reply: tx,
+            deadline: Instant::now() + Duration::from_secs(25),
+            started: false,
+        });
+        (bridge, rx)
+    }
+
+    /// B-36: the old page's "finished" must not answer a new navigation.
+    #[test]
+    fn navigate_ignores_finish_of_the_previous_page() {
+        let (mut bridge, mut rx) = waiting_navigation();
+        let view = BrowserView { url: "http://localhost:3000/".into(), ..Default::default() };
+        assert!(!bridge.on_loaded(&view), "finished before started = the old page");
+        assert!(rx.try_recv().is_err(), "still waiting");
+        bridge.on_load_started();
+        assert!(bridge.on_loaded(&view));
+        let out = rx.try_recv().expect("answered").expect("ok");
+        assert!(out.contains("localhost:3000"), "{out}");
+    }
+
+    /// B-36: a refused navigation answers at once, with the reason.
+    #[test]
+    fn blocked_navigation_answers_at_once() {
+        let (mut bridge, mut rx) = waiting_navigation();
+        assert!(bridge.on_blocked("blocked: dev-server-only"));
+        let err = rx.try_recv().expect("answered").unwrap_err();
+        assert!(err.contains("blocked"), "{err}");
+    }
+
+    /// B-36: every wait must end before the 25 s request deadline.
+    #[test]
+    fn wait_budget_stays_below_the_request_deadline() {
+        assert!(MAX_WAIT_MS + 2_000 < 25_000);
     }
 
     #[test]
