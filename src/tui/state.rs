@@ -207,6 +207,8 @@ pub struct AgentCard {
     pub detail: String,
     /// When the panel first saw this agent — the card shows elapsed time.
     pub started: std::time::Instant,
+    /// B-41: when the card first became Done or Failed; its clock stops here.
+    pub finished: Option<std::time::Instant>,
 }
 
 /// `2. Builder — create the modules…` → agent (title, task). Strict enough
@@ -284,8 +286,15 @@ pub fn wrap_n(s: &str, width: usize, max_lines: usize) -> Vec<String> {
             cur.push_str(w);
         }
     }
-    if !cur.is_empty() && lines.len() < max_lines {
-        lines.push(cur);
+    if !cur.is_empty() {
+        if lines.len() < max_lines {
+            lines.push(cur);
+        } else if let Some(last) = lines.last_mut() {
+            // B-41: a word was cut off — say so, like the loop above does.
+            if !last.ends_with('…') {
+                last.push('…');
+            }
+        }
     }
     if lines.is_empty() {
         lines.push(String::new());
@@ -370,6 +379,14 @@ pub struct App {
     pub palette: Option<Palette>,
     /// M6: `/help` reference overlay is open.
     pub help: bool,
+    /// B-41: how far the help overlay is scrolled, in rows.
+    pub help_scroll: u16,
+    /// B-41: how far the edit preview is scrolled, in rows.
+    pub edit_scroll: u16,
+    /// B-41: the furthest useful scroll of help / the edit preview. `draw`
+    /// sets them each frame (like `scroll_max`), so ↓ stops at the end.
+    pub help_scroll_max: std::cell::Cell<u16>,
+    pub edit_scroll_max: std::cell::Cell<u16>,
     /// M6: `/sessions` picker overlay.
     pub sessions: Option<SessionsOverlay>,
     /// M6: the model the core will use (shown in the header).
@@ -410,6 +427,11 @@ impl App {
             team: None,
             palette: None,
             help: false,
+            help_scroll: 0,
+            edit_scroll: 0,
+            // Unknown until the first frame is drawn: no cap yet.
+            help_scroll_max: std::cell::Cell::new(u16::MAX),
+            edit_scroll_max: std::cell::Cell::new(u16::MAX),
             sessions: None,
             model: None,
             agents: Vec::new(),
@@ -493,6 +515,7 @@ impl App {
             }
             KeyCode::F(1) => {
                 self.help = true;
+                self.help_scroll = 0;
                 None
             }
             // M3: Tab / Shift+Tab cycle accepted-edit jump sites (local, no model call).
@@ -537,7 +560,7 @@ impl App {
                     );
                     return None;
                 }
-                self.push(EntryKind::User, format!("> {content}"));
+                self.push(EntryKind::User, content.clone());
                 // Agent-running commands set busy; fast local ones don't.
                 let (action, busy) = match classify(&content) {
                     Some(Command::Team(goal)) => {
@@ -599,6 +622,7 @@ impl App {
                     }
                     Some(Command::Help) => {
                         self.help = true;
+                        self.help_scroll = 0;
                         (None, false)
                     }
                     Some(Command::Clear) => {
@@ -765,6 +789,25 @@ impl App {
                 self.push(EntryKind::System, "[edit] rejected".to_string());
                 None
             }
+            // B-41: long diffs scroll instead of losing their end.
+            KeyCode::Up => {
+                self.edit_scroll = self.edit_scroll.saturating_sub(1);
+                None
+            }
+            KeyCode::Down => {
+                self.edit_scroll =
+                    self.edit_scroll.saturating_add(1).min(self.edit_scroll_max.get());
+                None
+            }
+            KeyCode::PageUp => {
+                self.edit_scroll = self.edit_scroll.saturating_sub(10);
+                None
+            }
+            KeyCode::PageDown => {
+                self.edit_scroll =
+                    self.edit_scroll.saturating_add(10).min(self.edit_scroll_max.get());
+                None
+            }
             _ => None,
         }
     }
@@ -887,6 +930,15 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
+            // B-41: arrows scroll the help; any other key closes it.
+            KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+            KeyCode::Down => {
+                self.help_scroll = self.help_scroll.saturating_add(1).min(self.help_scroll_max.get())
+            }
+            KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+            KeyCode::PageDown => {
+                self.help_scroll = self.help_scroll.saturating_add(10).min(self.help_scroll_max.get())
+            }
             _ => self.help = false,
         }
         None
@@ -952,6 +1004,7 @@ impl App {
         self.scroll = 0;
         self.team = None;
         self.palette = None;
+        self.agents.clear();
         self.push(
             EntryKind::System,
             "[view cleared — history kept: /resume to other sessions, /export to save]"
@@ -1030,6 +1083,7 @@ impl App {
             }
             ServerEvent::EditPreview { path, diff, old, new, line, .. } => {
                 self.pending_edit = Some(PendingEdit { path, diff, old, new, line });
+                self.edit_scroll = 0;
                 self.busy = false;
             }
             ServerEvent::EditApplied { path, line, .. } => {
@@ -1108,17 +1162,27 @@ impl App {
                 // Upsert by agent id: one card per spawned agent.
                 match self.agents.iter().position(|a| a.agent_id == agent_id) {
                     Some(i) => {
-                        self.agents[i].state = state;
-                        self.agents[i].detail = detail;
+                        let card = &mut self.agents[i];
+                        // B-41: stop the card's clock the first time it ends.
+                        if state != TeamStatus::Working && card.finished.is_none() {
+                            card.finished = Some(std::time::Instant::now());
+                        }
+                        card.state = state;
+                        card.detail = detail;
                     }
-                    None => self.agents.push(AgentCard {
-                        agent_id,
-                        name,
-                        task,
-                        state,
-                        detail,
-                        started: std::time::Instant::now(),
-                    }),
+                    None => {
+                        let now = std::time::Instant::now();
+                        let finished = (state != TeamStatus::Working).then_some(now);
+                        self.agents.push(AgentCard {
+                            agent_id,
+                            name,
+                            task,
+                            state,
+                            detail,
+                            started: now,
+                            finished,
+                        })
+                    }
                 }
             }
         }

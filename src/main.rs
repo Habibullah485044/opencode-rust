@@ -740,7 +740,7 @@ async fn tui_run(
     // If a prompt was passed on the CLI, pre-fill and send. (kick_run
     // registers the run so a later prompt can abort/replace it.)
     if let Some(p) = prompt {
-        app.push(tui::EntryKind::User, format!("> {p}"));
+        app.push(tui::EntryKind::User, p.clone());
         app.busy = true;
         state.kick_run(session.id.clone(), p).await;
     }

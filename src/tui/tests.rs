@@ -1033,3 +1033,99 @@
         // Each word is 6 columns wide: two of them do not fit in 7.
         assert_eq!(wrap_n("日本語 日本語", 7, 2), vec!["日本語", "日本語"]);
     }
+
+    // ---- B-41: TUI polish ----
+
+    #[test]
+    fn wrap_n_marks_a_cut_off_last_word() {
+        assert_eq!(wrap_n("aaa bbb ccc", 3, 2), vec!["aaa", "bbb…"]);
+    }
+
+    #[test]
+    fn help_scrolls_with_arrows_and_closes_on_other_keys() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::F(1)));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        assert!(app.help, "arrows scroll instead of closing");
+        assert_eq!(app.help_scroll, 2);
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(!app.help, "any other key closes");
+        app.on_key(key(KeyCode::F(1)));
+        assert_eq!(app.help_scroll, 0, "reopening starts at the top");
+    }
+
+    #[test]
+    fn selected_session_is_always_drawn() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        let items = (1..=30)
+            .map(|i| SessionInfo {
+                id: format!("ses_{i:02}"),
+                title: format!("chat {i}"),
+                parent_id: None,
+                updated_at: 0,
+            })
+            .collect();
+        app.sessions = Some(SessionsOverlay { items, sel: 29 });
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String =
+            terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("ses_30"), "the selected 30th session is on screen");
+        assert!(!text.contains("ses_01"), "the list scrolled to reach it");
+    }
+
+    #[test]
+    fn long_edit_preview_scrolls_to_its_end_and_keeps_the_hint() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        app.on_event(ServerEvent::EditPreview {
+            session_id: "s".into(),
+            path: "big.txt".into(),
+            diff: (1..=100).map(|i| format!("+line {i:03}")).collect(),
+            old: String::new(),
+            new: String::new(),
+            line: 1,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        for _ in 0..12 {
+            app.on_key(key(KeyCode::PageDown));
+        }
+        assert!(app.pending_edit.is_some(), "scrolling does not answer the preview");
+        assert_eq!(app.edit_scroll, app.edit_scroll_max.get(), "↓ stops at the end");
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String =
+            terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("line 100"), "the end of the diff is reachable");
+        assert!(text.contains("[y] apply"), "the key hint stays on screen");
+    }
+
+    #[test]
+    fn user_lines_have_one_marker() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        type_line(&mut app, "hello");
+        app.on_key(key(KeyCode::Enter));
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String =
+            terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("› hello"), "{text}");
+        assert!(!text.contains("> hello"), "no second marker");
+    }
+
+    #[test]
+    fn a_finished_agent_card_stops_its_clock() {
+        let mut app = App::new();
+        app.on_event(agent_ev("ses_a", "explore", "working", "starting…"));
+        assert!(app.agents[0].finished.is_none());
+        app.on_event(agent_ev("ses_a", "explore", "done", "ok"));
+        let first = app.agents[0].finished.expect("set when it finishes");
+        app.on_event(agent_ev("ses_a", "explore", "done", "ok again"));
+        assert_eq!(app.agents[0].finished, Some(first), "only the first end counts");
+        type_line(&mut app, "/clear");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.agents.is_empty(), "/clear drops old cards");
+    }

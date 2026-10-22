@@ -251,7 +251,10 @@ pub fn draw(f: &mut Frame, app: &App) {
             };
             f.render_widget(Clear, area);
             let mut lines: Vec<Line> = Vec::new();
-            for (i, &idx) in pal.matches.iter().take(h as usize - 2).enumerate() {
+            // B-41: scroll the list so the selected row is always drawn.
+            let rows = h as usize - 2;
+            let first = pal.sel.saturating_sub(rows.saturating_sub(1));
+            for (i, &idx) in pal.matches.iter().enumerate().skip(first).take(rows) {
                 let b = &builtins()[idx];
                 let sel = i == pal.sel;
                 lines.push(
@@ -281,6 +284,12 @@ pub fn draw(f: &mut Frame, app: &App) {
         (" APPROVAL NEEDED: [y] once  [a] always  [n/Esc] deny ", true)
     } else if app.pending_edit.is_some() {
         (" EDIT PREVIEW: [y] apply  [n/Esc] reject ", true)
+    } else if app.mission_picker.is_some() {
+        (" ↑↓ mission   ←→ effort   Enter run   Esc cancel ", false)
+    } else if app.sessions.is_some() {
+        (" ↑↓ select   Enter switch   Esc close ", false)
+    } else if app.help {
+        (" ↑↓ scroll   any other key closes ", false)
     } else if app.palette.is_some() {
         (" ↑↓ select   Tab complete   Enter run   Esc dismiss ", false)
     } else {
@@ -311,7 +320,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         let area = centered_rect(60, 45, f.area());
         f.render_widget(Clear, area);
         let mut lines: Vec<Line> = vec![
-            Line::from("Missions").style(Style::default().fg(FB_INK).add_modifier(Modifier::BOLD)),
+            Line::from("Missions").style(Style::default().fg(FB_FG).add_modifier(Modifier::BOLD)),
             Line::from(""),
         ];
         for (i, k) in crate::mission::MissionKind::all().iter().enumerate() {
@@ -328,7 +337,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         lines.push(Line::from(""));
         lines.push(
             Line::from("Mission effort")
-                .style(Style::default().fg(FB_INK).add_modifier(Modifier::BOLD)),
+                .style(Style::default().fg(FB_FG).add_modifier(Modifier::BOLD)),
         );
         let row: Vec<Span> = crate::mission::Effort::all()
             .iter()
@@ -389,17 +398,28 @@ pub fn draw(f: &mut Frame, app: &App) {
             };
             lines.push(Line::from(d.clone()).style(style));
         }
-        lines.push(Line::from(""));
-        lines.push(Line::from("[y] apply   [n/Esc] reject"));
-        let block = Paragraph::new(lines)
+        // B-41: the key hint sits on the border, so a long diff that is
+        // scrolled can never push it off screen. Scrolling stops at the end
+        // (rows counted after wrapping, before the block is set — see B-14).
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let end = paragraph
+            .line_count(area.width.saturating_sub(2))
+            .saturating_sub(area.height.saturating_sub(2) as usize)
+            .min(u16::MAX as usize) as u16;
+        app.edit_scroll_max.set(end);
+        let block = paragraph
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(FB_BORDER))
-                    .title(" edit preview "),
+                    .title(" edit preview ")
+                    .title_bottom(
+                        Line::from(" [y] apply   [n/Esc] reject   [↑↓] scroll ")
+                            .style(Style::default().fg(FB_GREEN)),
+                    ),
             )
-            .wrap(Wrap { trim: false });
+            .scroll((app.edit_scroll.min(end), 0));
         f.render_widget(block, area);
     }
 
@@ -407,7 +427,14 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.help && !covered && app.mission_picker.is_none() && app.sessions.is_none() {
         let area = centered_rect(76, 84, f.area());
         f.render_widget(Clear, area);
-        let block = Paragraph::new(help_text())
+        // B-41: scrollable, stopping at the end (rows counted as in B-14).
+        let paragraph = Paragraph::new(help_text()).wrap(Wrap { trim: false });
+        let end = paragraph
+            .line_count(area.width.saturating_sub(2))
+            .saturating_sub(area.height.saturating_sub(2) as usize)
+            .min(u16::MAX as usize) as u16;
+        app.help_scroll_max.set(end);
+        let block = paragraph
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -415,7 +442,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                     .border_style(Style::default().fg(FB_BORDER))
                     .title(" help — any key to close "),
             )
-            .wrap(Wrap { trim: false });
+            .scroll((app.help_scroll.min(end), 0));
         f.render_widget(block, area);
     }
 
@@ -428,7 +455,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         if ov.items.is_empty() {
             lines.push(Line::from("no sessions yet").style(Style::default().fg(FB_MUTED)));
         }
-        for (i, s) in ov.items.iter().take(rows.max(1)).enumerate() {
+        // B-41: scroll the list so the selected session is always drawn.
+        let first = ov.sel.saturating_sub(rows.max(1) - 1);
+        for (i, s) in ov.items.iter().enumerate().skip(first).take(rows.max(1)) {
             let sel = i == ov.sel;
             let fork = if s.parent_id.is_some() { "↳" } else { " " };
             lines.push(
@@ -542,13 +571,20 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
     if inner.height < 4 || inner.width < 12 {
         return;
     }
-    // shortcut: the strip fits 4 cards; more agents need paging — upgrade if a run exceeds that
-    let n = app.agents.len().min(4);
+    // The strip fits 4 cards. B-41: running agents first, then the newest
+    // finished ones, so a live agent is never hidden behind old cards.
+    let mut order: Vec<usize> = (0..app.agents.len()).collect();
+    order.sort_by_key(|&i| {
+        let a = &app.agents[i];
+        (a.state != TeamStatus::Working, std::cmp::Reverse(a.started))
+    });
+    order.truncate(4);
+    let n = order.len();
     let cards = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(vec![Constraint::Ratio(1, n as u32); n])
         .split(inner);
-    for (i, card_area) in cards.iter().enumerate() {
+    for (card_area, &i) in cards.iter().zip(&order) {
         let a = &app.agents[i];
         let accent = TEAM_ACCENTS[i % TEAM_ACCENTS.len()];
         let (mark, border) = match a.state {
@@ -557,7 +593,12 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
             TeamStatus::Failed => ("✗ failed", FB_ERROR),
         };
         let w = card_area.width.saturating_sub(2) as usize;
-        let secs = a.started.elapsed().as_secs();
+        // B-41: a finished card's clock stops when it finished.
+        let secs = a
+            .finished
+            .unwrap_or_else(std::time::Instant::now)
+            .duration_since(a.started)
+            .as_secs();
         draw_agent_card(
             f,
             *card_area,
