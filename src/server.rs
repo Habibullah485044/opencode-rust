@@ -587,8 +587,26 @@ async fn events_sse(
 }
 
 fn internal<E: std::fmt::Display>(e: E) -> StatusCode {
-    eprintln!("[core] internal error: {e}");
+    // New (B-48): to the log file, not stderr (stderr draws over the TUI).
+    core_log(&format!("[core] internal error: {e}"));
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+/// New (B-48): append one line to `<state_dir>/core.log`. Use this instead
+/// of `eprintln!` in code that can run while the TUI owns the terminal.
+pub fn core_log(msg: &str) {
+    use std::io::Write;
+    let path = crate::config::default_state_dir().join("core.log");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{stamp}] {msg}");
+    }
 }
 
 /// M3: one non-streamed completion with NO tools — the inline-edit engine
@@ -741,8 +759,14 @@ fn turbo_continuation(st: &Shared, session_id: &str, result: &Result<String>) ->
 pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort: Arc<AtomicBool>) {
     // Safety net before anything mutates the workspace. Failure is not
     // fatal — snapshotting is a convenience, the run must still work.
-    if let Err(e) = crate::gitsnap::record_before_run(&st.workspace, &st.state_dir, "pre-run") {
-        eprintln!("[snapshot] {e:#}");
+    // New (B-48): git runs off the async threads; errors go to core.log.
+    let (ws, sd) = (st.workspace.clone(), st.state_dir.clone());
+    let snap = tokio::task::spawn_blocking(move || {
+        crate::gitsnap::record_before_run(&ws, &sd, "pre-run")
+    })
+    .await;
+    if let Ok(Err(e)) = snap {
+        core_log(&format!("[snapshot] {e:#}"));
     }
     let before = snapshot_stats(st, session_id);
     // New (P-02): fingerprint the git working tree first, so a run that only

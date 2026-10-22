@@ -1163,7 +1163,8 @@ async fn tui_run(
                             &st2.state_dir,
                             "pre-edit",
                         ) {
-                            eprintln!("[snapshot] {e:#}");
+                            // New (B-48): stderr would draw over the TUI.
+                            opencode_rust::server::core_log(&format!("[snapshot] {e:#}"));
                         }
                         tokio::spawn(async move {
                             let res = tokio::task::spawn_blocking(
