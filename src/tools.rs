@@ -440,22 +440,142 @@ fn grep_files(
     }
 }
 
+/// S-06: true only for normal public internet addresses. Loopback, private,
+/// link-local (cloud metadata), shared/CGNAT, multicast, broadcast,
+/// documentation, benchmarking, reserved and unspecified addresses are not.
+/// IPv6 forms that wrap an IPv4 address are judged by that IPv4 address.
+pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr};
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            !(v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || a == 0
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && (b == 18 || b == 19))
+                || a >= 240)
+        }
+        IpAddr::V6(v6) => {
+            // ::ffff:a.b.c.d and ::a.b.c.d
+            if let Some(v4) = v6.to_ipv4() {
+                return is_public_ip(IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            let embedded = |hi: u16, lo: u16| {
+                IpAddr::V4(Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8))
+            };
+            // 64:ff9b::/96 (NAT64) and 2002::/16 (6to4) carry an IPv4 address.
+            if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+                return is_public_ip(embedded(s[6], s[7]));
+            }
+            if s[0] == 0x2002 {
+                return is_public_ip(embedded(s[1], s[2]));
+            }
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xffc0) == 0xfec0
+                || (s[0] == 0x2001 && s[1] == 0x0db8))
+        }
+    }
+}
+
+/// webfetch reads at most this many bytes of a response body (S-06).
+const WEBFETCH_MAX_BYTES: usize = 2_000_000;
+/// webfetch follows at most this many redirects (S-06).
+const WEBFETCH_MAX_REDIRECTS: usize = 5;
+
 async fn webfetch(url: &str) -> Result<String> {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(anyhow!("only http(s) urls are allowed"));
+    fetch_checked(url, is_public_ip).await
+}
+
+/// S-06: GET `url` from addresses that pass `allowed` only. Checks every
+/// hop, pins each request to the checked addresses, caps the body.
+async fn fetch_checked(url: &str, allowed: fn(std::net::IpAddr) -> bool) -> Result<String> {
+    let mut current = reqwest::Url::parse(url).with_context(|| format!("invalid url `{url}`"))?;
+    for _ in 0..=WEBFETCH_MAX_REDIRECTS {
+        if !matches!(current.scheme(), "http" | "https") {
+            bail!("only http(s) urls are allowed");
+        }
+        let host = current
+            .host_str()
+            .ok_or_else(|| anyhow!("url `{current}` has no host"))?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
+        let port = current.port_or_known_default().unwrap_or(80);
+        let addrs: Vec<std::net::SocketAddr> = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => vec![std::net::SocketAddr::new(ip, port)],
+            Err(_) => tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .with_context(|| format!("cannot resolve {host}"))?
+                .collect(),
+        };
+        if addrs.is_empty() {
+            bail!("{host} did not resolve to any address");
+        }
+        if let Some(bad) = addrs.iter().find(|a| !allowed(a.ip())) {
+            bail!(
+                "refused: {host} points to {}, a local or private network address. \
+                 webfetch only reads public internet pages.",
+                bad.ip()
+            );
+        }
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent("opencode-rust/0.1")
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host, &addrs)
+            .build()?;
+        let mut resp = http
+            .get(current.clone())
+            .send()
+            .await
+            .with_context(|| format!("fetching {current}"))?;
+        let status = resp.status();
+        if status.is_redirection() {
+            let next = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow!("{current} returned {status} without a Location header"))?;
+            current = current
+                .join(next)
+                .with_context(|| format!("bad redirect target `{next}`"))?;
+            continue;
+        }
+        if !status.is_success() {
+            bail!("{current} returned {status}");
+        }
+        let mut body: Vec<u8> = Vec::new();
+        let mut cut = false;
+        while let Some(chunk) = resp.chunk().await? {
+            let room = WEBFETCH_MAX_BYTES - body.len();
+            if chunk.len() >= room {
+                body.extend_from_slice(&chunk[..room]);
+                cut = true;
+                break;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let mut text = truncate(&html_to_text(&String::from_utf8_lossy(&body)), 40_000);
+        if cut {
+            text.push_str(&format!(
+                "\n… [page is larger than {WEBFETCH_MAX_BYTES} bytes; only the start was read]"
+            ));
+        }
+        return Ok(text);
     }
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("opencode-rust/0.1")
-        .build()?;
-    let resp = http.get(url).send().await.with_context(|| format!("fetching {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(anyhow!("{url} returned {status}"));
-    }
-    let body = resp.text().await?;
-    let text = html_to_text(&body);
-    Ok(truncate(&text, 40_000))
+    bail!("too many redirects (more than {WEBFETCH_MAX_REDIRECTS}) starting at {url}")
 }
 
 /// Very small HTML→text: drop script/style, collapse tags to spaces, unescape basics.
@@ -725,6 +845,74 @@ mod s03_tools_tests {
         assert!(glob_files(&ws, "*", Some("..")).is_err());
         assert!(grep_files(&ws, "x", Some(".."), false).is_err());
         let _ = std::fs::remove_dir_all(&ws);
+    }
+}
+
+#[cfg(test)]
+mod s06_ip_tests {
+    use super::*;
+
+    #[test]
+    fn only_public_addresses_pass() {
+        let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
+        for bad in [
+            "127.0.0.1", "10.1.2.3", "172.16.5.4", "192.168.1.1", "169.254.169.254",
+            "100.64.0.1", "0.0.0.0", "255.255.255.255", "::1", "::", "fe80::1", "fd00::1",
+            "::ffff:10.0.0.1", "64:ff9b::a00:1", "2002:c0a8:101::1",
+        ] {
+            assert!(!is_public_ip(ip(bad)), "{bad} must be refused");
+        }
+        for good in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "64:ff9b::808:808"] {
+            assert!(is_public_ip(ip(good)), "{good} must be allowed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod s06_fetch_tests {
+    use super::*;
+    use axum::http::{header, StatusCode};
+    use axum::{routing::get, Router};
+
+    fn loopback_only(ip: std::net::IpAddr) -> bool {
+        ip.is_loopback()
+    }
+
+    async fn serve(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn webfetch_refuses_local_hosts() {
+        for url in ["http://127.0.0.1:9/", "http://localhost:9/", "http://[::1]:9/", "http://10.0.0.1/"] {
+            let err = webfetch(url).await.unwrap_err().to_string();
+            assert!(err.contains("refused"), "{url}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_redirect_is_checked_and_loops_stop() {
+        let app = Router::new()
+            .route("/start", get(|| async { (StatusCode::FOUND, [(header::LOCATION, "http://10.255.255.1/x")], "") }))
+            .route("/loop", get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/loop")], "") }));
+        let base = serve(app).await;
+        let err = fetch_checked(&format!("{base}/start"), loopback_only).await.unwrap_err().to_string();
+        assert!(err.contains("10.255.255.1"), "{err}");
+        let err = fetch_checked(&format!("{base}/loop"), loopback_only).await.unwrap_err().to_string();
+        assert!(err.contains("too many redirects"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn big_bodies_are_cut() {
+        let app = Router::new().route("/big", get(|| async { "a".repeat(3_000_000) }));
+        let base = serve(app).await;
+        let out = fetch_checked(&format!("{base}/big"), loopback_only).await.unwrap();
+        assert!(out.contains("only the start was read"), "size note missing");
     }
 }
 
