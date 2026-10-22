@@ -15,3 +15,4 @@ Tasks from [FIX_PLAN.md](FIX_PLAN.md), done in the recommended order (Part 2.1).
 - [x] S-01 Require a token on the local HTTP API — 2026-10-22 — cargo test: 210 passed (2 new); every route except `/api/health` needs `Authorization: Bearer <token>` and a loopback `Host` header; the token comes from `$OPENCODE_RUST_API_TOKEN` or a fresh random one in `<state_dir>/api-token`
 - [x] H-02 Make the desktop GUI an optional cargo feature — 2026-10-22 — cargo test: 210 passed (default) / 185 passed (`--no-default-features`); `tao`/`wry` are optional, `detect_dev_server` moved to `src/browser.rs`
 - [x] H-01 Add README.md, LICENSE and NOTICE — 2026-10-22 — no Rust change; ponytail LICENSE downloaded from upstream (MIT, © DietrichGebert), `vendor/` added to `.gitignore`
+- [x] H-03 Add GitHub Actions CI (Linux + Windows) — 2026-10-22 — `.github/workflows/ci.yml` with the three jobs; `cargo build --locked --tests` passes locally, YAML parsed
