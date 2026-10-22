@@ -1772,20 +1772,107 @@ fn build_chat_messages(st: &Shared, session_id: &str, system: &str) -> Result<Ve
             _ => {}
         }
     }
-    // Keep tool results that follow their assistant tool_call (the normal
-    // mid-loop state the model must see). Drop trailing tool messages only
-    // when they have no assistant tool_calls predecessor — true orphans
-    // left behind by an interrupted/restarted run.
-    let last_non_tool = out.iter().rposition(|m| m.role != "tool");
-    let orphaned = last_non_tool
-        .map(|i| !(out[i].role == "assistant" && out[i].tool_calls.is_some()))
-        .unwrap_or(true);
-    if orphaned {
-        while out.last().map(|m| m.role == "tool").unwrap_or(false) {
-            out.pop();
+    // New (B-04): repair what a crash, an abort or a compaction can leave
+    // behind before the provider sees it (see `repair_history`).
+    Ok(repair_history(out))
+}
+
+/// New (B-04): the result sent for a tool call that never finished.
+const INTERRUPTED_TOOL_RESULT: &str =
+    "[interrupted] this tool call did not finish (the run was stopped); its result is unknown";
+
+/// New (B-04): make a replayed history safe to send. Providers reject (or
+/// get confused by) shapes that a crash, an abort or a compaction can leave
+/// in the database:
+/// - every `tool_calls` id of an assistant message must be answered by a
+///   `tool` message right after it: a missing answer gets
+///   `INTERRUPTED_TOOL_RESULT`, an answer to an unknown id is dropped;
+/// - an assistant message with neither text nor tool calls is dropped;
+/// - only the first message may be `system`: system notes at the start (a
+///   compaction summary) are joined to it, later ones are sent as user text;
+/// - back-to-back user messages become one.
+fn repair_history(msgs: Vec<ChatMsg>) -> Vec<ChatMsg> {
+    let mut out: Vec<ChatMsg> = Vec::with_capacity(msgs.len());
+    // Tool call ids of the last assistant message that still need a result.
+    let mut open: Vec<String> = Vec::new();
+    for m in msgs {
+        if m.role != "tool" {
+            close_open_calls(&mut out, &mut open);
+        }
+        match m.role.as_str() {
+            "tool" => {
+                let id = m.tool_call_id.clone().unwrap_or_default();
+                if let Some(i) = open.iter().position(|c| *c == id) {
+                    open.remove(i);
+                    out.push(m);
+                }
+                // Otherwise it answers nothing we sent: drop it.
+            }
+            "assistant" => {
+                let has_text = m.content.as_deref().is_some_and(|t| !t.trim().is_empty());
+                let ids: Vec<String> = m
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| calls.iter().map(|c| c.id.clone()).collect())
+                    .unwrap_or_default();
+                if !has_text && ids.is_empty() {
+                    continue;
+                }
+                open = ids;
+                out.push(m);
+            }
+            "system" => {
+                let text = m.content.unwrap_or_default();
+                if out.iter().all(|x| x.role == "system") {
+                    match out.first_mut() {
+                        Some(first) => {
+                            let joined =
+                                format!("{}\n\n{text}", first.content.as_deref().unwrap_or(""));
+                            first.content = Some(joined);
+                        }
+                        None => out.push(ChatMsg {
+                            role: "system".into(),
+                            content: Some(text),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        }),
+                    }
+                } else {
+                    push_user_text(&mut out, format!("[system note]\n{text}"));
+                }
+            }
+            "user" => push_user_text(&mut out, m.content.unwrap_or_default()),
+            _ => out.push(m),
         }
     }
-    Ok(out)
+    close_open_calls(&mut out, &mut open);
+    out
+}
+
+/// New (B-04): answer every still-open tool call with
+/// `INTERRUPTED_TOOL_RESULT`.
+fn close_open_calls(out: &mut Vec<ChatMsg>, open: &mut Vec<String>) {
+    for id in open.drain(..) {
+        out.push(ChatMsg {
+            role: "tool".into(),
+            content: Some(INTERRUPTED_TOOL_RESULT.to_string()),
+            tool_calls: None,
+            tool_call_id: Some(id),
+        });
+    }
+}
+
+/// New (B-04): add user text; merge it into the previous message when that
+/// one is also from the user.
+fn push_user_text(out: &mut Vec<ChatMsg>, text: String) {
+    if let Some(last) = out.last_mut() {
+        if last.role == "user" {
+            let joined = format!("{}\n\n{text}", last.content.as_deref().unwrap_or(""));
+            last.content = Some(joined);
+            return;
+        }
+    }
+    out.push(ChatMsg { role: "user".into(), content: Some(text), tool_calls: None, tool_call_id: None });
 }
 
 /// Health endpoint for readiness checks + startup timing.
@@ -1957,6 +2044,184 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    // B-04 helpers: build chat messages in a few words.
+    fn hmsg(role: &str, content: Option<&str>) -> ChatMsg {
+        ChatMsg {
+            role: role.into(),
+            content: content.map(str::to_string),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+    fn hcalls(ids: &[&str]) -> ChatMsg {
+        let calls = ids
+            .iter()
+            .map(|id| crate::provider::ToolCallReq {
+                id: id.to_string(),
+                kind: "function".into(),
+                function: crate::provider::FunctionCall {
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
+            })
+            .collect();
+        ChatMsg { role: "assistant".into(), content: None, tool_calls: Some(calls), tool_call_id: None }
+    }
+    fn hresult(id: &str) -> ChatMsg {
+        ChatMsg {
+            role: "tool".into(),
+            content: Some("ok".into()),
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+        }
+    }
+    fn hroles(m: &[ChatMsg]) -> Vec<&str> {
+        m.iter().map(|x| x.role.as_str()).collect()
+    }
+
+    /// B-04: tool calls without a result get an "interrupted" result.
+    #[test]
+    fn repair_answers_dangling_tool_calls() {
+        let fixed = repair_history(vec![
+            hmsg("system", Some("S")),
+            hmsg("user", Some("go")),
+            hcalls(&["c1", "c2"]),
+            hresult("c1"),
+            hmsg("user", Some("next")),
+        ]);
+        assert_eq!(hroles(&fixed), vec!["system", "user", "assistant", "tool", "tool", "user"]);
+        assert_eq!(fixed[4].tool_call_id.as_deref(), Some("c2"));
+        assert_eq!(fixed[4].content.as_deref(), Some(INTERRUPTED_TOOL_RESULT));
+        // The same at the very end of the history.
+        let fixed =
+            repair_history(vec![hmsg("system", Some("S")), hmsg("user", Some("go")), hcalls(&["c9"])]);
+        assert_eq!(hroles(&fixed), vec!["system", "user", "assistant", "tool"]);
+    }
+
+    /// B-04: orphan tool results and empty assistant messages are dropped.
+    #[test]
+    fn repair_drops_orphans_and_empty_assistant_messages() {
+        let fixed = repair_history(vec![
+            hmsg("system", Some("S")),
+            hresult("lost"),
+            hmsg("user", Some("a")),
+            hmsg("assistant", None),
+            hmsg("user", Some("b")),
+        ]);
+        assert_eq!(hroles(&fixed), vec!["system", "user"]);
+        assert_eq!(fixed[1].content.as_deref(), Some("a
+
+b"));
+    }
+
+    /// B-04: one system message at the top; later notes become user text.
+    #[test]
+    fn repair_keeps_one_system_message() {
+        let fixed = repair_history(vec![
+            hmsg("system", Some("S")),
+            hmsg("system", Some("summary")),
+            hmsg("user", Some("u")),
+            hmsg("system", Some("expanded command")),
+            hmsg("assistant", Some("done")),
+        ]);
+        assert_eq!(hroles(&fixed), vec!["system", "user", "assistant"]);
+        assert_eq!(fixed[0].content.as_deref(), Some("S
+
+summary"));
+        assert_eq!(fixed[1].content.as_deref(), Some("u
+
+[system note]
+expanded command"));
+    }
+
+    /// B-04: a healthy history goes through unchanged.
+    #[test]
+    fn repair_leaves_a_healthy_history_alone() {
+        let healthy = vec![
+            hmsg("system", Some("S")),
+            hmsg("user", Some("go")),
+            hcalls(&["c1"]),
+            hresult("c1"),
+            hmsg("assistant", Some("done")),
+        ];
+        let fixed = repair_history(healthy.clone());
+        assert_eq!(hroles(&fixed), hroles(&healthy));
+        assert_eq!(fixed[3].content.as_deref(), Some("ok"));
+    }
+
+    /// B-04 end to end: a session left with a dangling tool call (as after a
+    /// crash) still works. The mock answers 400 to an invalid history.
+    #[tokio::test]
+    async fn session_with_dangling_tool_call_still_works() {
+        use axum::{http::header::CONTENT_TYPE, http::StatusCode as Code, routing::post, Router};
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: axum::extract::Json<Value>| async move {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                let mut valid = true;
+                for (i, m) in msgs.iter().enumerate() {
+                    if m["role"] == "system" && i > 0 {
+                        valid = false;
+                    }
+                    for c in m["tool_calls"].as_array().cloned().unwrap_or_default() {
+                        let answered = msgs[i + 1..]
+                            .iter()
+                            .take_while(|n| n["role"] == "tool")
+                            .any(|n| n["tool_call_id"] == c["id"]);
+                        valid &= answered;
+                    }
+                }
+                if valid {
+                    let ok = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}
+
+data: [DONE]
+
+";
+                    (Code::OK, [(CONTENT_TYPE, "text/event-stream")], ok.to_string())
+                } else {
+                    (Code::BAD_REQUEST, [(CONTENT_TYPE, "text/plain")], "invalid history".to_string())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let dir = std::env::temp_dir().join(format!("ocrs-b04-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("dangling", None).unwrap();
+        st.db.add_message(&s.id, "user", &[Part::Text { text: "first".into() }]).unwrap();
+        st.db
+            .add_message(
+                &s.id,
+                "assistant",
+                &[Part::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({ "command": "sleep 100" }),
+                }],
+            )
+            .unwrap();
+        let mut rx = st.events.subscribe();
+
+        run_agent(&st, &s.id, "next", Arc::new(AtomicBool::new(false))).await;
+
+        let mut finished = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::RunFinished { ok, message, .. } = ev {
+                finished.push((ok, message));
+            }
+        }
+        assert_eq!(finished.len(), 1, "{finished:?}");
+        assert!(finished[0].0, "the provider accepted the repaired history: {finished:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// S-01: the HTTP API needs the bearer token and a local Host header;
     /// /api/health needs no token.
