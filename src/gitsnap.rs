@@ -31,6 +31,40 @@ pub struct Manifest {
     pub present: Vec<String>,
     /// Paths that must not exist after restore (e.g. pre-snapshot renames).
     pub absent: Vec<String>,
+    /// Symlinks that were dirty at snapshot time. Undo never reads, writes
+    /// or deletes through a link, so these are left exactly as they are.
+    #[serde(default)]
+    pub links: Vec<String>,
+}
+
+/// `rel` as a safe workspace-relative path: not empty, and made only of
+/// normal names (no `.`, `..`, root or drive parts). Manifests and stacks
+/// are files on disk, so anything else in them is refused.
+fn checked_rel(rel: &str) -> Option<&Path> {
+    let p = Path::new(rel);
+    let ok = !rel.is_empty()
+        && p.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+    ok.then_some(p)
+}
+
+/// True when `rel` passes through a symlinked folder inside the workspace.
+/// Undo never reads or writes through one.
+fn under_symlinked_dir(workspace: &Path, rel: &str) -> bool {
+    let mut cur = workspace.to_path_buf();
+    let parts: Vec<_> = Path::new(rel).components().collect();
+    for c in parts.iter().take(parts.len().saturating_sub(1)) {
+        cur.push(c.as_os_str());
+        if std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Snapshot ids come from `next_snap_id` (`s<millis>_<hex>`). A stack file
+/// that names anything else was not written by us.
+fn valid_snap_id(id: &str) -> bool {
+    id.len() <= 64 && id.starts_with('s') && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +222,10 @@ fn read_stack(path: &Path) -> Vec<String> {
         .and_then(|t| serde_json::from_str::<StackFile>(&t).ok())
         .map(|s| s.entries)
         .unwrap_or_default()
+        .into_iter()
+        // Ids become folder names: ignore anything we did not write.
+        .filter(|id| valid_snap_id(id))
+        .collect()
 }
 
 fn write_stack(path: &Path, entries: &[String]) -> Result<()> {
@@ -232,11 +270,22 @@ pub fn take_snapshot(workspace: &Path, state_dir: &Path, label: &str) -> Result<
     let base_sha = git(workspace, &["rev-parse", "HEAD"]).ok().map(|s| s.trim().to_string());
     let mut present = Vec::new();
     let mut absent = Vec::new();
+    let mut links = Vec::new();
     for e in dirty_entries(workspace, state_dir)? {
         if let Some(old) = e.old_rel {
-            absent.push(old);
+            if checked_rel(&old).is_some() {
+                absent.push(old);
+            }
         }
-        if e.abs.is_file() {
+        // Never read through a symlinked folder: the bytes would come from
+        // outside the workspace.
+        if checked_rel(&e.rel).is_none() || under_symlinked_dir(workspace, &e.rel) {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(&e.abs);
+        if meta.as_ref().is_ok_and(|m| m.file_type().is_symlink()) {
+            links.push(e.rel);
+        } else if meta.as_ref().is_ok_and(|m| m.is_file()) {
             let bytes = std::fs::read(&e.abs)
                 .with_context(|| format!("reading {} for snapshot", e.abs.display()))?;
             let stored = dir.join(&e.rel);
@@ -259,15 +308,29 @@ pub fn take_snapshot(workspace: &Path, state_dir: &Path, label: &str) -> Result<
         base_sha,
         present,
         absent,
+        links,
     };
     std::fs::write(dir.join("manifest.json"), serde_json::to_string_pretty(&manifest)?)?;
     Ok(Some(manifest))
 }
 
 fn load_manifest(root: &Path, id: &str) -> Result<Manifest> {
+    if !valid_snap_id(id) {
+        return Err(anyhow!("refusing snapshot id {id:?}: not written by opencode-rust"));
+    }
     let text = std::fs::read_to_string(root.join(id).join("manifest.json"))
         .with_context(|| format!("snapshot {id} manifest"))?;
-    Ok(serde_json::from_str(&text)?)
+    let m: Manifest = serde_json::from_str(&text)?;
+    if m.id != id {
+        return Err(anyhow!("snapshot {id}: manifest names a different id ({})", m.id));
+    }
+    // A manifest is a file on disk: check every path before trusting it.
+    for p in m.present.iter().chain(&m.absent).chain(&m.links) {
+        if checked_rel(p).is_none() {
+            return Err(anyhow!("snapshot {id}: refusing unsafe path {p:?} in manifest"));
+        }
+    }
+    Ok(m)
 }
 
 fn restore_manifest(
@@ -277,46 +340,88 @@ fn restore_manifest(
     m: &Manifest,
 ) -> Result<()> {
     let dir = root.join(&m.id);
+    // Problems are collected, not swallowed: undo must say what it could
+    // not put back.
+    let mut problems: Vec<String> = Vec::new();
     // 1) Rewrite files that existed at snapshot time.
     for p in &m.present {
         let stored = dir.join(p);
         if !stored.is_file() {
+            problems.push(format!("{p}: the stored copy is missing"));
+            continue;
+        }
+        if under_symlinked_dir(workspace, p) {
+            problems.push(format!("{p}: inside a symlinked folder, not restored"));
             continue;
         }
         let abs = workspace.join(p);
+        // A symlink the run put here is removed first (that never touches
+        // its target), so the copy writes a plain file in the workspace.
+        if std::fs::symlink_metadata(&abs).is_ok_and(|md| md.file_type().is_symlink()) {
+            if let Err(e) = std::fs::remove_file(&abs) {
+                problems.push(format!("{p}: cannot remove the symlink: {e}"));
+                continue;
+            }
+        }
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(&stored, &abs)
-            .with_context(|| format!("restoring {p}"))?;
+        if let Err(e) = std::fs::copy(&stored, &abs) {
+            problems.push(format!("{p}: {e}"));
+        }
     }
-    // 2) Paths that must not exist (pre-snapshot renames/deletes).
+    // 2) Paths that must not exist (pre-snapshot renames/deletes). A symlink
+    //    here is removed as a link; its target is never touched.
     for p in &m.absent {
+        if under_symlinked_dir(workspace, p) {
+            problems.push(format!("{p}: inside a symlinked folder, not removed"));
+            continue;
+        }
         let abs = workspace.join(p);
-        if abs.is_file() {
-            let _ = std::fs::remove_file(&abs);
+        let Ok(md) = std::fs::symlink_metadata(&abs) else { continue };
+        if md.is_file() || md.file_type().is_symlink() {
+            if let Err(e) = std::fs::remove_file(&abs) {
+                problems.push(format!("{p}: cannot remove: {e}"));
+            }
         }
     }
     // 3) Dirty now but clean at snapshot time → the run changed it.
     let snapshot_set: std::collections::HashSet<String> =
-        m.present.iter().chain(m.absent.iter()).cloned().collect();
+        m.present.iter().chain(&m.absent).chain(&m.links).cloned().collect();
+    let repo = repo_root(workspace);
     for e in dirty_entries(workspace, state_dir)? {
-        if snapshot_set.contains(&e.rel) {
+        if snapshot_set.contains(&e.rel) || under_symlinked_dir(workspace, &e.rel) {
             continue;
         }
         if e.kind == "??" {
-            // File the run created: remove it.
-            if e.abs.is_file() {
-                let _ = std::fs::remove_file(&e.abs);
+            // File (or symlink) the run created: remove it. Removing a
+            // symlink removes the link only.
+            let file_or_link = std::fs::symlink_metadata(&e.abs)
+                .is_ok_and(|md| md.is_file() || md.file_type().is_symlink());
+            if file_or_link {
+                if let Err(err) = std::fs::remove_file(&e.abs) {
+                    problems.push(format!("{}: cannot remove: {err}", e.rel));
+                }
             }
         } else {
-            // Tracked file the run modified: scoped checkout to index/HEAD
-            // content == its clean-at-snapshot content. Explicit path only,
-            // repo-root-relative (that's what git expects).
-            let _ = git(workspace, &["checkout", "--", &e.root_rel]);
+            // Tracked file the run modified: check out its index/HEAD
+            // content (= its clean-at-snapshot content). `root_rel` is
+            // relative to the repo root, so git must run there; literal
+            // pathspecs keep `[`, `*` and `?` in names from matching others.
+            if let Err(err) = git(&repo, &["--literal-pathspecs", "checkout", "--", &e.root_rel]) {
+                problems.push(format!("{}: {err}", e.rel));
+            }
         }
     }
-    Ok(())
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "undo restored what it could, but {} path(s) need a look:\n  {}",
+            problems.len(),
+            problems.join("\n  ")
+        ))
+    }
 }
 
 fn stack_paths(root: &Path) -> (PathBuf, PathBuf) {
@@ -394,6 +499,9 @@ mod tests {
         git(&dir, &["config", "user.email", "t@t"]).unwrap();
         git(&dir, &["config", "user.name", "t"]).unwrap();
         git(&dir, &["config", "commit.gpgsign", "false"]).unwrap();
+        // Git for Windows defaults to autocrlf=true, so checkouts would turn
+        // "\n" into "\r\n" and break the byte-exact asserts below.
+        git(&dir, &["config", "core.autocrlf", "false"]).unwrap();
         std::fs::write(dir.join("a.txt"), "original a\n").unwrap();
         std::fs::write(dir.join("b.txt"), "original b\n").unwrap();
         git(&dir, &["add", "-A"]).unwrap();
@@ -521,5 +629,96 @@ mod tests {
         take_snapshot(&r.dir, &r.state, "one").unwrap();
         // Redo with an empty redo stack is a no-op even after undo-stack use.
         assert!(redo(&r.dir, &r.state).unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_refuses_unsafe_manifest_paths() {
+        let r = test_repo();
+        let name = format!("{}-victim.txt", r.dir.file_name().unwrap().to_string_lossy());
+        let victim = r.dir.with_file_name(&name);
+        std::fs::write(&victim, "keep me\n").unwrap();
+        let snap = record_before_run(&r.dir, &r.state, "pre-run").unwrap().unwrap();
+        // A damaged manifest that points outside the workspace.
+        let mpath = snap_root(&r.state, &r.dir).join(&snap.id).join("manifest.json");
+        let mut m: Manifest = serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+        m.absent.push(format!("../{name}"));
+        std::fs::write(&mpath, serde_json::to_string(&m).unwrap()).unwrap();
+
+        let err = undo(&r.dir, &r.state).unwrap_err();
+        assert!(err.to_string().contains("unsafe path"), "{err}");
+        assert_eq!(read(&victim), "keep me\n", "nothing outside the workspace is touched");
+        let _ = std::fs::remove_file(&victim);
+    }
+
+    #[test]
+    fn stack_ignores_ids_it_did_not_write() {
+        let r = test_repo();
+        let root = snap_root(&r.state, &r.dir);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("undo.json"), r#"{"entries":["../../outside"]}"#).unwrap();
+        assert!(undo(&r.dir, &r.state).unwrap().is_none(), "a foreign id is ignored");
+        assert!(valid_snap_id(&next_snap_id()));
+    }
+
+    #[test]
+    fn subdir_workspace_undo_reverts_tracked_changes() {
+        let r = test_repo();
+        let ws = r.dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("b.txt"), "original b\n").unwrap();
+        git(&r.dir, &["add", "-A"]).unwrap();
+        git(&r.dir, &["commit", "-m", "ws"]).unwrap();
+        let state = ws.join("_state");
+        record_before_run(&ws, &state, "pre-run").unwrap().unwrap();
+        // The run edits a tracked file that was clean at snapshot time.
+        std::fs::write(ws.join("b.txt"), "agent edit\n").unwrap();
+        undo(&ws, &state).unwrap().expect("undo works");
+        assert_eq!(read(&ws.join("b.txt")), "original b\n");
+    }
+
+    #[test]
+    fn literal_pathspec_leaves_similar_names_alone() {
+        let r = test_repo();
+        std::fs::write(r.dir.join("s[1].txt"), "bracket\n").unwrap();
+        std::fs::write(r.dir.join("s1.txt"), "plain\n").unwrap();
+        git(&r.dir, &["add", "-A"]).unwrap();
+        git(&r.dir, &["commit", "-m", "names"]).unwrap();
+        // The user's own edit, made before the run.
+        std::fs::write(r.dir.join("s1.txt"), "user edit\n").unwrap();
+        record_before_run(&r.dir, &r.state, "pre-run").unwrap().unwrap();
+        // The run changes the file whose name contains brackets.
+        std::fs::write(r.dir.join("s[1].txt"), "agent edit\n").unwrap();
+        undo(&r.dir, &r.state).unwrap().expect("undo works");
+        assert_eq!(read(&r.dir.join("s[1].txt")), "bracket\n");
+        assert_eq!(read(&r.dir.join("s1.txt")), "user edit\n", "a glob must not revert s1.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_never_writes_through_symlinks() {
+        let r = test_repo();
+        let outside = r.dir.with_file_name(format!(
+            "{}-outside.txt",
+            r.dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&outside, "outside\n").unwrap();
+        // A dirty file the snapshot stores, and an untracked symlink.
+        std::fs::write(r.dir.join("a.txt"), "edited a\n").unwrap();
+        std::os::unix::fs::symlink(&outside, r.dir.join("link.txt")).unwrap();
+        let snap = record_before_run(&r.dir, &r.state, "pre-run").unwrap().unwrap();
+        assert!(snap.links.contains(&"link.txt".to_string()), "{snap:?}");
+        assert!(!snap.present.contains(&"link.txt".to_string()), "link target not copied");
+
+        // The run replaces a.txt with a symlink to the outside file.
+        std::fs::remove_file(r.dir.join("a.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside, r.dir.join("a.txt")).unwrap();
+        undo(&r.dir, &r.state).unwrap().expect("undo works");
+
+        let a_meta = std::fs::symlink_metadata(r.dir.join("a.txt")).unwrap();
+        assert!(a_meta.is_file(), "a.txt is a plain file again");
+        assert_eq!(read(&r.dir.join("a.txt")), "edited a\n");
+        assert_eq!(read(&outside), "outside\n", "the link target was not overwritten");
+        assert!(std::fs::symlink_metadata(r.dir.join("link.txt")).is_ok(), "the user's link is kept");
+        let _ = std::fs::remove_file(&outside);
     }
 }
