@@ -988,12 +988,15 @@ pub async fn run(
     // opens the panel and it reports a usable rect.
     gs.browser.home = state.cfg.browser.home_url.clone();
     let browser_enabled = state.cfg.browser.enabled;
+    // S-12: shared between the bridge (writes) and the preview IPC handler (reads).
+    let bridge_ids: PendingIds = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let browser_webview: Option<wry::WebView> = if browser_enabled {
         let allow_remote = state.cfg.browser.allow_remote;
         let nav_tx = ui_tx.clone();
         let nav_proxy = event_loop.create_proxy();
         let eval_tx = ui_tx.clone();
         let eval_proxy = event_loop.create_proxy();
+        let eval_ids = bridge_ids.clone();
         let title_tx = ui_tx.clone();
         let title_proxy = event_loop.create_proxy();
         let load_tx = ui_tx.clone();
@@ -1007,7 +1010,20 @@ pub async fn run(
             // the channel their results come back on.
             .with_initialization_script(crate::browser::RUNTIME_JS)
             .with_ipc_handler(move |req: wry::http::Request<String>| {
-                let _ = eval_tx.send(UiMsg::Browser(BrowserEvt::Eval(req.body().clone())));
+                // S-12: only a reply to a request we are waiting for may pass,
+                // each id at most once, and never an oversized frame.
+                let body = req.body();
+                if body.len() > MAX_EVAL_FRAME_BYTES {
+                    return;
+                }
+                let Some((id, _)) = crate::browser::parse_reply(body) else {
+                    return;
+                };
+                let expected = eval_ids.lock().map(|mut set| set.remove(&id)).unwrap_or(false);
+                if !expected {
+                    return;
+                }
+                let _ = eval_tx.send(UiMsg::Browser(BrowserEvt::Eval(body.clone())));
                 let _ = eval_proxy.send_event(AppEvent::Wake);
             })
             .with_navigation_handler(move |url: String| {
@@ -1382,6 +1398,8 @@ pub async fn run(
                 }
                 // Requests that never get an answer must not hang the run.
                 bridge.expire();
+                // S-12: after start/expire/answers, publish which ids may reply.
+                bridge.publish_ids(&bridge_ids);
                 // B-13: a modal whose timeout passed long ago cannot block the
                 // window forever, even if its "resolved" event was lost.
                 if gs.expire_stale_approval(Instant::now()) {
@@ -1421,12 +1439,39 @@ pub async fn run(
     })
 }
 
+/// New (S-12): ids of bridge requests still waiting for a page reply. The
+/// preview's IPC handler reads it to drop frames nobody asked for.
+type PendingIds = Arc<std::sync::Mutex<std::collections::HashSet<u64>>>;
+
+/// New (S-12): biggest reply frame we accept from the preview page. A
+/// snapshot is capped far below this by the page runtime.
+const MAX_EVAL_FRAME_BYTES: usize = 1 << 20;
+
+/// New (S-12): a request id the page cannot guess.
+///
+/// Ids travel through JavaScript as plain numbers, which are exact only up
+/// to 2^53, so the id is kept below that. `RandomState` is seeded randomly
+/// for each process; hashing a counter and the clock with it is enough for
+/// a local, short-lived token (it is not a cryptographic secret).
+fn unguessable_id(counter: u64) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(counter);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    h.write_u128(nanos);
+    (h.finish() & ((1u64 << 53) - 1)).max(1)
+}
+
 /// Goal B: requests from agent tools that are waiting on this webview.
 ///
 /// Every request has a deadline; a page that never answers (a hung script, a
 /// destroyed view) fails the tool instead of freezing the run.
 struct Bridge {
-    next_id: u64,
+    /// S-12: only feeds `unguessable_id`; ids themselves are random.
+    counter: u64,
     pending: HashMap<u64, (tokio::sync::oneshot::Sender<Result<String, String>>, Instant)>,
     /// A navigation still waiting for its load event.
     nav: Option<NavWait>,
@@ -1447,11 +1492,19 @@ const MAX_WAIT_MS: u64 = 20_000;
 
 impl Bridge {
     fn new() -> Self {
-        Self { next_id: 1, pending: HashMap::new(), nav: None }
+        Self { counter: 0, pending: HashMap::new(), nav: None }
     }
 
     fn busy(&self) -> bool {
         !self.pending.is_empty() || self.nav.is_some()
+    }
+
+    /// New (S-12): tell the preview's IPC handler which ids may answer now.
+    fn publish_ids(&self, ids: &PendingIds) {
+        if let Ok(mut set) = ids.lock() {
+            set.clear();
+            set.extend(self.pending.keys().copied());
+        }
     }
 
     /// Dispatch one request. `None` webview = panel unavailable (config off).
@@ -1466,8 +1519,13 @@ impl Bridge {
             let _ = req.reply.send(Err("the preview panel is not available".into()));
             return;
         };
-        let id = self.next_id;
-        self.next_id += 1;
+        // S-12: random ids, so a page cannot answer a request it never got.
+        self.counter += 1;
+        let mut id = unguessable_id(self.counter);
+        while self.pending.contains_key(&id) {
+            self.counter += 1;
+            id = unguessable_id(self.counter);
+        }
         let deadline = Instant::now() + Duration::from_secs(25);
         match req.method.as_str() {
             "navigate" => {
@@ -2024,6 +2082,31 @@ mod tests {
         // A collapsed panel reports w=0; that is not a rect to place a view at.
         assert!(!PanelRect { x: 0.0, y: 0.0, w: 0.0, h: 400.0 }.is_usable());
         assert!(!PanelRect { x: f64::NAN, y: 0.0, w: 10.0, h: 10.0 }.is_usable());
+    }
+
+    /// S-12: ids are random, large, and still exact as JavaScript numbers.
+    #[test]
+    fn bridge_ids_are_random_and_js_safe() {
+        let a = unguessable_id(1);
+        let b = unguessable_id(2);
+        assert_ne!(a, b);
+        for id in [a, b] {
+            assert!(id > 0 && id < (1u64 << 53), "{id} must survive a JS number");
+        }
+        assert!(a > 1_000_000 || b > 1_000_000, "not a small counter");
+    }
+
+    /// S-12: the IPC filter sees exactly the ids that are waiting.
+    #[test]
+    fn bridge_publishes_only_pending_ids() {
+        let mut bridge = Bridge::new();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        bridge.pending.insert(77, (tx, Instant::now() + Duration::from_secs(5)));
+        let ids: PendingIds = Arc::new(std::sync::Mutex::new(std::collections::HashSet::from([5])));
+        bridge.publish_ids(&ids);
+        let set = ids.lock().unwrap();
+        assert!(set.contains(&77));
+        assert!(!set.contains(&5), "ids that are no longer waiting are removed");
     }
 
     #[test]
