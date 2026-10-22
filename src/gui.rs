@@ -573,23 +573,36 @@ fn sync_history(wv: &wry::WebView, view: &mut BrowserView) {
 
 /// True for URLs that stay on this machine. Used to enforce the
 /// dev-server-only mode (`[browser] allow_remote = false`).
+///
+/// The URL is parsed with the same rules a browser uses (the `url` crate,
+/// re-exported by `reqwest`), so the host we check is the host the preview
+/// really connects to. Cutting the text by hand got forms like
+/// `http://name:password@host/` wrong.
 pub fn is_local_url(url: &str) -> bool {
-    let u = url.trim().to_ascii_lowercase();
-    if u == "about:blank" {
+    let url = url.trim();
+    if url.eq_ignore_ascii_case("about:blank") {
         return true;
     }
-    let Some(rest) = ["http://", "https://"]
-        .iter()
-        .find_map(|scheme| u.strip_prefix(scheme))
-    else {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
-    // IPv6 literals contain colons, so they cannot go through `split(':')`.
-    if rest.starts_with("[::1]") {
-        return true;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
     }
-    let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
-    matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0")
+    match parsed.host_str() {
+        // The parser lower-cases host names, so `LOCALHOST` arrives here too.
+        Some("localhost") => true,
+        // IP addresses: any loopback address (127.0.0.0/8 or ::1), or the
+        // "all interfaces" address 0.0.0.0 that dev servers often print.
+        // `host_str()` keeps the brackets around IPv6, so strip them first.
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback() || ip.is_unspecified())
+            .unwrap_or(false),
+        None => false,
+    }
 }
 
 /// First `http://localhost:<port>` / `http://127.0.0.1:<port>` in tool output.
@@ -1652,6 +1665,42 @@ mod tests {
             "file:///etc/passwd",
         ] {
             assert!(!is_local_url(u), "{u} should not count as local");
+        }
+    }
+
+    /// S-10: the host we check must be the host the browser really uses.
+    #[test]
+    fn local_url_detection_reads_the_real_host() {
+        for u in [
+            "http://localhost:x@example.com/",
+            "http://localhost@example.com/",
+            "http://127.0.0.1:80@example.com/",
+            "http://[::1]@example.com/",
+            "http://localhost.example.com/",
+            "http://example.com/?next=http://localhost:3000",
+            "http://example.com/#localhost",
+        ] {
+            assert!(!is_local_url(u), "{u} is a remote URL");
+        }
+        // A user name in front of a real local host is still local.
+        assert!(is_local_url("http://user:pw@localhost:3000/"));
+    }
+
+    /// S-10: IPv6, upper case, the whole loopback range, and junk input.
+    #[test]
+    fn local_url_detection_handles_ipv6_case_and_junk() {
+        for u in [
+            "http://[::1]/",
+            "http://[0:0:0:0:0:0:0:1]:8080/app",
+            "HTTP://LOCALHOST:3000",
+            "http://127.0.0.2:5173",
+            "  http://localhost:3000  ",
+            "ABOUT:BLANK",
+        ] {
+            assert!(is_local_url(u), "{u} is local");
+        }
+        for u in ["http://[::2]/", "http://10.0.0.1/", "ftp://localhost/", "localhost:3000", ""] {
+            assert!(!is_local_url(u), "{u} is not a local http(s) URL");
         }
     }
 
