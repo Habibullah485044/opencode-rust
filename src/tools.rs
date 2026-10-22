@@ -393,16 +393,44 @@ fn write_file(workspace: &Path, path: &str, content: &str) -> Result<String> {
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let existing = std::fs::read_to_string(&abs).ok();
-    std::fs::write(&abs, content).with_context(|| format!("writing {}", abs.display()))?;
+    // B-31: the old size from metadata (works for any file, reads nothing).
+    let old_len = std::fs::metadata(&abs).ok().filter(|m| m.is_file()).map(|m| m.len());
+    write_atomic(&abs, content.as_bytes()).with_context(|| format!("writing {}", abs.display()))?;
     let bytes = content.len();
-    Ok(match existing {
+    Ok(match old_len {
         Some(old) => {
-            let delta = content.len() as i64 - old.len() as i64;
+            let delta = bytes as i64 - old as i64;
             format!("wrote {path} ({bytes} bytes, {delta:+} bytes vs previous)")
         }
         None => format!("created {path} ({bytes} bytes)"),
     })
+}
+
+/// Write a file so it is never left half written (B-31): write a
+/// temporary file in the same folder, then rename it over the target.
+/// Keeps the old permissions, refuses read-only files, and falls back to
+/// a plain write when the rename is refused (Windows, file held open).
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let old_perms = std::fs::metadata(path).ok().map(|m| m.permissions());
+    if old_perms.as_ref().map(|p| p.readonly()).unwrap_or(false) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the file is read-only"));
+    }
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.ocrs-{}-{n}.tmp", std::process::id()));
+    std::fs::write(&tmp, data)?;
+    if let Some(perms) = old_perms {
+        let _ = std::fs::set_permissions(&tmp, perms);
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(path, data)
+        }
+    }
 }
 
 fn edit_file(
@@ -436,7 +464,7 @@ fn edit_file(
     } else {
         text.replacen(old_str, new_str, 1)
     };
-    std::fs::write(&abs, &new_text).with_context(|| format!("writing {}", abs.display()))?;
+    write_atomic(&abs, new_text.as_bytes()).with_context(|| format!("writing {}", abs.display()))?;
     let lines_before = text.matches('\n').count();
     let lines_after = new_text.matches('\n').count();
     Ok(format!(
@@ -1167,6 +1195,58 @@ mod b30_tests {
         let out = read_file(&ws, "min.js", 0, 10).unwrap();
         assert!(out.contains("line cut at 2000 characters"), "{}", out.len());
         assert!(out.len() < 3000, "{}", out.len());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+}
+
+#[cfg(test)]
+mod b31_tests {
+    use super::*;
+
+    fn ws(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ocrs-b31-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn overwriting_a_non_utf8_file_says_wrote() {
+        let ws = ws("msg");
+        std::fs::write(ws.join("bin.dat"), [0xffu8, 0xfe, 0x00]).unwrap();
+        let msg = write_file(&ws, "bin.dat", "text").unwrap();
+        assert!(msg.starts_with("wrote"), "{msg}");
+        assert!(msg.contains("+1 bytes vs previous"), "{msg}");
+        assert!(write_file(&ws, "new.txt", "abc").unwrap().starts_with("created"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn writes_leave_no_temp_files() {
+        let ws = ws("tmp");
+        write_file(&ws, "a.txt", "one\n").unwrap();
+        edit_file(&ws, "a.txt", "one", "two", false).unwrap();
+        assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "two\n");
+        let leftovers: Vec<String> = std::fs::read_dir(&ws)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".ocrs-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_keeps_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = ws("mode");
+        std::fs::write(ws.join("run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(ws.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_file(&ws, "run.sh", "#!/bin/sh\necho hi\n").unwrap();
+        let mode = std::fs::metadata(ws.join("run.sh")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
         let _ = std::fs::remove_dir_all(&ws);
     }
 }
