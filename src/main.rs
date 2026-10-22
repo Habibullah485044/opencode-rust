@@ -173,6 +173,7 @@ USAGE:
 
 OPTIONS:
   --headless       Run one prompt without the TUI (prints result, exits)
+  --yes            Headless only: approve tool calls without asking (default: deny)
   --gui            Desktop app window (egui) instead of the terminal UI
   --port N         Server port (default: ephemeral, printed at start)
   --base-url URL   OpenAI-compatible provider base URL (…/v1)
@@ -183,6 +184,8 @@ OPTIONS:
 CONFIG:
   ~/.config/opencode-rust/config.toml  (or $OPENCODE_RUST_CONFIG)
   Env: OPENCODE_RUST_BASE_URL, OPENCODE_RUST_MODEL, OPENCODE_RUST_API_KEY
+  Headless approvals: denied unless --yes or OPENCODE_RUST_AUTO_APPROVE=1;
+       OPENCODE_RUST_AUTO_DENY=1 always forces deny
 
 COMMANDS (in TUI, most also headless — type / for the palette, F1 for the reference):
   Enter            Send message                     Tab   Complete a command
@@ -215,6 +218,26 @@ M4:
                      Embedded preview browser (tao + wry / WebView2)",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+/// New (S-02): may headless mode say "yes" to approval prompts by itself?
+/// Default: no. `--yes` (before any `--`) or OPENCODE_RUST_AUTO_APPROVE=1
+/// turns it on; OPENCODE_RUST_AUTO_DENY=1 always wins and forces "no".
+fn auto_approve_policy(args: &[String], approve_env: Option<&str>, deny_env: Option<&str>) -> bool {
+    if deny_env.map(str::trim) == Some("1") {
+        return false;
+    }
+    let yes_flag = args.iter().take_while(|a| a.as_str() != "--").any(|a| a == "--yes");
+    yes_flag || approve_env.map(str::trim) == Some("1")
+}
+
+/// New (S-02): `auto_approve_policy` for this process (its real command
+/// line and environment).
+fn headless_auto_approve() -> bool {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let approve = std::env::var("OPENCODE_RUST_AUTO_APPROVE").ok();
+    let deny = std::env::var("OPENCODE_RUST_AUTO_DENY").ok();
+    auto_approve_policy(&args, approve.as_deref(), deny.as_deref())
 }
 
 async fn headless_run(
@@ -528,14 +551,15 @@ async fn headless_run(
                 println!("  {} {tool}", if ok { "✓" } else { "✗" });
             }
             Ok(server::ServerEvent::ApprovalNeeded { approval_id, tool, detail, .. }) => {
-                // Headless: auto-approve unless OPENCODE_RUST_AUTO_DENY=1.
-                let auto_deny =
-                    std::env::var("OPENCODE_RUST_AUTO_DENY").map(|v| v == "1").unwrap_or(false);
+                // New (S-02): nobody can answer a prompt here, so the default
+                // is "deny". Opt in with --yes or OPENCODE_RUST_AUTO_APPROVE=1;
+                // OPENCODE_RUST_AUTO_DENY=1 always wins.
+                let approve = headless_auto_approve();
                 eprintln!(
                     "\n[approval] {tool}: {detail} → {}",
-                    if auto_deny { "denied" } else { "auto-approved (headless)" }
+                    if approve { "auto-approved (--yes)" } else { "denied (pass --yes to allow)" }
                 );
-                let _ = state.decide(&approval_id, !auto_deny, false);
+                let _ = state.decide(&approval_id, approve, false);
             }
             Ok(server::ServerEvent::RunFinished { ok, message, .. }) => {
                 println!();
@@ -1032,4 +1056,32 @@ async fn tui_run(
     tui::run(&mut app2, evt_rx, act_tx).await?;
     let _ = addr;
     Ok(())
+}
+
+#[cfg(test)]
+mod headless_policy_tests {
+    use super::auto_approve_policy;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn headless_denies_by_default() {
+        assert!(!auto_approve_policy(&args(&["--headless", "do it"]), None, None));
+        assert!(!auto_approve_policy(&args(&["--headless"]), Some("0"), None));
+    }
+
+    #[test]
+    fn yes_flag_or_env_opts_in() {
+        assert!(auto_approve_policy(&args(&["--headless", "--yes", "do it"]), None, None));
+        assert!(auto_approve_policy(&args(&["--headless", "do it"]), Some("1"), None));
+        // After `--` it is prompt text, not the flag.
+        assert!(!auto_approve_policy(&args(&["--headless", "--", "--yes"]), None, None));
+    }
+
+    #[test]
+    fn auto_deny_always_wins() {
+        assert!(!auto_approve_policy(&args(&["--yes"]), Some("1"), Some("1")));
+    }
 }
