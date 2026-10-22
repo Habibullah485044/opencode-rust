@@ -11,12 +11,23 @@ pub enum Action {
 }
 
 impl Action {
-    fn parse(s: &str) -> Option<Self> {
-        match s {
+    /// "allow" | "ask" | "deny" — letter case and surrounding spaces do not
+    /// matter. Anything else is `None`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
             "allow" => Some(Action::Allow),
             "ask" => Some(Action::Ask),
             "deny" => Some(Action::Deny),
             _ => None,
+        }
+    }
+
+    /// The canonical config word for this action.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::Allow => "allow",
+            Action::Ask => "ask",
+            Action::Deny => "deny",
         }
     }
 }
@@ -34,15 +45,37 @@ pub struct Engine {
     rules: Vec<RuleCfg>,
 }
 
+/// Sort key for default entries: (exact name?, number of literal characters).
+fn default_specificity(pattern: &str) -> (bool, usize) {
+    let literal = pattern.chars().filter(|c| *c != '*' && *c != '?').count();
+    (literal == pattern.chars().count(), literal)
+}
+
 impl Engine {
     pub fn new(cfg: &PermissionsCfg) -> Self {
-        let mut defaults = Vec::new();
-        for (tool, action) in &cfg.defaults {
-            if let Some(a) = Action::parse(action) {
-                defaults.push((tool.clone(), a));
-            }
-        }
-        Self { defaults, rules: cfg.rules.clone() }
+        // An unknown action word never drops a default or a rule silently:
+        // it becomes "ask". (`Config::load` already rejects such configs.)
+        let mut defaults: Vec<(String, Action)> = cfg
+            .defaults
+            .iter()
+            .map(|(tool, action)| (tool.clone(), Action::parse(action).unwrap_or(Action::Ask)))
+            .collect();
+        // `cfg.defaults` is a HashMap, whose order changes from run to run.
+        // Sort so the most specific entry is found first: exact tool names,
+        // then patterns with more literal characters, then by name.
+        defaults.sort_by(|(a, _), (b, _)| {
+            default_specificity(b).cmp(&default_specificity(a)).then_with(|| a.cmp(b))
+        });
+        let rules = cfg
+            .rules
+            .iter()
+            .map(|r| RuleCfg {
+                tool: r.tool.clone(),
+                pattern: r.pattern.clone(),
+                action: Action::parse(&r.action).unwrap_or(Action::Ask).as_str().to_string(),
+            })
+            .collect();
+        Self { defaults, rules }
     }
 
     /// Evaluate for (tool, detail) where detail is the command for bash,
@@ -671,5 +704,37 @@ mod tests {
         assert!(!w("git log 2>&1", Shell::Posix));
         assert!(!w("dir > NUL", Shell::Cmd));
         assert!(w("dir > out.txt", Shell::Cmd));
+    }
+
+    #[test]
+    fn wildcard_default_never_beats_an_exact_name() {
+        // Every new HashMap has a new order; the answer must not change.
+        for _ in 0..20 {
+            let mut cfg = PermissionsCfg::default();
+            cfg.defaults.insert("*".into(), "allow".into());
+            cfg.defaults.insert("bash".into(), "ask".into());
+            let e = Engine::new(&cfg);
+            assert_eq!(e.evaluate("bash", "ls", deny_all()).action, Action::Ask);
+            assert_eq!(e.evaluate("some_mcp_tool", "x", deny_all()).action, Action::Allow);
+        }
+    }
+
+    #[test]
+    fn bad_rule_action_asks_instead_of_being_skipped() {
+        let rule = |action: &str| PermissionsCfg {
+            rules: vec![RuleCfg {
+                tool: "read".into(),
+                pattern: "secrets/*".into(),
+                action: action.into(),
+            }],
+            ..Default::default()
+        };
+        // Before this fix the bad rule was skipped and the read default
+        // ("allow") won.
+        let e = Engine::new(&rule("denny"));
+        assert_eq!(e.evaluate("read", "secrets/key.pem", deny_all()).action, Action::Ask);
+        // Letter case and spaces do not matter.
+        let e = Engine::new(&rule(" Deny "));
+        assert_eq!(e.evaluate("read", "secrets/key.pem", deny_all()).action, Action::Deny);
     }
 }

@@ -37,6 +37,9 @@ reuse_gate = true
 [permissions]
 # Default action per tool: "allow" | "ask" | "deny"
 [permissions.defaults]
+# Letter case of the action word is ignored. Tools you leave out keep their
+# built-in default. A typo in an action word stops the program at startup
+# with an error that names the entry.
 read = "allow"
 list = "allow"
 glob = "allow"

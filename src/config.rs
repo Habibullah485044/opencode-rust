@@ -111,6 +111,9 @@ impl Default for ProviderCfg {
 #[serde(default)]
 pub struct PermissionsCfg {
     /// Per-tool default action when no rule matches: "allow" | "ask" | "deny".
+    /// Tools you do not list keep their built-in default (see
+    /// `builtin_permission_defaults`); a listed tool overrides it.
+    #[serde(deserialize_with = "merge_with_builtin_defaults")]
     pub defaults: HashMap<String, String>,
     /// Ordered rules; first match wins.
     /// `tool` supports `*` wildcards; `pattern` is glob-matched against the
@@ -139,6 +142,58 @@ impl Default for PermissionsCfg {
             defaults.insert(t.to_string(), "ask".to_string());
         }
         Self { defaults, rules: Vec::new(), approval_timeout_secs: 300 }
+    }
+}
+
+/// The defaults every config starts from (the list in
+/// `impl Default for PermissionsCfg`). A user's `[permissions.defaults]`
+/// table is merged on top of this list; it does not replace it.
+pub fn builtin_permission_defaults() -> HashMap<String, String> {
+    PermissionsCfg::default().defaults
+}
+
+/// serde helper for `PermissionsCfg::defaults`: user entries on top of the
+/// built-in ones.
+fn merge_with_builtin_defaults<'de, D>(d: D) -> std::result::Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let user = HashMap::<String, String>::deserialize(d)?;
+    let mut merged = builtin_permission_defaults();
+    merged.extend(user);
+    Ok(merged)
+}
+
+impl PermissionsCfg {
+    /// Every action word must be "allow", "ask" or "deny" (any letter case).
+    /// The error lists every bad entry at once.
+    pub fn validate(&self) -> Result<()> {
+        let ok = |s: &str| matches!(s.trim().to_ascii_lowercase().as_str(), "allow" | "ask" | "deny");
+        let mut bad = Vec::new();
+        let mut names: Vec<&String> = self.defaults.keys().collect();
+        names.sort();
+        for tool in names {
+            let action = &self.defaults[tool];
+            if !ok(action) {
+                bad.push(format!("permissions.defaults.{tool} = {action:?}"));
+            }
+        }
+        for (i, r) in self.rules.iter().enumerate() {
+            if !ok(&r.action) {
+                bad.push(format!(
+                    "permissions.rules[{i}].action = {:?} (tool {:?}, pattern {:?})",
+                    r.action, r.tool, r.pattern
+                ));
+            }
+        }
+        if bad.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "invalid permission action (use \"allow\", \"ask\" or \"deny\"): {}",
+                bad.join("; ")
+            )
+        }
     }
 }
 
@@ -210,6 +265,9 @@ impl Config {
         if let Ok(m) = std::env::var("OPENCODE_RUST_MODEL") {
             if !m.is_empty() { cfg.provider.model = m; }
         }
+        cfg.permissions
+            .validate()
+            .with_context(|| format!("checking [permissions] in {}", path.display()))?;
         let _ = workspace; // reserved: project-level .opencode-rust.toml in M2
         Ok(cfg)
     }
@@ -309,6 +367,32 @@ mod tests {
         assert_eq!(c.mcp.servers[0].args, vec!["srv.js", "--flag"]);
         // Default config has no MCP servers.
         assert!(Config::default().mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn user_defaults_merge_with_builtins() {
+        let c: Config = toml::from_str("[permissions.defaults]\nbash = \"allow\"\n").unwrap();
+        assert_eq!(c.permissions.defaults.get("bash").unwrap(), "allow", "user value wins");
+        assert_eq!(c.permissions.defaults.get("read").unwrap(), "allow", "built-in kept");
+        assert_eq!(c.permissions.defaults.get("write").unwrap(), "ask", "built-in kept");
+    }
+
+    #[test]
+    fn invalid_permission_actions_are_rejected() {
+        let c: Config = toml::from_str(
+            "[permissions.defaults]\nwrite = \"alow\"\n\
+             [[permissions.rules]]\ntool = \"bash\"\npattern = \"rm *\"\naction = \"denny\"\n",
+        )
+        .unwrap();
+        let err = c.permissions.validate().unwrap_err().to_string();
+        assert!(err.contains("permissions.defaults.write"), "{err}");
+        assert!(err.contains("permissions.rules[0]"), "{err}");
+        // Letter case does not matter.
+        let c: Config = toml::from_str(
+            "[[permissions.rules]]\ntool = \"bash\"\npattern = \"rm *\"\naction = \"Deny\"\n",
+        )
+        .unwrap();
+        assert!(c.permissions.validate().is_ok());
     }
 }
 
