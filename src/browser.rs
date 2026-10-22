@@ -195,8 +195,16 @@ pub const RUNTIME_JS: &str = r#"(function () {
     var s = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
   }
+  // Password, one-time-code and payment card fields: their values never
+  // leave the page (not in a snapshot, not in a click reply).
+  function secret(el) {
+    if (String(el.type || '').toLowerCase() === 'password') return true;
+    var ac = String(el.getAttribute('autocomplete') || '').toLowerCase();
+    return /(^|\s)(current-password|new-password|one-time-code|cc-[a-z-]+)(\s|$)/.test(ac);
+  }
   function nm(el) {
-    var v = el.getAttribute('aria-label') || el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('title') || el.tagName;
+    var val = secret(el) ? '' : el.value;
+    var v = el.getAttribute('aria-label') || el.innerText || val || el.getAttribute('placeholder') || el.getAttribute('title') || el.tagName;
     return String(v).replace(/\s+/g, ' ').trim().slice(0, 90);
   }
   function role(el) {
@@ -217,7 +225,7 @@ pub const RUNTIME_JS: &str = r#"(function () {
         var id = 'e' + (out.length + 1);
         el.setAttribute('data-habi-ref', id);
         var n = { ref: id, role: role(el), name: nm(el) };
-        if (el.value) n.value = String(el.value).slice(0, 80);
+        if (el.value) n.value = secret(el) ? '[hidden]' : String(el.value).slice(0, 80);
         if (el.tagName === 'A' && el.href) n.href = String(el.href).slice(0, 140);
         if (el.checked) n.checked = true;
         out.push(n);
@@ -500,5 +508,76 @@ mod tests {
         assert_eq!(detect_dev_server("http://localhost:"), None, "no port, no chip");
         assert_eq!(detect_dev_server("https://localhost:3000 is tls"), None, "tls is not a dev server");
         assert_eq!(detect_dev_server("compiled successfully"), None);
+    }
+
+    /// A tiny fake DOM for `run_runtime_in_node`. The test defines `FIELDS`,
+    /// the page's elements, built with `field(tag, type, value, attrs)`.
+    const FAKE_DOM: &str = r#"
+function field(tag, type, value, attrs) {
+  return {
+    tagName: tag, type: type, value: value, innerText: '', attrs: attrs || {},
+    getAttribute: function (k) { return this.attrs[k] === undefined ? null : this.attrs[k]; },
+    setAttribute: function (k, v) { this.attrs[k] = String(v); },
+    removeAttribute: function (k) { delete this.attrs[k]; },
+    getBoundingClientRect: function () { return this.hidden ? { width: 0, height: 0 } : { width: 10, height: 10 }; },
+    scrollIntoView: function () {}, focus: function () {},
+    click: function () { this.clicks = (this.clicks || 0) + 1; }
+  };
+}
+globalThis.window = globalThis;
+globalThis.getComputedStyle = function () { return { visibility: 'visible', display: 'block' }; };
+globalThis.location = { href: 'http://localhost/' };
+globalThis.document = {
+  title: 't', readyState: 'complete', body: { innerText: '' },
+  querySelectorAll: function (sel) {
+    if (sel.indexOf('h1') === 0) return [];
+    if (sel === '[data-habi-ref]') {
+      return FIELDS.filter(function (f) { return f.attrs['data-habi-ref'] !== undefined; });
+    }
+    return FIELDS;
+  },
+  querySelector: function (sel) {
+    var m = /data-habi-ref="([^"]+)"/.exec(sel);
+    return FIELDS.filter(function (f) { return m && f.attrs['data-habi-ref'] === m[1]; })[0] || null;
+  }
+};
+"#;
+
+    /// Run `prelude`, then the real RUNTIME_JS, then `epilogue` under Node.
+    /// Returns stdout, or `None` (test skipped) when Node is not installed.
+    fn run_runtime_in_node(prelude: &str, epilogue: &str) -> Option<String> {
+        let script = format!("{prelude}\n{RUNTIME_JS}\n{epilogue}");
+        let out = match std::process::Command::new("node").arg("-e").arg(&script).output() {
+            Ok(o) => o,
+            Err(_) => {
+                eprintln!("node is not installed; skipping this check");
+                return None;
+            }
+        };
+        assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn snapshot_hides_secret_field_values() {
+        let prelude = format!(
+            "{FAKE_DOM}\nvar FIELDS = [\n\
+             field('INPUT', 'password', 'hunter2-secret'),\n\
+             field('INPUT', 'text', '123456', {{ autocomplete: 'one-time-code' }}),\n\
+             field('INPUT', 'text', '4111111111111111', {{ autocomplete: 'cc-number' }}),\n\
+             field('INPUT', 'text', 'alice')\n];"
+        );
+        let Some(out) = run_runtime_in_node(
+            &prelude,
+            "console.log(JSON.stringify(window.__habi.snapshot()));\n\
+             console.log(JSON.stringify(window.__habi.click('e1')));",
+        ) else {
+            return;
+        };
+        for secret in ["hunter2-secret", "123456", "4111111111111111"] {
+            assert!(!out.contains(secret), "secret value leaked: {out}");
+        }
+        assert!(out.contains("alice"), "ordinary values are still reported: {out}");
+        assert!(out.contains("[hidden]"), "the model is told the field has a value: {out}");
     }
 }
