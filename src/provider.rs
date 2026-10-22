@@ -19,7 +19,7 @@ pub struct Client {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMsg {
     pub role: String, // system | user | assistant | tool
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// B-21: always sent (`null` when empty); some servers reject a missing key.
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallReq>>,
@@ -68,11 +68,13 @@ pub enum StreamEvent {
 
 #[derive(Deserialize)]
 struct SseChunk {
+    #[serde(default)] // B-21: usage-only chunks have no `choices`
     choices: Vec<SseChoice>,
 }
 
 #[derive(Deserialize)]
 struct SseChoice {
+    #[serde(default)] // B-21: some servers send the last chunk without `delta`
     delta: SseDelta,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -238,11 +240,15 @@ fn sse_event_stream(
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = buf.drain(..=pos).collect();
                     let line = String::from_utf8_lossy(&line).trim().to_string();
+                    // B-21: an `error` frame fails the stream loudly.
+                    if let Some(msg) = sse_error_message(&line) {
+                        return Some((Err(anyhow!("provider error: {msg}")), (src, buf, pending, true)));
+                    }
                     if let Some((events, line_done)) = parse_sse_line(&line) {
+                        // B-21: `[DONE]` or a finish_reason ends the reply.
+                        let finished = events.iter().any(|e| matches!(e, StreamEvent::Done { .. }));
                         pending.extend(events);
-                        // Only the explicit `[DONE]` sentinel terminates the stream;
-                        // a per-choice finish_reason is just another event.
-                        if line_done {
+                        if line_done || finished {
                             done = true;
                         }
                     }
@@ -266,13 +272,46 @@ fn sse_event_stream(
                         return Some((Err(anyhow!("stream error: {e}")), (src, buf, pending, true)));
                     }
                     Ok(None) => {
-                        // Transport closed without [DONE]; flush nothing, then stop.
-                        done = true;
+                        // B-21: closed before `[DONE]` and before any finish_reason.
+                        // A last line without its newline still counts.
+                        let rest = String::from_utf8_lossy(&buf).trim().to_string();
+                        buf.clear();
+                        if let Some((events, line_done)) = parse_sse_line(&rest) {
+                            if line_done || events.iter().any(|e| matches!(e, StreamEvent::Done { .. })) {
+                                pending.extend(events);
+                                done = true;
+                                continue;
+                            }
+                        }
+                        return Some((
+                            Err(anyhow!(
+                                "provider stream ended early: the connection closed before \
+                                 the reply was finished"
+                            )),
+                            (src, buf, pending, true),
+                        ));
                     }
                 }
             }
         },
     )
+}
+
+/// The message of a mid-stream error frame such as
+/// `data: {"error": {"message": "..."}}` (B-21), or `None` for other lines.
+fn sse_error_message(line: &str) -> Option<String> {
+    let data = line.strip_prefix("data:")?.trim();
+    if !data.starts_with('{') || !data.contains("\"error\"") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(data).ok()?;
+    let err = v.get("error").filter(|e| !e.is_null())?;
+    let msg = err
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| err.to_string());
+    Some(msg.chars().take(400).collect())
 }
 
 /// Parse one SSE line. Returns the events it produced (possibly empty) and
@@ -318,7 +357,7 @@ fn parse_sse_line(line: &str) -> Option<(Vec<StreamEvent>, bool)> {
                 args_delta,
             });
         }
-        if let Some(fr) = &choice.finish_reason {
+        if let Some(fr) = choice.finish_reason.as_ref().filter(|f| !f.is_empty()) {
             // Emitted AFTER any deltas on this same line so nothing is lost.
             events.push(StreamEvent::Done { finish_reason: Some(fr.clone()) });
         }
@@ -329,17 +368,29 @@ fn parse_sse_line(line: &str) -> Option<(Vec<StreamEvent>, bool)> {
 /// Accumulates streamed tool-call fragments into final calls.
 #[derive(Default)]
 pub struct ToolCallAccumulator {
-    calls: std::collections::BTreeMap<usize, (String, String, String)>, // idx -> (id, name, args)
+    calls: std::collections::BTreeMap<usize, (String, String, String)>, // slot -> (id, name, args)
+    /// B-21: provider `index` -> slot in `calls`.
+    slot_of: std::collections::HashMap<usize, usize>,
+    next_slot: usize,
 }
 
 impl ToolCallAccumulator {
     pub fn push(&mut self, ev: &StreamEvent) {
         if let StreamEvent::ToolCallDelta { index, id, name, args_delta } = ev {
-            let entry = self.calls.entry(*index).or_default();
-            if let Some(id) = id {
-                if !id.is_empty() {
-                    entry.0 = id.clone();
+            let new_id = id.as_deref().filter(|s| !s.is_empty());
+            // B-21: some servers send every call as `index: 0`. A different id
+            // on a known index means a new call, not more of the old one.
+            let slot = match self.slot_of.get(index).copied() {
+                Some(s) => {
+                    let known = self.calls.get(&s).map(|c| c.0.as_str()).unwrap_or("");
+                    let other_call = matches!(new_id, Some(n) if !known.is_empty() && known != n);
+                    if other_call { self.new_slot(*index) } else { s }
                 }
+                None => self.new_slot(*index),
+            };
+            let entry = self.calls.entry(slot).or_default();
+            if let Some(n) = new_id {
+                entry.0 = n.to_string();
             }
             if let Some(name) = name {
                 if !name.is_empty() {
@@ -350,13 +401,26 @@ impl ToolCallAccumulator {
         }
     }
 
+    /// B-21: start a new call slot for provider `index`.
+    fn new_slot(&mut self, index: usize) -> usize {
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        self.slot_of.insert(index, slot);
+        slot
+    }
+
     /// Returns final calls; args parsed as JSON (falls back to {"raw": args}).
+    /// B-21: empty args become `{}`; a missing id gets a generated one.
     pub fn finish(self) -> Vec<(String, String, Value)> {
         self.calls
             .into_values()
             .map(|(id, name, args)| {
-                let v = serde_json::from_str(&args)
-                    .unwrap_or_else(|_| json!({ "raw": args }));
+                let v = if args.trim().is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str(&args).unwrap_or_else(|_| json!({ "raw": args }))
+                };
+                let id = if id.is_empty() { crate::db::new_id("call") } else { id };
                 (id, name, v)
             })
             .collect()
@@ -532,5 +596,95 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, "bash");
         assert_eq!(calls[0].2["command"], "ls");
+    }
+}
+
+#[cfg(test)]
+mod b21_stream_tests {
+    use super::*;
+
+    async fn collect(body: &str) -> Vec<Result<StreamEvent>> {
+        let src = futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(body.to_string()))]);
+        let mut s = Box::pin(sse_event_stream(src, std::time::Duration::from_secs(5)));
+        let mut out = Vec::new();
+        while let Some(ev) = s.next().await {
+            let stop = ev.is_err();
+            out.push(ev);
+            if stop {
+                break;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn error_frame_fails_the_stream() {
+        let out = collect("data: {\"error\":{\"message\":\"upstream overloaded\",\"code\":502}}\n\n").await;
+        let err = out.last().unwrap().as_ref().unwrap_err().to_string();
+        assert!(err.contains("upstream overloaded"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn early_close_is_an_error() {
+        let out = collect("data: {\"choices\":[{\"delta\":{\"content\":\"hal\"}}]}\n\n").await;
+        assert!(matches!(out[0], Ok(StreamEvent::Text(ref t)) if t == "hal"));
+        let err = out.last().unwrap().as_ref().unwrap_err().to_string();
+        assert!(err.contains("ended early"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn finish_without_done_and_missing_delta_are_fine() {
+        // The last chunk has no `delta`, no newline, and there is no `[DONE]`.
+        let out = collect(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: {\"choices\":[{\"finish_reason\":\"stop\"}]}",
+        )
+        .await;
+        assert_eq!(out.len(), 2, "text + done, no error");
+        assert!(matches!(out[1], Ok(StreamEvent::Done { finish_reason: Some(ref f) }) if f == "stop"));
+    }
+}
+
+#[cfg(test)]
+mod b21_calls_tests {
+    use super::*;
+
+    fn delta(index: usize, id: Option<&str>, args: &str) -> StreamEvent {
+        StreamEvent::ToolCallDelta {
+            index,
+            id: id.map(str::to_string),
+            name: Some("read".into()),
+            args_delta: args.into(),
+        }
+    }
+
+    #[test]
+    fn calls_that_reuse_index_zero_stay_separate() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.push(&delta(0, Some("a"), "{\"path\":\"x\"}"));
+        acc.push(&delta(0, Some("b"), "{\"path\":\"y\"}"));
+        let calls = acc.finish();
+        assert_eq!(calls.len(), 2);
+        assert_eq!((calls[0].0.as_str(), calls[0].2["path"].as_str()), ("a", Some("x")));
+        assert_eq!((calls[1].0.as_str(), calls[1].2["path"].as_str()), ("b", Some("y")));
+    }
+
+    #[test]
+    fn missing_ids_and_empty_args_are_filled_in() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.push(&delta(0, None, ""));
+        acc.push(&delta(1, None, ""));
+        let calls = acc.finish();
+        assert_eq!(calls.len(), 2);
+        assert!(!calls[0].0.is_empty() && calls[0].0 != calls[1].0, "{calls:?}");
+        assert_eq!(calls[0].2, json!({}));
+    }
+
+    #[test]
+    fn assistant_tool_call_message_sends_null_content() {
+        let msg = ChatMsg { role: "assistant".into(), content: None, tool_calls: Some(vec![]), tool_call_id: None };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert!(v.as_object().unwrap().contains_key("content"), "{v}");
+        assert!(v["content"].is_null());
     }
 }

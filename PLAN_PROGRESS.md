@@ -16,3 +16,4 @@ Tasks from [FIX_PLAN.md](FIX_PLAN.md), done in the recommended order (Part 2.1).
 - [x] H-02 Make the desktop GUI an optional cargo feature — 2026-10-22 — cargo test: 210 passed (default) / 185 passed (`--no-default-features`); `tao`/`wry` are optional, `detect_dev_server` moved to `src/browser.rs`
 - [x] H-01 Add README.md, LICENSE and NOTICE — 2026-10-22 — no Rust change; ponytail LICENSE downloaded from upstream (MIT, © DietrichGebert), `vendor/` added to `.gitignore`
 - [x] H-03 Add GitHub Actions CI (Linux + Windows) — 2026-10-22 — `.github/workflows/ci.yml` with the three jobs; `cargo build --locked --tests` passes locally, YAML parsed
+- [x] B-21 Provider stream: error frames, early end, missing delta, ids — 2026-10-22 — cargo test: 216 passed (6 new); error frames fail the stream, an early close is an error, `finish_reason`/`[DONE]` end the reply, parallel tool calls that reuse `index` stay separate, `content` is always sent
