@@ -1367,6 +1367,93 @@ pub(crate) fn tool_allowed(mode: AgentMode, opts: &LoopOpts, name: &str) -> bool
     }
 }
 
+/// F-09 loop guard: the third identical call in a row (same tool, same
+/// arguments) is refused instead of run.
+pub(crate) const LOOP_GUARD_LIMIT: u32 = 3;
+
+/// F-09: remembers the last tool call of one run and how many times in a
+/// row the model asked for exactly that call.
+#[derive(Default)]
+pub(crate) struct LoopGuard {
+    last: Option<String>,
+    streak: u32,
+}
+
+impl LoopGuard {
+    /// Count one requested call. Returns the error text for the model when
+    /// this is the LOOP_GUARD_LIMIT-th identical call in a row (or later).
+    /// Any different call resets the count.
+    pub(crate) fn check(&mut self, name: &str, input: &Value) -> Option<String> {
+        let key = format!("{name} {}", canonical_json(input));
+        if self.last.as_deref() == Some(key.as_str()) {
+            self.streak += 1;
+        } else {
+            self.last = Some(key);
+            self.streak = 1;
+        }
+        if self.streak < LOOP_GUARD_LIMIT {
+            return None;
+        }
+        Some(format!(
+            "loop guard: you asked for `{name}` with exactly the same arguments {} times \
+             in a row, so it was not run again. Repeating it gives the same result. \
+             Change your approach: use what the earlier results told you, try different \
+             arguments or another tool, or stop and tell the user what blocks you.",
+            self.streak
+        ))
+    }
+}
+
+/// JSON text with object keys sorted at every level, so `{"a":1,"b":2}`
+/// and `{"b":2,"a":1}` give the same text.
+fn canonical_json(v: &Value) -> String {
+    match v {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let fields: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("{}:{}", Value::String(k.clone()), canonical_json(&map[k])))
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        }
+        Value::Array(items) => {
+            let items: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", items.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// F-09: run one batch of calls past the loop guard, in call order. A
+/// refused call gets its error result right away (started/finished events,
+/// stats, saved tool message) and is left out; the rest come back in order.
+fn apply_loop_guard(
+    st: &Shared,
+    opts: &LoopOpts,
+    session_id: &str,
+    loop_guard: &mut LoopGuard,
+    calls: Vec<(String, String, Value)>,
+) -> Result<Vec<(String, String, Value)>> {
+    let mut keep = Vec::with_capacity(calls.len());
+    for (id, name, input) in calls {
+        let Some(msg) = loop_guard.check(&name, &input) else {
+            keep.push((id, name, input));
+            continue;
+        };
+        let detail = tool_detail(st, &name, &input);
+        tool_started(st, opts, session_id, &id, &name, &detail);
+        if opts.emit_activity {
+            let _ = st.events.send(ServerEvent::Note {
+                session_id: session_id.to_string(),
+                text: format!("loop guard: stopped a repeated `{name}` call"),
+            });
+        }
+        finish_tool_call(st, opts, session_id, &id, &name, &input, msg, false)?;
+    }
+    Ok(keep)
+}
+
 /// The agent loop: load history, call model, execute tools, repeat until done.
 pub async fn run_loop(
     st: &Shared,
@@ -1375,6 +1462,8 @@ pub async fn run_loop(
     abort: &AtomicBool,
 ) -> Result<String> {
     let mode = st.mode_for(session_id);
+    // F-09: one loop guard per run (a spawned subagent has its own).
+    let mut loop_guard = LoopGuard::default();
     // Spec list: base tools + MCP tools (+ spawn), then filter by mode/role.
     let mut specs = tools::tool_specs();
     // Browser tools only work while a GUI panel is attached. Advertising them
@@ -1519,6 +1608,10 @@ pub async fn run_loop(
             break;
         }
 
+        // F-09 loop guard: an identical call repeated LOOP_GUARD_LIMIT times
+        // in a row is answered with an error and never runs (no approval
+        // prompt either). Every requested call counts, spawns included.
+        let calls = apply_loop_guard(st, opts, session_id, &mut loop_guard, calls)?;
         // Execute each tool call: role gate → permission gate → route.
         // `spawn` calls run concurrently with each other — the agents panel
         // shows the parallel work — everything else keeps its call order.
@@ -4189,6 +4282,107 @@ data: [DONE]
             .await
             .unwrap_err();
         assert!(err.to_string().contains("blocked by a permissions rule"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F-09: the third identical call in a row is refused; key order in the
+    /// arguments does not matter, and any different call resets the count.
+    #[test]
+    fn loop_guard_blocks_the_third_identical_call() {
+        let mut g = LoopGuard::default();
+        let a = serde_json::json!({"path": "src", "depth": 1});
+        let same: Value = serde_json::from_str(r#"{"depth":1,"path":"src"}"#).unwrap();
+        assert!(g.check("list", &a).is_none());
+        assert!(g.check("list", &same).is_none(), "same args in another key order");
+        let msg = g.check("list", &a).expect("the third identical call is refused");
+        assert!(msg.contains("loop guard") && msg.contains("`list`"), "{msg}");
+        assert!(g.check("list", &a).is_some(), "the fourth one too");
+        assert!(g.check("read", &a).is_none(), "a different tool resets the count");
+        assert!(g.check("list", &a).is_none());
+        assert!(g.check("list", &a).is_none());
+        let other = serde_json::json!({"path": "other"});
+        assert!(g.check("list", &other).is_none(), "different args reset the count");
+    }
+
+    /// F-09 end to end: a model that keeps sending the same `list` call gets
+    /// two real results, then loop-guard errors instead of more runs.
+    #[tokio::test]
+    async fn run_loop_refuses_repeated_identical_calls() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = std::env::temp_dir().join(format!("ocrs-loopguard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Requests 0-3: the same `list` call (a new call id each time); then text.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |_body: axum::extract::Json<Value>| {
+                let calls = calls2.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    let payload = if n < 4 {
+                        let frame = serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+                            "index": 0,
+                            "id": format!("call_{n}"),
+                            "function": {"name": "list", "arguments": "{\"path\":\".\"}"}
+                        }]}, "finish_reason": null}]});
+                        format!(
+                            "data: {frame}\n\n\
+                             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
+                             data: [DONE]\n\n"
+                        )
+                    } else {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"giving up\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                            .to_string()
+                    };
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        payload,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("lg", None).unwrap();
+        let mut rx = st.events.subscribe();
+
+        run_agent(&st, &s.id, "list the folder", Arc::new(AtomicBool::new(false))).await;
+
+        let results: Vec<(String, bool)> = st
+            .db
+            .messages(&s.id)
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m.parts.first() {
+                Some(Part::ToolResult { output, is_error, .. }) => {
+                    Some((output.clone(), *is_error))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 4, "{results:?}");
+        assert!(!results[0].1 && !results[1].1, "the first two calls ran: {results:?}");
+        for (out, is_error) in &results[2..] {
+            assert!(*is_error && out.contains("loop guard"), "refused: {out}");
+        }
+        let mut notes = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::Note { text, .. } = ev {
+                notes.push(text);
+            }
+        }
+        assert!(notes.iter().any(|n| n.contains("loop guard")), "{notes:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
