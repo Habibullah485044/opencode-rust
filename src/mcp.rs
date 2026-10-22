@@ -265,11 +265,17 @@ pub fn spec_for(server: &str, t: &McpTool) -> ToolSpec {
     }
 }
 
-/// One live MCP server connection (child process + session + tool cache).
-pub struct McpConn {
+/// The running server process and its JSON-RPC session (B-20). Each server
+/// has its own lock around this, so one slow server never blocks another.
+pub struct Live {
     #[allow(dead_code)] // kept alive; kill_on_drop kills the child on drop
     child: tokio::process::Child,
     pub client: Client<BufReader<tokio::process::ChildStdout>, tokio::process::ChildStdin>,
+}
+
+/// One live MCP server connection (child process + session + tool cache).
+pub struct McpConn {
+    pub live: std::sync::Arc<tokio::sync::Mutex<Live>>,
     pub tools: Vec<McpTool>,
     pub server: String,
 }
@@ -302,15 +308,16 @@ impl McpConn {
             }
             fresh
         });
-        Ok(Self { child, client, tools, server })
+        let live = std::sync::Arc::new(tokio::sync::Mutex::new(Live { child, client }));
+        Ok(Self { live, tools, server })
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.iter().map(|t| spec_for(&self.server, t)).collect()
     }
 
-    pub async fn call(&mut self, tool: &str, args: &Value) -> Result<String> {
-        self.client.call_tool(tool, args).await
+    pub async fn call(&self, tool: &str, args: &Value) -> Result<String> {
+        self.live.lock().await.client.call_tool(tool, args).await
     }
 }
 
@@ -361,6 +368,21 @@ impl Registry {
         self.conns.values().flat_map(|c| c.specs()).collect()
     }
 
+    /// Find the server behind a model-facing MCP name and return a handle
+    /// that calls it WITHOUT the registry being locked (B-20).
+    pub fn route(&self, fn_name: &str) -> Result<McpRoute> {
+        let (server, tool) =
+            parse_fn_name(fn_name).ok_or_else(|| anyhow!("`{fn_name}` is not an MCP tool"))?;
+        let conn = self
+            .conns
+            .get(&server)
+            .ok_or_else(|| anyhow!("mcp server `{server}` is not connected"))?;
+        Ok(McpRoute {
+            live: conn.live.clone(),
+            tool: resolve_tool_name(&conn.server, &conn.tools, &tool),
+        })
+    }
+
     pub async fn call(&mut self, fn_name: &str, args: &Value) -> Result<String> {
         let (server, tool) =
             parse_fn_name(fn_name).ok_or_else(|| anyhow!("`{fn_name}` is not an MCP tool"))?;
@@ -374,6 +396,18 @@ impl Registry {
 
     pub fn connected(&self) -> Vec<&str> {
         self.conns.keys().map(String::as_str).collect()
+    }
+}
+
+/// One MCP tool, ready to call without holding the registry lock (B-20).
+pub struct McpRoute {
+    live: std::sync::Arc<tokio::sync::Mutex<Live>>,
+    tool: String,
+}
+
+impl McpRoute {
+    pub async fn call(&self, args: &Value) -> Result<String> {
+        self.live.lock().await.client.call_tool(&self.tool, args).await
     }
 }
 
@@ -598,7 +632,7 @@ rl.on('line', (line) => {
             command: node,
             args: vec![path.to_string_lossy().into_owned()],
         };
-        let mut conn = McpConn::spawn("fake", &cfg).await.expect("spawn node server");
+        let conn = McpConn::spawn("fake", &cfg).await.expect("spawn node server");
         assert_eq!(conn.tools.len(), 1);
         let specs = conn.specs();
         assert_eq!(specs[0].function.name, "mcp__fake__echo");
@@ -734,6 +768,73 @@ rl.on('line', (line) => {
         assert!(took < Duration::from_millis(2700), "servers started one after another: {took:?}");
         assert_eq!(reg.specs().len(), 2, "the duplicate `echo` is dropped on each server");
         drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod b20_tests {
+    use super::*;
+
+    fn node_bin() -> Option<String> {
+        ["node", "nodejs"].iter().find_map(|c| {
+            let ok = std::process::Command::new(c)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            ok.then(|| c.to_string())
+        })
+    }
+
+    /// A slow server (1.5 s per call) must not hold up a fast one, and the
+    /// registry lock must be free while the slow call runs.
+    #[tokio::test]
+    async fn calls_to_different_servers_run_in_parallel() {
+        let Some(node) = node_bin() else {
+            eprintln!("skip: node not found on PATH");
+            return;
+        };
+        let script = r#"
+const delay = Number(process.argv[2] || 0);
+const rl = require('readline').createInterface({ input: process.stdin });
+const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+rl.on('line', (line) => {
+  let m; try { m = JSON.parse(line); } catch { return; }
+  if (m.id === undefined) return;
+  if (m.method === 'initialize') send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'t',version:'0'}}});
+  else if (m.method === 'tools/list') send({jsonrpc:'2.0',id:m.id,result:{tools:[{name:'echo',inputSchema:{type:'object'}}]}});
+  else setTimeout(() => send({jsonrpc:'2.0',id:m.id,result:{content:[{type:'text',text:'ok'}]}}), delay);
+});
+"#;
+        let dir = std::env::temp_dir().join(format!("ocrs-b20-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("timed_mcp.js");
+        std::fs::write(&path, script).unwrap();
+        let cfg = |name: &str, delay: &str| McpServerCfg {
+            name: name.into(),
+            command: node.clone(),
+            args: vec![path.to_string_lossy().into_owned(), delay.into()],
+            ..Default::default() // keeps compiling when McpServerCfg gets more fields (F-03)
+        };
+        let mut reg = Registry::default();
+        reg.start_all(&[cfg("slow", "1500"), cfg("fast", "0")]).await;
+        // Same shape as AppState: the registry behind an async mutex.
+        let reg = tokio::sync::Mutex::new(reg);
+
+        let slow = reg.lock().await.route("mcp__slow__echo").unwrap();
+        let slow_call = tokio::spawn(async move { slow.call(&serde_json::json!({})).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(reg.try_lock().is_ok(), "registry lock is free during a call");
+        let started = std::time::Instant::now();
+        let fast = reg.lock().await.route("mcp__fast__echo").unwrap();
+        assert_eq!(fast.call(&serde_json::json!({})).await.unwrap(), "ok");
+        assert!(started.elapsed() < Duration::from_millis(1000), "fast call waited for the slow one");
+
+        assert_eq!(slow_call.await.unwrap().unwrap(), "ok");
+        assert!(reg.lock().await.route("mcp__nope__echo").is_err());
+        assert!(reg.lock().await.route("bash").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

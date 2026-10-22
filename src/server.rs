@@ -1696,7 +1696,21 @@ async fn execute_routed(
     abort: &AtomicBool,
 ) -> (String, bool) {
     if crate::mcp::parse_fn_name(name).is_some() {
-        return match st.mcp.lock().await.call(name, input).await {
+        // B-20: the registry lock is held only for the lookup (the guard is
+        // dropped at the end of this statement), never during the call.
+        let route = st.mcp.lock().await.route(name);
+        let result = match route {
+            Ok(route) => tokio::select! {
+                r = route.call(input) => r,
+                _ = async {
+                    while !abort.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                } => Err(anyhow::anyhow!("aborted")),
+            },
+            Err(e) => Err(e),
+        };
+        return match result {
             Ok(out) => (out, true),
             Err(e) => (format!("error: {e:#}"), false),
         };
