@@ -211,7 +211,7 @@ pub struct AppState {
     pub modes: Mutex<HashMap<String, AgentMode>>,
     /// P-05: per-session ponytail level (in-memory; default from config).
     pub ponytail_levels: Mutex<HashMap<String, agents::PonytailLevel>>,
-    /// M5: per-session todo lists (in-memory).
+    /// M5: per-session todo lists, stored in SQLite (F-11).
     pub todo_store: TodoStore,
     /// Runtime autonomy mode (not per-session): the composer selector and
     /// `/turbo` write it; permission checks and auto-continuation read it.
@@ -247,6 +247,7 @@ impl AppState {
 pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
     let state_dir = crate::config::default_state_dir();
     let db = Db::open(&state_dir.join("opencode.db"))?;
+    let todo_store = TodoStore::open(&state_dir.join("opencode.db"))?;
     let engine = Engine::new(&cfg.permissions);
     let client = Client::from_cfg(&cfg.effective_base_url()?, &cfg.provider)?;
     let (events, _) = broadcast::channel(EVENT_BUFFER);
@@ -266,7 +267,7 @@ pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
         modes: Mutex::new(HashMap::new()),
         ponytail_levels: Mutex::new(HashMap::new()),
         client: AsyncMutex::new(client),
-        todo_store: TodoStore::default(),
+        todo_store,
         perm_mode: AtomicU8::new(PermissionMode::Default as u8),
         skill_base,
         mcp: AsyncMutex::new(mcp),

@@ -1,9 +1,10 @@
 //! M5: per-session todo list. The agent can add, complete, list, and remove
-//! tasks so it doesn't lose track during a long session. Stored in memory,
-//! keyed by session id. (A future phase could persist these to SQLite.)
+//! tasks so it doesn't lose track during a long session. Stored in SQLite
+//! (the session database), keyed by session id, so todos survive a restart.
 
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 /// One todo item.
@@ -33,6 +34,7 @@ pub enum TodoResult {
     Completed { item: TodoItem },
     Removed { id: String },
     NotFound { id: String },
+    Failed { error: String },
 }
 
 fn next_id() -> String {
@@ -50,10 +52,20 @@ fn next_id() -> String {
     format!("todo_{:016x}", h.finish())
 }
 
-/// In-memory per-session todo store.
+/// Per-session todo store in SQLite, so a restart keeps the list.
+/// `new()`/`default()` keep it in memory; `open(path)` uses a database file.
 pub struct TodoStore {
-    todos: Mutex<HashMap<String, Vec<TodoItem>>>,
+    conn: Mutex<Connection>,
 }
+
+const TODO_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS todos (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id, created_at);";
 
 impl Default for TodoStore {
     fn default() -> Self {
@@ -62,57 +74,83 @@ impl Default for TodoStore {
 }
 
 impl TodoStore {
+    /// In-memory store (tests, ephemeral runs).
     pub fn new() -> Self {
-        Self {
-            todos: Mutex::new(HashMap::new()),
-        }
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(TODO_SCHEMA).expect("todo table");
+        Self { conn: Mutex::new(conn) }
+    }
+
+    /// Store kept in the database file at `path` (the same file as `Db`).
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(TODO_SCHEMA)?;
+        Ok(Self { conn: Mutex::new(conn) })
     }
 
     pub fn exec(&self, session_id: &str, op: TodoOp) -> TodoResult {
-        let mut guard = self.todos.lock().unwrap();
-        let items = guard.entry(session_id.to_string()).or_default();
-        match op {
-            TodoOp::Add { content } => {
-                let item = TodoItem {
-                    id: next_id(),
-                    content,
-                    completed: false,
-                };
-                items.push(item.clone());
-                TodoResult::Added { item }
-            }
-            TodoOp::List => TodoResult::Listed {
-                items: items.clone(),
-            },
-            TodoOp::Complete { id } => match items.iter_mut().find(|i| i.id == id) {
-                Some(item) => {
-                    item.completed = true;
-                    TodoResult::Completed { item: item.clone() }
-                }
-                None => TodoResult::NotFound { id },
-            },
-            TodoOp::Remove { id } => {
-                let pos = items.iter().position(|i| i.id == id);
-                match pos {
-                    Some(i) => {
-                        items.remove(i);
-                        TodoResult::Removed { id }
-                    }
-                    None => TodoResult::NotFound { id },
-                }
-            }
-        }
+        let conn = self.conn.lock().unwrap();
+        exec_sql(&conn, session_id, op).unwrap_or_else(|e| TodoResult::Failed { error: e.to_string() })
     }
+
 
     /// Snapshot all todos for a session (used by `/todos` command or display).
     pub fn list_all(&self, session_id: &str) -> Vec<TodoItem> {
-        self.todos
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default()
+        let conn = self.conn.lock().unwrap();
+        list_sql(&conn, session_id).unwrap_or_default()
     }
+}
+
+fn row_item(r: &rusqlite::Row) -> rusqlite::Result<TodoItem> {
+    Ok(TodoItem { id: r.get(0)?, content: r.get(1)?, completed: r.get::<_, i64>(2)? != 0 })
+}
+
+fn list_sql(conn: &Connection, session_id: &str) -> rusqlite::Result<Vec<TodoItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, content, completed FROM todos WHERE session_id=?1 ORDER BY created_at, rowid",
+    )?;
+    let rows = stmt.query_map(params![session_id], row_item)?;
+    rows.collect()
+}
+
+fn exec_sql(conn: &Connection, session_id: &str, op: TodoOp) -> rusqlite::Result<TodoResult> {
+    let find = |id: &str| {
+        conn.query_row(
+            "SELECT id, content, completed FROM todos WHERE session_id=?1 AND id=?2",
+            params![session_id, id],
+            row_item,
+        )
+        .optional()
+    };
+    Ok(match op {
+        TodoOp::Add { content } => {
+            let item = TodoItem { id: next_id(), content, completed: false };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            conn.execute(
+                "INSERT INTO todos (id, session_id, content, completed, created_at) VALUES (?1,?2,?3,0,?4)",
+                params![item.id, session_id, item.content, now],
+            )?;
+            TodoResult::Added { item }
+        }
+        TodoOp::List => TodoResult::Listed { items: list_sql(conn, session_id)? },
+        TodoOp::Complete { id } => {
+            conn.execute(
+                "UPDATE todos SET completed=1 WHERE session_id=?1 AND id=?2",
+                params![session_id, id],
+            )?;
+            match find(&id)? {
+                Some(item) => TodoResult::Completed { item },
+                None => TodoResult::NotFound { id },
+            }
+        }
+        TodoOp::Remove { id } => {
+            let n = conn.execute("DELETE FROM todos WHERE session_id=?1 AND id=?2", params![session_id, id])?;
+            if n > 0 { TodoResult::Removed { id } } else { TodoResult::NotFound { id } }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -163,5 +201,23 @@ mod tests {
         let TodoResult::Listed { items } = store.exec("a", TodoOp::List) else { panic!() };
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].content, "a1");
+    }
+
+    #[test]
+    fn todos_survive_a_restart() {
+        let path = std::env::temp_dir().join(format!("ocrs-todos-{}.db", std::process::id()));
+        {
+            let store = TodoStore::open(&path).unwrap();
+            store.exec("s1", TodoOp::Add { content: "write tests".into() });
+        }
+        let store = TodoStore::open(&path).unwrap();
+        let items = store.list_all("s1");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content, "write tests");
+        assert!(store.list_all("s2").is_empty(), "sessions stay separate");
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }
