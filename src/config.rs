@@ -235,6 +235,10 @@ pub struct AgentCfg {
     /// Laziness Meter: hint the model when a write duplicates something the
     /// repo already has, and flag overbuilt writes.
     pub reuse_gate: bool,
+    /// F-07: the model's context window in tokens. When the next request
+    /// would use about 80% of it, older messages are compacted first.
+    /// 0 = off (default).
+    pub context_tokens: usize,
 }
 
 impl Default for AgentCfg {
@@ -248,6 +252,7 @@ impl Default for AgentCfg {
             verify_timeout_secs: 600,
             auto_review: true,
             reuse_gate: true,
+            context_tokens: 0,
         }
     }
 }
@@ -403,6 +408,13 @@ mod tests {
         )
         .unwrap();
         assert!(c.permissions.validate().is_ok());
+    }
+
+    #[test]
+    fn automatic_compaction_is_off_by_default() {
+        assert_eq!(Config::default().agent.context_tokens, 0);
+        let c: Config = toml::from_str("[agent]\ncontext_tokens = 8192\n").unwrap();
+        assert_eq!(c.agent.context_tokens, 8192);
     }
 }
 

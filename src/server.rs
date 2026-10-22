@@ -1380,6 +1380,68 @@ pub(crate) fn tool_allowed(mode: AgentMode, opts: &LoopOpts, name: &str) -> bool
     }
 }
 
+/// F-07: rough size of the next request in tokens: about 4 characters per
+/// token for the messages and the tool list. Good enough to decide when to
+/// compact; not a billing number.
+fn estimate_tokens(msgs: &[ChatMsg], specs: &[crate::provider::ToolSpec]) -> usize {
+    let mut chars = serde_json::to_string(specs).map_or(0, |s| s.len());
+    for m in msgs {
+        chars += m.role.len() + m.content.as_deref().map_or(0, str::len) + 8;
+        for c in m.tool_calls.iter().flatten() {
+            chars += c.function.name.len() + c.function.arguments.len() + 16;
+        }
+    }
+    chars / 4
+}
+
+/// F-07: compact the session when the next request would use 80% or more
+/// of `agent.context_tokens`. A failed attempt is remembered per session
+/// (by message count), so it is not retried on every step.
+async fn auto_compact_if_needed(
+    st: &Shared,
+    session_id: &str,
+    system: &str,
+    specs: &[crate::provider::ToolSpec],
+    abort: &AtomicBool,
+) {
+    static FAILED_AT: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
+    let limit = st.cfg.agent.context_tokens;
+    if limit == 0 {
+        return;
+    }
+    let Ok(msgs) = build_chat_messages(st, session_id, system) else { return };
+    let used = estimate_tokens(&msgs, specs);
+    if used.saturating_mul(5) < limit.saturating_mul(4) {
+        return;
+    }
+    let failed = FAILED_AT.get_or_init(|| Mutex::new(HashMap::new()));
+    let tried_here = failed
+        .lock()
+        .map(|m| m.get(session_id) == Some(&msgs.len()))
+        .unwrap_or(false);
+    if tried_here {
+        return;
+    }
+    let text = match crate::compact::compact(st, session_id, abort).await {
+        Ok(o) => {
+            if let Ok(mut m) = failed.lock() {
+                m.remove(session_id);
+            }
+            format!(
+                "context is ~{used} of {limit} tokens: compacted {} older message(s) into a summary",
+                o.removed
+            )
+        }
+        Err(e) => {
+            if let Ok(mut m) = failed.lock() {
+                m.insert(session_id.to_string(), msgs.len());
+            }
+            format!("context is ~{used} of {limit} tokens: automatic compaction skipped ({e})")
+        }
+    };
+    let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
+}
+
 /// F-09 loop guard: the third identical call in a row (same tool, same
 /// arguments) is refused instead of run.
 pub(crate) const LOOP_GUARD_LIMIT: u32 = 3;
@@ -1505,6 +1567,8 @@ pub async fn run_loop(
         if abort.load(Ordering::SeqCst) {
             return Ok("aborted".into());
         }
+        // F-07: compact first when the context is nearly full.
+        auto_compact_if_needed(st, session_id, &opts.system, &specs, abort).await;
         let msgs = build_chat_messages(st, session_id, &opts.system)?;
         // B-29: copy the client out of the lock; never hold it while waiting.
         let client = st.client.lock().await.clone();
@@ -4639,6 +4703,47 @@ data: [DONE]
         let passed_at = notes.iter().position(|n| n.contains("passed")).expect("pass note");
         assert!(failed_at < passed_at, "{notes:?}");
         assert_eq!(finished, vec![true], "one completion, after the verify loop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_estimate_is_about_four_chars_per_token() {
+        let msgs = vec![ChatMsg {
+            role: "user".into(),
+            content: Some("x".repeat(4000)),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let n = estimate_tokens(&msgs, &[]);
+        assert!((1000..1010).contains(&n), "{n}");
+    }
+
+    #[tokio::test]
+    async fn auto_compaction_runs_near_the_context_limit() {
+        let dir = std::env::temp_dir().join(format!("ocrs-autocompact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = mock_text_llm().await; // answers "Hello" = the summary
+        cfg.provider.model = "stub".into();
+        cfg.agent.context_tokens = 400; // tiny on purpose
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("auto", None).unwrap();
+        for i in 0..12 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let text = format!("message {i} {}", "x".repeat(200));
+            st.db.add_message(&s.id, role, &[Part::Text { text }]).unwrap();
+        }
+        let mut events = st.events.subscribe();
+        let abort = AtomicBool::new(false);
+        auto_compact_if_needed(&st, &s.id, "system prompt", &[], &abort).await;
+        assert_eq!(st.db.messages(&s.id).unwrap().len(), 7, "6 kept + 1 summary");
+        let mut noted = false;
+        while let Ok(ev) = events.try_recv() {
+            if let ServerEvent::Note { text, .. } = ev {
+                noted |= text.contains("compacted");
+            }
+        }
+        assert!(noted, "the user is told about the compaction");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

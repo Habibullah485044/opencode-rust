@@ -30,6 +30,9 @@ max_retries = 3
 
 [agent]
 max_steps = 40
+# Context window of your model in tokens; at ~80% the agent compacts older
+# messages automatically. 0 = off. The Kaggle/Ollama setup uses 8192.
+# context_tokens = 8192
 ponytail = true
 auto_review = true
 reuse_gate = true

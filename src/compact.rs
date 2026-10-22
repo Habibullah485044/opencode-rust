@@ -33,11 +33,16 @@ pub fn split_at(len: usize) -> Option<usize> {
 /// Serialize the prefix for the summarizer, keeping the *most recent* part
 /// when it exceeds the budget (recent context matters most).
 pub fn render_transcript(lines: &[String]) -> String {
+    render_transcript_within(lines, BUDGET)
+}
+
+/// [`render_transcript`] with an explicit byte budget.
+pub fn render_transcript_within(lines: &[String], budget: usize) -> String {
     let text = lines.join("\n");
-    if text.len() <= BUDGET {
+    if text.len() <= budget {
         return text;
     }
-    let mut start = text.len() - BUDGET;
+    let mut start = text.len() - budget;
     while !text.is_char_boundary(start) {
         start += 1;
     }
@@ -171,7 +176,13 @@ pub async fn compact(
     let summarized_ids: Vec<String> = prefix.iter().map(|m| m.id.clone()).collect();
 
     let lines = transcript_lines(&prefix);
-    let transcript = render_transcript(&lines);
+    // F-07: with a known context size the transcript gets at most half of
+    // it, so the summary request itself fits.
+    let budget = match st.cfg.agent.context_tokens {
+        0 => BUDGET,
+        t => t.saturating_mul(2).min(BUDGET),
+    };
+    let transcript = render_transcript_within(&lines, budget);
     let summary = summarize(st, &transcript, abort).await?;
     if summary.is_empty() {
         bail!("summarizer returned an empty summary — compaction cancelled");
