@@ -157,6 +157,9 @@ pub struct BrowserView {
     /// Set while an HTML overlay covers the panel. A native child view always
     /// paints above the page, so it must be hidden, not layered under.
     pub covered: bool,
+    /// New (B-42): the user closed the panel. Only an explicit `open()` (the
+    /// user or the agent asked for a page) shows it again.
+    pub user_closed: bool,
 }
 
 impl BrowserView {
@@ -166,6 +169,7 @@ impl BrowserView {
         self.error = None;
         self.loading = true;
         self.visible = true;
+        self.user_closed = false;
     }
 
     /// Refuse or fail: the native view cannot be composited under HTML, so it
@@ -460,7 +464,11 @@ impl GuiState {
             BrowserEvt::Url(url) => {
                 self.browser.url = url;
                 self.browser.error = None;
-                self.browser.visible = true;
+                // B-42: a page that navigates by itself (redirect, reload, hot
+                // reload) must not reopen a panel the user closed.
+                if !self.browser.user_closed {
+                    self.browser.visible = true;
+                }
             }
             BrowserEvt::Title(t) => self.browser.title = t,
             BrowserEvt::Loading(loading) => self.browser.loading = loading,
@@ -601,7 +609,9 @@ pub fn entries_from_messages(msgs: &[Message]) -> Vec<(EntryKind, String)> {
                 Part::Text { text } => out.push((base.clone(), text.clone())),
                 Part::Reasoning { text } => out.push((EntryKind::Thinking, format!("\u{273b} {text}"))),
                 Part::ToolCall { name, input, .. } => {
-                    out.push((EntryKind::Tool, format!("\u{23fa} {name}({input})")));
+                    // B-42: clipped like results; a `write` input is a whole file.
+                    let shown = clip(&input.to_string(), 160);
+                    out.push((EntryKind::Tool, format!("\u{23fa} {name}({shown})")));
                 }
                 Part::ToolResult { output, is_error, .. } => out.push((
                     EntryKind::Tool,
@@ -869,6 +879,14 @@ pub fn is_local_url(url: &str) -> bool {
     }
 }
 
+/// New (B-42): the newest chat, if it has no messages yet (reuse it instead of
+/// creating another empty "New chat").
+fn newest_empty_session(st: &server::AppState) -> Option<crate::db::Session> {
+    let newest = st.db.list_sessions().ok()?.into_iter().next()?;
+    let empty = st.db.messages(&newest.id).map(|m| m.is_empty()).unwrap_or(false);
+    empty.then_some(newest)
+}
+
 /// Refresh the sidebar chat list from the database.
 fn refresh_sessions(gs: &mut GuiState, st: &server::AppState) {
     if let Ok(list) = st.db.list_sessions() {
@@ -941,7 +959,11 @@ pub async fn run(
     prompt: Option<String>,
     boot_ms: u128,
 ) -> Result<()> {
-    let session = state.db.create_session(NEW_CHAT, None)?;
+    // B-42: reuse the newest chat while it is still empty.
+    let session = match newest_empty_session(&state) {
+        Some(s) => s,
+        None => state.db.create_session(NEW_CHAT, None)?,
+    };
     let mut gs = GuiState::new();
     gs.session = Some(session.id.clone());
     gs.approval_timeout_secs = state.cfg.permissions.approval_timeout_secs;
@@ -1207,6 +1229,8 @@ pub async fn run(
                                 changed = true;
                             }
                         }
+                        // B-42: already on an empty chat — nothing to create.
+                        UiMsg::Ipc(IpcMsg::NewSession) if gs.entries.is_empty() && !gs.busy => {}
                         UiMsg::Ipc(IpcMsg::NewSession) => match st.db.create_session(NEW_CHAT, None) {
                             Ok(s) => {
                                 // B-12: a running chat keeps its live transcript.
@@ -1344,6 +1368,7 @@ pub async fn run(
                         }
                         UiMsg::Ipc(IpcMsg::PanelVisible(visible)) => {
                             gs.browser.visible = visible;
+                            gs.browser.user_closed = !visible;
                             if let Some(wv) = &browser_webview {
                                 show_browser(wv, &gs.browser);
                             }
@@ -2144,6 +2169,46 @@ mod tests {
         )]);
         assert!(long[0].1.chars().count() < 200);
         assert!(long[0].1.contains('\u{2717}'));
+    }
+
+    /// B-42: a replayed `write` call does not dump the whole file.
+    #[test]
+    fn replayed_tool_calls_are_clipped() {
+        let input = serde_json::json!({ "path": "a.rs", "content": "x".repeat(5_000) });
+        let msgs = vec![Message {
+            id: "m".into(),
+            session_id: "s".into(),
+            role: "assistant".into(),
+            parts: vec![Part::ToolCall { id: "t".into(), name: "write".into(), input }],
+            created_at: 0,
+        }];
+        let e = entries_from_messages(&msgs);
+        assert!(e[0].1.chars().count() < 200, "{} chars", e[0].1.chars().count());
+    }
+
+    /// B-42: a page navigating by itself does not reopen a closed panel.
+    #[test]
+    fn a_closed_panel_stays_closed_when_the_page_navigates() {
+        let mut g = GuiState::new();
+        g.browser.open("http://localhost:3000");
+        // What `IpcMsg::PanelVisible(false)` does when the user closes it:
+        g.browser.visible = false;
+        g.browser.user_closed = true;
+        g.on_browser_event(BrowserEvt::Url("http://localhost:3000/next".into()));
+        assert!(!g.browser.visible);
+        g.browser.open("http://localhost:3000/agent");
+        assert!(g.browser.visible, "an explicit open still shows it");
+    }
+
+    /// B-42: start-up reuses the newest chat only while it is empty.
+    #[tokio::test]
+    async fn startup_reuses_an_empty_newest_chat() {
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
+            .await;
+        let s = st.db.create_session(NEW_CHAT, None).unwrap();
+        assert_eq!(newest_empty_session(&st).map(|x| x.id), Some(s.id.clone()));
+        st.db.add_message(&s.id, "user", &[Part::Text { text: "hi".into() }]).unwrap();
+        assert!(newest_empty_session(&st).is_none(), "a chat with messages is not reused");
     }
 
     #[test]
