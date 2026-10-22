@@ -390,6 +390,15 @@ async fn headless_run(
                 for d in &proposal.diff {
                     println!("{d}");
                 }
+                // S-15: nobody can answer the preview in headless mode, so
+                // write only with the same opt-in switch as tool approvals.
+                if !headless_auto_approve() {
+                    eprintln!(
+                        "[edit] preview only, nothing written. Re-run with --yes \
+                         (or set OPENCODE_RUST_AUTO_APPROVE=1) to apply it."
+                    );
+                    std::process::exit(2);
+                }
                 // Snapshot first so /undo can revert the inline edit.
                 if let Err(e) = opencode_rust::gitsnap::record_before_run(
                     &state.workspace,

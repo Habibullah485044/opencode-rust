@@ -42,11 +42,28 @@ pub fn resolve_in_workspace(workspace: &Path, path: &str) -> Result<PathBuf> {
     if p.components().any(|c| matches!(c, Component::ParentDir)) {
         bail!("path may not contain `..`");
     }
-    let abs = workspace.join(p);
-    if !abs.starts_with(workspace) {
-        bail!("path escapes the workspace");
+    // Windows `\x` or `C:x` are rooted without being "absolute".
+    if p.components().any(|c| matches!(c, Component::RootDir | Component::Prefix(_))) {
+        bail!("inline edit is limited to the workspace (rooted path not allowed)");
     }
-    Ok(abs)
+    // S-15: `confine_path` (S-03) also resolves symlinks, so a link inside
+    // the workspace that points outside it is refused here too.
+    crate::tools::confine_path(workspace, path)
+}
+
+/// S-15: `/edit` obeys the permission rules like the agent's own tools. A
+/// `deny` rule for `read` (the file goes to the model) or `edit` (the file
+/// is rewritten) on this path stops it before anything is read. `ask`
+/// needs no extra prompt: the diff preview is the question.
+pub fn check_edit_allowed(st: &Shared, path: &str) -> Result<()> {
+    let detail = crate::permissions::normalize_path_detail(&st.workspace, path);
+    for tool in ["read", "edit"] {
+        let decision = st.engine.evaluate(tool, &detail, |_, _| false);
+        if decision.action == crate::permissions::Action::Deny {
+            bail!("a permission rule denies `{tool}` for {detail} (rule {})", decision.key);
+        }
+    }
+    Ok(())
 }
 
 /// Ask the model for the new file content, then build the diff preview.
@@ -60,6 +77,7 @@ pub async fn propose(
         bail!("edit instruction is empty");
     }
     let abs = resolve_in_workspace(&st.workspace, path)?;
+    check_edit_allowed(st, path)?;
     let old = std::fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
     if old.len() > MAX_EDIT_BYTES {
         bail!("file is {} bytes; inline /edit caps at {MAX_EDIT_BYTES} bytes", old.len());
@@ -238,9 +256,18 @@ impl JumpTracker {
 mod tests {
     use super::*;
 
+    /// A fresh, empty workspace folder for one test.
+    fn temp_ws(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ocrs-ws-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn resolve_rejects_absolute_and_parent_escapes() {
-        let ws = Path::new("/ws");
+        let ws_buf = temp_ws("rejects");
+        let ws = ws_buf.as_path();
         assert!(resolve_in_workspace(ws, "src/main.rs").is_ok());
         assert!(resolve_in_workspace(ws, "").is_err());
         // `\` separates path parts only on Windows. On Linux/macOS
@@ -263,10 +290,42 @@ mod tests {
 
     #[test]
     fn resolve_keeps_relative_paths_inside_workspace() {
-        let ws = Path::new("/ws");
-        let abs = resolve_in_workspace(ws, "nested/dir/file.txt").unwrap();
-        assert!(abs.starts_with(ws));
-        assert!(abs.ends_with(Path::new("nested/dir/file.txt")) || abs.ends_with(Path::new("nested\\dir\\file.txt")));
+        let ws = temp_ws("keeps");
+        let rel = Path::new("nested").join("dir").join("file.txt");
+        let abs = resolve_in_workspace(&ws, rel.to_str().unwrap()).unwrap();
+        assert!(abs.starts_with(ws.canonicalize().unwrap()) || abs.starts_with(&ws));
+        assert!(abs.ends_with(&rel));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_refuses_a_symlink_that_leaves_the_workspace() {
+        let ws = temp_ws("symlink");
+        let outside = temp_ws("symlink-outside");
+        std::fs::write(outside.join("secret.txt"), "s").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("link")).unwrap();
+        assert!(resolve_in_workspace(&ws, "link/secret.txt").is_err());
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[tokio::test]
+    async fn propose_obeys_deny_rules() {
+        let dir = temp_ws("deny");
+        std::fs::write(dir.join(".env"), "TOKEN=1\n").unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.rules.push(crate::config::RuleCfg {
+            tool: "edit".into(),
+            pattern: ".env".into(),
+            action: "deny".into(),
+        });
+        let st = crate::server::build_state_ephemeral(cfg, dir.clone()).await;
+        let abort = AtomicBool::new(false);
+        // The check runs before any model call, so no mock server is needed.
+        let err = propose(&st, ".env", "change it", &abort).await.unwrap_err();
+        assert!(err.to_string().contains("denies"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
