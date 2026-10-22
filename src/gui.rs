@@ -457,9 +457,8 @@ impl GuiState {
             }
             BrowserEvt::Title(t) => self.browser.title = t,
             BrowserEvt::Loading(loading) => self.browser.loading = loading,
-            BrowserEvt::Blocked(url) => {
-                self.browser.fail(format!("Blocked: `{url}` — the panel only loads http(s) pages."))
-            }
+            // The message was already written by `check_navigation`.
+            BrowserEvt::Blocked(msg) => self.browser.fail(msg),
             // Requests/responses are matched by id in the event loop, not here.
             BrowserEvt::Eval(_) => {}
         }
@@ -610,7 +609,8 @@ pub enum BrowserEvt {
     Url(String),
     Title(String),
     Loading(bool),
-    /// A scheme we refuse to load (file://, javascript:, …).
+    /// A navigation we refused. Carries the message the panel shows
+    /// (written by `check_navigation`).
     Blocked(String),
     /// A result frame posted by the injected page runtime (Goal B).
     Eval(String),
@@ -660,6 +660,21 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "stop" => Some(IpcMsg::Stop),
         _ => None,
     }
+}
+
+/// New (S-11): the one rule for every page the preview panel opens — typed
+/// URLs, the agent's `browser_navigate`, the dev-server button, links,
+/// redirects and back/forward. `Err` carries the message the panel shows.
+pub fn check_navigation(url: &str, allow_remote: bool) -> Result<(), String> {
+    if !is_allowed_scheme(url) {
+        return Err(format!("Blocked: `{url}` — the panel only loads http(s) pages."));
+    }
+    if !allow_remote && !is_local_url(url) {
+        return Err(format!(
+            "`{url}` is blocked: this panel is dev-server-only ([browser] allow_remote = false)."
+        ));
+    }
+    Ok(())
 }
 
 /// Schemes the panel may load. Anything else (`file:`, `javascript:`, `data:`)
@@ -927,6 +942,7 @@ pub async fn run(
     gs.browser.home = state.cfg.browser.home_url.clone();
     let browser_enabled = state.cfg.browser.enabled;
     let browser_webview: Option<wry::WebView> = if browser_enabled {
+        let allow_remote = state.cfg.browser.allow_remote;
         let nav_tx = ui_tx.clone();
         let nav_proxy = event_loop.create_proxy();
         let eval_tx = ui_tx.clone();
@@ -948,11 +964,17 @@ pub async fn run(
                 let _ = eval_proxy.send_event(AppEvent::Wake);
             })
             .with_navigation_handler(move |url: String| {
-                let allowed = is_allowed_scheme(&url);
-                if allowed {
-                    let _ = nav_tx.send(UiMsg::Browser(BrowserEvt::Url(url)));
-                } else {
-                    let _ = nav_tx.send(UiMsg::Browser(BrowserEvt::Blocked(url)));
+                // S-11: links, redirects and page scripts follow the same rule
+                // as typed URLs, including `allow_remote = false`.
+                let verdict = check_navigation(&url, allow_remote);
+                let allowed = verdict.is_ok();
+                match verdict {
+                    Ok(()) => {
+                        let _ = nav_tx.send(UiMsg::Browser(BrowserEvt::Url(url)));
+                    }
+                    Err(msg) => {
+                        let _ = nav_tx.send(UiMsg::Browser(BrowserEvt::Blocked(msg)));
+                    }
                 }
                 let _ = nav_proxy.send_event(AppEvent::Wake);
                 allowed
@@ -1020,14 +1042,22 @@ pub async fn run(
     // that URL at boot and logs every webview callback. It exists because the
     // child view can only be verified by a human clicking the window
     // otherwise — this makes "does a real page actually render?" testable.
-    if let (Some(wv), Ok(url)) = (&browser_webview, std::env::var("OPENCODE_RUST_PREVIEW_SMOKE")) {
-        let rect = PanelRect { x: 800.0, y: 80.0, w: 440.0, h: 700.0 };
-        gs.browser.rect = Some(rect);
-        gs.browser.open(&url);
-        let _ = wv.set_bounds(rect.to_wry());
-        let _ = wv.set_visible(true);
-        let _ = wv.load_url(&url);
-        eprintln!("[preview-smoke] loading {url}");
+    if let (Some(wv), Ok(raw)) = (&browser_webview, std::env::var("OPENCODE_RUST_PREVIEW_SMOKE")) {
+        // S-11: the diagnostic hook obeys the same rule as the URL bar.
+        let checked = normalize_url(&raw)
+            .and_then(|url| check_navigation(&url, state.cfg.browser.allow_remote).map(|()| url));
+        match checked {
+            Ok(url) => {
+                let rect = PanelRect { x: 800.0, y: 80.0, w: 440.0, h: 700.0 };
+                gs.browser.rect = Some(rect);
+                gs.browser.open(&url);
+                let _ = wv.set_bounds(rect.to_wry());
+                let _ = wv.set_visible(true);
+                let _ = wv.load_url(&url);
+                eprintln!("[preview-smoke] loading {url}");
+            }
+            Err(e) => eprintln!("[preview-smoke] refused: {e}"),
+        }
     }
 
     // First paint (the page also asks for one via IpcMsg::Ready once loaded),
@@ -1158,18 +1188,12 @@ pub async fn run(
                             changed = true;
                         }
                         UiMsg::Ipc(IpcMsg::Browse(raw)) => {
-                            match normalize_url(&raw) {
-                                // `allow_remote = false` makes this a dev-server-only
-                                // surface; refuse the rest instead of loading it.
-                                Ok(url) if !st.cfg.browser.allow_remote && !is_local_url(&url) => {
-                                    gs.browser.fail(format!(
-                                        "`{url}` is blocked: this panel is dev-server-only \
-                                         ([browser] allow_remote = false)."
-                                    ));
-                                    if let Some(wv) = &browser_webview {
-                                        show_browser(wv, &gs.browser);
-                                    }
-                                }
+                            // S-11: typed URLs pass the same check as links,
+                            // redirects, the dev-server button and the agent.
+                            let target = normalize_url(&raw).and_then(|url| {
+                                check_navigation(&url, st.cfg.browser.allow_remote).map(|()| url)
+                            });
+                            match target {
                                 Ok(url) => match &browser_webview {
                                     Some(wv) => {
                                         gs.browser.open(&url);
@@ -1236,12 +1260,19 @@ pub async fn run(
                                     if home.is_empty() { None } else { Some(home) }
                                 })
                                 .unwrap_or_else(|| "http://localhost:3000".into());
-                            match normalize_url(&target) {
+                            // S-11: the button obeys `allow_remote` too.
+                            let checked = normalize_url(&target).and_then(|url| {
+                                check_navigation(&url, st.cfg.browser.allow_remote).map(|()| url)
+                            });
+                            match checked {
                                 Ok(u) => {
                                     if let Some(wv) = &browser_webview {
                                         gs.browser.open(&u);
                                         show_browser(wv, &gs.browser);
-                                        let _ = wv.load_url(&u);
+                                        if let Err(e) = wv.load_url(&u) {
+                                            gs.browser.fail(format!("navigate failed: {e}"));
+                                            show_browser(wv, &gs.browser);
+                                        }
                                     } else {
                                         gs.browser.fail(if browser_enabled {
                                             "Preview panel unavailable on this system."
@@ -1250,7 +1281,12 @@ pub async fn run(
                                         });
                                     }
                                 }
-                                Err(e) => gs.browser.fail(e),
+                                Err(e) => {
+                                    gs.browser.fail(e);
+                                    if let Some(wv) = &browser_webview {
+                                        show_browser(wv, &gs.browser);
+                                    }
+                                }
                             }
                             changed = true;
                         }
@@ -1365,8 +1401,11 @@ impl Bridge {
         match req.method.as_str() {
             "navigate" => {
                 let raw = req.input.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                match normalize_url(raw) {
-                    Ok(url) if allow_remote || is_local_url(&url) => {
+                // S-11: the same rule as every other way of opening a page.
+                let checked = normalize_url(raw)
+                    .and_then(|url| check_navigation(&url, allow_remote).map(|()| url));
+                match checked {
+                    Ok(url) => {
                         view.open(&url);
                         show_browser(wv, view);
                         if let Err(e) = wv.load_url(&url) {
@@ -1375,12 +1414,6 @@ impl Bridge {
                         }
                         // Resolved by the next Loading(false) event.
                         self.nav = Some((req.reply, deadline));
-                    }
-                    Ok(url) => {
-                        let _ = req.reply.send(Err(format!(
-                            "`{url}` is blocked: the panel is dev-server-only \
-                             ([browser] allow_remote = false)"
-                        )));
                     }
                     Err(e) => {
                         let _ = req.reply.send(Err(e));
@@ -1828,6 +1861,19 @@ mod tests {
         assert!(is_allowed_scheme("about:blank"));
     }
 
+    /// S-11: one rule for typed URLs, links, redirects, the dev-server
+    /// button and agent navigation.
+    #[test]
+    fn check_navigation_applies_scheme_and_allow_remote() {
+        assert!(check_navigation("http://localhost:3000/", false).is_ok());
+        assert!(check_navigation("about:blank", false).is_ok());
+        assert!(check_navigation("https://example.com/", true).is_ok());
+        let remote = check_navigation("https://example.com/", false).unwrap_err();
+        assert!(remote.contains("allow_remote"), "{remote}");
+        let scheme = check_navigation("file:///etc/hosts", true).unwrap_err();
+        assert!(scheme.contains("http(s)"), "{scheme}");
+    }
+
     /// A-B1: CSS pixels are logical pixels. `Rect` must not be pre-multiplied
     /// by the scale factor or the child view lands off-panel on a 125% display.
     #[test]
@@ -1912,7 +1958,8 @@ mod tests {
         assert!(g.browser.has_page());
         assert!(!g.browser.loading);
         assert!(g.browser.visible);
-        g.on_browser_event(BrowserEvt::Blocked("file:///etc/passwd".into()));
+        let refusal = check_navigation("file:///etc/passwd", true).unwrap_err();
+        g.on_browser_event(BrowserEvt::Blocked(refusal));
         assert!(!g.browser.visible, "a native view over an error card is unreadable");
         assert!(g.browser.error.unwrap().contains("Blocked"));
     }
