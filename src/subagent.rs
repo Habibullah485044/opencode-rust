@@ -38,6 +38,48 @@ pub fn spawn_spec() -> ToolSpec {
     }
 }
 
+/// Most subagents one parent session may run at the same time (B-27).
+pub const MAX_RUNNING_SUBAGENTS: usize = 4;
+
+/// Running children per parent session (B-27).
+fn running() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static RUNNING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    RUNNING.get_or_init(Default::default)
+}
+
+/// One running child (B-27). The slot is given back when this value is
+/// dropped, also on error, abort or panic.
+struct SpawnSlot(String);
+
+impl SpawnSlot {
+    fn take(parent: &str) -> Result<Self> {
+        let mut map = running().lock().map_err(|_| anyhow!("subagent counter is poisoned"))?;
+        let count = map.entry(parent.to_string()).or_insert(0);
+        if *count >= MAX_RUNNING_SUBAGENTS {
+            return Err(anyhow!(
+                "too many subagents at once: at most {MAX_RUNNING_SUBAGENTS} can run for this \
+                 session. Wait for their results, then spawn the rest."
+            ));
+        }
+        *count += 1;
+        Ok(SpawnSlot(parent.to_string()))
+    }
+}
+
+impl Drop for SpawnSlot {
+    fn drop(&mut self) {
+        if let Ok(mut map) = running().lock() {
+            if let Some(count) = map.get_mut(&self.0) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    map.remove(&self.0);
+                }
+            }
+        }
+    }
+}
+
 /// Execute a `spawn` call: child session + restricted loop, summary back.
 pub async fn spawn_subagent(
     st: &Shared,
@@ -56,6 +98,8 @@ pub async fn spawn_subagent(
         .ok_or_else(|| anyhow!("missing `task` — give the subagent a complete task"))?;
     let def = agents::find_subagent(name)
         .ok_or_else(|| anyhow!("unknown subagent `{name}` (available: explore, worker)"))?;
+    // B-27: held until this function returns.
+    let _slot = SpawnSlot::take(parent_session_id)?;
 
     let session = st.db.create_session(&format!("sub:{name}"), Some(parent_session_id))?;
     st.db
@@ -73,6 +117,12 @@ pub async fn spawn_subagent(
         ponytail: st.cfg.agent.ponytail,
         baked: &crate::skills::load_baked(&st.skill_base),
     });
+    // B-27: the shared prompt says "ask when unclear"; a child has nobody to ask.
+    const CHILD_RULES: &str = "\n\n## Running as a subagent\n\n\
+        Nobody can answer questions during this run. Do not ask clarifying \
+        questions: make the most reasonable assumption, say which one in your \
+        summary, and finish the task.";
+    let system = format!("{system}{CHILD_RULES}");
     // M7: the agents panel watches this run through `AgentStatus` events.
     let agent = AgentInfo {
         id: session.id.clone(),
@@ -95,6 +145,11 @@ pub async fn spawn_subagent(
             return Err(e);
         }
     };
+    // B-27: run_loop returns "aborted" when stopped; that is not a result.
+    if abort.load(std::sync::atomic::Ordering::SeqCst) || out.trim() == "aborted" {
+        agent_status(st, &agent, "failed", "aborted".into());
+        return Err(anyhow!("subagent `{name}` was aborted before it finished"));
+    }
     let summary = if out.trim().is_empty() { "(no summary)".into() } else { out };
     let mut summary = summary;
     if summary.chars().count() > 4000 {
@@ -426,4 +481,46 @@ data: [DONE]
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[cfg(test)]
+mod b27_tests {
+    use super::*;
+
+    #[test]
+    fn running_subagents_are_capped_per_parent() {
+        let parent = format!("ses_b27_cap_{}", std::process::id());
+        let slots: Vec<SpawnSlot> =
+            (0..MAX_RUNNING_SUBAGENTS).map(|_| SpawnSlot::take(&parent).unwrap()).collect();
+        let err = SpawnSlot::take(&parent).err().expect("cap reached").to_string();
+        assert!(err.contains("at most"), "{err}");
+        assert!(SpawnSlot::take("ses_b27_other").is_ok(), "other sessions are not affected");
+        drop(slots);
+        assert!(SpawnSlot::take(&parent).is_ok(), "slots come back when children finish");
+    }
+
+    #[tokio::test]
+    async fn aborted_subagent_is_not_reported_done() {
+        let dir = std::env::temp_dir().join(format!("ocrs-b27-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:9".into();
+        let st = crate::server::build_state_ephemeral(cfg, dir.clone()).await;
+        let parent = st.db.create_session("p", None).unwrap();
+        let mut rx = st.events.subscribe();
+        let abort = AtomicBool::new(true);
+        let args = json!({"subagent": "explore", "task": "look around"});
+        let err = spawn_subagent(&st, &parent.id, &args, &abort).await.unwrap_err();
+        assert!(err.to_string().contains("aborted"), "{err}");
+        let mut states = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::server::ServerEvent::AgentStatus { state, .. } = ev {
+                states.push(state);
+            }
+        }
+        assert!(!states.iter().any(|s| s == "done"), "{states:?}");
+        assert_eq!(states.last().map(String::as_str), Some("failed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
