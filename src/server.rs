@@ -1442,7 +1442,10 @@ fn finish_tool_call(
     mut output: String,
     ok: bool,
 ) -> Result<()> {
-    account_tool(st, session_id, name, input);
+    // New (P-01): refused, blocked or failed calls changed nothing.
+    if ok {
+        account_tool(st, session_id, name, input);
+    }
     // A dev server announces itself on stdout (Vite, Next, uvicorn, cargo run…).
     // Surfacing it here means the panel can offer "open" without the model
     // having to remember the port.
@@ -1521,8 +1524,9 @@ fn account_tool(st: &Shared, session_id: &str, name: &str, input: &Value) {
                 s.added += content.lines().count() as u64;
             }
             "edit" => {
-                let old = input.get("old").and_then(Value::as_str).unwrap_or("");
-                let new = input.get("new").and_then(Value::as_str).unwrap_or("");
+                // New (P-01): the edit tool's keys are old_str / new_str.
+                let old = input.get("old_str").and_then(Value::as_str).unwrap_or("");
+                let new = input.get("new_str").and_then(Value::as_str).unwrap_or("");
                 s.edits += 1;
                 s.deleted += old.lines().count() as u64;
                 s.added += new.lines().count() as u64;
@@ -2363,6 +2367,61 @@ mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
 
+    /// P-01: a refused call adds nothing to the Laziness Meter (and so
+    /// triggers no automatic review).
+    #[tokio::test]
+    async fn refused_write_is_not_counted() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::AtomicUsize;
+        let dir = std::env::temp_dir().join(format!("ocrs-p01-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |_body: axum::extract::Json<Value>| {
+                let calls = calls2.clone();
+                async move {
+                    let payload = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_w1\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"made.txt\\\",\\\"content\\\":\\\"hello\\\\n\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    } else {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                    };
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        cfg.permissions.rules.push(crate::config::RuleCfg {
+            tool: "write".into(),
+            pattern: "*".into(),
+            action: "deny".into(),
+        });
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("p01", None).unwrap();
+
+        run_agent(&st, &s.id, "make a file", Arc::new(AtomicBool::new(false))).await;
+
+        assert!(!dir.join("made.txt").exists(), "the write was refused");
+        let debt = st.debt_report(&s.id);
+        assert!(debt.contains("+0"), "{debt}");
+        assert!(debt.contains("0 write(s)"), "{debt}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no review run was started");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// B-26: running out of steps is reported, not a silent empty answer.
     #[tokio::test]
     async fn max_steps_exhaustion_is_reported() {
@@ -3135,7 +3194,7 @@ data: [DONE]
         let cfg = crate::config::Config::default();
         let st = build_state_ephemeral(cfg, dir).await;
         account_tool(&st, "s1", "write", &serde_json::json!({"path": "a", "content": "x\ny\nz"}));
-        account_tool(&st, "s1", "edit", &serde_json::json!({"old": "a\nb", "new": "a"}));
+        account_tool(&st, "s1", "edit", &serde_json::json!({"old_str": "a\nb", "new_str": "a"}));
         bump_hints(&st, "s1");
         let report = st.debt_report("s1");
         assert!(report.contains("+4"), "3 written + 1 edited: {report}");
