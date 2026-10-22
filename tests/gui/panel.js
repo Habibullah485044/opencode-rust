@@ -210,6 +210,25 @@
   }));
   ok("agent navigation opens the panel", !panel.classList.contains("collapsed"));
 
+  // --- B-37: incremental transcript ---
+  var tp = payload({ url: "", title: "", can_back: false, can_forward: false, loading: false, error: null, visible: false });
+  tp.entries = [{ k: "u", t: "› hi" }, { k: "t", t: "✻ think" }, { k: "a", t: "Hel" }];
+  window.render(tp);
+  var logEl = document.getElementById("log");
+  var firstRow = logEl.children[0];
+  logEl.querySelector("details").open = true;
+  var tp2 = Object.assign({}, tp, { entries: [{ k: "a", t: "Hello **there**" }], entries_from: 2, entries_len: 3 });
+  window.render(tp2);
+  ok("a tail update keeps earlier rows", logEl.children.length === 3 && logEl.children[0] === firstRow);
+  ok("a tail update renders the new text", /Hello/.test(logEl.children[2].textContent) &&
+    !!logEl.children[2].querySelector("strong"));
+  ok("an open reasoning box stays open", logEl.querySelector("details").open === true);
+  sent = [];
+  window.render(Object.assign({}, tp, { entries: [{ k: "a", t: "x" }], entries_from: 7, entries_len: 8 }));
+  ok("a gap asks Rust for a full resend", count("resync") === 1, JSON.stringify(sent));
+  window.render(Object.assign({}, tp, { entries: [] }));
+  ok("an empty list clears the transcript", logEl.children.length === 0, logEl.children.length);
+
   // --- D1: approval modal ---
   function withApproval(ap) {
     return Object.assign(

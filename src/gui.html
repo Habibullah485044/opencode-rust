@@ -1626,6 +1626,148 @@
     }, 1600);
   };
 
+  // ---- B-37: transcript rendering, one row per entry ----
+  // Rows are kept between paints. A streamed token only changes the last
+  // entry, so only that row is redrawn; open reasoning boxes and text
+  // selections in older rows survive.
+  function buildRow(e) {
+    var text = e.t || "";
+    var row = document.createElement("div");
+    if (e.k === "u") {
+      row.className = "e-row u";
+      var ub = document.createElement("div");
+      ub.className = "e-bubble-u";
+      ub.textContent = text.replace(/^›\s*/, "");
+      row.appendChild(ub);
+    } else if (e.k === "a") {
+      row.className = "e-row a";
+      var head = document.createElement("div");
+      head.className = "assistant-header";
+      head.innerHTML = '<span class="assistant-avatar">H</span><span class="assistant-name">Habi</span>';
+      var ab = document.createElement("div");
+      ab.className = "e-bubble-a";
+      ab.innerHTML = renderMarkdown(text);
+      row.appendChild(head);
+      row.appendChild(ab);
+    } else if (e.k === "t") {
+      row.className = "e-row";
+      var details = document.createElement("details");
+      details.className = "thinking-box";
+      var summary = document.createElement("summary");
+      summary.innerHTML = '<span class="thinking-pulse"></span><span>Reasoning Process</span>';
+      var body = document.createElement("div");
+      body.className = "thinking-content";
+      body.textContent = text.replace(/^[✻\s]*/, "");
+      details.appendChild(summary);
+      details.appendChild(body);
+      row.appendChild(details);
+    } else if (e.k === "w") {
+      row.className = "e-row";
+      var toolCard = document.createElement("div");
+      toolCard.className = "tool-card";
+      toolCard.innerHTML = '<span class="t-icon">⚡</span><span>' + esc(text) + '</span>';
+      row.appendChild(toolCard);
+    } else if (e.k === "x") {
+      row.className = "e-row";
+      var errDiv = document.createElement("div");
+      errDiv.className = "e-err";
+      errDiv.textContent = text;
+      row.appendChild(errDiv);
+    } else {
+      row.className = "e-row";
+      var sysDiv = document.createElement("div");
+      sysDiv.className = "e-sys";
+      sysDiv.textContent = text;
+      row.appendChild(sysDiv);
+    }
+    row._k = e.k;
+    row._t = text;
+    return row;
+  }
+
+  // Bring one existing row up to date with entry `e`; returns the row that is
+  // now in the list. A reasoning box is updated in place so it stays open
+  // while it streams; an assistant bubble only re-renders its own Markdown.
+  function updateRow(log, row, e) {
+    var text = e.t || "";
+    if (row._k === e.k && row._t === text) return row;
+    var target = null;
+    if (row._k === e.k && e.k === "t") target = row.querySelector(".thinking-content");
+    if (row._k === e.k && e.k === "a") target = row.querySelector(".e-bubble-a");
+    if (target && e.k === "t") {
+      target.textContent = text.replace(/^[✻\s]*/, "");
+      row._t = text;
+      return row;
+    }
+    if (target && e.k === "a") {
+      target.innerHTML = renderMarkdown(text);
+      row._t = text;
+      return row;
+    }
+    var fresh = buildRow(e);
+    log.replaceChild(fresh, row);
+    return fresh;
+  }
+
+  // Render the transcript. Rust may send only the changed tail:
+  // `entries` = entries[entries_from..] of a list that is `entries_len` long.
+  // Without those two keys, `entries` is the whole list.
+  function renderTranscript(d) {
+    var log = document.getElementById("log");
+    var entries = document.getElementById("entries");
+    if (!log) return;
+    var session = d.session || "";
+    var list = d.entries || [];
+    var from = typeof d.entries_from === "number" ? d.entries_from : 0;
+    var total = typeof d.entries_len === "number" ? d.entries_len : from + list.length;
+    var sameChat = log._rows !== undefined && log._session === session;
+    var rows = sameChat ? log._rows : [];
+    if (!sameChat) log.textContent = "";
+    log._rows = rows;
+    log._session = session;
+    if (from > rows.length) {
+      // We missed a paint (for example the page reloaded): ask for all.
+      postToRust({ type: "resync" });
+      return;
+    }
+    // Keep the reader's place: follow new text only if they were at the bottom.
+    var stick = true;
+    if (entries && sameChat) {
+      stick = entries.scrollHeight - entries.scrollTop - entries.clientHeight < 60;
+    }
+    var saved = entries ? entries.scrollTop : 0;
+    var changed = !sameChat;
+    for (var j = 0; j < list.length; j++) {
+      var e = list[j];
+      var idx = from + j;
+      if (idx < rows.length) {
+        var old = rows[idx];
+        if (old._k !== e.k || old._t !== (e.t || "")) {
+          rows[idx] = updateRow(log, old, e);
+          changed = true;
+        }
+      } else {
+        var row = buildRow(e);
+        log.appendChild(row);
+        rows.push(row);
+        changed = true;
+      }
+    }
+    while (rows.length > total) {
+      log.removeChild(rows.pop());
+      changed = true;
+    }
+    if (!changed || !entries) return;
+    if (stick) {
+      entries.scrollTop = entries.scrollHeight;
+    } else {
+      // Restore the reading position instantly (no smooth animation).
+      entries.style.scrollBehavior = "auto";
+      entries.scrollTop = saved;
+      entries.style.scrollBehavior = "";
+    }
+  }
+
   // Called by Rust: window.render(d)
   window.render = function (d) {
     if (!d) return;
@@ -1738,97 +1880,9 @@
       modeHint.classList.toggle("manual", permMode === "manual");
     }
 
-    // Render Transcript Entries — rebuild only when they changed, and keep
-    // the reader's place: auto-scroll only when they were already at the
-    // bottom, so a heartbeat repaint can't yank them back down mid-read.
-    var log = document.getElementById("log");
-    var entries = document.getElementById("entries");
-    var sig = JSON.stringify(d.entries || []) + "\u0000" + (d.session || "");
-    if (log && log._sig !== sig) {
-      var stick = true;
-      if (entries && log._sig !== undefined && log._session === (d.session || "")) {
-        stick = entries.scrollHeight - entries.scrollTop - entries.clientHeight < 60;
-      }
-      var saved = entries ? entries.scrollTop : 0;
-      log._sig = sig;
-      log._session = d.session || "";
-      log.textContent = "";
+    // Render Transcript Entries (B-37: incremental, see renderTranscript).
+    renderTranscript(d);
 
-      if (d.entries && d.entries.length) {
-        for (var j = 0; j < d.entries.length; j++) {
-          var e = d.entries[j];
-          var text = e.t || "";
-          var row = document.createElement("div");
-
-          if (e.k === "u") {
-            row.className = "e-row u";
-            var ub = document.createElement("div");
-            ub.className = "e-bubble-u";
-            ub.textContent = text.replace(/^›\s*/, "");
-            row.appendChild(ub);
-          } else if (e.k === "a") {
-            row.className = "e-row a";
-            var head = document.createElement("div");
-            head.className = "assistant-header";
-            head.innerHTML = '<span class="assistant-avatar">H</span><span class="assistant-name">Habi</span>';
-            
-            var ab = document.createElement("div");
-            ab.className = "e-bubble-a";
-            ab.innerHTML = renderMarkdown(text);
-
-            row.appendChild(head);
-            row.appendChild(ab);
-          } else if (e.k === "t") {
-            row.className = "e-row";
-            var details = document.createElement("details");
-            details.className = "thinking-box";
-            details.open = false;
-            
-            var summary = document.createElement("summary");
-            summary.innerHTML = '<span class="thinking-pulse"></span><span>Reasoning Process</span>';
-            
-            var body = document.createElement("div");
-            body.className = "thinking-content";
-            body.textContent = text.replace(/^[✻\s]*/, "");
-
-            details.appendChild(summary);
-            details.appendChild(body);
-            row.appendChild(details);
-          } else if (e.k === "w") {
-            row.className = "e-row";
-            var toolCard = document.createElement("div");
-            toolCard.className = "tool-card";
-            toolCard.innerHTML = '<span class="t-icon">⚡</span><span>' + esc(text) + '</span>';
-            row.appendChild(toolCard);
-          } else if (e.k === "x") {
-            row.className = "e-row";
-            var errDiv = document.createElement("div");
-            errDiv.className = "e-err";
-            errDiv.textContent = text;
-            row.appendChild(errDiv);
-          } else {
-            row.className = "e-row";
-            var sysDiv = document.createElement("div");
-            sysDiv.className = "e-sys";
-            sysDiv.textContent = text;
-            row.appendChild(sysDiv);
-          }
-
-          log.appendChild(row);
-        }
-      }
-
-      if (entries) {
-        if (stick) {
-          entries.scrollTop = entries.scrollHeight;
-        } else {
-          // Restore the reading position instantly (no smooth animation).
-          entries.style.scrollBehavior = "auto";
-          entries.scrollTop = saved;
-          entries.style.scrollBehavior = "";
-        }
-      }
-    }
 
     // ---- Preview panel chrome (A-F1 / A-F2 / A-F4) ----
     // Goal A: the panel is a native child webview, so this block only keeps the
@@ -1922,7 +1976,9 @@
 
     var empty = document.getElementById("empty");
     if (empty) {
-      empty.style.display = (d.entries && d.entries.length) ? "none" : "";
+      // B-37: `entries` may be only the changed tail; `entries_len` is the count.
+      var count = typeof d.entries_len === "number" ? d.entries_len : (d.entries || []).length;
+      empty.style.display = count ? "none" : "";
     }
   };
 

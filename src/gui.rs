@@ -58,6 +58,11 @@ pub struct GuiState {
     /// Autonomy mode shown by the composer selector. The core owns the real
     /// value; this mirrors it for the page.
     pub perm_mode: PermissionMode,
+    /// New (B-37): the entries as the page last received them, and for which
+    /// chat, so a paint only sends what changed. `RefCell` because painting
+    /// only has `&GuiState`.
+    sent: std::cell::RefCell<Vec<(EntryKind, String)>>,
+    sent_session: std::cell::RefCell<Option<String>>,
 }
 
 /// One `ask` decision the engine is blocked on. The core holds the actual
@@ -97,6 +102,8 @@ impl Default for GuiState {
             approval: None,
             approval_timeout_secs: 300,
             perm_mode: PermissionMode::Default,
+            sent: std::cell::RefCell::new(Vec::new()),
+            sent_session: std::cell::RefCell::new(None),
         }
     }
 }
@@ -482,9 +489,43 @@ impl GuiState {
 
     /// JSON payload for `window.render(...)` — keys are read by gui.html.
     pub fn payload(&self) -> String {
+        self.payload_from(0)
+    }
+
+    /// New (B-37): the payload for a paint. It sends only the entries that
+    /// changed since the last paint; the page keeps the rows it already has.
+    pub fn paint_payload(&self) -> String {
+        let mut sent = self.sent.borrow_mut();
+        // Another chat on screen: the page rebuilds, so send everything.
+        if *self.sent_session.borrow() != self.session {
+            sent.clear();
+            *self.sent_session.borrow_mut() = self.session.clone();
+        }
+        let from = self
+            .entries
+            .iter()
+            .zip(sent.iter())
+            .take_while(|(now, before)| now == before)
+            .count();
+        sent.truncate(from);
+        sent.extend(self.entries[from..].iter().cloned());
+        drop(sent);
+        self.payload_from(from)
+    }
+
+    /// New (B-37): forget what the page has; the next paint sends everything.
+    pub fn resync(&self) {
+        self.sent.borrow_mut().clear();
+        *self.sent_session.borrow_mut() = None;
+    }
+
+    /// New (B-37): the payload with `entries[from..]`, plus `entries_from`
+    /// and `entries_len` so the page knows where that slice starts.
+    fn payload_from(&self, from: usize) -> String {
         let entries: Vec<serde_json::Value> = self
             .entries
             .iter()
+            .skip(from)
             .map(|(k, t)| serde_json::json!({ "k": kind_class(k).to_string(), "t": t }))
             .collect();
         let sessions: Vec<serde_json::Value> = self
@@ -506,6 +547,8 @@ impl GuiState {
             "api": self.api.map(|(ok, ms)| serde_json::json!([ok, ms])),
             "sessions": sessions,
             "entries": entries,
+            "entries_from": from,
+            "entries_len": self.entries.len(),
             "browser": self.browser.payload(),
             "dev_server": self.dev_server,
             "approval": self.approval.as_ref().map(|a| serde_json::json!({
@@ -578,6 +621,8 @@ pub enum IpcMsg {
     Load(String),
     /// The page finished loading — trigger the first paint.
     Ready,
+    /// New (B-37): the page missed a paint and wants everything again.
+    Resync,
     Minimize,
     MaximizeToggle,
     Close,
@@ -634,6 +679,7 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "new" => Some(IpcMsg::NewSession),
         "load" => Some(IpcMsg::Load(v.get("id")?.as_str()?.to_string())),
         "ready" => Some(IpcMsg::Ready),
+        "resync" => Some(IpcMsg::Resync),
         "min" => Some(IpcMsg::Minimize),
         "max" => Some(IpcMsg::MaximizeToggle),
         "close" => Some(IpcMsg::Close),
@@ -732,8 +778,9 @@ fn normalize_url(raw: &str) -> Result<String, String> {
 }
 
 /// Push the current state into the page (no-op until the page is loaded).
+/// B-37: only the entries that changed since the last paint are sent.
 fn paint(webview: &wry::WebView, gs: &GuiState) {
-    let _ = webview.evaluate_script(&format!("window.render&&window.render({})", gs.payload()));
+    let _ = webview.evaluate_script(&format!("window.render&&window.render({})", gs.paint_payload()));
 }
 
 /// Apply the panel's rect and visibility to the native child view.
@@ -1137,7 +1184,11 @@ pub async fn run(
                             changed = true;
                         }
                         // The page just finished loading: give it the state.
-                        UiMsg::Ipc(IpcMsg::Ready) => changed = true,
+                        // B-37: also when the page asks for a full resend.
+                        UiMsg::Ipc(IpcMsg::Ready) | UiMsg::Ipc(IpcMsg::Resync) => {
+                            gs.resync();
+                            changed = true;
+                        }
                         UiMsg::Ipc(IpcMsg::PageError(msg)) => {
                             eprintln!("[gui] page error: {msg}");
                         }
@@ -1836,6 +1887,28 @@ mod tests {
         let g2 = GuiState::new();
         let v2: serde_json::Value = serde_json::from_str(&g2.payload()).unwrap();
         assert_eq!(v2["title"], NEW_CHAT);
+    }
+
+    /// B-37: a streamed token only resends the entry it changed.
+    #[test]
+    fn paint_sends_only_the_changed_tail() {
+        let mut g = GuiState::new();
+        g.session = Some("s".into());
+        g.push(EntryKind::User, "hi");
+        g.push(EntryKind::Assistant, "Hel");
+        let first: serde_json::Value = serde_json::from_str(&g.paint_payload()).unwrap();
+        assert_eq!(first["entries_from"], 0);
+        assert_eq!(first["entries"].as_array().unwrap().len(), 2);
+        g.push(EntryKind::Assistant, "lo");
+        let next: serde_json::Value = serde_json::from_str(&g.paint_payload()).unwrap();
+        assert_eq!(next["entries_from"], 1, "the user bubble is not resent");
+        assert_eq!(next["entries_len"], 2);
+        assert_eq!(next["entries"][0]["t"], "Hello");
+        // A resync (page reload) starts from zero again.
+        g.resync();
+        let full: serde_json::Value = serde_json::from_str(&g.paint_payload()).unwrap();
+        assert_eq!(full["entries_from"], 0);
+        assert_eq!(parse_ipc(r#"{"type":"resync"}"#), Some(IpcMsg::Resync));
     }
 
     #[test]
