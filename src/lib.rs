@@ -5,11 +5,13 @@ pub mod compact;
 pub mod config;
 pub mod db;
 pub mod gitsnap;
+#[cfg(feature = "gui")]
 pub mod gui;
 pub mod inline_edit;
 pub mod mcp;
 pub mod mission;
 pub mod permissions;
+#[cfg(feature = "gui")]
 pub mod preview;
 pub mod provider;
 pub mod server;

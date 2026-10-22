@@ -76,7 +76,15 @@ fn run() -> Result<()> {
             .and_then(|i| args.get(i + 1))
             .and_then(|s| s.parse::<u64>().ok())
             .map(std::time::Duration::from_millis);
-        return opencode_rust::preview::open_preview(&url, &title, exit_after);
+        #[cfg(feature = "gui")]
+        {
+            return opencode_rust::preview::open_preview(&url, &title, exit_after);
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            let _ = (url, title, exit_after);
+            anyhow::bail!("this build has no GUI support; rebuild with: cargo build --features gui");
+        }
     }
 
     let workspace = std::env::current_dir().context("determining cwd")?;
@@ -128,7 +136,14 @@ fn run() -> Result<()> {
             return headless_run(state, addr, prompt, boot_ms).await;
         }
         if gui {
-            return opencode_rust::gui::run(state, addr, prompt, boot_ms).await;
+            #[cfg(feature = "gui")]
+            {
+                return opencode_rust::gui::run(state, addr, prompt, boot_ms).await;
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                anyhow::bail!("this build has no GUI support; rebuild with: cargo build --features gui");
+            }
         }
         tui_run(state, addr, prompt, boot_ms).await
     })
@@ -176,7 +191,7 @@ USAGE:
 OPTIONS:
   --headless       Run one prompt without the TUI (prints result, exits)
   --yes            Headless only: approve tool calls without asking (default: deny)
-  --gui            Desktop app window (egui) instead of the terminal UI
+  --gui            Desktop app window (WebView2; needs the `gui` feature)
   --port N         Server port (default: ephemeral, printed at start)
   --base-url URL   OpenAI-compatible provider base URL (…/v1)
   --model NAME     Model id at the provider

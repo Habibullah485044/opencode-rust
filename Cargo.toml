@@ -44,8 +44,15 @@ bytes = "1"
 # M4: embedded preview browser — Rust shell (tao window + wry WebView2).
 # The engine itself is the OS out-of-process Chromium (WebView2), which is
 # the lowest-RAM option that can still run real JS dev-server apps.
-tao = "0.37"
-wry = "0.57"
+tao = { version = "0.37", optional = true }
+wry = { version = "0.57", optional = true }
+
+[features]
+# `gui` = the desktop window (`--gui`) and the `preview` subcommand.
+# Without it (`cargo build --no-default-features`) the crate needs no
+# GTK/WebKit on Linux; the terminal UI and headless mode still work.
+default = ["gui"]
+gui = ["dep:tao", "dep:wry"]
 
 [profile.release]
 opt-level = "z"

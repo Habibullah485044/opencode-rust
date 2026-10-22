@@ -1230,7 +1230,7 @@ fn finish_tool_call(
     // Surfacing it here means the panel can offer "open" without the model
     // having to remember the port.
     if ok && name == "bash" {
-        if let Some(url) = crate::gui::detect_dev_server(&output) {
+        if let Some(url) = crate::browser::detect_dev_server(&output) {
             let _ = st.events.send(ServerEvent::DevServer {
                 session_id: session_id.to_string(),
                 url,

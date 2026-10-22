@@ -605,28 +605,6 @@ pub fn is_local_url(url: &str) -> bool {
     }
 }
 
-/// First `http://localhost:<port>` / `http://127.0.0.1:<port>` in tool output.
-///
-/// Dev servers print their URL in whatever shape the framework likes
-/// ("Local: http://localhost:5173/", "listening on http://127.0.0.1:3000"),
-/// so this scans rather than parses. Returns the origin only — the chip and
-/// the CTA want something navigable, not a log line.
-pub fn detect_dev_server(text: &str) -> Option<String> {
-    const PREFIXES: [&str; 2] = ["http://localhost:", "http://127.0.0.1:"];
-    for (i, _) in text.char_indices() {
-        let Some(tail) = text.get(i..) else { continue };
-        for p in PREFIXES {
-            let Some(rest) = tail.strip_prefix(p) else { continue };
-            let port: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if port.is_empty() {
-                continue;
-            }
-            return Some(format!("{p}{port}"));
-        }
-    }
-    None
-}
-
 /// Refresh the sidebar chat list from the database.
 fn refresh_sessions(gs: &mut GuiState, st: &server::AppState) {
     if let Ok(list) = st.db.list_sessions() {
@@ -1704,20 +1682,4 @@ mod tests {
         }
     }
 
-    /// A-B5: dev servers announce themselves in log output; the chip and CTA
-    /// need the origin, not the sentence around it.
-    #[test]
-    fn dev_server_is_detected_in_tool_output() {
-        assert_eq!(
-            detect_dev_server("  VITE v5 ready\n  ➜  Local:   http://localhost:5173/\n").as_deref(),
-            Some("http://localhost:5173")
-        );
-        assert_eq!(
-            detect_dev_server("listening on http://127.0.0.1:8080").as_deref(),
-            Some("http://127.0.0.1:8080")
-        );
-        assert_eq!(detect_dev_server("http://localhost:"), None, "no port, no chip");
-        assert_eq!(detect_dev_server("https://localhost:3000 is tls"), None, "tls is not a dev server");
-        assert_eq!(detect_dev_server("compiled successfully"), None);
-    }
 }
