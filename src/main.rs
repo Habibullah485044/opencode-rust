@@ -131,7 +131,11 @@ fn run() -> Result<()> {
         let port = cfg.server.port;
         let state = server::build_state(cfg, workspace.clone()).await?;
         let addr = server::serve(state.clone(), port).await?;
-        state.start_heartbeat(); // M5: endpoint health + tunnel keepalive
+        // M5: endpoint health + tunnel keepalive. New (B-08): only the TUI
+        // and the GUI show it; a headless run does not need it.
+        if !headless {
+            state.start_heartbeat();
+        }
         let boot_ms = t0.elapsed().as_millis();
         // New (S-01): say where the HTTP API token is (never the token).
         eprintln!("[api] {}", server::api_token_note(&state.state_dir));

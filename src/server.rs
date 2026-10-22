@@ -380,16 +380,19 @@ impl AppState {
         on
     }
 
-    /// M5: probe `{base}/models` every 15s. Any HTTP response (even 404)
-    /// counts as reachable — only transport errors mean DOWN. Also keeps
-    /// Cloudflare quick tunnels warm between prompts.
+    /// M5: probe `{base}/models` every 15s and emit `Heartbeat`. Only a 2xx
+    /// answer counts as up: Cloudflare error pages (530/1033) and auth
+    /// errors (401) arrive fine at the transport level and must show DOWN.
+    /// New (B-08): sends the API key like the real client, and uses the same
+    /// base URL rule (`effective_base_url`). Also keeps Cloudflare quick
+    /// tunnels warm between prompts.
     pub fn start_heartbeat(self: &Shared) {
         let st = self.clone();
         tokio::spawn(async move {
-            let base = st.cfg.provider.base_url.trim().trim_end_matches('/').to_string();
-            if base.is_empty() {
+            let Ok(base) = st.cfg.effective_base_url() else {
                 return;
-            }
+            };
+            let key = st.cfg.provider.api_key.clone();
             let http = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(8))
                 .build()
@@ -401,8 +404,11 @@ impl AppState {
                 let t0 = std::time::Instant::now();
                 // Require 2xx: Cloudflare error pages (530/1030/1033) arrive
                 // fine at the transport level and must count as DOWN.
-                let ok = http
-                    .get(format!("{base}/models"))
+                let mut req = http.get(format!("{base}/models"));
+                if !key.is_empty() {
+                    req = req.bearer_auth(&key);
+                }
+                let ok = req
                     .send()
                     .await
                     .map(|r| r.status().is_success())
@@ -2176,6 +2182,46 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// B-08: the heartbeat sends the API key (providers answer 401 without
+    /// it) and a 2xx answer reports "up".
+    #[tokio::test]
+    async fn heartbeat_sends_the_api_key() {
+        use axum::{http::HeaderMap, http::StatusCode as Code, routing::get, Router};
+        let app = Router::new().route(
+            "/v1/models",
+            get(|headers: HeaderMap| async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+                if auth == Some("Bearer sekret") {
+                    (Code::OK, "{\"data\":[]}")
+                } else {
+                    (Code::UNAUTHORIZED, "missing key")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1/");
+        cfg.provider.model = "m".into();
+        cfg.provider.api_key = "sekret".into();
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        let mut rx = st.events.subscribe();
+        st.start_heartbeat();
+        let ok = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(ServerEvent::Heartbeat { ok, .. }) = rx.recv().await {
+                    return ok;
+                }
+            }
+        })
+        .await
+        .expect("a heartbeat arrives");
+        assert!(ok, "the key was sent, so the endpoint reports up");
+    }
 
     /// B-09: a waiting approval can be fetched again (after a lag) and is
     /// gone once it was answered.
