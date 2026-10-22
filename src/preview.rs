@@ -22,10 +22,14 @@ use wry::WebViewBuilder;
 /// e.g. `preview <url> --exit-after-ms 6000`).
 pub fn open_preview(url: &str, title: &str, exit_after: Option<std::time::Duration>) -> Result<()> {
     let t0 = std::time::Instant::now();
-    // URL sanity: WebView2 needs an absolute http(s)/file URL.
-    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://")) {
-        anyhow::bail!("preview URL must be http(s):// or file:// (got: {url})");
+    // URL sanity: WebView2 needs an absolute http(s)/file URL (any letter case).
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("file://")) {
+        anyhow::bail!("preview URL must be http(s):// or file:// (got: {})", safe_log(url));
     }
+    // Pages may move to http(s) and about:blank; to file:// only when the
+    // window itself was opened on a local file.
+    let allow_file = lower.starts_with("file://");
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title(format!("{title} — opencode-rust preview"))
@@ -34,9 +38,10 @@ pub fn open_preview(url: &str, title: &str, exit_after: Option<std::time::Durati
         .context("creating the preview window")?;
     let _webview = WebViewBuilder::new()
         .with_url(url)
-        .with_navigation_handler(|nav| {
-            eprintln!("[preview] navigating: {nav}");
-            true
+        .with_navigation_handler(move |nav| {
+            let ok = preview_nav_allowed(&nav, allow_file);
+            eprintln!("[preview] {} {}", if ok { "navigating:" } else { "blocked:" }, safe_log(&nav));
+            ok
         })
         .with_initialization_script(
             "window.addEventListener('load', () => {\n\
@@ -47,7 +52,7 @@ pub fn open_preview(url: &str, title: &str, exit_after: Option<std::time::Durati
              \x20});",
         )
         .with_ipc_handler(move |body: wry::http::Request<String>| {
-            eprintln!("[preview] page says: {}", body.body());
+            eprintln!("[preview] page says: {}", safe_log(body.body()));
         })
         .build(&window)
         .map_err(|e| {
@@ -94,6 +99,30 @@ pub fn open_preview(url: &str, title: &str, exit_after: Option<std::time::Durati
     });
 }
 
+/// Navigation rule for the standalone window: web pages and about:blank
+/// always; local files only when the window started on one.
+fn preview_nav_allowed(url: &str, allow_file: bool) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower == "about:blank"
+        || (allow_file && lower.starts_with("file://"))
+}
+
+/// Page-provided text for the terminal: control characters (escape codes,
+/// line breaks) are shown escaped, and long text is cut to 300 characters.
+fn safe_log(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars().take(300) {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +142,23 @@ mod tests {
     fn guard_message_names_the_problem() {
         let err = open_preview("ftp://x", "t", None).unwrap_err();
         assert!(err.to_string().contains("http"));
+    }
+
+    #[test]
+    fn navigation_rule_allows_only_web_pages() {
+        assert!(preview_nav_allowed("https://example.com/", false));
+        assert!(preview_nav_allowed("HTTP://localhost:5173/", false));
+        assert!(preview_nav_allowed("about:blank", false));
+        assert!(!preview_nav_allowed("file:///etc/hosts", false));
+        assert!(preview_nav_allowed("file:///C:/site/index.html", true));
+        assert!(!preview_nav_allowed("javascript:void(0)", true));
+    }
+
+    #[test]
+    fn page_text_is_logged_safely() {
+        let s = safe_log("ok\u{1b}[31mred\nnext");
+        assert!(!s.contains('\u{1b}') && !s.contains('\n'), "{s}");
+        assert!(s.contains("ok") && s.contains("red"));
+        assert_eq!(safe_log(&"x".repeat(1000)).len(), 300);
     }
 }
