@@ -35,6 +35,17 @@ pub struct GuiState {
     pub api: Option<(bool, u64)>,
     /// Sidebar chats, newest-first: (id, title). Mirrors `db.list_sessions()`.
     pub sessions: Vec<(String, String)>,
+    /// New (B-12): chats that have a run in flight right now.
+    pub running: std::collections::HashSet<String>,
+    /// New (B-12): live transcripts of running chats that are not on screen,
+    /// so switching back shows what streamed while they were hidden.
+    pub background: HashMap<String, Vec<(EntryKind, String)>>,
+    /// New (B-12): approvals waiting behind the one on screen (several chats
+    /// can be blocked at once). Shown one at a time, oldest first.
+    pub approval_queue: std::collections::VecDeque<PendingApproval>,
+    /// New (B-12): another client created or switched a chat; reload the
+    /// sidebar list from the database.
+    pub sessions_stale: bool,
     /// Preview panel: URL, history flags, geometry. Drawn by the page;
     /// the page itself lives in a separate native child webview.
     pub browser: BrowserView,
@@ -54,6 +65,8 @@ pub struct GuiState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingApproval {
     pub id: String,
+    /// New (B-12): the chat whose run is blocked on this approval.
+    pub session_id: String,
     pub tool: String,
     pub detail: String,
     pub started: std::time::Instant,
@@ -75,6 +88,10 @@ impl Default for GuiState {
             session: None,
             api: None,
             sessions: Vec::new(),
+            running: std::collections::HashSet::new(),
+            background: HashMap::new(),
+            approval_queue: std::collections::VecDeque::new(),
+            sessions_stale: false,
             browser: BrowserView::default(),
             dev_server: None,
             approval: None,
@@ -184,6 +201,30 @@ impl GuiState {
         Self::default()
     }
 
+    /// New (B-12): true when chat `id` is the one on screen.
+    pub fn is_current(&self, id: &str) -> bool {
+        self.session.as_deref() == Some(id)
+    }
+
+    /// New (B-12): sidebar title of chat `id` ("New chat" when unknown).
+    pub fn session_title(&self, id: &str) -> &str {
+        self.sessions
+            .iter()
+            .find(|(sid, _)| sid == id)
+            .map(|(_, t)| t.as_str())
+            .unwrap_or(NEW_CHAT)
+    }
+
+    /// New (B-12): approval `id` is answered or gone. Drop it (on screen or
+    /// queued) and show the next waiting one, if any.
+    pub fn finish_approval(&mut self, id: &str) {
+        self.approval_queue.retain(|a| a.id != id);
+        if self.approval.as_ref().is_some_and(|a| a.id == id) {
+            self.approval = self.approval_queue.pop_front();
+        }
+        self.browser.covered = self.approval.is_some();
+    }
+
     /// Title of the active session (chat header + window title).
     pub fn title(&self) -> &str {
         self.session
@@ -212,8 +253,74 @@ impl GuiState {
         self.entries.push((kind, text));
     }
 
-    /// Drain one server event into the transcript.
+    /// New (B-12): the chat on screen is being replaced. If its run is still
+    /// going, keep its transcript so its events can keep arriving.
+    pub fn leave_current_chat(&mut self) {
+        let entries = std::mem::take(&mut self.entries);
+        if let Some(cur) = self.session.clone() {
+            if self.running.contains(&cur) {
+                self.background.insert(cur, entries);
+            }
+        }
+    }
+
+    /// New (B-12): the chat a transcript event belongs to. `None` for events
+    /// that are not transcript text (run state, approvals, heartbeat).
+    fn transcript_session(ev: &ServerEvent) -> Option<String> {
+        match ev {
+            ServerEvent::AssistantDelta { session_id, .. }
+            | ServerEvent::ReasoningDelta { session_id, .. }
+            | ServerEvent::ToolStarted { session_id, .. }
+            | ServerEvent::ToolFinished { session_id, .. }
+            | ServerEvent::Note { session_id, .. }
+            | ServerEvent::EditPreview { session_id, .. }
+            | ServerEvent::EditApplied { session_id, .. } => Some(session_id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Drain one server event into the chat it belongs to.
+    ///
+    /// B-12: every chat's events share one bus. Text for a chat that is not
+    /// on screen goes to its live copy in `background` (or is dropped), so it
+    /// never lands in the open chat.
     pub fn on_event(&mut self, ev: ServerEvent) {
+        // A chat was created or switched by another client: refresh the
+        // sidebar, but never take over the chat the user is looking at.
+        if matches!(ev, ServerEvent::SessionCreated { .. } | ServerEvent::SessionLoaded { .. }) {
+            self.sessions_stale = true;
+            return;
+        }
+        // Run state, approvals and the heartbeat are handled in `apply_event`.
+        let Some(sid) = Self::transcript_session(&ev) else {
+            return self.apply_event(ev);
+        };
+        // Streaming output means that chat's run is going.
+        if matches!(
+            ev,
+            ServerEvent::AssistantDelta { .. }
+                | ServerEvent::ReasoningDelta { .. }
+                | ServerEvent::ToolStarted { .. }
+        ) {
+            self.running.insert(sid.clone());
+            if self.is_current(&sid) {
+                self.busy = true;
+            }
+        }
+        if self.is_current(&sid) {
+            return self.apply_event(ev);
+        }
+        // Another chat: append to its live copy while we keep one.
+        if let Some(mut live) = self.background.remove(&sid) {
+            std::mem::swap(&mut self.entries, &mut live);
+            self.apply_event(ev);
+            std::mem::swap(&mut self.entries, &mut live);
+            self.background.insert(sid, live);
+        }
+    }
+
+    /// Apply one event to the chat on screen (`entries`, `busy`, the modal).
+    fn apply_event(&mut self, ev: ServerEvent) {
         match ev {
             ServerEvent::AssistantDelta { text, .. } => self.push(EntryKind::Assistant, text),
             ServerEvent::ReasoningDelta { text, .. } => {
@@ -236,39 +343,51 @@ impl GuiState {
                 self.push(EntryKind::Tool, format!("  {} {tool}", if ok { "\u{2713}" } else { "\u{2717}" }));
             }
             ServerEvent::Note { text, .. } => self.push(EntryKind::System, text),
-            ServerEvent::RunFinished { ok, message, .. } => {
+            ServerEvent::RunFinished { session_id, ok, message } => {
                 eprintln!("[gui] run finished ok={ok}");
+                self.running.remove(&session_id);
+                // A finished run cannot still be waiting on an approval — but
+                // only ITS approvals end; another chat's run may still wait.
+                self.approval_queue.retain(|a| a.session_id != session_id);
+                if self.approval.as_ref().is_some_and(|a| a.session_id == session_id) {
+                    self.approval = self.approval_queue.pop_front();
+                }
+                self.browser.covered = self.approval.is_some();
+                if !self.is_current(&session_id) {
+                    // The database now has the whole reply; the next visit
+                    // to that chat replays it from there.
+                    self.background.remove(&session_id);
+                    return;
+                }
                 self.busy = false;
-                // A finished run cannot still be waiting on an approval.
-                self.approval = None;
-                self.browser.covered = false;
                 if let Some(m) = message {
                     self.push(if ok { EntryKind::System } else { EntryKind::Error }, m);
                 }
             }
-            ServerEvent::SessionCreated { session_id, .. } => self.session = Some(session_id),
-            ServerEvent::SessionLoaded { session_id, transcript, .. } => {
-                self.session = Some(session_id);
-                self.busy = false;
-                self.entries = transcript
-                    .into_iter()
-                    .map(|l| {
-                        let kind = if l.role == "user" { EntryKind::User } else { EntryKind::Assistant };
-                        (kind, l.text)
-                    })
-                    .collect();
-            }
+            // SessionCreated / SessionLoaded are handled in `on_event` (B-12).
             ServerEvent::Heartbeat { ok, latency_ms } => self.api = Some((ok, latency_ms)),
             ServerEvent::DevServer { url, .. } => self.dev_server = Some(url),
-            ServerEvent::ApprovalNeeded { approval_id, tool, detail, .. } => {
+            ServerEvent::ApprovalNeeded { session_id, approval_id, tool, detail, .. } => {
                 // The run is blocked until this is answered (or times out).
-                self.approval = Some(PendingApproval {
+                // B-12: shown for every chat (a hidden chat's run is blocked
+                // too), queued behind one already on screen, and only the
+                // chat on screen turns "busy".
+                self.running.insert(session_id.clone());
+                if self.is_current(&session_id) {
+                    self.busy = true;
+                }
+                let pending = PendingApproval {
                     id: approval_id,
+                    session_id,
                     tool,
                     detail,
                     started: std::time::Instant::now(),
-                });
-                self.busy = true;
+                };
+                if self.approval.is_some() {
+                    self.approval_queue.push_back(pending);
+                } else {
+                    self.approval = Some(pending);
+                }
                 // Never leave a native view painted over the modal.
                 self.browser.covered = true;
             }
@@ -308,6 +427,10 @@ impl GuiState {
         }
         self.push(EntryKind::User, format!("\u{203a} {content}"));
         self.busy = true;
+        // B-12: remember which chat runs (the user may leave it meanwhile).
+        if let Some(sid) = self.session.clone() {
+            self.running.insert(sid);
+        }
         Some(content)
     }
 
@@ -344,6 +467,10 @@ impl GuiState {
                 "tool": a.tool,
                 "detail": a.detail,
                 "secs_left": a.secs_left(self.approval_timeout_secs),
+                // B-12: which chat asks, and how many requests wait behind it.
+                "other_chat": !self.is_current(&a.session_id),
+                "chat": self.session_title(&a.session_id),
+                "queued": self.approval_queue.len(),
             })),
         })
         .to_string()
@@ -560,11 +687,8 @@ fn show_browser(wv: &wry::WebView, view: &BrowserView) {
 /// Clear the modal for the request it belongs to and unhide the panel.
 /// `answered` is false when the engine already timed out / aborted it.
 fn settle_approval(gs: &mut GuiState, id: &str, answered: bool) {
-    let mine = gs.approval.as_ref().map(|a| a.id == id).unwrap_or(false);
-    if mine {
-        gs.approval = None;
-        gs.browser.covered = false;
-    }
+    // B-12: also brings up the next queued approval, if any.
+    gs.finish_approval(id);
     if !answered {
         gs.push(EntryKind::System, "That approval had already expired.".to_string());
     }
@@ -618,15 +742,24 @@ fn refresh_sessions(gs: &mut GuiState, st: &server::AppState) {
 }
 
 /// Switch to an existing session, replaying its transcript into the chat.
+///
+/// B-12: a chat whose run is still going is shown from its live copy, and
+/// the chat we leave keeps its live copy if its run is still going.
 fn load_session(gs: &mut GuiState, st: &server::AppState, id: &str) {
-    match st.db.messages(id) {
-        Ok(msgs) => {
-            gs.session = Some(id.to_string());
-            gs.entries = entries_from_messages(&msgs);
-            gs.busy = false;
-        }
-        Err(e) => gs.push(EntryKind::Error, format!("load session failed: {e}")),
-    }
+    let entries = match gs.background.remove(id) {
+        Some(live) => live,
+        None => match st.db.messages(id) {
+            Ok(msgs) => entries_from_messages(&msgs),
+            Err(e) => {
+                gs.push(EntryKind::Error, format!("load session failed: {e}"));
+                return;
+            }
+        },
+    };
+    gs.leave_current_chat();
+    gs.session = Some(id.to_string());
+    gs.entries = entries;
+    gs.busy = gs.running.contains(id);
 }
 
 /// Submit the composer and name the chat after its first message. Shared by
@@ -866,6 +999,11 @@ pub async fn run(
                     gs.on_event(ev);
                     changed = true;
                 }
+                // B-12: another client added or switched a chat.
+                if gs.sessions_stale {
+                    gs.sessions_stale = false;
+                    refresh_sessions(&mut gs, &st);
+                }
                 while let Ok(msg) = ui_rx.try_recv() {
                     match msg {
                         UiMsg::Ipc(IpcMsg::Send(text)) => {
@@ -882,6 +1020,8 @@ pub async fn run(
                         }
                         UiMsg::Ipc(IpcMsg::NewSession) => match st.db.create_session(NEW_CHAT, None) {
                             Ok(s) => {
+                                // B-12: a running chat keeps its live transcript.
+                                gs.leave_current_chat();
                                 gs.session = Some(s.id);
                                 gs.entries.clear();
                                 gs.busy = false;
@@ -925,13 +1065,9 @@ pub async fn run(
                             let granted = st.set_perm_mode(mode);
                             gs.perm_mode = mode;
                             // Switching to turbo answers whatever was blocking,
-                            // so the modal must not outlive the grant.
-                            let answered = gs
-                                .approval
-                                .as_ref()
-                                .is_some_and(|ap| granted.iter().any(|id| id == &ap.id));
-                            if answered {
-                                gs.approval = None;
+                            // so no modal (shown or queued) may outlive the grant.
+                            for id in &granted {
+                                gs.finish_approval(id);
                             }
                             eprintln!(
                                 "[gui] permission mode -> {} ({} prompt(s) released)",
@@ -1297,6 +1433,7 @@ mod tests {
     #[test]
     fn assistant_deltas_merge_into_one_bubble() {
         let mut g = GuiState::new();
+        g.session = Some("s".into());
         g.on_event(delta("Hel"));
         g.on_event(delta("lo!"));
         let assistant: Vec<_> = g
@@ -1311,6 +1448,7 @@ mod tests {
     #[test]
     fn reasoning_marker_once_then_merge() {
         let mut g = GuiState::new();
+        g.session = Some("s".into());
         g.on_event(ServerEvent::ReasoningDelta { session_id: "s".into(), text: "think".into() });
         g.on_event(ServerEvent::ReasoningDelta { session_id: "s".into(), text: "ing".into() });
         let thinking: Vec<_> = g.entries.iter().filter(|(k, _)| *k == EntryKind::Thinking).collect();
@@ -1322,6 +1460,7 @@ mod tests {
     #[test]
     fn run_finished_clears_busy_and_reports() {
         let mut g = GuiState::new();
+        g.session = Some("s".into());
         g.busy = true;
         g.on_event(ServerEvent::RunFinished {
             session_id: "s".into(),
@@ -1332,22 +1471,110 @@ mod tests {
         assert!(g.entries.iter().any(|(k, t)| *k == EntryKind::System && t == "done"));
     }
 
+    fn delta_for(sid: &str, text: &str) -> ServerEvent {
+        ServerEvent::AssistantDelta { session_id: sid.into(), text: text.into() }
+    }
+
+    /// Built from JSON so the helper works with or without optional fields
+    /// (task B-22 adds `preview` to this event).
+    fn ask(sid: &str, id: &str) -> ServerEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "approval_needed",
+            "session_id": sid,
+            "approval_id": id,
+            "tool": "bash",
+            "detail": "ls"
+        }))
+        .unwrap()
+    }
+
+    /// B-12: approvals from several chats queue up and end by id.
     #[test]
-    fn session_loaded_replays_transcript() {
+    fn approvals_from_any_chat_queue_and_finish_by_id() {
         let mut g = GuiState::new();
-        g.busy = true;
-        g.on_event(ServerEvent::SessionLoaded {
-            session_id: "ses_x".into(),
-            mode: "build".into(),
-            transcript: vec![
-                server::TranscriptLine { role: "user".into(), text: "hi".into() },
-                server::TranscriptLine { role: "assistant".into(), text: "hello".into() },
-            ],
+        g.session = Some("a".into());
+        g.on_event(ask("b", "apr_b"));
+        g.on_event(ask("a", "apr_a"));
+        assert_eq!(g.approval.as_ref().map(|a| a.id.as_str()), Some("apr_b"), "first come, first shown");
+        assert!(g.busy, "chat a is blocked too");
+        let v: serde_json::Value = serde_json::from_str(&g.payload()).unwrap();
+        assert_eq!(v["approval"]["other_chat"], true);
+        assert_eq!(v["approval"]["queued"], 1);
+        // Chat b's run ends: its modal goes, chat a's approval comes up.
+        g.on_event(ServerEvent::RunFinished { session_id: "b".into(), ok: true, message: None });
+        assert_eq!(g.approval.as_ref().map(|a| a.id.as_str()), Some("apr_a"));
+        assert!(g.browser.covered);
+        g.finish_approval("apr_a");
+        assert!(g.approval.is_none());
+        assert!(!g.browser.covered);
+    }
+
+    /// B-12: one bus carries every chat; text must land in its own chat.
+    #[test]
+    fn events_from_other_chats_stay_out_of_the_open_chat() {
+        let mut g = GuiState::new();
+        g.session = Some("a".into());
+        g.on_event(delta_for("b", "text from b"));
+        assert!(g.entries.is_empty(), "nothing from chat b in chat a");
+        assert!(!g.busy, "chat a is not running");
+        g.on_event(ServerEvent::RunFinished {
+            session_id: "b".into(),
+            ok: false,
+            message: Some("b failed".into()),
         });
-        assert_eq!(g.session.as_deref(), Some("ses_x"));
-        assert!(!g.busy);
-        assert_eq!(g.entries.len(), 2);
-        assert_eq!(g.entries[0].0, EntryKind::User);
+        assert!(g.entries.is_empty());
+    }
+
+    /// B-12: a chat that runs while hidden keeps streaming into its live copy.
+    #[test]
+    fn a_running_chat_keeps_streaming_while_hidden() {
+        let mut g = GuiState::new();
+        g.session = Some("a".into());
+        g.input = "go".into();
+        g.submit();
+        g.on_event(delta_for("a", "part one "));
+        g.leave_current_chat();
+        g.session = Some("b".into());
+        g.on_event(delta_for("a", "part two"));
+        let live = g.background.get("a").expect("live copy kept");
+        assert!(live.iter().any(|(_, t)| t == "part one part two"), "{live:?}");
+        assert!(g.entries.is_empty());
+    }
+
+    /// B-12: switching chats keeps a running chat's transcript.
+    #[tokio::test]
+    async fn switching_chats_keeps_a_running_chat_live() {
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
+            .await;
+        let a = st.db.create_session("a", None).unwrap();
+        let b = st.db.create_session("b", None).unwrap();
+        let mut g = GuiState::new();
+        g.session = Some(a.id.clone());
+        g.input = "long job".into();
+        g.submit();
+        load_session(&mut g, &st, &b.id);
+        assert_eq!(g.session.as_deref(), Some(b.id.as_str()));
+        assert!(!g.busy, "chat b is idle");
+        load_session(&mut g, &st, &a.id);
+        assert!(g.busy, "chat a is still running");
+        assert!(g.entries.iter().any(|(_, t)| t.contains("long job")), "live copy restored");
+    }
+
+    /// B-12: another client's chat events never take over the open chat.
+    #[test]
+    fn session_events_from_other_clients_do_not_switch_the_chat() {
+        let mut g = GuiState::new();
+        g.session = Some("mine".into());
+        g.entries.push((EntryKind::User, "hello".into()));
+        g.on_event(ServerEvent::SessionCreated { session_id: "theirs".into(), title: "x".into() });
+        g.on_event(ServerEvent::SessionLoaded {
+            session_id: "theirs".into(),
+            mode: "build".into(),
+            transcript: vec![server::TranscriptLine { role: "user".into(), text: "hi".into() }],
+        });
+        assert_eq!(g.session.as_deref(), Some("mine"));
+        assert_eq!(g.entries.len(), 1);
+        assert!(g.sessions_stale, "the sidebar is refreshed instead");
     }
 
     #[test]
