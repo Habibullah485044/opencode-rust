@@ -715,13 +715,22 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
         eprintln!("[snapshot] {e:#}");
     }
     let before = snapshot_stats(st, session_id);
+    // New (P-02): fingerprint the git working tree first, so a run that only
+    // ran read-only commands (ls, cargo test, git log) gets no review.
+    let tree_before = if st.cfg.agent.auto_review {
+        st.workspace_fingerprint().await
+    } else {
+        None
+    };
     let result = agent_inner(st, session_id, user_content, &abort).await;
-    // Laziness Meter: did this run change the workspace at all?
+    // Laziness Meter: did this run change the workspace at all? Successful
+    // write/edit calls always count. New (P-02): bash counts only when the
+    // git working tree really changed (or when there is no git to ask).
     let touched = {
         let after = snapshot_stats(st, session_id);
-        after.writes > before.writes
-            || after.edits > before.edits
-            || after.bash_runs > before.bash_runs
+        let bash_changed = after.bash_runs > before.bash_runs
+            && (tree_before.is_none() || st.workspace_fingerprint().await != tree_before);
+        after.writes > before.writes || after.edits > before.edits || bash_changed
     };
     // The reply already streamed to clients as AssistantDelta — resending it
     // as `message` made the TUI print the whole answer a second time.
@@ -829,6 +838,25 @@ pub async fn install_skill_flow(st: &Shared, source: &str, abort: &AtomicBool) -
 }
 
 impl AppState {
+    /// New (P-02): a fingerprint of the git working tree (status plus diff),
+    /// or None when the workspace is not a git repository. Git runs off the
+    /// async threads.
+    pub(crate) async fn workspace_fingerprint(&self) -> Option<u64> {
+        let ws = self.workspace.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::hash::{Hash, Hasher};
+            let status = crate::gitsnap::git(&ws, &["status", "--porcelain=v1", "-uall"]).ok()?;
+            let diff = crate::gitsnap::git(&ws, &["diff", "--no-ext-diff", "HEAD"]).unwrap_or_default();
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            status.hash(&mut h);
+            diff.hash(&mut h);
+            Some(h.finish())
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Laziness Meter report for `/debt`.
     pub fn debt_report(&self, session_id: &str) -> String {
         let s = self
@@ -2366,6 +2394,82 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// P-02 helper: a git repo with one commit, and a mock that asks for one
+    /// `bash` call (`command`) and then answers with text. Returns the state.
+    async fn p02_state(tag: &str, command: &'static str) -> (Shared, std::path::PathBuf) {
+        use axum::{routing::post, Router};
+        let dir = std::env::temp_dir().join(format!("ocrs-p02-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| crate::gitsnap::git(&dir, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("hello.txt"), "hi\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<Value>| async move {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                let last_role = msgs.last().and_then(|m| m["role"].as_str()).unwrap_or("");
+                let payload = if last_role != "tool" {
+                    let args = serde_json::json!({ "command": command }).to_string();
+                    let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                        {"index":0,"id":"b1","function":{"name":"bash","arguments":args}}
+                    ]},"finish_reason":null}]});
+                    format!("data: {chunk}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string()
+                };
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        cfg.permissions.defaults.insert("bash".into(), "allow".into());
+        (build_state_ephemeral(cfg, dir.clone()).await, dir)
+    }
+
+    /// P-02: did the run announce the automatic review?
+    async fn p02_reviewed(st: &Shared) -> bool {
+        let s = st.db.create_session("p02", None).unwrap();
+        let mut rx = st.events.subscribe();
+        run_agent(st, &s.id, "do it", Arc::new(AtomicBool::new(false))).await;
+        let mut reviewed = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::Note { text, .. } = ev {
+                reviewed |= text.contains("ponytail review");
+            }
+        }
+        reviewed
+    }
+
+    /// P-02: a read-only bash command gets no review.
+    #[tokio::test]
+    async fn read_only_bash_gets_no_review() {
+        let (st, dir) = p02_state("ro", "git status").await;
+        assert!(!p02_reviewed(&st).await, "nothing changed, so no review");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P-02: a bash command that changes files still gets the review.
+    /// (`git init sub` creates new files without a `>` redirect: after S-08,
+    /// a redirect into a file asks for approval even when bash is allowed,
+    /// and nobody answers in a test.)
+    #[tokio::test]
+    async fn changing_bash_gets_the_review() {
+        let (st, dir) = p02_state("rw", "git init sub").await;
+        assert!(p02_reviewed(&st).await, "new files appeared, so review it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// P-01: a refused call adds nothing to the Laziness Meter (and so
     /// triggers no automatic review).
