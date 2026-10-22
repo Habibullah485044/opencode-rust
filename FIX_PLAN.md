@@ -26,6 +26,33 @@ written so a coding AI can follow it one task at a time.
 
 ---
 
+## Progress status
+
+*Updated 22 Oct 2026, checked against the code in `opencode-rust/` (git `2ccb80b`).*
+
+**21 of 92 tasks done (23%).** Phase 1 is complete. Phase 2 has 7 of its 28 tasks done.
+Each finished task has its own commit, and its code changes and new tests are in the code.
+
+- **Build:** `cargo build` gives 0 warnings (Windows).
+- **Tests:** `cargo test` gives **238 passed, 0 failed** on Windows (185 original + 53 new).
+  `bash_timeout_kills_background_children` is Unix-only, so it does not run here.
+- **Next task:** `B-07` (CLI: the prompt must not pick up option values), then `B-09` → `B-08` → `B-22` …
+- **Not checked yet for finished tasks:** the manual checks (real terminal, real desktop window, real model APIs)
+  were not run. CI (H-03) has not run on GitHub, because nothing was pushed.
+
+| Phase | Done | Status |
+|---|---|---|
+| Phase 1 — Safety and quick wins (do these first) | 14 / 14 | done |
+| Phase 2 — Stop losing work, make runs reliable | 7 / 28 | in progress |
+| Phase 3 — Quality: remaining bugs and ponytail fixes | 0 / 26 | not started |
+| Phase 4 — New features | 0 / 8 | not started |
+| Phase 5 — Polish | 0 / 16 | not started |
+
+The **Status** column in 2.2 lists every task, with the commit that did it.
+`PLAN_PROGRESS.md` has one line per finished task with its test count.
+
+---
+
 ## For the human: how to use this file
 
 1. Save this file in the root of the repository as `FIX_PLAN.md` (next to `Cargo.toml`).
@@ -432,100 +459,100 @@ Do the phases in order. Inside a phase, go left to right. A task's
 
 ### 2.2 All tasks
 
-| ID | Title | Priority | Size | Depends on |
-|---|---|---|---|---|
-| S-01 | Require a token on the local HTTP API | P0 | M | — |
-| S-02 | Headless mode must not approve tool calls by default | P0 | S | — |
-| S-03 | Keep file tools inside the workspace | P0 | M | — |
-| S-04 | Canonical path details for permission rules (no `..`, Windows case) | P0 | M | — |
-| S-05 | Keep the provider API key out of child processes | P0 | S | — |
-| S-06 | webfetch: public addresses only, checked redirects, size cap | P0 | M | — |
-| S-07 | Scope "Always allow" to the workspace and stop duplicate approvals | P0 | M | — |
-| S-08 | Bash permission rules must check every part of a chained command | P1 | M | — |
-| S-09 | Deterministic permission defaults, merged with built-ins, invalid actions rejected | P1 | M | — |
-| S-10 | GUI `is_local_url`: parse URLs properly (userinfo etc.) | P0 | S | — |
-| S-11 | GUI: enforce `allow_remote` on every navigation path | P1 | M | — |
-| S-12 | GUI preview bridge: unguessable request ids, bounded queue | P2 | M | — |
-| S-13 | Browser snapshot must not return password, one-time-code or card values | P1 | S | — |
-| S-14 | gitsnap: validate stored paths, never follow symlinks, literal pathspecs | P1 | M | — |
-| S-15 | Inline `/edit`: obey permission rules, refuse symlink escapes, no headless auto-apply | P1 | M | S-02, S-03 |
-| S-16 | `/export`: stay inside the workspace, no silent overwrite | P2 | S | — |
-| S-17 | Skill install: treat downloaded text as untrusted, robust verdict, permission checks | P2 | M | — |
-| S-18 | GUI hardening: devtools only in debug, CSP, no external fonts, lock main webview navigation, preview clipboard | P2 | M | — |
-| S-19 | kaggle_setup_cell.py: no shell strings from remote data, token check in front of the tunnel | P1 | M | — |
-| B-01 | `edit` tool: reject an empty `old_str` | P0 | S | — |
-| B-02 | `/edit` must not cut Markdown files or drop the last newline | P0 | S | — |
-| B-03 | Cut-off replies (`finish_reason: "length"`) are treated as complete | P1 | M | — |
-| B-04 | Repair chat history before sending it to the provider | P1 | M | — |
-| B-05 | Compaction: safe split point, never delete new messages, one transaction, role labels | P1 | M | — |
-| B-06 | Abort really stops: between tool calls, inside bash, for every run kind | P1 | L | — |
-| B-07 | CLI: the prompt must not pick up option values | P1 | S | — |
-| B-08 | Heartbeat: send the API key, match the comment, skip it in headless mode | P1 | S | — |
-| B-09 | Event bus: survive lag, recover pending approvals, limit headless time | P1 | M | S-02, B-06, B-07 |
-| B-10 | New event `ApprovalResolved` (answered, timed out, aborted, released by turbo) | P1 | M | — |
-| B-11 | GUI: `covered` flag never hides the native preview view | P1 | S | — |
-| B-12 | GUI: events from other sessions leak into the open chat | P1 | M | — |
-| B-13 | GUI: approval modal lingers, hotkeys need focus, one-key always-allow | P1 | M | B-10 (adds `ServerEvent::ApprovalResolved`), B-12 (adds `PendingApproval::session_id`, `GuiState::finish_approval`, `approval_queue` and the payload keys `other_chat`, `chat`, `queued`) |
-| B-14 | TUI transcript: show the newest lines even when lines wrap | P1 | M | — |
-| B-15 | TUI approval overlay: full detail, queue, safe keys, always on top | P1 | M | B-10, S-07, B-22 |
-| B-16 | TUI: give the terminal back on errors and panics | P1 | S | — |
-| B-17 | Make the `..\evil.rs` test assertion correct on every OS | P1 | S | — |
-| B-18 | /team: plan-mode gate, subtask cap, honest fallback, abort status | P1 | M | — |
-| B-19 | MCP: startup can hang; provider-safe tool names; output cap | P1 | M | — |
-| B-20 | MCP: one global lock serializes every call | P1 | M | B-19 (uses its `resolve_tool_name`) |
-| B-21 | Provider stream: error frames, early end, missing delta, ids, `content: null` | P1 | M | — |
-| B-22 | Write/edit approvals must show what will change | P1 | M | B-09 (only the order: apply B-09 first if you do both; both edit `check_permission`) |
-| B-23 | TUI subscribes to events too late (startup race) | P2 | S | — |
-| B-24 | Turbo: one run until the last continuation, and a cap that really holds | P2 | M | B-06 |
-| B-25 | `/parallel`: real parallelism, current model, no hidden approval waits | P2 | M | — |
-| B-26 | Say so when a run stops at `max_steps` | P2 | S | — |
-| B-27 | Subagents: abort shown as done, children told to ask questions, no spawn limit | P2 | M | — |
-| B-28 | MCP protocol gaps: server requests, null fields, pagination, cancel-safe reads | P2 | M | B-19 (uses its `list_tools_within` and its `limit` parameter) |
-| B-29 | The client lock is held while waiting for the provider | P2 | S | — |
-| B-30 | read tool: binary detection, memory use, offset meaning, very long lines | P2 | S | — |
-| B-31 | write/edit: atomic writes and a correct "created/wrote" message | P2 | S | — |
-| B-32 | glob/grep: same path style, `{a,b}`, correct `**/`, skip `.git`, report skipped files | P2 | M | — |
-| B-33 | TUI: keep the busy flag true while a run is going | P2 | S | — |
-| B-34 | TUI team panel: reach Done, parse failures, show the synthesis | P2 | S | — |
-| B-35 | TUI input: Ctrl/Alt keys, pasting, long lines, wide characters | P2 | M | B-16 |
-| B-36 | GUI preview bridge timing bugs | P2 | M | — |
-| B-37 | GUI transcript re-render cost per streamed token | P2 | M | — |
-| B-38 | db: transactions, foreign keys, schema parity, readable parse errors, better ids | P2 | M | S-07 (moves the approvals table), B-05 (replaces `apply_compaction`). The Find blocks below are not touched by either task, so the order does not matter for applying; do them first for a clean history. |
-| B-39 | gitsnap: clear redo on a new run, pop only after success, stable folder hash | P2 | M | S-14 (it validates stack ids, which this task relies on when it deletes snapshot folders; it also makes `restore_manifest` report problems instead of hiding them) |
-| B-40 | browser.rs: element refs from an older snapshot can hit the wrong element | P2 | S | S-13 (its test helpers `FAKE_DOM` and `run_runtime_in_node` are reused here) |
-| B-41 | TUI polish: scrolling overlays, visible selections, colors, small display bugs | P3 | M | B-15 |
-| B-42 | GUI: panel reopens itself, replay differences, empty sessions pile up | P3 | S | — |
-| B-43 | webfetch `html_to_text`: double decoding, slow on broken HTML | P3 | S | — |
-| B-44 | skills.rs: frontmatter parser fixes and no silent overwrite on install | P3 | S | — |
-| B-45 | config: warn on unknown keys, fail on a missing `OPENCODE_RUST_CONFIG` file, honest docs | P3 | S | — |
-| B-46 | preview.rs (standalone window): navigation filter and safe logging | P3 | S | — |
-| B-47 | Missions: Explore read-only, CLI effort, derived Default | P3 | S | — |
-| B-48 | No stderr output while the TUI runs; git off the async threads | P3 | S | — |
-| B-49 | Inline edit leftovers: CRLF files, size check first, cancel, test folders | P3 | S | B-02, B-06 |
-| P-01 | Laziness meter counts only successful calls (and reads the right edit keys) | P2 | S | — |
-| P-02 | Automatic review only when files really changed | P2 | M | — |
-| P-03 | No automatic review after an abort | P2 | S | — |
-| P-04 | Reuse gate: fewer false hints, one walk, honest comment | P3 | M | — |
-| P-05 | Add the `/ponytail lite\|full\|ultra\|off` command the prompt promises | P2 | M | B-27 (order only: B-27 edits the same lines in `src/subagent.rs`; apply it first if you do it) |
-| F-01 | Retry the provider request with backoff (429 / 5xx / connection errors) | P1 | M | — |
-| F-02 | Native Anthropic Messages API provider | P2 | L | F-01 (`send_with_retry`, `from_cfg`), B-08 (Stage 4 edits its heartbeat code); B-04 recommended first |
-| F-03 | MCP servers over Streamable HTTP | P2 | L | B-19, B-20 (uses B-19's `cap_result` and `tool_fn_name`, and B-20's `Live` struct) |
-| F-04 | `browser_screenshot` tool | P2 | M | H-02 (makes `tao`/`wry` optional and adds the `gui` feature; this task adds two Windows-only crates to that feature) |
-| F-05 | Git-worktree isolation for worker subagents and team workers | P2 | L | B-06 (one call passes B-06's abort flag; see the note in step 9) |
-| F-06 | GUI: Stop button, multiline composer, IME guard | P1 | M | — |
-| F-07 | Automatic compaction near the context limit | P2 | M | B-05 (safe compaction; this task calls `compact::compact` from the agent loop and edits a line B-05 wrote) |
-| F-08 | Verification loop (`agent.verify_command`) | P2 | M | — |
-| F-09 | Loop guard: refuse the third identical tool call in a row | P2 | M | — |
-| F-10 | Context7 + ast-grep MCP setup (config, docs, skill), Serena note | P3 | S | B-19 (start-up time limits, provider-safe tool names), B-20 (parallel MCP calls) |
-| F-11 | Persist todos in SQLite | P3 | M | — |
-| F-12 | HTTP API parity: mode, model, permission mode, approvals list, rename/delete | P3 | M | S-01, B-06, B-09 |
-| F-13 | GUI release polish: WebView2-missing dialog, single-instance guard | P3 | S | F-04 (only its `Cargo.toml` step: the Windows-only `windows` dependency with the `Win32_UI_WindowsAndMessaging` feature) |
-| H-01 | Add README.md, LICENSE and NOTICE | P1 | S | H-02 (the README mentions `--no-default-features`) |
-| H-02 | Make the desktop GUI an optional cargo feature | P1 | S | — |
-| H-03 | Add GitHub Actions CI (Linux + Windows) | P1 | S | B-17 (otherwise the Linux job fails on a Windows-only test), H-02 (for the "core only" job) |
-| H-04 | Bring GOALS.md up to date | P3 | S | — |
-| H-05 | tests/gui/run.sh: also run on Linux/macOS | P3 | S | — |
-| H-06 | Remove the unused `separate_demo/` crate | P3 | S | — |
+| ID | Title | Priority | Size | Depends on | Status |
+|---|---|---|---|---|---|
+| S-01 | Require a token on the local HTTP API | P0 | M | — | ✅ done (`7ba9336`) |
+| S-02 | Headless mode must not approve tool calls by default | P0 | S | — | ✅ done (`7618078`) |
+| S-03 | Keep file tools inside the workspace | P0 | M | — | ✅ done (`14bb4cb`) |
+| S-04 | Canonical path details for permission rules (no `..`, Windows case) | P0 | M | — | ✅ done (`1b72574`) |
+| S-05 | Keep the provider API key out of child processes | P0 | S | — | ✅ done (`374ee2c`) |
+| S-06 | webfetch: public addresses only, checked redirects, size cap | P0 | M | — | ✅ done (`a38c995`) |
+| S-07 | Scope "Always allow" to the workspace and stop duplicate approvals | P0 | M | — | ✅ done (`e6006cd`) |
+| S-08 | Bash permission rules must check every part of a chained command | P1 | M | — | ⬜ to do |
+| S-09 | Deterministic permission defaults, merged with built-ins, invalid actions rejected | P1 | M | — | ⬜ to do |
+| S-10 | GUI `is_local_url`: parse URLs properly (userinfo etc.) | P0 | S | — | ✅ done (`df30858`) |
+| S-11 | GUI: enforce `allow_remote` on every navigation path | P1 | M | — | ⬜ to do |
+| S-12 | GUI preview bridge: unguessable request ids, bounded queue | P2 | M | — | ⬜ to do |
+| S-13 | Browser snapshot must not return password, one-time-code or card values | P1 | S | — | ⬜ to do |
+| S-14 | gitsnap: validate stored paths, never follow symlinks, literal pathspecs | P1 | M | — | ⬜ to do |
+| S-15 | Inline `/edit`: obey permission rules, refuse symlink escapes, no headless auto-apply | P1 | M | S-02, S-03 | ⬜ to do |
+| S-16 | `/export`: stay inside the workspace, no silent overwrite | P2 | S | — | ⬜ to do |
+| S-17 | Skill install: treat downloaded text as untrusted, robust verdict, permission checks | P2 | M | — | ⬜ to do |
+| S-18 | GUI hardening: devtools only in debug, CSP, no external fonts, lock main webview navigation, preview clipboard | P2 | M | — | ⬜ to do |
+| S-19 | kaggle_setup_cell.py: no shell strings from remote data, token check in front of the tunnel | P1 | M | — | ⬜ to do |
+| B-01 | `edit` tool: reject an empty `old_str` | P0 | S | — | ✅ done (`511adca`) |
+| B-02 | `/edit` must not cut Markdown files or drop the last newline | P0 | S | — | ✅ done (`6ceb57e`) |
+| B-03 | Cut-off replies (`finish_reason: "length"`) are treated as complete | P1 | M | — | ✅ done (`d0ef53f`) |
+| B-04 | Repair chat history before sending it to the provider | P1 | M | — | ✅ done (`3161de2`) |
+| B-05 | Compaction: safe split point, never delete new messages, one transaction, role labels | P1 | M | — | ✅ done (`d56b1ff`) |
+| B-06 | Abort really stops: between tool calls, inside bash, for every run kind | P1 | L | — | ✅ done (`2ccb80b`) |
+| B-07 | CLI: the prompt must not pick up option values | P1 | S | — | ⏭️ next |
+| B-08 | Heartbeat: send the API key, match the comment, skip it in headless mode | P1 | S | — | ⬜ to do |
+| B-09 | Event bus: survive lag, recover pending approvals, limit headless time | P1 | M | S-02, B-06, B-07 | ⬜ to do |
+| B-10 | New event `ApprovalResolved` (answered, timed out, aborted, released by turbo) | P1 | M | — | ✅ done (`a73fc48`) |
+| B-11 | GUI: `covered` flag never hides the native preview view | P1 | S | — | ⬜ to do |
+| B-12 | GUI: events from other sessions leak into the open chat | P1 | M | — | ⬜ to do |
+| B-13 | GUI: approval modal lingers, hotkeys need focus, one-key always-allow | P1 | M | B-10 (adds `ServerEvent::ApprovalResolved`), B-12 (adds `PendingApproval::session_id`, `GuiState::finish_approval`, `approval_queue` and the payload keys `other_chat`, `chat`, `queued`) | ⬜ to do |
+| B-14 | TUI transcript: show the newest lines even when lines wrap | P1 | M | — | ⬜ to do |
+| B-15 | TUI approval overlay: full detail, queue, safe keys, always on top | P1 | M | B-10, S-07, B-22 | ⬜ to do |
+| B-16 | TUI: give the terminal back on errors and panics | P1 | S | — | ⬜ to do |
+| B-17 | Make the `..\evil.rs` test assertion correct on every OS | P1 | S | — | ✅ done (`69d17d2`) |
+| B-18 | /team: plan-mode gate, subtask cap, honest fallback, abort status | P1 | M | — | ⬜ to do |
+| B-19 | MCP: startup can hang; provider-safe tool names; output cap | P1 | M | — | ⬜ to do |
+| B-20 | MCP: one global lock serializes every call | P1 | M | B-19 (uses its `resolve_tool_name`) | ⬜ to do |
+| B-21 | Provider stream: error frames, early end, missing delta, ids, `content: null` | P1 | M | — | ✅ done (`f67317a`) |
+| B-22 | Write/edit approvals must show what will change | P1 | M | B-09 (only the order: apply B-09 first if you do both; both edit `check_permission`) | ⬜ to do |
+| B-23 | TUI subscribes to events too late (startup race) | P2 | S | — | ⬜ to do |
+| B-24 | Turbo: one run until the last continuation, and a cap that really holds | P2 | M | B-06 | ⬜ to do |
+| B-25 | `/parallel`: real parallelism, current model, no hidden approval waits | P2 | M | — | ⬜ to do |
+| B-26 | Say so when a run stops at `max_steps` | P2 | S | — | ⬜ to do |
+| B-27 | Subagents: abort shown as done, children told to ask questions, no spawn limit | P2 | M | — | ⬜ to do |
+| B-28 | MCP protocol gaps: server requests, null fields, pagination, cancel-safe reads | P2 | M | B-19 (uses its `list_tools_within` and its `limit` parameter) | ⬜ to do |
+| B-29 | The client lock is held while waiting for the provider | P2 | S | — | ⬜ to do |
+| B-30 | read tool: binary detection, memory use, offset meaning, very long lines | P2 | S | — | ⬜ to do |
+| B-31 | write/edit: atomic writes and a correct "created/wrote" message | P2 | S | — | ⬜ to do |
+| B-32 | glob/grep: same path style, `{a,b}`, correct `**/`, skip `.git`, report skipped files | P2 | M | — | ⬜ to do |
+| B-33 | TUI: keep the busy flag true while a run is going | P2 | S | — | ⬜ to do |
+| B-34 | TUI team panel: reach Done, parse failures, show the synthesis | P2 | S | — | ⬜ to do |
+| B-35 | TUI input: Ctrl/Alt keys, pasting, long lines, wide characters | P2 | M | B-16 | ⬜ to do |
+| B-36 | GUI preview bridge timing bugs | P2 | M | — | ⬜ to do |
+| B-37 | GUI transcript re-render cost per streamed token | P2 | M | — | ⬜ to do |
+| B-38 | db: transactions, foreign keys, schema parity, readable parse errors, better ids | P2 | M | S-07 (moves the approvals table), B-05 (replaces `apply_compaction`). The Find blocks below are not touched by either task, so the order does not matter for applying; do them first for a clean history. | ⬜ to do |
+| B-39 | gitsnap: clear redo on a new run, pop only after success, stable folder hash | P2 | M | S-14 (it validates stack ids, which this task relies on when it deletes snapshot folders; it also makes `restore_manifest` report problems instead of hiding them) | ⬜ to do |
+| B-40 | browser.rs: element refs from an older snapshot can hit the wrong element | P2 | S | S-13 (its test helpers `FAKE_DOM` and `run_runtime_in_node` are reused here) | ⬜ to do |
+| B-41 | TUI polish: scrolling overlays, visible selections, colors, small display bugs | P3 | M | B-15 | ⬜ to do |
+| B-42 | GUI: panel reopens itself, replay differences, empty sessions pile up | P3 | S | — | ⬜ to do |
+| B-43 | webfetch `html_to_text`: double decoding, slow on broken HTML | P3 | S | — | ⬜ to do |
+| B-44 | skills.rs: frontmatter parser fixes and no silent overwrite on install | P3 | S | — | ⬜ to do |
+| B-45 | config: warn on unknown keys, fail on a missing `OPENCODE_RUST_CONFIG` file, honest docs | P3 | S | — | ⬜ to do |
+| B-46 | preview.rs (standalone window): navigation filter and safe logging | P3 | S | — | ⬜ to do |
+| B-47 | Missions: Explore read-only, CLI effort, derived Default | P3 | S | — | ⬜ to do |
+| B-48 | No stderr output while the TUI runs; git off the async threads | P3 | S | — | ⬜ to do |
+| B-49 | Inline edit leftovers: CRLF files, size check first, cancel, test folders | P3 | S | B-02, B-06 | ⬜ to do |
+| P-01 | Laziness meter counts only successful calls (and reads the right edit keys) | P2 | S | — | ⬜ to do |
+| P-02 | Automatic review only when files really changed | P2 | M | — | ⬜ to do |
+| P-03 | No automatic review after an abort | P2 | S | — | ⬜ to do |
+| P-04 | Reuse gate: fewer false hints, one walk, honest comment | P3 | M | — | ⬜ to do |
+| P-05 | Add the `/ponytail lite\|full\|ultra\|off` command the prompt promises | P2 | M | B-27 (order only: B-27 edits the same lines in `src/subagent.rs`; apply it first if you do it) | ⬜ to do |
+| F-01 | Retry the provider request with backoff (429 / 5xx / connection errors) | P1 | M | — | ✅ done (`5bb6ae7`) |
+| F-02 | Native Anthropic Messages API provider | P2 | L | F-01 (`send_with_retry`, `from_cfg`), B-08 (Stage 4 edits its heartbeat code); B-04 recommended first | ⬜ to do |
+| F-03 | MCP servers over Streamable HTTP | P2 | L | B-19, B-20 (uses B-19's `cap_result` and `tool_fn_name`, and B-20's `Live` struct) | ⬜ to do |
+| F-04 | `browser_screenshot` tool | P2 | M | H-02 (makes `tao`/`wry` optional and adds the `gui` feature; this task adds two Windows-only crates to that feature) | ⬜ to do |
+| F-05 | Git-worktree isolation for worker subagents and team workers | P2 | L | B-06 (one call passes B-06's abort flag; see the note in step 9) | ⬜ to do |
+| F-06 | GUI: Stop button, multiline composer, IME guard | P1 | M | — | ⬜ to do |
+| F-07 | Automatic compaction near the context limit | P2 | M | B-05 (safe compaction; this task calls `compact::compact` from the agent loop and edits a line B-05 wrote) | ⬜ to do |
+| F-08 | Verification loop (`agent.verify_command`) | P2 | M | — | ⬜ to do |
+| F-09 | Loop guard: refuse the third identical tool call in a row | P2 | M | — | ⬜ to do |
+| F-10 | Context7 + ast-grep MCP setup (config, docs, skill), Serena note | P3 | S | B-19 (start-up time limits, provider-safe tool names), B-20 (parallel MCP calls) | ⬜ to do |
+| F-11 | Persist todos in SQLite | P3 | M | — | ⬜ to do |
+| F-12 | HTTP API parity: mode, model, permission mode, approvals list, rename/delete | P3 | M | S-01, B-06, B-09 | ⬜ to do |
+| F-13 | GUI release polish: WebView2-missing dialog, single-instance guard | P3 | S | F-04 (only its `Cargo.toml` step: the Windows-only `windows` dependency with the `Win32_UI_WindowsAndMessaging` feature) | ⬜ to do |
+| H-01 | Add README.md, LICENSE and NOTICE | P1 | S | H-02 (the README mentions `--no-default-features`) | ✅ done (`a96d420`) |
+| H-02 | Make the desktop GUI an optional cargo feature | P1 | S | — | ✅ done (`feab2a4`) |
+| H-03 | Add GitHub Actions CI (Linux + Windows) | P1 | S | B-17 (otherwise the Linux job fails on a Windows-only test), H-02 (for the "core only" job) | ✅ done (`44e663d`) |
+| H-04 | Bring GOALS.md up to date | P3 | S | — | ⬜ to do |
+| H-05 | tests/gui/run.sh: also run on Linux/macOS | P3 | S | — | ⬜ to do |
+| H-06 | Remove the unused `separate_demo/` crate | P3 | S | — | ⬜ to do |
 
 Totals: S = 19, B = 49, P = 5, F = 13, H = 6 — 92 tasks.
 
