@@ -111,11 +111,15 @@ fn run() -> Result<()> {
             cfg.provider.base_url = u.clone();
         }
     }
-    // Positional prompt for headless mode.
-    let prompt: Option<String> = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .cloned();
+    // Positional prompt: every word that is not an option or an option's
+    // value, joined with spaces. New (B-07): see `positional_prompt`.
+    let prompt: Option<String> = match positional_prompt(&args) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}\nRun `opencode-rust --help` for the list of options.");
+            std::process::exit(2);
+        }
+    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -147,6 +151,43 @@ fn run() -> Result<()> {
         }
         tui_run(state, addr, prompt, boot_ms).await
     })
+}
+
+/// New (B-07): options that take a value. Their value is never part of the
+/// prompt. (`--timeout` is used by task B-09.)
+const VALUE_FLAGS: &[&str] = &["--port", "--model", "--base-url", "--timeout"];
+/// New (B-07): options without a value. (`--yes` is used by task S-02.)
+const SWITCH_FLAGS: &[&str] = &["--headless", "--gui", "--yes", "--version", "-V", "--help", "-h"];
+
+/// New (B-07): the prompt from the command line. Options and their values
+/// are skipped, the remaining words are joined with spaces, and everything
+/// after `--` is prompt text (so a prompt may start with `-`).
+/// Err = an option this program does not know.
+fn positional_prompt(args: &[String]) -> Result<Option<String>, String> {
+    let mut words: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            words.extend(args[i + 1..].iter().map(String::as_str));
+            break;
+        }
+        if VALUE_FLAGS.contains(&a) {
+            i += 2; // skip the option and its value
+            continue;
+        }
+        if SWITCH_FLAGS.contains(&a) {
+            i += 1;
+            continue;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            return Err(format!("unknown option: {a}"));
+        }
+        words.push(a);
+        i += 1;
+    }
+    let prompt = words.join(" ");
+    Ok(if prompt.trim().is_empty() { None } else { Some(prompt) })
 }
 
 /// `/undo` / `/redo`: git snapshot restore off the async runtime (subprocess).
@@ -186,7 +227,8 @@ fn print_help() {
         "opencode-rust {} — lightweight terminal AI coding agent
 
 USAGE:
-  opencode-rust [OPTIONS] [PROMPT]
+  opencode-rust [OPTIONS] [PROMPT...]
+  (prompt words are joined; put -- before a prompt that starts with -)
 
 OPTIONS:
   --headless       Run one prompt without the TUI (prints result, exits)
@@ -1098,5 +1140,34 @@ mod headless_policy_tests {
     #[test]
     fn auto_deny_always_wins() {
         assert!(!auto_approve_policy(&args(&["--yes"]), Some("1"), Some("1")));
+    }
+}
+
+#[cfg(test)]
+mod cli_args_tests {
+    use super::positional_prompt;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn option_values_are_not_the_prompt() {
+        let a = args(&["--model", "gpt-4", "--headless", "fix", "the", "bug"]);
+        assert_eq!(positional_prompt(&a).unwrap(), Some("fix the bug".to_string()));
+        assert_eq!(positional_prompt(&args(&["--port", "4000"])).unwrap(), None);
+        assert_eq!(positional_prompt(&args(&[])).unwrap(), None);
+    }
+
+    #[test]
+    fn double_dash_ends_the_options() {
+        let a = args(&["--headless", "--", "--explain", "this"]);
+        assert_eq!(positional_prompt(&a).unwrap(), Some("--explain this".to_string()));
+    }
+
+    #[test]
+    fn unknown_options_are_reported() {
+        let err = positional_prompt(&args(&["--headles", "hi"])).unwrap_err();
+        assert!(err.contains("--headles"), "{err}");
     }
 }
