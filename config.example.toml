@@ -41,3 +41,13 @@ bash = "ask"
 write = "ask"
 edit = "ask"
 webfetch = "ask"
+
+# Rules are checked in order; the first match wins.
+# For file tools the pattern is matched against the path relative to the
+# workspace, with "/" separators ("src/main.rs"). "." and ".." are resolved
+# first. Paths outside the workspace look like "outside:/abs/path".
+# On Windows, file patterns ignore letter case.
+# [[permissions.rules]]
+# tool = "read"
+# pattern = ".env"
+# action = "deny"

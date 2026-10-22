@@ -1577,7 +1577,10 @@ fn tool_detail(st: &Shared, tool: &str, input: &Value) -> String {
             normalize_path_detail(&st.workspace, p)
         }
         "webfetch" => input.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
-        "list" => input.get("path").and_then(Value::as_str).unwrap_or(".").to_string(),
+        "list" => normalize_path_detail(
+            &st.workspace,
+            input.get("path").and_then(Value::as_str).unwrap_or("."),
+        ),
         _ => serde_json::to_string(input).unwrap_or_default(),
     }
 }
