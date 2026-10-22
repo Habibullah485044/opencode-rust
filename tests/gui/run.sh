@@ -54,7 +54,7 @@ run() {
 # --- suite 1: the app page -------------------------------------------------
 {
   head -n -2 "$root/src/gui.html"     # drop </body></html>
-  printf '<script>\n'
+  printf '<script nonce="habi-ui">\n'
   cat "$root/tests/gui/panel.js"
   printf '\n</script>\n</body>\n</html>\n'
 } > "$tmp/panel.html"

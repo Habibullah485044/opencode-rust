@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- S-18: nothing loads from the network, and only the script carrying our
+     nonce runs (injected onclick= handlers are refused). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-habi-ui'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <title>Habi Studio</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
     --sky: #38bdf8;
@@ -1461,7 +1461,7 @@
   </div>
 </div>
 
-<script>
+<script nonce="habi-ui">
 (function () {
   "use strict";
 
@@ -1553,7 +1553,7 @@
             '<div class="code-block">' +
               '<div class="code-header">' +
                 '<span>' + esc(langTag) + '</span>' +
-                '<button class="copy-btn" onclick="copyCode(\'' + id + '\', this)">Copy</button>' +
+                '<button class="copy-btn" data-copy="' + id + '">Copy</button>' +
               '</div>' +
               '<pre class="code-content"><code id="' + id + '">' + esc(codeBuf.join("\n")) + '</code></pre>' +
             '</div>'
@@ -1610,21 +1610,25 @@
     return s;
   }
 
-  window.copyCode = function (id, btn) {
+  // S-18: called by one delegated click listener (see initApp), because the
+  // CSP refuses inline onclick handlers.
+  function copyCode(id, btn) {
     var el = document.getElementById(id);
     if (!el) return;
     var text = el.textContent || "";
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text);
+    function show(label) {
+      btn.textContent = label;
+      setTimeout(function () { btn.textContent = "Copy"; }, 1600);
     }
-    var orig = btn.textContent;
-    btn.textContent = "Copied!";
-    btn.style.color = "var(--sky)";
-    setTimeout(function () {
-      btn.textContent = orig;
-      btn.style.color = "";
-    }, 1600);
-  };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { show("Copied!"); },
+        function () { show("Copy failed"); }
+      );
+    } else {
+      show("Copy failed");
+    }
+  }
 
   // ---- B-37: transcript rendering, one row per entry ----
   // Rows are kept between paints. A streamed token only changes the last
@@ -2256,6 +2260,15 @@
         }, collapsed ? 320 : 0);
       }
     });
+
+    // S-18: Copy buttons in code blocks (rows are redrawn, so listen on #log).
+    var logEl = document.getElementById("log");
+    if (logEl) {
+      logEl.addEventListener("click", function (ev) {
+        var btn = ev.target && ev.target.closest ? ev.target.closest(".copy-btn") : null;
+        if (btn && btn.getAttribute("data-copy")) copyCode(btn.getAttribute("data-copy"), btn);
+      });
+    }
 
     // Starter Prompt Chips
     var chips = document.querySelectorAll(".chip");

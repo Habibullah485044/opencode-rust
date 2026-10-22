@@ -783,6 +783,29 @@ fn paint(webview: &wry::WebView, gs: &GuiState) {
     let _ = webview.evaluate_script(&format!("window.render&&window.render({})", gs.paint_payload()));
 }
 
+/// New (S-18): may the main window go to `uri`? Only our own page: WebView2
+/// reports the page loaded from a string as `about:blank` or as a
+/// `data:text/html…` URI (the exact form depends on the runtime version).
+/// Chromium itself refuses `data:` navigations started by page scripts.
+fn main_window_may_navigate(uri: &str) -> bool {
+    let u = uri.trim().to_ascii_lowercase();
+    u == "about:blank" || u.starts_with("data:text/html")
+}
+
+/// New (S-18): navigation handler for the main window. The very first
+/// navigation is always our own page (`with_html`), whatever URI the
+/// runtime reports for it; after that only `main_window_may_navigate` URIs.
+fn main_window_navigation_guard() -> impl Fn(String) -> bool + 'static {
+    let first = std::sync::atomic::AtomicBool::new(true);
+    move |uri: String| {
+        if first.swap(false, std::sync::atomic::Ordering::SeqCst) || main_window_may_navigate(&uri) {
+            return true;
+        }
+        eprintln!("[gui] blocked a navigation of the main window to {uri}");
+        false
+    }
+}
+
 /// Apply the panel's rect and visibility to the native child view.
 ///
 /// Bounds go first: a view shown at a stale rect flashes a grey/white
@@ -956,13 +979,18 @@ pub async fn run(
     let page_tx = ui_tx.clone();
     let webview = wry::WebViewBuilder::new()
         .with_background_color((7, 10, 18, 255))
-        .with_devtools(true)
+        // S-18: DevTools only in debug builds (`cargo run`), never in release.
+        .with_devtools(cfg!(debug_assertions))
         .with_initialization_script(
             "window.addEventListener('error', (e) => {\n\
              \x20 try { window.ipc.postMessage(JSON.stringify({ type: 'page_error', msg: e.message })) } catch (_) {}\n\
              \x20});",
         )
         .with_html(APP_HTML)
+        // S-18: this window only ever shows our own page; refuse every other
+        // navigation, so no link or script can swap the app for a page that
+        // would then get our IPC channel.
+        .with_navigation_handler(main_window_navigation_guard())
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             if let Some(msg) = parse_ipc(req.body()) {
                 let _ = page_tx.send(UiMsg::Ipc(msg));
@@ -1004,7 +1032,8 @@ pub async fn run(
         let built = wry::WebViewBuilder::new()
             .with_background_color((7, 10, 18, 255))
             .with_visible(false)
-            .with_clipboard(true)
+            // S-18: no `with_clipboard(true)`: in wry 0.57 on Windows it lets
+            // every page in the panel read the clipboard without asking.
             .with_bounds(PanelRect::fallback().to_wry())
             // Goal B: the page-side primitives (snapshot/click/type/wait) and
             // the channel their results come back on.
@@ -2011,6 +2040,20 @@ mod tests {
         assert_eq!(clip("short", 10), "short");
         assert_eq!(clip("hello world", 5), "hello\u{2026}");
         assert_eq!(clip("\u{1f512}abc", 2), "\u{1f512}a\u{2026}");
+    }
+
+    /// S-18: the main window only ever shows our own page.
+    #[test]
+    fn main_window_navigation_is_locked() {
+        assert!(main_window_may_navigate("about:blank"));
+        assert!(main_window_may_navigate("data:text/html;charset=utf-8;base64,PGgxPg=="));
+        assert!(!main_window_may_navigate("https://example.com/"));
+        assert!(!main_window_may_navigate("http://localhost:3000/"));
+        assert!(!main_window_may_navigate("file:///C:/Windows/win.ini"));
+        let guard = main_window_navigation_guard();
+        assert!(guard("data:text/html,first".to_string()), "the first load is ours");
+        assert!(!guard("https://example.com/".to_string()));
+        assert!(guard("about:blank".to_string()));
     }
 
     /// A-F1: everything a person might paste into the URL bar has to turn into

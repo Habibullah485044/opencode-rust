@@ -295,6 +295,22 @@
   window.render(payload({ url: "", title: "", can_back: false, can_forward: false, loading: false, error: null, visible: false }));
   ok("modal hides when the run settles", document.getElementById("approval").hidden);
 
+  // --- S-18: CSP, no network fonts, Copy without inline onclick ---
+  ok("the page declares a CSP", !!document.querySelector('meta[http-equiv="Content-Security-Policy"]'));
+  ok("no stylesheet is loaded from the network", document.querySelectorAll('link[rel="stylesheet"]').length === 0);
+  var probe = document.createElement("div");
+  probe.innerHTML = '<button id="csp-probe" onclick="window.__cspProbe = 1">x</button>';
+  document.body.appendChild(probe);
+  document.getElementById("csp-probe").click();
+  ok("the CSP refuses inline event handlers", window.__cspProbe === undefined);
+  probe.remove();
+  var cp = payload({ url: "", title: "", can_back: false, can_forward: false, loading: false, error: null, visible: false });
+  cp.entries = [{ k: "a", t: "```js\nlet x = 1;\n```" }];
+  window.render(cp);
+  var copyBtn = document.querySelector(".copy-btn");
+  ok("code blocks get a Copy button without inline onclick",
+    !!copyBtn && !copyBtn.hasAttribute("onclick") && !!copyBtn.getAttribute("data-copy"));
+
   // --- Permission mode selector: default / manual / turbo ---
   var basePage = { url: "", title: "", can_back: false, can_forward: false, loading: false, error: null, visible: false };
   function withMode(mode) {
