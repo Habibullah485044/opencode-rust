@@ -207,13 +207,22 @@ fn next_snap_id() -> String {
     format!("s{}_{:x}", now_ms(), CTR.fetch_add(1, Ordering::Relaxed))
 }
 
-/// workspace-specific snapshot root under the state dir.
+/// Workspace-specific snapshot root under the state dir. The folder name is
+/// a fixed FNV-1a hash of the canonical workspace path (lower-case on
+/// Windows), so it survives restarts, Rust upgrades and other spellings of
+/// the same folder.
 fn snap_root(state_dir: &Path, workspace: &Path) -> PathBuf {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    workspace.to_string_lossy().hash(&mut h);
-    state_dir.join(format!("snaps_{:016x}", h.finish()))
+    let canon = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let mut key = canon.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        key = key.to_lowercase();
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    state_dir.join(format!("snaps_{h:016x}"))
 }
 
 fn read_stack(path: &Path) -> Vec<String> {
@@ -439,36 +448,63 @@ pub fn record_before_run(
         return Ok(None);
     };
     let root = snap_root(state_dir, workspace);
-    let (undo_path, _) = stack_paths(&root);
+    let (undo_path, redo_path) = stack_paths(&root);
     push_stack(&undo_path, &m.id, &root)?;
+    // A new run starts a new history: what /redo could bring back belongs
+    // to the old one. (read_stack only returns ids we wrote, see S-14.)
+    for old in read_stack(&redo_path) {
+        let _ = std::fs::remove_dir_all(root.join(old));
+    }
+    write_stack(&redo_path, &[])?;
     Ok(Some(m))
+}
+
+/// Shared body of undo and redo: restore the newest entry of the `from`
+/// stack after saving the current state on the `to` stack.
+/// - A damaged entry (bad manifest) is dropped from `from` and reported;
+///   nothing else changes.
+/// - If the counter-snapshot fails, both stacks stay as they were.
+/// - Once files may have changed, the step is recorded even when restore
+///   reports problems: the counter-snapshot goes on `to`, the used entry
+///   leaves `from`, and its folder is deleted.
+fn step(
+    workspace: &Path,
+    state_dir: &Path,
+    from: &Path,
+    to: &Path,
+    label: &str,
+) -> Result<Option<Manifest>> {
+    let root = snap_root(state_dir, workspace);
+    let Some(id) = read_stack(from).last().cloned() else { return Ok(None) };
+    let m = match load_manifest(&root, &id) {
+        Ok(m) => m,
+        Err(e) => {
+            pop_stack(from);
+            return Err(anyhow!("{e:#} (snapshot {id} was dropped from the stack)"));
+        }
+    };
+    let cur = take_snapshot(workspace, state_dir, label)?;
+    let restored = restore_manifest(workspace, state_dir, &root, &m);
+    if let Some(cur) = cur {
+        push_stack(to, &cur.id, &root)?;
+    }
+    pop_stack(from);
+    let _ = std::fs::remove_dir_all(root.join(&id));
+    restored.map(|_| Some(m))
 }
 
 /// Restore the most recent snapshot (undo). `Ok(None)` = nothing to undo.
 pub fn undo(workspace: &Path, state_dir: &Path) -> Result<Option<Manifest>> {
     let root = snap_root(state_dir, workspace);
     let (undo_path, redo_path) = stack_paths(&root);
-    let Some(id) = pop_stack(&undo_path) else { return Ok(None) };
-    // Capture the state we're about to replace so redo can bring it back.
-    if let Some(cur) = take_snapshot(workspace, state_dir, "pre-undo")? {
-        push_stack(&redo_path, &cur.id, &root)?;
-    }
-    let m = load_manifest(&root, &id)?;
-    restore_manifest(workspace, state_dir, &root, &m)?;
-    Ok(Some(m))
+    step(workspace, state_dir, &undo_path, &redo_path, "pre-undo")
 }
 
 /// Re-apply the state an `/undo` replaced. `Ok(None)` = nothing to redo.
 pub fn redo(workspace: &Path, state_dir: &Path) -> Result<Option<Manifest>> {
     let root = snap_root(state_dir, workspace);
     let (undo_path, redo_path) = stack_paths(&root);
-    let Some(id) = pop_stack(&redo_path) else { return Ok(None) };
-    if let Some(cur) = take_snapshot(workspace, state_dir, "pre-redo")? {
-        push_stack(&undo_path, &cur.id, &root)?;
-    }
-    let m = load_manifest(&root, &id)?;
-    restore_manifest(workspace, state_dir, &root, &m)?;
-    Ok(Some(m))
+    step(workspace, state_dir, &redo_path, &undo_path, "pre-redo")
 }
 
 #[cfg(test)]
@@ -720,5 +756,48 @@ mod tests {
         assert_eq!(read(&outside), "outside\n", "the link target was not overwritten");
         assert!(std::fs::symlink_metadata(r.dir.join("link.txt")).is_ok(), "the user's link is kept");
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn a_new_run_clears_redo() {
+        let r = test_repo();
+        record_before_run(&r.dir, &r.state, "run 1").unwrap().unwrap();
+        std::fs::write(r.dir.join("a.txt"), "run 1 edit\n").unwrap();
+        undo(&r.dir, &r.state).unwrap().unwrap();
+        // A new run starts: the old redo entry must not survive it.
+        record_before_run(&r.dir, &r.state, "run 2").unwrap().unwrap();
+        assert!(redo(&r.dir, &r.state).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_damaged_entry_is_dropped_and_older_ones_still_work() {
+        let r = test_repo();
+        record_before_run(&r.dir, &r.state, "run 1").unwrap().unwrap();
+        std::fs::write(r.dir.join("a.txt"), "run 1 edit\n").unwrap();
+        let newest = record_before_run(&r.dir, &r.state, "run 2").unwrap().unwrap();
+        let root = snap_root(&r.state, &r.dir);
+        std::fs::write(root.join(&newest.id).join("manifest.json"), "{ broken").unwrap();
+        assert!(undo(&r.dir, &r.state).is_err(), "damaged entry is reported");
+        // The next undo uses the older snapshot (clean tree before run 1).
+        undo(&r.dir, &r.state).unwrap().expect("older entry still works");
+        assert_eq!(read(&r.dir.join("a.txt")), "original a\n");
+    }
+
+    #[test]
+    fn used_snapshot_folders_are_deleted() {
+        let r = test_repo();
+        let snap = record_before_run(&r.dir, &r.state, "run").unwrap().unwrap();
+        std::fs::write(r.dir.join("a.txt"), "agent edit\n").unwrap();
+        undo(&r.dir, &r.state).unwrap().unwrap();
+        let root = snap_root(&r.state, &r.dir);
+        assert!(!root.join(&snap.id).exists(), "the restored snapshot folder is removed");
+    }
+
+    #[test]
+    fn snapshot_folder_name_is_stable() {
+        // A path that does not exist is hashed as written; the value must
+        // never change between builds (FNV-1a of "/nonexistent-ocrs/ws").
+        let root = snap_root(Path::new("state"), Path::new("/nonexistent-ocrs/ws"));
+        assert_eq!(root, Path::new("state").join("snaps_c72a95b4f23df8bc"));
     }
 }
