@@ -299,9 +299,14 @@ pub fn install_skill(base: &Path, doc: &Doc) -> Result<PathBuf> {
         })
         .collect();
     let path = dir.join(format!("{safe}.md"));
+    // Frontmatter values are single lines: a line break in a name or a
+    // description must not add keys or end the block early.
+    let one_line = |s: &str| s.replace(['\r', '\n'], " ").trim().to_string();
     let text = format!(
         "---\nname: {}\ndescription: {}\n---\n\n{}\n",
-        doc.name, doc.description, doc.body
+        one_line(&doc.name),
+        one_line(&doc.description),
+        doc.body
     );
     std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
