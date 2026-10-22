@@ -225,6 +225,13 @@ pub struct AgentCfg {
     pub ponytail: bool,
     /// Automatically run a ponytail review after runs that changed files.
     pub auto_review: bool,
+    /// F-08: command that checks the work after a run that changed files,
+    /// for example "cargo test". Unset (the default) = no check.
+    pub verify_command: Option<String>,
+    /// F-08: how many fix rounds the agent gets when the check fails.
+    pub verify_max_rounds: u32,
+    /// F-08: seconds before a check that hangs is stopped.
+    pub verify_timeout_secs: u64,
     /// Laziness Meter: hint the model when a write duplicates something the
     /// repo already has, and flag overbuilt writes.
     pub reuse_gate: bool,
@@ -236,6 +243,9 @@ impl Default for AgentCfg {
             max_steps: 40,
             system_prompt: None,
             ponytail: true,
+            verify_command: None,
+            verify_max_rounds: 2,
+            verify_timeout_secs: 600,
             auto_review: true,
             reuse_gate: true,
         }

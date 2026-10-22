@@ -34,6 +34,12 @@ ponytail = true
 auto_review = true
 reuse_gate = true
 
+# F-08: check the work after every run that changed files (unset = off).
+# On failure the agent gets the output and up to verify_max_rounds tries to fix it.
+# verify_command = "cargo test"
+# verify_max_rounds = 2
+# verify_timeout_secs = 600
+
 [permissions]
 # Default action per tool: "allow" | "ask" | "deny"
 [permissions.defaults]

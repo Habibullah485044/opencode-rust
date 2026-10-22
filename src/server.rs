@@ -665,6 +665,14 @@ fn turbo_streak(st: &Shared, session_id: &str) -> u32 {
         if m.role != "user" {
             continue;
         }
+        // F-08: a verify hand-back is not a real user message. Skip it, so
+        // it neither counts toward nor resets the turbo safety cap.
+        let is_verify = m.parts.iter().any(|p| {
+            matches!(p, Part::Text { text } if text.starts_with(VERIFY_PREFIX))
+        });
+        if is_verify {
+            continue;
+        }
         // New (B-24): the automatic review adds its own "user" prompt after
         // every run that changed files. It must neither count nor break the
         // streak, or the cap never holds.
@@ -767,6 +775,11 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
             .unwrap_or(false)
     };
     if !superseded {
+        // F-08 verification loop: check the work before the review and
+        // before the turn is declared done. Never after an abort.
+        if ok && touched && !abort.load(Ordering::SeqCst) {
+            verify_after_run(st, session_id, &abort).await;
+        }
         // Auto ponytail review: any run that changed files gets the
         // outside-the-diff senior-dev pass BEFORE the turn is declared done.
         // New (P-03): never after an abort; the user asked us to stop.
@@ -1950,6 +1963,132 @@ pub async fn run_review(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) 
         agent: None,
     };
     run_loop(st, session_id, &opts, abort).await
+}
+
+/// F-08: marks the user message that hands a failed check back to the agent.
+pub const VERIFY_PREFIX: &str = "[verify]";
+
+/// F-08 verification loop. After a top-level run that changed files, run
+/// `agent.verify_command` in the workspace. When it fails, hand the output
+/// back to the agent as a user message and run the agent again — at most
+/// `agent.verify_max_rounds` times. Each step shows up as a `Note`.
+async fn verify_after_run(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) {
+    let Some(cmd) = st.cfg.agent.verify_command.as_deref().map(str::trim) else {
+        return;
+    };
+    if cmd.is_empty() {
+        return;
+    }
+    let note = |text: String| {
+        let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
+    };
+    // Deny rules still apply. There is no "ask" prompt: the user set this command.
+    if st.engine.evaluate("bash", cmd, |_, _| false).action == Action::Deny {
+        note(format!("{VERIFY_PREFIX} skipped: a deny rule blocks `{cmd}`"));
+        return;
+    }
+    let timeout = std::time::Duration::from_secs(st.cfg.agent.verify_timeout_secs.max(1));
+    let max_rounds = st.cfg.agent.verify_max_rounds;
+    let mut round = 0;
+    loop {
+        if abort.load(Ordering::SeqCst) {
+            return;
+        }
+        note(format!("{VERIFY_PREFIX} running `{cmd}`…"));
+        let result = run_verify_command(cmd, &st.workspace, timeout, abort).await;
+        if abort.load(Ordering::SeqCst) {
+            return;
+        }
+        let (code, output) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                note(format!("{VERIFY_PREFIX} could not run `{cmd}`: {e:#}"));
+                return;
+            }
+        };
+        if code == Some(0) {
+            note(format!("{VERIFY_PREFIX} `{cmd}` passed"));
+            return;
+        }
+        let status = match code {
+            Some(c) => format!("exit {c}"),
+            None => "timed out or was killed".to_string(),
+        };
+        if round >= max_rounds {
+            note(format!(
+                "{VERIFY_PREFIX} `{cmd}` still fails ({status}) after {round} fix round(s) — over to you"
+            ));
+            return;
+        }
+        round += 1;
+        note(format!("{VERIFY_PREFIX} `{cmd}` failed ({status}) — fix round {round} of {max_rounds}"));
+        let msg = format!(
+            "{VERIFY_PREFIX} `{cmd}` failed ({status}). Output (last 4000 chars):\n```\n{}\n```\n\
+             Fix the failures, then stop.",
+            tail_chars(&output, 4000)
+        );
+        if let Err(e) = agent_inner(st, session_id, &msg, abort).await {
+            note(format!("{VERIFY_PREFIX} fix round failed: {e}"));
+            return;
+        }
+    }
+}
+
+/// F-08: run the check in the workspace with a timeout. Returns the exit code
+/// (`None` = timed out or killed) and stdout + stderr. Stops early on abort.
+async fn run_verify_command(
+    cmd: &str,
+    workspace: &std::path::Path,
+    timeout: std::time::Duration,
+    abort: &AtomicBool,
+) -> Result<(Option<i32>, String)> {
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(cmd);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    };
+    command
+        .current_dir(workspace)
+        // S-05 spirit: child processes never get the provider API key.
+        .env_remove("OPENCODE_RUST_API_KEY")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = command.spawn().context("starting the verify command")?;
+    let out = tokio::select! {
+        r = tokio::time::timeout(timeout, child.wait_with_output()) => match r {
+            Ok(r) => r.context("waiting for the verify command")?,
+            Err(_) => {
+                return Ok((None, format!("(stopped: no result after {}s)", timeout.as_secs())));
+            }
+        },
+        _ = async {
+            while !abort.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        } => anyhow::bail!("aborted"),
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok((out.status.code(), text))
+}
+
+/// The last `max` characters of `s` (never splits a character).
+fn tail_chars(s: &str, max: usize) -> &str {
+    let count = s.chars().count();
+    if count <= max {
+        return s;
+    }
+    let start = s.char_indices().nth(count - max).map(|(i, _)| i).unwrap_or(0);
+    &s[start..]
 }
 
 /// Run `task` twice, in two isolated git worktrees, and summarize the results.
@@ -4383,6 +4522,123 @@ data: [DONE]
             }
         }
         assert!(notes.iter().any(|n| n.contains("loop guard")), "{notes:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F-08: the check helper reports exit codes and output, the tail helper
+    /// never splits a character, a verify hand-back does not reset the turbo
+    /// streak, and verification is off by default.
+    #[tokio::test]
+    async fn verify_helpers_report_exit_codes_and_keep_the_turbo_cap() {
+        let dir = std::env::temp_dir();
+        let abort = AtomicBool::new(false);
+        let t = std::time::Duration::from_secs(30);
+        let (code, out) = run_verify_command("echo verify-ok", &dir, t, &abort).await.unwrap();
+        assert_eq!(code, Some(0));
+        assert!(out.contains("verify-ok"), "{out}");
+        let (code, _) = run_verify_command("exit 3", &dir, t, &abort).await.unwrap();
+        assert_eq!(code, Some(3));
+        assert_eq!(tail_chars("abcdef", 3), "def");
+        assert_eq!(tail_chars("äöü", 5), "äöü");
+
+        let cfg = crate::config::Config::default();
+        assert!(cfg.agent.verify_command.is_none(), "off unless configured");
+        assert_eq!(cfg.agent.verify_max_rounds, 2);
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("v", None).unwrap();
+        let text = format!("{TURBO_CONTINUE_PREFIX} keep going");
+        st.db.add_message(&s.id, "user", &[Part::Text { text }]).unwrap();
+        let text = format!("{VERIFY_PREFIX} `x` failed (exit 1).");
+        st.db.add_message(&s.id, "user", &[Part::Text { text }]).unwrap();
+        assert_eq!(turbo_streak(&st, &s.id), 1, "a verify hand-back neither counts nor resets");
+    }
+
+    /// F-08 end to end: the run writes a file, the check fails, the agent gets
+    /// the output as a `[verify]` message, fixes it, and the check passes.
+    #[tokio::test]
+    async fn verify_failure_runs_a_fix_round_until_the_check_passes() {
+        use axum::{routing::post, Router};
+        fn write_call(id: &str, path: &str) -> String {
+            let args = serde_json::json!({"path": path, "content": "ok\n"}).to_string();
+            let frame = serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": id,
+                "function": {"name": "write", "arguments": args}
+            }]}, "finish_reason": null}]});
+            format!(
+                "data: {frame}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
+                 data: [DONE]\n\n"
+            )
+        }
+        let dir = std::env::temp_dir().join(format!("ocrs-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The check passes only once `fixed.txt` exists.
+        #[cfg(windows)]
+        let check = "dir fixed.txt";
+        #[cfg(not(windows))]
+        let check = "test -f fixed.txt";
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.auto_review = false;
+        cfg.agent.verify_command = Some(check.to_string());
+        cfg.permissions.defaults.insert("write".into(), "allow".into());
+        cfg.permissions.approval_timeout_secs = 2;
+        // First request: write made.txt. After a `[verify]` message: write
+        // fixed.txt. After any tool result: a short text answer.
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: axum::extract::Json<Value>| async move {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                let last = msgs.last().cloned().unwrap_or_default();
+                let payload = if last["role"] == "tool" {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                        .to_string()
+                } else if last["content"].as_str().unwrap_or("").starts_with("[verify]") {
+                    write_call("call_fix", "fixed.txt")
+                } else {
+                    write_call("call_make", "made.txt")
+                };
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    payload,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("verify", None).unwrap();
+        let mut rx = st.events.subscribe();
+
+        run_agent(&st, &s.id, "make a marker", Arc::new(AtomicBool::new(false))).await;
+
+        assert!(dir.join("fixed.txt").is_file(), "the fix round ran");
+        let msgs = st.db.messages(&s.id).unwrap();
+        assert!(
+            msgs.iter().any(|m| m.role == "user"
+                && m.parts.iter().any(|p| matches!(p, Part::Text { text }
+                    if text.starts_with("[verify]") && text.contains("failed (exit 1)")))),
+            "the failure was handed back to the agent"
+        );
+        let mut notes = Vec::new();
+        let mut finished = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ServerEvent::Note { text, .. } => notes.push(text),
+                ServerEvent::RunFinished { ok, .. } => finished.push(ok),
+                _ => {}
+            }
+        }
+        let failed_at = notes.iter().position(|n| n.contains("failed")).expect("failure note");
+        let passed_at = notes.iter().position(|n| n.contains("passed")).expect("pass note");
+        assert!(failed_at < passed_at, "{notes:?}");
+        assert_eq!(finished, vec![true], "one completion, after the verify loop");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
