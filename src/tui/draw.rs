@@ -297,35 +297,14 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(footer, chunks[3]);
 
     // Approval overlay — centered box on top (rendered last = on top).
-    if let Some(ap) = &app.approval {
-        let area = centered_rect(60, 30, f.area());
-        f.render_widget(Clear, area);
-        let text = vec![
-            Line::from("Tool approval required")
-                .style(Style::default().fg(FB_ERROR).add_modifier(Modifier::BOLD)),
-            Line::from(""),
-            Line::from(format!("Tool:  {}", ap.tool)).style(Style::default().fg(FB_FG)),
-            Line::from(format!("Input: {}", truncate_str(&ap.detail, 200)))
-                .style(Style::default().fg(FB_MUTED)),
-            Line::from(""),
-            Line::from("[y] allow once   [a] always (this workspace)   [n] deny")
-                .style(Style::default().fg(FB_GREEN)),
-        ];
-        let block = Paragraph::new(text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(FB_BORDER))
-                    .title(" approval "),
-            )
-            .wrap(Wrap { trim: false });
-        f.render_widget(block, area);
-    }
+    // B-15: the overlays below are skipped while one that gets the keys
+    // first (state.rs `on_key`) is open, so nothing ever covers it.
+    draw_approval(f, app);
 
     // Mission picker overlay — Freebuff's Missions dialog layout:
     // mission list with the chosen one checked, effort row underneath.
-    if let Some(mp) = &app.mission_picker {
+    let covered = app.approval.is_some() || app.pending_edit.is_some();
+    if let Some(mp) = app.mission_picker.as_ref().filter(|_| !covered) {
         let area = centered_rect(60, 45, f.area());
         f.render_widget(Clear, area);
         let mut lines: Vec<Line> = vec![
@@ -388,8 +367,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_widget(block, area);
     }
 
-    // M3: inline-edit diff preview overlay.
-    if let Some(pe) = &app.pending_edit {
+    // M3: inline-edit diff preview overlay (B-15: never over an approval).
+    if let Some(pe) = app.pending_edit.as_ref().filter(|_| app.approval.is_none()) {
         let area = centered_rect(80, 70, f.area());
         f.render_widget(Clear, area);
         let mut lines: Vec<Line> = vec![
@@ -422,7 +401,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 
     // M6: `/help` reference overlay (also F1). Any key closes it.
-    if app.help {
+    if app.help && !covered && app.mission_picker.is_none() && app.sessions.is_none() {
         let area = centered_rect(76, 84, f.area());
         f.render_widget(Clear, area);
         let block = Paragraph::new(help_text())
@@ -438,7 +417,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 
     // M6: `/sessions` browser (newest first; ↳ marks a fork of another session).
-    if let Some(ov) = &app.sessions {
+    if let Some(ov) = app.sessions.as_ref().filter(|_| !covered && app.mission_picker.is_none()) {
         let area = centered_rect(72, 70, f.area());
         f.render_widget(Clear, area);
         let rows = area.height.saturating_sub(4) as usize;
@@ -648,4 +627,52 @@ fn centered_rect(pct_x: u16, pct_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - pct_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+/// B-15: the approval overlay — the WHOLE tool input, scrollable, with the
+/// keys in the bottom border so they stay visible.
+fn draw_approval(f: &mut Frame, app: &App) {
+    let Some(ap) = &app.approval else { return };
+    let area = centered_rect(80, 70, f.area());
+    f.render_widget(Clear, area);
+    let mut text = vec![
+        Line::from("Tool approval required")
+            .style(Style::default().fg(FB_ERROR).add_modifier(Modifier::BOLD)),
+        Line::from(format!("Tool:  {}", ap.tool)).style(Style::default().fg(FB_FG)),
+        Line::from("Input:").style(Style::default().fg(FB_FG)),
+    ];
+    for l in approval_detail_lines(&ap.detail) {
+        text.push(Line::from(l).style(Style::default().fg(FB_MUTED)));
+    }
+    let title = match app.approval_queue.len() {
+        0 => " approval ".to_string(),
+        n => format!(" approval · {n} more waiting "),
+    };
+    let keys = " [y] allow once  [a] always (this workspace)  [n/Esc] deny  [↑↓] scroll ";
+    let scroll = app.approval_scroll.min(text.len().min(u16::MAX as usize) as u16);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(FB_BORDER))
+        .title(title)
+        .title_bottom(Line::from(keys).style(Style::default().fg(FB_GREEN)));
+    let widget = Paragraph::new(text).block(block).wrap(Wrap { trim: false }).scroll((scroll, 0));
+    f.render_widget(widget, area);
+}
+
+/// B-15: one row per line of the detail; a tab becomes four spaces and any
+/// other control character `\u{..}`, so nothing is hidden or merged.
+pub fn approval_detail_lines(detail: &str) -> Vec<String> {
+    detail
+        .split('\n')
+        .map(|line| {
+            line.chars()
+                .map(|c| match c {
+                    '\t' => "    ".to_string(),
+                    c if c.is_control() => format!("\\u{{{:x}}}", c as u32),
+                    c => c.to_string(),
+                })
+                .collect()
+        })
+        .collect()
 }

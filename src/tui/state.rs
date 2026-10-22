@@ -269,6 +269,12 @@ pub struct App {
     pub cursor: usize,
     pub approval: Option<PendingApproval>,
     pub busy: bool,
+    /// B-15: approvals that arrived while another one was on screen.
+    pub approval_queue: std::collections::VecDeque<PendingApproval>,
+    /// B-15: rows the approval detail is scrolled down.
+    pub approval_scroll: u16,
+    /// B-15: when the current approval appeared (decision keys wait a moment).
+    pub approval_since: Option<std::time::Instant>,
     pub should_quit: bool,
     pub session_id: Option<String>,
     pub scroll: u16,
@@ -319,6 +325,9 @@ impl App {
             cursor: 0,
             approval: None,
             busy: false,
+            approval_queue: std::collections::VecDeque::new(),
+            approval_scroll: 0,
+            approval_since: None,
             should_quit: false,
             session_id: None,
             scroll: 0,
@@ -693,22 +702,56 @@ impl App {
         }
     }
 
-    /// Approval overlay keys: y = once, a = always, n/Esc = deny.
+    /// B-15: decision keys are ignored this long after an approval appears.
+    const APPROVAL_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+
+    /// Approval overlay keys: y = once, a = always, n/Esc = deny,
+    /// ↑/↓/PgUp/PgDn scroll the detail, Ctrl+C quits (B-15).
     fn on_approval_key(&mut self, key: KeyEvent) -> Option<InputAction> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if ctrl && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return None;
+        }
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let ap = self.approval.take()?;
-                Some(InputAction::Approve { id: ap.id, always: false })
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                let ap = self.approval.take()?;
-                Some(InputAction::Approve { id: ap.id, always: true })
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                let ap = self.approval.take()?;
-                Some(InputAction::Deny(ap.id))
-            }
-            _ => None,
+            KeyCode::Up => self.approval_scroll = self.approval_scroll.saturating_sub(1),
+            KeyCode::Down => self.approval_scroll = self.approval_scroll.saturating_add(1),
+            KeyCode::PageUp => self.approval_scroll = self.approval_scroll.saturating_sub(10),
+            KeyCode::PageDown => self.approval_scroll = self.approval_scroll.saturating_add(10),
+            _ => {}
+        }
+        // Never answer on Ctrl/Alt combinations (Ctrl+A must not mean
+        // "always"), nor on keys typed just before the overlay appeared.
+        if ctrl || alt || self.approval_since.is_some_and(|t| t.elapsed() < Self::APPROVAL_GRACE) {
+            return None;
+        }
+        let ap = match key.code {
+            KeyCode::Char('y' | 'Y' | 'a' | 'A' | 'n' | 'N') | KeyCode::Esc => self.approval.take()?,
+            _ => return None,
+        };
+        let action = match key.code {
+            KeyCode::Char('y' | 'Y') => InputAction::Approve { id: ap.id, always: false },
+            KeyCode::Char('a' | 'A') => InputAction::Approve { id: ap.id, always: true },
+            _ => InputAction::Deny(ap.id),
+        };
+        self.next_approval();
+        Some(action)
+    }
+
+    /// B-15: put `ap` on screen with a fresh scroll and grace timer.
+    fn show_approval(&mut self, ap: PendingApproval) {
+        self.approval = Some(ap);
+        self.approval_scroll = 0;
+        self.approval_since = Some(std::time::Instant::now());
+    }
+
+    /// B-15: show the next queued approval, if any.
+    fn next_approval(&mut self) {
+        self.approval_scroll = 0;
+        self.approval_since = None;
+        if let Some(ap) = self.approval_queue.pop_front() {
+            self.show_approval(ap);
         }
     }
 
@@ -820,7 +863,13 @@ impl App {
                 self.push(EntryKind::Tool, format!("  {mark} {tool}"));
             }
             ServerEvent::ApprovalNeeded { approval_id, tool, detail, .. } => {
-                self.approval = Some(PendingApproval { id: approval_id, tool, detail });
+                // B-15: never replace the request on screen — queue the new one.
+                let ap = PendingApproval { id: approval_id, tool, detail };
+                if self.approval.is_some() {
+                    self.approval_queue.push_back(ap);
+                } else {
+                    self.show_approval(ap);
+                }
             }
             ServerEvent::RunFinished { ok, message, .. } => {
                 self.busy = false;
@@ -882,7 +931,17 @@ impl App {
             }
             // New (B-10): the approval ended elsewhere. B-15 closes the
             // overlay here.
-            ServerEvent::ApprovalResolved { .. } => {}
+            ServerEvent::ApprovalResolved { approval_id, allowed, reason, .. } => {
+                // B-15: the request is gone — never keep asking about it.
+                let on_screen = self.approval.as_ref().is_some_and(|a| a.id == approval_id);
+                self.approval_queue.retain(|a| a.id != approval_id);
+                if on_screen {
+                    let tool = self.approval.take().map(|a| a.tool).unwrap_or_default();
+                    let verdict = if allowed { "allowed" } else { "denied" };
+                    self.push(EntryKind::System, format!("[approval] {tool}: {verdict} ({reason})"));
+                    self.next_approval();
+                }
+            }
             ServerEvent::Stats {
                 added, deleted, hints, ..
             } => {

@@ -830,3 +830,73 @@
         assert!(text.contains("para 0:"), "top of the transcript reachable");
         assert!(!text.contains("FINAL-LINE"));
     }
+
+    // ---- B-15: approval overlay ----
+
+    fn approval_ev(id: &str, detail: &str) -> ServerEvent {
+        ServerEvent::ApprovalNeeded {
+            session_id: "s".into(),
+            approval_id: id.into(),
+            tool: "bash".into(),
+            detail: detail.into(),
+            preview: String::new(), // field added by B-22
+        }
+    }
+
+    /// Pretend the grace period of the approval on screen is over.
+    fn skip_grace(app: &mut App) {
+        app.approval_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn approvals_queue_and_ignore_unsafe_keys() {
+        let mut app = App::new();
+        app.on_event(approval_ev("apr_1", "ls"));
+        app.on_event(approval_ev("apr_2", "pwd"));
+        assert_eq!(app.approval.as_ref().unwrap().id, "apr_1", "first stays on screen");
+        assert!(app.on_key(key(KeyCode::Char('y'))).is_none(), "grace period");
+        skip_grace(&mut app);
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(app.on_key(ctrl_a).is_none(), "Ctrl+A is not 'always'");
+        let a = app.on_key(key(KeyCode::Char('n')));
+        assert!(matches!(a, Some(InputAction::Deny(ref id)) if id == "apr_1"));
+        assert_eq!(app.approval.as_ref().unwrap().id, "apr_2", "next one shown");
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit, "Ctrl+C quits even with an approval open");
+    }
+
+    #[test]
+    fn approval_resolved_elsewhere_closes_the_overlay() {
+        let mut app = App::new();
+        app.on_event(approval_ev("apr_1", "ls"));
+        app.on_event(approval_ev("apr_2", "pwd"));
+        let resolved = |id: &str, reason: &str| ServerEvent::ApprovalResolved {
+            session_id: "s".into(),
+            approval_id: id.into(),
+            allowed: false,
+            reason: reason.into(),
+        };
+        app.on_event(resolved("apr_2", "timeout"));
+        assert!(app.approval_queue.is_empty(), "queued request dropped");
+        app.on_event(resolved("apr_1", "turbo"));
+        assert!(app.approval.is_none(), "overlay closed");
+        assert!(app.entries.last().unwrap().text.contains("turbo"));
+    }
+
+    #[test]
+    fn approval_overlay_shows_everything_and_sits_on_top() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        app.help = true; // another overlay is open
+        let long = format!("echo start; {} echo END-OF-COMMAND", "x ".repeat(150));
+        app.on_event(approval_ev("apr_1", &format!("{long}\nsecond-line\u{1b}[0m")));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String =
+            terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Tool approval required"), "not hidden by help");
+        assert!(!text.contains("help — any key to close"), "help stays below");
+        assert!(text.contains("END-OF-COMMAND"), "no 200-character cut");
+        assert!(text.contains("second-line\\u{1b}[0m"), "own row, control char shown");
+        assert!(text.contains("[y] allow once"), "keys always visible");
+    }
