@@ -1898,9 +1898,9 @@ fn bump_hints(st: &Shared, session_id: &str) {
     }
 }
 
-/// Laziness Meter reuse gate: before accepting a `write`, look for what it is
-/// about to duplicate. Returns a hint appended to the tool result so the
-/// model reads it mid-run.
+/// Laziness Meter reuse gate: right AFTER a successful `write`, look for what
+/// it duplicates. Returns a hint appended to the tool result so the model
+/// reads it mid-run (and can remove the duplicate).
 fn reuse_gate(workspace: &std::path::Path, name: &str, input: &Value) -> Option<String> {
     if name != "write" {
         return None;
@@ -1915,13 +1915,12 @@ fn reuse_gate(workspace: &std::path::Path, name: &str, input: &Value) -> Option<
              already in the repo, solves it"
         ));
     }
-    for sym in top_level_symbols(content) {
-        if let Some(found) = find_symbol(workspace, path, &sym) {
-            hints.push(format!(
-                "ponytail reuse hint: `{sym}` already exists in {found} — use the \
-                 existing code instead of rewriting it"
-            ));
-        }
+    // New (P-04): one walk for all names, and only real definitions count.
+    for (sym, found) in find_symbols(workspace, path, &top_level_symbols(content)) {
+        hints.push(format!(
+            "ponytail reuse hint: `{sym}` already exists in {found} — use the \
+             existing code instead of rewriting it"
+        ));
     }
     if hints.is_empty() {
         None
@@ -1934,6 +1933,10 @@ fn reuse_gate(workspace: &std::path::Path, name: &str, input: &Value) -> Option<
 fn top_level_symbols(content: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in content.lines() {
+        // New (P-04): indented lines are methods or nested items.
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
         let mut t = line.trim();
         loop {
             let stripped = ["pub ", "export ", "async ", "public ", "static "]
@@ -1953,7 +1956,12 @@ fn top_level_symbols(content: &str) -> Vec<String> {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
-            if name.len() > 1 && !out.contains(&name) {
+            // New (P-04): short and very common names exist everywhere.
+            const COMMON: [&str; 12] = [
+                "main", "new", "run", "test", "init", "default", "from", "build", "start", "stop",
+                "handle", "setup",
+            ];
+            if name.chars().count() >= 4 && !COMMON.contains(&name.as_str()) && !out.contains(&name) {
                 out.push(name);
             }
         }
@@ -1961,8 +1969,18 @@ fn top_level_symbols(content: &str) -> Vec<String> {
     out
 }
 
-/// Word-boundary search for a symbol across the workspace's source files.
-fn find_symbol(workspace: &std::path::Path, skip_path: &str, sym: &str) -> Option<String> {
+/// New (P-04): ONE walk over the workspace's source files (skipping the file
+/// just written) that finds where any of `syms` is DEFINED (`fn name`,
+/// `def name`, `class name`, …). Returns (name, file) pairs.
+fn find_symbols(
+    workspace: &std::path::Path,
+    skip_path: &str,
+    syms: &[String],
+) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    if syms.is_empty() {
+        return found;
+    }
     let skip = workspace.join(skip_path);
     let mut scanned = 0usize;
     for entry in ignore::WalkBuilder::new(workspace)
@@ -1970,6 +1988,9 @@ fn find_symbol(workspace: &std::path::Path, skip_path: &str, sym: &str) -> Optio
         .build()
         .flatten()
     {
+        if found.len() == syms.len() {
+            break; // every name was found
+        }
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
@@ -1994,15 +2015,29 @@ fn find_symbol(workspace: &std::path::Path, skip_path: &str, sym: &str) -> Optio
             if text.len() > 512_000 {
                 continue;
             }
-            if text
-                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .any(|w| w == sym)
-            {
-                return Some(p.strip_prefix(workspace).unwrap_or(p).display().to_string());
+            for sym in syms {
+                if !found.iter().any(|(s, _)| s == sym) && defines(&text, sym) {
+                    let rel = p.strip_prefix(workspace).unwrap_or(p).display().to_string();
+                    found.push((sym.clone(), rel));
+                }
             }
         }
     }
-    None
+    found
+}
+
+/// New (P-04): true when a line of `text` defines `sym` (`fn sym`, `def sym`, …).
+fn defines(text: &str, sym: &str) -> bool {
+    const KW: [&str; 7] = ["fn ", "def ", "class ", "struct ", "function ", "interface ", "trait "];
+    text.lines().any(|line| {
+        KW.iter().any(|k| {
+            line.find(k).is_some_and(|i| {
+                let rest = &line[i + k.len()..];
+                rest.starts_with(sym)
+                    && !rest[sym.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+            })
+        })
+    })
 }
 
 /// Ponytail review pass — read-only senior-dev review of the workspace's
@@ -2885,6 +2920,24 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// P-04: common names, methods and mere mentions give no reuse hint.
+    #[test]
+    fn reuse_gate_ignores_common_names_and_mentions() {
+        let dir = std::env::temp_dir().join(format!("ocrs-p04-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("other.rs"), "// calls render_page() here\nfn main() {}\n").unwrap();
+        let write = serde_json::json!({
+            "path": "new.rs",
+            "content": "fn main() {}\nfn render_page() {}\nimpl X {\n    fn helper_method() {}\n}\n"
+        });
+        assert!(
+            reuse_gate(&dir, "write", &write).is_none(),
+            "main is common; render_page is only mentioned"
+        );
+        assert!(top_level_symbols("impl X {\n    fn helper_method() {}\n}\n").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// S-16: exports stay inside the workspace and never replace a file that
     /// is not an earlier export (unless --force).
