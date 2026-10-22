@@ -31,10 +31,16 @@ const MAX_SERVER_PART: usize = 24;
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpTool {
     pub name: String,
-    #[serde(default)]
+    /// `null` is accepted and becomes "" (B-28).
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub description: String,
     #[serde(rename = "inputSchema", default)]
     pub input_schema: Value,
+}
+
+/// Read a string field that may be `null` (B-28).
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 /// JSON-RPC session over any async line-oriented transport.
@@ -42,6 +48,9 @@ pub struct Client<R, W> {
     reader: R,
     writer: W,
     next_id: i64,
+    /// Bytes of a line not finished yet (B-28). `read_until` appends here and
+    /// keeps them even when a timeout cancels the read.
+    line: Vec<u8>,
 }
 
 impl<R, W> Client<R, W>
@@ -50,7 +59,7 @@ where
     W: AsyncWrite + Unpin,
 {
     pub fn new(reader: R, writer: W) -> Self {
-        Self { reader, writer, next_id: 0 }
+        Self { reader, writer, next_id: 0, line: Vec::new() }
     }
 
     async fn write_msg(&mut self, value: &Value) -> Result<()> {
@@ -71,18 +80,44 @@ where
             "jsonrpc": "2.0", "id": id, "method": method, "params": params
         }))
         .await
-        .map_err(|e| anyhow!("mcp server unavailable during `{method}`: {e}"))?;
+        .map_err(|e| {
+            anyhow!(
+                "mcp server unavailable during `{method}`: {e} (the server process has \
+                 probably exited; restart opencode-rust to reconnect it)"
+            )
+        })?;
         loop {
-            let mut line = String::new();
-            let n = self.reader.read_line(&mut line).await?;
+            let n = self.reader.read_until(b'\n', &mut self.line).await?;
             if n == 0 {
-                return Err(anyhow!("mcp server closed its stdout during `{method}`"));
+                return Err(anyhow!(
+                    "mcp server closed its stdout during `{method}` (the server process has \
+                     probably exited; restart opencode-rust to reconnect it)"
+                ));
             }
-            let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
+            if self.line.last() != Some(&b'\n') {
+                continue; // end of stream inside a line; the next read returns 0
+            }
+            let raw = std::mem::take(&mut self.line);
+            let Ok(msg) = serde_json::from_slice::<Value>(&raw) else {
                 continue; // non-JSON noise on stdout: ignore
             };
+            // B-28: a message with a `method` comes FROM the server.
+            if let Some(server_method) = msg.get("method").and_then(Value::as_str) {
+                if let Some(req_id) = msg.get("id").cloned() {
+                    let reply = if server_method == "ping" {
+                        json!({ "jsonrpc": "2.0", "id": req_id, "result": {} })
+                    } else {
+                        json!({ "jsonrpc": "2.0", "id": req_id, "error": {
+                            "code": -32601,
+                            "message": format!("`{server_method}` is not supported by this client")
+                        }})
+                    };
+                    self.write_msg(&reply).await?;
+                }
+                continue; // requests are answered, notifications ignored
+            }
             if msg.get("id").and_then(Value::as_i64) != Some(id) {
-                continue; // notification or another id
+                continue; // a reply to an older, timed-out request
             }
             if let Some(err) = msg.get("error") {
                 return Err(anyhow!("mcp `{method}` failed: {err}"));
@@ -125,13 +160,31 @@ where
         let res = tokio::time::timeout(limit, self.request("tools/list", json!({})))
             .await
             .context("mcp tools/list timed out")??;
-        let arr = res
-            .get("tools")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow!("tools/list response has no `tools` array"))?;
-        arr.iter()
-            .map(|t| serde_json::from_value(t.clone()).context("bad tool entry"))
-            .collect()
+        // B-28: servers may split the list into pages (`nextCursor`), and one
+        // malformed entry must not cost the whole server.
+        const MAX_TOOL_PAGES: usize = 20;
+        let mut tools = Vec::new();
+        let mut page = res;
+        for _ in 0..MAX_TOOL_PAGES {
+            let arr = page
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("tools/list response has no `tools` array"))?;
+            for t in arr {
+                match serde_json::from_value::<McpTool>(t.clone()) {
+                    Ok(tool) => tools.push(tool),
+                    Err(e) => eprintln!("[mcp] skipping a tool entry in an unexpected shape: {e}"),
+                }
+            }
+            let Some(cursor) = page.get("nextCursor").and_then(Value::as_str).map(str::to_string)
+            else {
+                break;
+            };
+            page = tokio::time::timeout(limit, self.request("tools/list", json!({ "cursor": cursor })))
+                .await
+                .context("mcp tools/list timed out")??;
+        }
+        Ok(tools)
     }
 
     /// Call a tool; returns concatenated text content. Server-reported
@@ -836,5 +889,87 @@ rl.on('line', (line) => {
         assert!(reg.lock().await.route("mcp__nope__echo").is_err());
         assert!(reg.lock().await.route("bash").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod b28_reply_tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    async fn send(ws: &mut (impl AsyncWrite + Unpin), v: Value) {
+        ws.write_all(format!("{v}\n").as_bytes()).await.unwrap();
+        ws.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_requests_are_answered_not_taken_as_replies() {
+        let (client_end, server_end) = duplex(64 * 1024);
+        let (r, w) = tokio::io::split(client_end);
+        let mut client = Client::new(BufReader::new(r), w);
+        let server = tokio::spawn(async move {
+            let (rs, mut ws) = tokio::io::split(server_end);
+            let mut lines = BufReader::new(rs).lines();
+            let req: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let id = req["id"].clone();
+            // The server pings first, re-using the same id number.
+            send(&mut ws, json!({"jsonrpc": "2.0", "id": id, "method": "ping"})).await;
+            let pong: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            send(&mut ws, json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [{"name": "t"}]}})).await;
+            pong
+        });
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.len(), 1);
+        let pong = server.await.unwrap();
+        assert!(pong.get("result").is_some() && pong.get("method").is_none(), "{pong}");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_server_says_how_to_recover() {
+        let (client_end, server_end) = duplex(1024);
+        let (r, w) = tokio::io::split(client_end);
+        let mut client = Client::new(BufReader::new(r), w);
+        drop(server_end);
+        let err = client.request("tools/call", json!({})).await.unwrap_err().to_string();
+        assert!(err.contains("restart opencode-rust"), "{err}");
+        assert!(err.contains("tools/call"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod b28_list_tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    async fn send(ws: &mut (impl AsyncWrite + Unpin), v: Value) {
+        ws.write_all(format!("{v}\n").as_bytes()).await.unwrap();
+        ws.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pages_null_descriptions_and_bad_entries() {
+        let (client_end, server_end) = duplex(64 * 1024);
+        let (r, w) = tokio::io::split(client_end);
+        let mut client = Client::new(BufReader::new(r), w);
+        let server = tokio::spawn(async move {
+            let (rs, mut ws) = tokio::io::split(server_end);
+            let mut lines = BufReader::new(rs).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let result = if req["params"]["cursor"] == "p2" {
+                    json!({"tools": [{"name": "c", "description": null}]})
+                } else {
+                    json!({"tools": [{"name": "a", "description": null}, {"description": "no name"}, {"name": "b"}],
+                           "nextCursor": "p2"})
+                };
+                send(&mut ws, json!({"jsonrpc": "2.0", "id": req["id"], "result": result})).await;
+            }
+        });
+        let tools = client.list_tools().await.unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        assert_eq!(tools[0].description, "");
+        drop(client);
+        let _ = server.await;
     }
 }
