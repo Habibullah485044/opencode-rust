@@ -70,11 +70,22 @@ pub struct McpServerCfg {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    /// F-03: Streamable HTTP endpoint, e.g. "https://example.com/mcp".
+    /// When set, `command` and `args` are ignored and nothing is spawned.
+    pub url: Option<String>,
+    /// F-03: extra HTTP headers for `url`, e.g. an Authorization token.
+    pub headers: HashMap<String, String>,
 }
 
 impl Default for McpServerCfg {
     fn default() -> Self {
-        Self { name: String::new(), command: String::new(), args: Vec::new() }
+        Self {
+            name: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            url: None,
+            headers: HashMap::new(),
+        }
     }
 }
 
@@ -460,5 +471,21 @@ mod f02_tests {
         let c: Config = toml::from_str("[provider]\napi = 'anthropic'\nmax_tokens = 4096\n").unwrap();
         assert_eq!((c.provider.api, c.provider.max_tokens), (ProviderApi::Anthropic, 4096));
         assert!(toml::from_str::<Config>("[provider]\napi = 'gemini'\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod f03_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_server_url_and_headers_parse() {
+        let text = "[[mcp.servers]]\nname = 'docs'\nurl = 'https://example.com/mcp'\nheaders = { Authorization = 'Bearer t' }\n";
+        let c: Config = toml::from_str(text).unwrap();
+        let s = &c.mcp.servers[0];
+        assert_eq!(s.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(s.headers.get("Authorization").map(String::as_str), Some("Bearer t"));
+        assert!(s.command.is_empty());
+        assert!(McpServerCfg::default().url.is_none(), "stdio stays the default");
     }
 }

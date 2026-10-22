@@ -322,8 +322,29 @@ pub fn spec_for(server: &str, t: &McpTool) -> ToolSpec {
 /// has its own lock around this, so one slow server never blocks another.
 pub struct Live {
     #[allow(dead_code)] // kept alive; kill_on_drop kills the child on drop
-    child: tokio::process::Child,
-    pub client: Client<BufReader<tokio::process::ChildStdout>, tokio::process::ChildStdin>,
+    child: Option<tokio::process::Child>, // F-03: None for HTTP servers
+    pub client: Transport,
+}
+
+/// How we talk to one MCP server (F-03).
+pub enum Transport {
+    /// A child process: newline-delimited JSON-RPC on stdin/stdout.
+    Stdio(Client<BufReader<tokio::process::ChildStdout>, tokio::process::ChildStdin>),
+    /// Streamable HTTP (`url` in the config).
+    Http(crate::mcp_http::HttpClient),
+}
+
+impl Transport {
+    /// Same contract as the stdio [`Client::call_tool`], with B-19's size cap.
+    pub async fn call_tool(&mut self, name: &str, args: &Value) -> Result<String> {
+        match self {
+            Transport::Stdio(c) => c.call_tool(name, args).await,
+            Transport::Http(c) => match c.call_tool(name, args).await {
+                Ok(text) => Ok(cap_result(text)),
+                Err(e) => Err(anyhow!("{}", cap_result(format!("{e:#}")))),
+            },
+        }
+    }
 }
 
 /// One live MCP server connection (child process + session + tool cache).
@@ -336,6 +357,17 @@ pub struct McpConn {
 impl McpConn {
     pub async fn spawn(name: &str, cfg: &McpServerCfg) -> Result<Self> {
         let server = sanitize_server(name);
+        // F-03: a `url` means Streamable HTTP; no process is started.
+        if let Some(url) = cfg.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            let mut client = crate::mcp_http::HttpClient::new(url, &cfg.headers)?;
+            client.initialize().await?;
+            let mut tools = client.list_tools().await?;
+            let mut seen = std::collections::HashSet::new();
+            tools.retain(|t| seen.insert(tool_fn_name(&server, &t.name)));
+            let live = Live { child: None, client: Transport::Http(client) };
+            let live = std::sync::Arc::new(tokio::sync::Mutex::new(live));
+            return Ok(Self { live, tools, server });
+        }
         let mut cmd = tokio::process::Command::new(&cfg.command);
         cmd.args(&cfg.args)
             .stdin(std::process::Stdio::piped())
@@ -361,7 +393,8 @@ impl McpConn {
             }
             fresh
         });
-        let live = std::sync::Arc::new(tokio::sync::Mutex::new(Live { child, client }));
+        let live = Live { child: Some(child), client: Transport::Stdio(client) };
+        let live = std::sync::Arc::new(tokio::sync::Mutex::new(live));
         Ok(Self { live, tools, server })
     }
 
@@ -389,7 +422,8 @@ impl Registry {
         let mut starts = Vec::new();
         let mut planned = std::collections::HashSet::new();
         for cfg in servers {
-            if cfg.name.is_empty() || cfg.command.is_empty() {
+            let has_url = cfg.url.as_deref().is_some_and(|u| !u.trim().is_empty());
+            if cfg.name.is_empty() || (cfg.command.is_empty() && !has_url) {
                 continue;
             }
             let key = sanitize_server(&cfg.name);
@@ -684,6 +718,7 @@ rl.on('line', (line) => {
             name: "fake".into(),
             command: node,
             args: vec![path.to_string_lossy().into_owned()],
+            ..Default::default()
         };
         let conn = McpConn::spawn("fake", &cfg).await.expect("spawn node server");
         assert_eq!(conn.tools.len(), 1);

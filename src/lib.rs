@@ -9,6 +9,7 @@ pub mod gitsnap;
 pub mod gui;
 pub mod inline_edit;
 pub mod mcp;
+pub mod mcp_http;
 pub mod mission;
 pub mod permissions;
 #[cfg(feature = "gui")]
