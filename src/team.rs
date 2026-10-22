@@ -20,9 +20,12 @@ pub struct Subtask {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerReport {
     pub subtask: String,
-    pub outcome: String, // "done" | "failed"
+    pub outcome: String, // "done" | "failed" | "aborted"
     pub summary: String,
 }
+
+/// Most subtasks one /team run starts (B-18); the planner is asked for 1-4.
+const MAX_SUBTASKS: usize = 4;
 
 pub async fn run_team(
     st: &Shared,
@@ -30,6 +33,13 @@ pub async fn run_team(
     goal: &str,
     abort: Arc<AtomicBool>,
 ) -> Result<String> {
+    // B-18: plan mode is read-only, and team workers can edit files.
+    if st.mode_for(session_id) == crate::agents::AgentMode::Plan {
+        anyhow::bail!(
+            "/team is not available in plan mode: team workers can edit files. \
+             Switch with /build first."
+        );
+    }
     let _ = st.events.send(ServerEvent::AssistantDelta {
         session_id: session_id.to_string(),
         text: format!("[team] decomposing goal: {goal}\n"),
@@ -44,9 +54,10 @@ pub async fn run_team(
         text: format!("[team] plan: {} subtask(s)\n", subtasks.len()),
     });
     for (i, t) in subtasks.iter().enumerate() {
+        let task = if t.instructions.trim().is_empty() { &t.title } else { &t.instructions };
         let _ = st.events.send(ServerEvent::AssistantDelta {
             session_id: session_id.to_string(),
-            text: format!("  {}. {} — {}\n", i + 1, t.title, t.instructions),
+            text: format!("  {}. {} — {}\n", i + 1, t.title.replace('\n', " "), task.replace('\n', " ")),
         });
     }
 
@@ -64,41 +75,40 @@ pub async fn run_team(
             (i, task.title.clone(), r)
         }));
     }
-    for h in handles {
-        match h.await {
-            Ok((i, title, Ok(summary))) => {
-                let _ = st.events.send(ServerEvent::AssistantDelta {
-                    session_id: session_id.to_string(),
-                    text: format!("[team] worker {i} ({title}) done\n"),
-                });
-                reports.push(WorkerReport { subtask: title, outcome: "done".into(), summary });
-            }
-            Ok((i, title, Err(e))) => {
-                let _ = st.events.send(ServerEvent::AssistantDelta {
-                    session_id: session_id.to_string(),
-                    text: format!("[team] worker {i} ({title}) failed: {e}\n"),
-                });
-                reports.push(WorkerReport {
-                    subtask: title,
-                    outcome: "failed".into(),
-                    summary: format!("error: {e}"),
-                });
-            }
-            Err(e) => {
-                reports.push(WorkerReport {
-                    subtask: "unknown".into(),
-                    outcome: "failed".into(),
-                    summary: format!("join error: {e}"),
-                });
-            }
-        }
+    // B-18: longest worker summary kept, in characters.
+    const MAX_SUMMARY_CHARS: usize = 4000;
+    for (n, h) in handles.into_iter().enumerate() {
+        let title = subtasks[n].title.clone();
+        let (outcome, summary) = match h.await {
+            // B-18: run_loop returns "aborted" when stopped; that is not "done".
+            Ok((_, _, Ok(s))) if s.trim() == "aborted" => ("aborted", "stopped before it finished".to_string()),
+            Ok((_, _, Ok(s))) => ("done", s.chars().take(MAX_SUMMARY_CHARS).collect()),
+            Ok((_, _, Err(e))) => ("failed", format!("error: {e:#}")),
+            Err(e) => ("failed", format!("worker crashed: {e}")),
+        };
+        // The TUI team panel looks for "done" and "failed": keep those words.
+        let status = match outcome {
+            "done" => "done".to_string(),
+            "aborted" => "failed: aborted".to_string(),
+            _ => format!("failed: {}", summary.replace('\n', " ")),
+        };
+        let _ = st.events.send(ServerEvent::AssistantDelta {
+            session_id: session_id.to_string(),
+            text: format!("[team] worker {n} ({title}) {status}\n"),
+        });
+        reports.push(WorkerReport { subtask: title, outcome: outcome.into(), summary });
     }
 
     // 3. REVIEWER — one call verifies the reports (plan: "reviewer agent
     // verifies"), using the small model when configured.
-    let verdict = match review(st, goal, &reports, &abort).await {
-        Ok(v) => v,
-        Err(e) => format!("reviewer unavailable: {e}"),
+    // B-18: after an abort nothing finished, so there is nothing to verify.
+    let verdict = if abort.load(std::sync::atomic::Ordering::SeqCst) {
+        "skipped: the run was aborted".to_string()
+    } else {
+        match review(st, goal, &reports, &abort).await {
+            Ok(v) => v,
+            Err(e) => format!("reviewer unavailable: {e:#}"),
+        }
     };
     let _ = st.events.send(ServerEvent::AssistantDelta {
         session_id: session_id.to_string(),
@@ -127,7 +137,7 @@ async fn plan(st: &Shared, goal: &str, abort: &AtomicBool) -> Result<Vec<Subtask
         true,
     )
     .await?;
-    Ok(parse_subtasks(&text))
+    Ok(parse_subtasks(&text, goal))
 }
 
 /// Reviewer: one non-streamed call verifying the worker reports.
@@ -152,11 +162,34 @@ async fn review(
     Ok(text.trim().to_string())
 }
 
+/// B-18: at most MAX_SUBTASKS subtasks; when the planner gave nothing
+/// usable, one subtask whose instructions are the user's goal.
+fn parse_subtasks(text: &str, goal: &str) -> Vec<Subtask> {
+    let mut subtasks = parse_subtask_array(text);
+    if subtasks.is_empty() {
+        let instructions = goal.chars().take(2000).collect();
+        subtasks.push(Subtask { title: "task".into(), instructions });
+    }
+    subtasks.truncate(MAX_SUBTASKS);
+    subtasks
+}
+
 /// Robustly extract a JSON array from model output (handles ```json fences etc).
-fn parse_subtasks(text: &str) -> Vec<Subtask> {
-    let start = text.find('[');
-    let end = text.rfind(']');
-    if let (Some(s), Some(e)) = (start, end) {
+/// B-18: start at the first `[` where a JSON array of objects with a "title"
+/// begins; read exactly that one value. Returns an empty list when none.
+fn parse_subtask_array(text: &str) -> Vec<Subtask> {
+    let span = text.char_indices().filter(|&(_, c)| c == '[').find_map(|(s, _)| {
+        let mut values = serde_json::Deserializer::from_str(&text[s..]).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(Value::Array(items)))
+                if items.iter().any(|v| v.get("title").and_then(Value::as_str).is_some()) =>
+            {
+                Some((s, s + values.byte_offset() - 1))
+            }
+            _ => None,
+        }
+    });
+    if let Some((s, e)) = span {
         if e > s {
             if let Ok(arr) = serde_json::from_str::<Vec<Subtask>>(&text[s..=e]) {
                 if !arr.is_empty() {
@@ -184,8 +217,8 @@ fn parse_subtasks(text: &str) -> Vec<Subtask> {
             }
         }
     }
-    // Fallback: single subtask = the whole goal.
-    vec![Subtask { title: "task".into(), instructions: text.chars().take(2000).collect() }]
+    // Nothing usable: `parse_subtasks` falls back to the user's goal (B-18).
+    Vec::new()
 }
 
 /// Worker: child session with the standard agent loop but scoped tools.
@@ -216,9 +249,14 @@ async fn run_worker_agent(
     st.db.add_message(session_id, "user", &[Part::Text { text: prompt.to_string() }])?;
     let mut system = format!(
         "You are a focused worker agent in team mode. Complete only your subtask.\n\n\
-         Workspace: {}.\nReport a 1-2 sentence summary when finished.",
+         Workspace: {}.\nNobody can answer questions during this run: make reasonable \
+         decisions yourself and finish. Report a 1-2 sentence summary when finished.",
         st.workspace.display()
     );
+    if let Some(md) = crate::skills::load_agents_md(&st.workspace) {
+        system.push_str("\n\n## Project instructions (AGENTS.md)\n\n");
+        system.push_str(md.trim());
+    }
     if st.cfg.agent.ponytail {
         system.push_str("\n\n## Ponytail — lazy senior dev discipline\n\n");
         system.push_str(crate::agents::ponytail_rules().trim());
@@ -244,15 +282,16 @@ mod tests {
     #[test]
     fn parses_fenced_json() {
         let text = "Sure!\n```json\n[{\"title\":\"a\",\"instructions\":\"do a\"},{\"title\":\"b\",\"instructions\":\"do b\"}]\n```";
-        let subs = parse_subtasks(text);
+        let subs = parse_subtasks(text, "goal");
         assert_eq!(subs.len(), 2);
         assert_eq!(subs[0].title, "a");
     }
 
     #[test]
     fn falls_back_to_single() {
-        let subs = parse_subtasks("just some prose, no json");
+        let subs = parse_subtasks("just some prose, no json", "the goal");
         assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].instructions, "the goal");
     }
 
     #[tokio::test]
@@ -325,5 +364,44 @@ mod tests {
             });
             Self { url: format!("http://{addr}/v1") }
         }
+    }
+}
+
+#[cfg(test)]
+mod b18_tests {
+    use super::*;
+
+    #[test]
+    fn plan_parsing_ignores_prose_brackets_and_caps_subtasks() {
+        let text = "Plan [draft], see [1]:\n[{\"title\":\"a\",\"instructions\":\"do a\"}]\nDone [ok]";
+        let subs = parse_subtasks(text, "goal");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].title, "a");
+        let many: Vec<Value> = (0..9)
+            .map(|i| serde_json::json!({"title": format!("t{i}"), "instructions": "x"}))
+            .collect();
+        let subs = parse_subtasks(&serde_json::to_string(&many).unwrap(), "goal");
+        assert_eq!(subs.len(), MAX_SUBTASKS);
+    }
+
+    #[test]
+    fn fallback_uses_the_goal_not_the_planner_text() {
+        let subs = parse_subtasks("I could not decide.", "write hello.txt");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].instructions, "write hello.txt");
+    }
+
+    #[tokio::test]
+    async fn team_is_refused_in_plan_mode() {
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:9/v1".into();
+        let st = crate::server::build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        let s = st.db.create_session("team-plan", None).unwrap();
+        st.set_mode(&s.id, crate::agents::AgentMode::Plan);
+        let err = run_team(&st, &s.id, "edit things", Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("plan mode"), "{err}");
+        assert!(st.db.messages(&s.id).unwrap().is_empty(), "nothing stored");
     }
 }
