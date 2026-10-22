@@ -550,7 +550,16 @@ pub async fn one_shot(
         }
         match ev? {
             StreamEvent::Text(t) => text.push_str(&t),
-            StreamEvent::Done { .. } => break,
+            StreamEvent::Done { finish_reason } => {
+                // B-03: half an answer must not be used as a whole one.
+                if finish_reason.as_deref() == Some("length") {
+                    anyhow::bail!(
+                        "the model's reply was cut off by its output token limit \
+                         (finish_reason = length); the incomplete result was not used"
+                    );
+                }
+                break;
+            }
             _ => {}
         }
     }
@@ -1085,6 +1094,7 @@ pub async fn run_loop(
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut acc = ToolCallAccumulator::default();
+        let mut finish_reason: Option<String> = None;
         // Poll the stream in racing with the abort flag: a replaced run must
         // exit promptly even when the transport yields nothing at all.
         let mut abort_tick =
@@ -1122,12 +1132,52 @@ pub async fn run_loop(
                         });
                     }
                 }
-                StreamEvent::Done { .. } => break,
+                StreamEvent::Done { finish_reason: fr } => {
+                    finish_reason = fr.clone();
+                    break;
+                }
                 _ => acc.push(&ev),
             }
         }
 
         let calls = acc.finish();
+        // B-03: "length" = the model hit its output token limit.
+        let truncated = finish_reason.as_deref() == Some("length");
+        if truncated {
+            let _ = st.events.send(ServerEvent::Note {
+                session_id: session_id.to_string(),
+                text: "the model's reply was cut off by its output token limit".to_string(),
+            });
+            if calls.is_empty() {
+                text.push_str("\n\n[reply cut off: the model reached its output token limit]");
+            }
+        }
+        let cut_off = |v: &Value| v.as_object().map(|o| o.len() == 1 && o.contains_key("raw")).unwrap_or(false);
+        if truncated && calls.iter().any(|(_, _, input)| cut_off(input)) {
+            let mut parts = Vec::new();
+            if !reasoning.is_empty() {
+                parts.push(Part::Reasoning { text: reasoning.clone() });
+            }
+            if !text.is_empty() {
+                parts.push(Part::Text { text: text.clone() });
+            }
+            for (id, name, input) in &calls {
+                parts.push(Part::ToolCall { id: id.clone(), name: name.clone(), input: input.clone() });
+            }
+            st.db.add_message(session_id, "assistant", &parts)?;
+            for (id, _, _) in &calls {
+                let output = "not run: your reply hit the output token limit before this call's \
+                              arguments were complete. Send it again in smaller pieces (for \
+                              example write a big file in several steps)."
+                    .to_string();
+                st.db.add_message(
+                    session_id,
+                    "tool",
+                    &[Part::ToolResult { tool_id: id.clone(), output, is_error: true }],
+                )?;
+            }
+            continue;
+        }
         let mut assistant_parts = Vec::new();
         if !reasoning.is_empty() {
             assistant_parts.push(Part::Reasoning { text: reasoning });
@@ -2675,6 +2725,101 @@ data: [DONE]
         let err = install_skill_flow(&st, "fluff.md", &abort).await.unwrap_err();
         assert!(err.to_string().contains("not worth"), "{err}");
         assert_eq!(crate::skills::load_baked(&base).len(), 1, "unworthy skill not baked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod b03_tests {
+    use super::*;
+
+    /// Mock provider. A request whose last message is a tool result gets
+    /// "ok"; any other request gets `first` and then `finish_reason: "length"`.
+    async fn mock(first: Value) -> String {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<Value>| {
+                let first = first.clone();
+                async move {
+                    let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                    let last_role = msgs.last().and_then(|m| m["role"].as_str()).unwrap_or("").to_string();
+                    let payload = if last_role == "tool" {
+                        let ok = json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
+                        format!("data: {ok}\n\ndata: [DONE]\n\n")
+                    } else {
+                        let cut = json!({"choices": [{"delta": {}, "finish_reason": "length"}]});
+                        format!("data: {first}\n\ndata: {cut}\n\ndata: [DONE]\n\n")
+                    };
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/v1")
+    }
+
+    async fn state(base: &str, tag: &str) -> (Shared, String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ocrs-b03-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = base.to_string();
+        cfg.provider.model = "mock".into();
+        cfg.agent.auto_review = false;
+        cfg.permissions.defaults.insert("write".into(), "allow".into());
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let sid = st.db.create_session(tag, None).unwrap().id;
+        (st, sid, dir)
+    }
+
+    #[tokio::test]
+    async fn cut_off_text_reply_is_marked() {
+        let base = mock(json!({"choices": [{"delta": {"content": "half an ans"}, "finish_reason": null}]})).await;
+        let (st, sid, dir) = state(&base, "text").await;
+        let mut rx = st.events.subscribe();
+        run_agent(&st, &sid, "explain", Arc::new(AtomicBool::new(false))).await;
+        let msgs = st.db.messages(&sid).unwrap();
+        let last = msgs.iter().rev().find(|m| m.role == "assistant").expect("assistant reply");
+        let Part::Text { text } = &last.parts[0] else { panic!("wrong part {:?}", last.parts[0]) };
+        assert!(text.starts_with("half an ans") && text.contains("reply cut off"), "{text}");
+        let mut noted = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::Note { text, .. } = ev {
+                noted |= text.contains("cut off");
+            }
+        }
+        assert!(noted, "the user is told");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cut_off_tool_call_is_not_run() {
+        let call = json!({"index": 0, "id": "call_cut", "function": {
+            "name": "write", "arguments": "{\"path\":\"cut.txt\",\"content\":\"hal"}});
+        let base = mock(json!({"choices": [{"delta": {"tool_calls": [call]}, "finish_reason": null}]})).await;
+        let (st, sid, dir) = state(&base, "tool").await;
+        run_agent(&st, &sid, "write it", Arc::new(AtomicBool::new(false))).await;
+        assert!(!dir.join("cut.txt").exists(), "a cut-off call must not write anything");
+        let msgs = st.db.messages(&sid).unwrap();
+        let tool = msgs.iter().find(|m| m.role == "tool").expect("tool result");
+        let Part::ToolResult { output, is_error, .. } = &tool.parts[0] else { panic!("wrong part") };
+        assert!(*is_error && output.contains("output token limit"), "{output}");
+        let last = msgs.iter().rev().find(|m| m.role == "assistant").unwrap();
+        assert!(matches!(&last.parts[0], Part::Text { text } if text == "ok"), "the model retried");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn one_shot_refuses_a_cut_off_reply() {
+        let base = mock(json!({"choices": [{"delta": {"content": "half"}, "finish_reason": null}]})).await;
+        let (st, _sid, dir) = state(&base, "oneshot").await;
+        let err = one_shot(&st, "sys", "hi", &AtomicBool::new(false), false).await.unwrap_err();
+        assert!(err.to_string().contains("cut off"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -85,7 +85,16 @@ async fn summarize(st: &Shared, transcript: &str, abort: &AtomicBool) -> Result<
         }
         match ev? {
             StreamEvent::Text(t) => text.push_str(&t),
-            StreamEvent::Done { .. } => break,
+            StreamEvent::Done { finish_reason } => {
+                // B-03: a cut-off summary would replace real history.
+                if finish_reason.as_deref() == Some("length") {
+                    bail!(
+                        "the summary was cut off by the model's output token limit; \
+                         history was left unchanged"
+                    );
+                }
+                break;
+            }
             _ => {}
         }
     }
