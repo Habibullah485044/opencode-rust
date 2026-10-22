@@ -778,10 +778,17 @@ fn html_to_text(html: &str) -> String {
             continue;
         }
         if bytes[i] == b'<' {
-            if let Some(p) = html[i..].find('>') {
-                out.push(' ');
-                i += p + 1;
-                continue;
+            match html[i..].find('>') {
+                Some(p) => {
+                    out.push(' ');
+                    i += p + 1;
+                    continue;
+                }
+                // B-43: no `>` anywhere after this point, so no more tags.
+                None => {
+                    out.push_str(&html[i..]);
+                    break;
+                }
             }
         }
         let ch_len = utf8_len(bytes[i]);
@@ -790,11 +797,12 @@ fn html_to_text(html: &str) -> String {
         i = end;
     }
     out.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+        // B-43: `&amp;` last, so `&amp;lt;` stays the text `&lt;`.
+        .replace("&amp;", "&")
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -1352,5 +1360,19 @@ mod b32_grep_tests {
         assert!(out.contains("1 file(s) not searched"), "{out}");
         assert!(glob_files(&ws, "**/config", None).unwrap().contains("no files matched"));
         let _ = std::fs::remove_dir_all(&ws);
+    }
+}
+
+#[cfg(test)]
+mod b43_tests {
+    use super::*;
+
+    #[test]
+    fn entities_are_decoded_once_and_stray_brackets_are_fast() {
+        assert_eq!(html_to_text("<p>&amp;lt;b&amp;gt; &lt;i&gt;</p>"), "&lt;b&gt; <i>");
+        let started = std::time::Instant::now();
+        let text = html_to_text(&"a<".repeat(100_000));
+        assert_eq!(text.len(), 200_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }
