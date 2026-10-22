@@ -447,6 +447,28 @@ impl App {
                     self.should_quit = true;
                     return None;
                 }
+                // B-33: one run at a time. A plain prompt (and /mission or
+                // /turbo <prompt>) REPLACES the running agent run on the
+                // server; these commands would run next to it instead.
+                if self.busy
+                    && matches!(
+                        classify(&content),
+                        Some(Command::Team(_))
+                            | Some(Command::Compact)
+                            | Some(Command::Review)
+                            | Some(Command::Parallel(_))
+                            | Some(Command::Edit { .. })
+                            | Some(Command::SkillInstall(_))
+                    )
+                {
+                    self.cursor = content.chars().count();
+                    self.input = content;
+                    self.push(
+                        EntryKind::Error,
+                        "a run is still going — wait for it to finish, then press Enter again",
+                    );
+                    return None;
+                }
                 self.push(EntryKind::User, format!("> {content}"));
                 // Agent-running commands set busy; fast local ones don't.
                 let (action, busy) = match classify(&content) {
@@ -544,7 +566,11 @@ impl App {
                         }
                     }
                 };
-                self.busy = busy;
+                // B-33: local commands leave `busy` alone — they must not
+                // flip the header to "ready" while a run is still going.
+                if busy {
+                    self.busy = true;
+                }
                 action
             }
             KeyCode::Backspace => {
@@ -691,6 +717,7 @@ impl App {
                     effort: crate::mission::Effort::all()[mp.effort_idx],
                     goal: mp.goal,
                 };
+                self.busy = true; // B-33: the mission runs the agent
                 Some(InputAction::Mission(mission))
             }
             KeyCode::Esc => {
@@ -948,8 +975,8 @@ impl App {
                 self.stats = Some((added, deleted, hints));
             }
             ServerEvent::SessionList { sessions } => {
+                // B-33: an answer to a local command; a run may still be going.
                 self.sessions = Some(SessionsOverlay { items: sessions, sel: 0 });
-                self.busy = false;
             }
             ServerEvent::ModelInfo { current, available } => {
                 self.model = Some(current.clone());
@@ -963,8 +990,7 @@ impl App {
                         text.push_str(&format!("   {mark} {m}\n"));
                     }
                 }
-                self.push(EntryKind::System, text);
-                self.busy = false;
+                self.push(EntryKind::System, text); // B-33: busy unchanged
             }
             ServerEvent::AgentStatus { agent_id, name, task, state, detail } => {
                 let state = match state.as_str() {

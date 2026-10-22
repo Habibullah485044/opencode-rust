@@ -88,6 +88,8 @@
         type_line(&mut app, "/review");
         assert!(matches!(app.on_key(key(KeyCode::Enter)), Some(InputAction::Review)));
         assert!(app.busy, "review is an agent run");
+        // B-33: the review run ends; only then is the app idle again.
+        app.on_event(ServerEvent::RunFinished { session_id: "s".into(), ok: true, message: None });
         type_line(&mut app, "/debt");
         assert!(matches!(app.on_key(key(KeyCode::Enter)), Some(InputAction::Debt)));
         assert!(!app.busy, "debt is local");
@@ -899,4 +901,46 @@
         assert!(text.contains("END-OF-COMMAND"), "no 200-character cut");
         assert!(text.contains("second-line\\u{1b}[0m"), "own row, control char shown");
         assert!(text.contains("[y] allow once"), "keys always visible");
+    }
+
+    // ---- B-33: busy flag ----
+
+    #[test]
+    fn local_commands_do_not_clear_busy_during_a_run() {
+        let mut app = App::new();
+        type_line(&mut app, "do the thing");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.busy);
+        type_line(&mut app, "/debt");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.busy, "/debt is local; the run is still going");
+        app.on_event(ServerEvent::ModelInfo { current: "m".into(), available: vec![] });
+        app.on_event(ServerEvent::SessionList { sessions: vec![] });
+        assert!(app.busy, "answers to local commands do not end the run");
+        app.on_event(ServerEvent::RunFinished { session_id: "s".into(), ok: true, message: None });
+        assert!(!app.busy);
+    }
+
+    #[test]
+    fn competing_run_commands_wait_while_busy() {
+        let mut app = App::new();
+        app.busy = true;
+        type_line(&mut app, "/team ship it");
+        assert!(app.on_key(key(KeyCode::Enter)).is_none(), "refused while busy");
+        assert_eq!(app.input, "/team ship it", "typed line kept for later");
+        assert_eq!(app.entries.last().unwrap().kind, EntryKind::Error);
+        // A plain prompt still goes through (the server replaces the run).
+        app.input.clear();
+        app.cursor = 0;
+        type_line(&mut app, "actually, do this instead");
+        assert!(matches!(app.on_key(key(KeyCode::Enter)), Some(InputAction::Prompt(_))));
+    }
+
+    #[test]
+    fn mission_from_the_picker_marks_busy() {
+        let mut app = App::new();
+        type_line(&mut app, "/mission fix the flaky test");
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.on_key(key(KeyCode::Enter)), Some(InputAction::Mission(_))));
+        assert!(app.busy);
     }
