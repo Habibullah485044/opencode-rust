@@ -21,6 +21,12 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Largest tool result handed to the model, in bytes (B-19).
+const MAX_RESULT_BYTES: usize = 60_000;
+/// Providers accept function names of at most 64 characters (B-19).
+const MAX_FN_NAME: usize = 64;
+/// Longest server part of a model-facing tool name (B-19).
+const MAX_SERVER_PART: usize = 24;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpTool {
@@ -109,7 +115,16 @@ where
     }
 
     pub async fn list_tools(&mut self) -> Result<Vec<McpTool>> {
-        let res = self.request("tools/list", json!({})).await?;
+        // `tools/list` must answer within this time (B-19).
+        const LIST_TIMEOUT: Duration = Duration::from_secs(20);
+        self.list_tools_within(LIST_TIMEOUT).await
+    }
+
+    /// `tools/list` with a time limit, so a silent server cannot hang startup.
+    async fn list_tools_within(&mut self, limit: Duration) -> Result<Vec<McpTool>> {
+        let res = tokio::time::timeout(limit, self.request("tools/list", json!({})))
+            .await
+            .context("mcp tools/list timed out")??;
         let arr = res
             .get("tools")
             .and_then(Value::as_array)
@@ -147,26 +162,63 @@ where
             })
             .unwrap_or_default();
         if is_error {
-            Err(anyhow!("{}", if text.is_empty() { "tool error" } else { text.as_str() }))
+            Err(anyhow!("{}", if text.is_empty() { "tool error".to_string() } else { cap_result(text) }))
         } else if text.is_empty() {
             Ok("(no output)".into())
         } else {
-            Ok(text)
+            Ok(cap_result(text))
         }
     }
 }
 
+/// Cut an over-long tool result to MAX_RESULT_BYTES (B-19).
+fn cap_result(text: String) -> String {
+    if text.len() <= MAX_RESULT_BYTES {
+        return text;
+    }
+    let mut cut = MAX_RESULT_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n… [mcp result truncated: {} bytes in total]", &text[..cut], text.len())
+}
+
 /// Server names become part of a function name: keep [A-Za-z0-9-], fold the
 /// rest to `-`, so `mcp__<server>__<tool>` parsing stays unambiguous.
+/// B-19: at most MAX_SERVER_PART characters, so the tool part has room.
 pub fn sanitize_server(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .take(MAX_SERVER_PART)
         .collect()
 }
 
-/// The model-facing function name for an MCP tool.
+/// Short, stable hash (FNV-1a, 32 bit): same input, same output, every run.
+fn short_hash(s: &str) -> String {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in s.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    format!("{h:08x}")
+}
+
+/// The model-facing function name for an MCP tool, always matching
+/// `^[a-zA-Z0-9_-]{1,64}$` (B-19). [`resolve_tool_name`] maps it back.
 pub fn tool_fn_name(server: &str, tool: &str) -> String {
-    format!("mcp__{}__{}", sanitize_server(server), tool)
+    let prefix = format!("mcp__{}__", sanitize_server(server));
+    let clean: String = tool
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    let full = format!("{prefix}{clean}");
+    if clean == tool && !clean.is_empty() && full.len() <= MAX_FN_NAME {
+        return full;
+    }
+    // Room for the readable part: 64 minus the prefix, minus "_" + 8 hex digits.
+    let room = MAX_FN_NAME - prefix.len() - 9;
+    let head: String = clean.chars().take(room).collect();
+    format!("{prefix}{head}_{}", short_hash(tool))
 }
 
 /// Inverse of [`tool_fn_name`]; `None` when the name isn't MCP-shaped.
@@ -177,6 +229,17 @@ pub fn parse_fn_name(fn_name: &str) -> Option<(String, String)> {
         return None;
     }
     Some((server.to_string(), tool.to_string()))
+}
+
+/// The real MCP tool name behind the tool part of `mcp__<server>__<part>`
+/// (B-19). Falls back to `part` itself when no tool matches.
+pub fn resolve_tool_name(server: &str, tools: &[McpTool], part: &str) -> String {
+    let wanted = format!("mcp__{server}__{part}");
+    tools
+        .iter()
+        .find(|t| tool_fn_name(server, &t.name) == wanted)
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| part.to_string())
 }
 
 /// OpenAI function spec for an MCP tool.
@@ -229,7 +292,16 @@ impl McpConn {
         let stdout = BufReader::new(child.stdout.take().context("mcp child has no stdout")?);
         let mut client = Client::new(stdout, stdin);
         client.initialize().await?;
-        let tools = client.list_tools().await?;
+        let mut tools = client.list_tools().await?;
+        // B-19: two tools with the same model-facing name would be ambiguous.
+        let mut seen = std::collections::HashSet::new();
+        tools.retain(|t| {
+            let fresh = seen.insert(tool_fn_name(&server, &t.name));
+            if !fresh {
+                eprintln!("[mcp] {server}: skipping tool `{}` (its name collides with another tool)", t.name);
+            }
+            fresh
+        });
         Ok(Self { child, client, tools, server })
     }
 
@@ -252,15 +324,26 @@ impl Registry {
     /// Start every not-yet-running server. Failures are logged, not fatal —
     /// one broken MCP config must not stop the agent from booting.
     pub async fn start_all(&mut self, servers: &[McpServerCfg]) {
+        // B-19: all servers start at the same time; each start is bounded by
+        // the initialize and tools/list time limits.
+        let mut starts = Vec::new();
+        let mut planned = std::collections::HashSet::new();
         for cfg in servers {
             if cfg.name.is_empty() || cfg.command.is_empty() {
                 continue;
             }
             let key = sanitize_server(&cfg.name);
             if self.conns.contains_key(&key) {
+                continue; // already running
+            }
+            if !planned.insert(key.clone()) {
+                eprintln!("[mcp] skipping `{}`: another server already uses the name `{key}`", cfg.name);
                 continue;
             }
-            match McpConn::spawn(&cfg.name, cfg).await {
+            starts.push(async move { (key, cfg, McpConn::spawn(&cfg.name, cfg).await) });
+        }
+        for (key, cfg, result) in futures::future::join_all(starts).await {
+            match result {
                 Ok(conn) => {
                     eprintln!(
                         "[mcp] {} connected ({} tool(s))",
@@ -285,7 +368,8 @@ impl Registry {
             .conns
             .get_mut(&server)
             .ok_or_else(|| anyhow!("mcp server `{server}` is not connected"))?;
-        conn.call(&tool, args).await
+        let real = resolve_tool_name(&conn.server, &conn.tools, &tool);
+        conn.call(&real, args).await
     }
 
     pub fn connected(&self) -> Vec<&str> {
@@ -544,5 +628,112 @@ rl.on('line', (line) => {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod b19_names_tests {
+    use super::*;
+
+    #[test]
+    fn tool_names_are_provider_safe_and_map_back() {
+        let long = "x".repeat(100);
+        let names = ["read.file", "a b/c", long.as_str(), "plain_name", "a_b", "a.b", ""];
+        let tools: Vec<McpTool> = names
+            .iter()
+            .map(|n| McpTool { name: n.to_string(), description: String::new(), input_schema: Value::Null })
+            .collect();
+        let server = "my server with a very long name indeed";
+        let mut seen = std::collections::HashSet::new();
+        for t in &tools {
+            let fname = tool_fn_name(server, &t.name);
+            let safe = fname.len() <= MAX_FN_NAME
+                && fname.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            assert!(safe, "{fname}");
+            assert!(seen.insert(fname.clone()), "duplicate name {fname}");
+            let (srv, part) = parse_fn_name(&fname).expect("mcp-shaped");
+            assert_eq!(resolve_tool_name(&srv, &tools, &part), t.name);
+        }
+        assert_eq!(tool_fn_name("srv", "plain_name"), "mcp__srv__plain_name");
+    }
+
+    #[test]
+    fn huge_results_are_cut() {
+        let out = cap_result("é".repeat(MAX_RESULT_BYTES));
+        assert!(out.len() < MAX_RESULT_BYTES + 100, "{}", out.len());
+        assert!(out.contains("truncated"));
+        assert_eq!(cap_result("short".into()), "short");
+    }
+}
+
+#[cfg(test)]
+mod b19_startup_tests {
+    use super::*;
+    use tokio::io::{duplex, AsyncReadExt};
+
+    #[tokio::test]
+    async fn list_tools_gives_up_on_a_silent_server() {
+        let (client_end, mut server_end) = duplex(64 * 1024);
+        let (r, w) = tokio::io::split(client_end);
+        let mut client = Client::new(BufReader::new(r), w);
+        // This "server" reads everything and never answers.
+        let silent = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = server_end.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let err = client.list_tools_within(Duration::from_millis(200)).await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        drop(client);
+        let _ = silent.await;
+    }
+
+    /// Two servers that each take 1.5 s to answer `initialize` start in
+    /// about 1.5 s together, not 3 s. Each lists `echo` twice; one is dropped.
+    #[tokio::test]
+    async fn servers_start_at_the_same_time() {
+        let node = ["node", "nodejs"].iter().find(|c| {
+            std::process::Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        });
+        let Some(node) = node else {
+            eprintln!("skip: node not found on PATH");
+            return;
+        };
+        let script = r#"
+const delay = Number(process.argv[2] || 0);
+const rl = require('readline').createInterface({ input: process.stdin });
+const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+rl.on('line', (line) => {
+  let m; try { m = JSON.parse(line); } catch { return; }
+  if (m.id === undefined) return;
+  if (m.method === 'initialize') setTimeout(() => send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'slow',version:'0'}}}), delay);
+  else if (m.method === 'tools/list') send({jsonrpc:'2.0',id:m.id,result:{tools:[{name:'echo',inputSchema:{type:'object'}},{name:'echo',inputSchema:{type:'object'}}]}});
+  else send({jsonrpc:'2.0',id:m.id,result:{content:[{type:'text',text:'ok'}]}});
+});
+"#;
+        let dir = std::env::temp_dir().join(format!("ocrs-b19-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("slow_mcp.js");
+        std::fs::write(&path, script).unwrap();
+        let cfg = |name: &str| McpServerCfg {
+            name: name.into(),
+            command: node.to_string(),
+            args: vec![path.to_string_lossy().into_owned(), "1500".into()],
+            ..Default::default() // keeps compiling when McpServerCfg gets more fields (F-03)
+        };
+        let mut reg = Registry::default();
+        let started = std::time::Instant::now();
+        reg.start_all(&[cfg("a"), cfg("b")]).await;
+        let took = started.elapsed();
+        let mut names = reg.connected();
+        names.sort();
+        assert_eq!(names, vec!["a", "b"]);
+        assert!(took < Duration::from_millis(2700), "servers started one after another: {took:?}");
+        assert_eq!(reg.specs().len(), 2, "the duplicate `echo` is dropped on each server");
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
