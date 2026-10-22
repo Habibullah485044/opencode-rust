@@ -33,11 +33,16 @@ Not verified: `browser_screenshot` (needs CDP `Page.captureScreenshot` and was n
 built), wheel-scrolling inside the native view by a human, and multi-monitor DPI
 changes (bounds are recomputed from `getBoundingClientRect`, which should cover it).
 
+
+Open work is tracked as tasks in FIX_PLAN.md (IDs like F-04, F-09).
+
 ---
 
 ---
 
 ## 0. What the code actually is today
+
+> Historical: this section describes the code *before* Goal A. Kept for context; see the Status table above for today.
 
 **Frontend** — `src/gui.html` (≈1.6k lines, single file, no build step, embedded
 with `include_str!`), driven by `src/gui.rs`:
@@ -143,28 +148,28 @@ press Enter, it loads; Back/Forward/Reload work; the panel behaves like a browse
 and collapses cleanly.
 
 ### A-B1 — Child webview lifecycle (backend) `M`
-- [ ] Add a `Browser` state struct next to the main webview in `gui.rs::run`.
-- [ ] Build the child with `WebViewBuilder::new().build_as_child(&window)`,
+- [x] Add a `Browser` state struct next to the main webview in `gui.rs::run`.
+- [x] Build the child with `WebViewBuilder::new().build_as_child(&window)`,
   `with_visible(false)` initially, `with_clipboard(true)`, background `#070A12`.
-- [ ] `set_bounds(Rect { position: LogicalPosition::new(x, y).into(), size:
+- [x] `set_bounds(Rect { position: LogicalPosition::new(x, y).into(), size:
   LogicalSize::new(w, h).into() })`, fed straight from `getBoundingClientRect()`
   in CSS pixels. No manual DPI math. Unit-test the rect→Rect conversion.
-- [ ] `set_visible(false)` when collapsed; `true` + bounds on open.
+- [x] `set_visible(false)` when collapsed; `true` + bounds on open.
 - [ ] Destroy/recreate on window recreate (maximize/minimize edge cases).
 
 ### A-B2 — IPC surface (backend + frontend contract) `S`
-- [ ] Extend `IpcMsg`: `Browse(String)`, `NavBack`, `NavFwd`, `NavReload`,
+- [x] Extend `IpcMsg`: `Browse(String)`, `NavBack`, `NavFwd`, `NavReload`,
   `PanelRect { x, y, w, h }`, `PanelVisible(bool)`, `OpenDevServer`.
-- [ ] Extend `GuiState`/payload with `url`, `title`, `can_back`, `can_forward`,
+- [x] Extend `GuiState`/payload with `url`, `title`, `can_back`, `can_forward`,
   `loading` so the chrome reflects reality.
-- [ ] Keep `parse_ipc` total: unknown → `None` (existing behavior), add tests for
+- [x] Keep `parse_ipc` total: unknown → `None` (existing behavior), add tests for
   every new variant including malformed rects.
 
 ### A-B3 — Navigation feedback (backend) `S`
-- [ ] `with_navigation_handler` → push URL + `can_back/can_forward` to the page.
-- [ ] `with_document_title_changed_handler` → tab title.
-- [ ] `with_on_page_load_handler` → loading spinner state.
-- [ ] Block `file://` and `javascript:` from the URL bar (allow `http(s)`, `about:blank`,
+- [x] `with_navigation_handler` → push URL + `can_back/can_forward` to the page.
+- [x] `with_document_title_changed_handler` → tab title.
+- [x] `with_on_page_load_handler` → loading spinner state.
+- [x] Block `file://` and `javascript:` from the URL bar (allow `http(s)`, `about:blank`,
   `localhost`); log refusals as a page-level error chip.
 
 ### A-B4 — Browser context / profile choice (backend) `S`
@@ -177,43 +182,43 @@ second browser process group** (~80–150 MB on top). Decide deliberately:
 | **Reuse the main context** (recommended for A) | 0 extra processes | shares the cookie jar with the app page, which loads only local HTML — no network origin, so nothing to leak |
 | Dedicated `WebContext` now | +1 browser process | real cookie isolation from day one |
 
-- [ ] Ship A on the shared context; introduce `WebContext` per profile only in
+- [x] Ship A on the shared context; introduce `WebContext` per profile only in
   C2 where profiles are the feature and the cost is justified.
-- [ ] Config keys reserved now: `[browser] enabled, home_url, allow_remote, profile_dir`.
+- [x] Config keys reserved now: `[browser] enabled, home_url, allow_remote, profile_dir`.
 - [ ] When profiles land: never let the automation profile touch the user's
   signed-in session; select explicitly.
 
 ### A-B5 — Dev-server detection (backend) `M`
-- [ ] Parse `bash` tool output / run events for `http://localhost:<port>` and
+- [x] Parse `bash` tool output / run events for `http://localhost:<port>` and
   `127.0.0.1:<port>`; emit `dev_server{url}` on the event bus.
-- [ ] GUI surfaces a "Open localhost:5173" chip; clicking navigates the panel.
-- [ ] Honors "Open Dev Server" CTA that today does nothing.
+- [x] GUI surfaces a "Open localhost:5173" chip; clicking navigates the panel.
+- [x] Honors "Open Dev Server" CTA that today does nothing.
 
 ### A-F1 — URL bar becomes real (frontend) `S` ← *this is the paste bug*
-- [ ] Replace `<div id="url">` with `<input id="url" spellcheck="false">`.
-- [ ] Enter → `postToRust({type:"browse", url})`; Escape → restore current URL.
-- [ ] Ctrl+L / Cmd+L focuses and selects the bar; paste works natively once it is
+- [x] Replace `<div id="url">` with `<input id="url" spellcheck="false">`.
+- [x] Enter → `postToRust({type:"browse", url})`; Escape → restore current URL.
+- [x] Ctrl+L / Cmd+L focuses and selects the bar; paste works natively once it is
   a real input.
-- [ ] `:3000` and `localhost:3000` shorthand → prefix `http://`.
+- [x] `:3000` and `localhost:3000` shorthand → prefix `http://`.
 - [ ] Show lock / globe icon by scheme; truncate long URLs in the middle.
 
 ### A-F2 — Navigation controls (frontend) `S`
-- [ ] Wire `←` `→` `⟳` buttons to `nav_back` / `nav_fwd` / `nav_reload`.
-- [ ] Disable arrows via `can_back/can_forward` from the payload.
-- [ ] Spinner state on the reload button while `loading`.
+- [x] Wire `←` `→` `⟳` buttons to `nav_back` / `nav_fwd` / `nav_reload`.
+- [x] Disable arrows via `can_back/can_forward` from the payload.
+- [x] Spinner state on the reload button while `loading`.
 
 ### A-F3 — Panel geometry plumbing (frontend) `M`
-- [ ] `ResizeObserver` on `#bcontent`; `getBoundingClientRect()` → `window.devicePixelRatio`.
-- [ ] Send `panel_rect` on: open, close, sidebar resize, window resize, browser zoom.
-- [ ] Send `panel_visible` on collapse/expand, and whenever a modal/menu/overlay
+- [x] `ResizeObserver` on `#bcontent`; `getBoundingClientRect()` → `window.devicePixelRatio`.
+- [x] Send `panel_rect` on: open, close, sidebar resize, window resize, browser zoom.
+- [x] Send `panel_visible` on collapse/expand, and whenever a modal/menu/overlay
   opens above the panel (native views don't respect z-index).
-- [ ] Throttle to one message per animation frame.
+- [x] Throttle to one message per animation frame.
 
 ### A-F4 — Panel states (frontend) `S`
-- [ ] Empty state (current globe card, but with a working "Open Dev Server").
-- [ ] Loading skeleton while the child view is hidden.
-- [ ] Error card for refused URLs / failed loads (`ERR_NAME_NOT_RESOLVED` etc.).
-- [ ] Keep the panel chrome visible during load — never a white flash.
+- [x] Empty state (current globe card, but with a working "Open Dev Server").
+- [x] Loading skeleton while the child view is hidden.
+- [x] Error card for refused URLs / failed loads (`ERR_NAME_NOT_RESOLVED` etc.).
+- [x] Keep the panel chrome visible during load — never a white flash.
 
 ### Acceptance for Goal A
 1. Paste a link, press Enter, page renders in the panel.
@@ -246,32 +251,32 @@ tell me what happened" works from chat, with the user watching it happen.
 
 ### B-B2 — Browser tools (backend) `L`
 Each is a `ToolSpec` in `tools.rs`'s style, executed against the GUI browser:
-- [ ] `browser_navigate{url}`
-- [ ] `browser_snapshot{}` — accessibility tree, **not** raw HTML
-- [ ] `browser_click{ref}` / `browser_type{ref,text,submit?}`
-- [ ] `browser_screenshot{}` — `Page.captureScreenshot` → temp PNG, returned as a path
-- [ ] `browser_wait{selector|text|ms}`
+- [x] `browser_navigate{url}`
+- [x] `browser_snapshot{}` — accessibility tree, **not** raw HTML
+- [x] `browser_click{ref}` / `browser_type{ref,text,submit?}`
+- [x] `browser_screenshot{}` — `Page.captureScreenshot` → temp PNG, returned as a path *(done in F-04)*
+- [x] `browser_wait{selector|text|ms}`
 - [ ] `browser_tabs{action,id}` (depends on Goal C tabs)
 - [ ] Every tool returns a compact JSON envelope `{ok, url, title, note}`.
 
 ### B-B3 — Permissions integration (backend) `M`
-- [ ] Read-only ops (`navigate`, `snapshot`, `screenshot`) → `allow` by default.
-- [ ] Mutating ops (`click` on submit, `type` into password/checkout) → `ask`,
+- [x] Read-only ops (`navigate`, `snapshot`, `screenshot`) → `allow` by default.
+- [x] Mutating ops (`click` on submit, `type` into password/checkout) → `ask`,
   routed through the existing approval engine.
-- [ ] **Depends on the approval UI** (Goal D1) — today an `ask` has no surface and
-  silently becomes a denial. Do D1 first or in the same slice.
+- [x] **Depends on the approval UI** (Goal D1) — today an `ask` has no surface and
+  silently becomes a denial. Do D1 first or in the same slice. (historical — D1 shipped)
 
 ### B-B4 — Snapshot engineering (backend) `M`
-- [ ] Stable refs (`e12`) mapped to DOM nodes for the session, invalidated on nav.
-- [ ] Cap tokens: prune to interactive + text nodes, drop decorative divs.
-- [ ] Include `role`, `name`, `value`, `href`, `checked`; omit styles/classes.
-- [ ] Regression test against a local fixture page with known structure.
+- [x] Stable refs (`e12`) mapped to DOM nodes for the session, invalidated on nav.
+- [x] Cap tokens: prune to interactive + text nodes, drop decorative divs.
+- [x] Include `role`, `name`, `value`, `href`, `checked`; omit styles/classes.
+- [x] Regression test against a local fixture page with known structure.
 
 ### B-B5 — Safety rails (backend) `S`
 - [ ] Max 1 navigation in flight; queue the rest.
-- [ ] Loop guard: identical tool+args 3× in a row → error back to the model.
+- [x] Loop guard: identical tool+args 3× in a row → error back to the model. *(done in F-09)*
 - [ ] Never auto-fill credentials from config.
-- [ ] CDP stays in-process; open no ports.
+- [x] CDP stays in-process; open no ports.
 
 ### B-F1 — Agent activity view (frontend) `M`
 - [ ] Live "browsing…" chip with the current action (`click e12`, `type …`).
@@ -331,19 +336,19 @@ Ordered by value per unit of work; each is independently shippable.
 ## GOAL D — Close the shell's remaining holes
 
 ### D1 — Approval UI (frontend + backend) `M` — **highest user-visible gap**
-- [ ] `ServerEvent::ApprovalRequest` already exists in the engine; the GUI drops it.
+- [x] `ServerEvent::ApprovalRequest` already exists in the engine; the GUI drops it.
 - [ ] Modal: tool name, exact command/path, diff preview for writes, Allow once /
   Always allow / Deny.
-- [ ] Wire to `POST /api/approvals/{id}`; keyboard `y`/`n`.
-- [ ] Timeout countdown from `approval_timeout_secs`.
+- [x] Wire to `POST /api/approvals/{id}`; keyboard `y`/`n`.
+- [x] Timeout countdown from `approval_timeout_secs`.
 
 ### D2 — Release build `S`
 - [ ] `cargo build --release`, smoke-test the exe (not just debug).
 - [ ] Decide on an installer (MSIX vs portable folder); icon + version stamping.
 
 ### D3 — Crash/edge hygiene `S`
-- [ ] WebView2 missing → actionable dialog, not a stack trace.
-- [ ] Single-instance guard (two GUIs writing one DB).
+- [x] WebView2 missing → actionable dialog, not a stack trace. *(done in F-13)*
+- [x] Single-instance guard (two GUIs writing one DB). *(done in F-13)*
 
 ---
 
