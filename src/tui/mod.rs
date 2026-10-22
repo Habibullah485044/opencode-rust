@@ -16,7 +16,53 @@ use crossterm::{
     ExecutableCommand,
 };
 use ratatui::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// B-16: true while the TUI owns the terminal (raw mode + alternate screen).
+static TERMINAL_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// B-16: claim the "restore" job. Returns true exactly once per take.
+fn release_terminal() -> bool {
+    TERMINAL_TAKEN.swap(false, Ordering::SeqCst)
+}
+
+/// B-16: give the terminal back — end raw mode, leave the alternate screen,
+/// show the cursor. Does nothing if the TUI does not own the terminal.
+/// Every step is tried even when an earlier one fails.
+fn restore_terminal() {
+    if release_terminal() {
+        let _ = disable_raw_mode();
+        let mut out = std::io::stdout();
+        let _ = out.execute(LeaveAlternateScreen);
+        let _ = out.execute(crossterm::cursor::Show);
+    }
+}
+
+/// B-16: restores the terminal when dropped — on the normal exit and on
+/// every early `?` return out of [`run`].
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+/// B-16: restore the terminal BEFORE the panic message is printed. With
+/// `panic = "abort"` no destructor runs on a panic, but the hook does. It
+/// chains to the previous hook (main.rs `install_crash_log`), so the
+/// message and crash.log are still written.
+fn install_panic_restore() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            previous(info);
+        }));
+    });
+}
 /// Run the TUI event loop. `on_action` is invoked for user intents;
 /// events come in over a channel from the SSE reader task.
 pub async fn run(
@@ -24,8 +70,12 @@ pub async fn run(
     mut event_rx: tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
     action_tx: tokio::sync::mpsc::UnboundedSender<InputAction>,
 ) -> Result<()> {
+    install_panic_restore();
     let mut stdout = std::io::stdout();
     enable_raw_mode()?;
+    TERMINAL_TAKEN.store(true, Ordering::SeqCst);
+    // From here on, any early return (`?`) restores the terminal.
+    let _guard = TerminalGuard;
     stdout.execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
@@ -57,7 +107,6 @@ pub async fn run(
         }
     }
 
-    disable_raw_mode()?;
-    terminal2.backend_mut().execute(LeaveAlternateScreen)?;
+    // `_guard` restores the terminal when this function returns.
     Ok(())
 }

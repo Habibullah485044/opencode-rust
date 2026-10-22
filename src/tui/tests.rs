@@ -794,3 +794,12 @@
         assert!(row.contains("model gpt-5"), "{row}");
         assert!(row.trim_end().ends_with("api ok 9ms"), "right-aligned: {row}");
     }
+
+    #[test]
+    fn terminal_restore_runs_once_per_take() {
+        use std::sync::atomic::Ordering;
+        super::TERMINAL_TAKEN.store(true, Ordering::SeqCst);
+        assert!(super::release_terminal(), "first restore does the work");
+        assert!(!super::release_terminal(), "second restore is a no-op");
+        assert!(!super::TERMINAL_TAKEN.load(Ordering::SeqCst));
+    }
