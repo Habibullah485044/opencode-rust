@@ -31,7 +31,7 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "edit",
-            "Replace old_str with new_str in a file. old_str must match exactly once unless replace_all.",
+            "Replace old_str with new_str in a file. old_str must be non-empty, copied exactly from the file, and match exactly once unless replace_all.",
             json!({"type":"object","properties":{"path":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_str","new_str"]}),
         ),
         spec(
@@ -227,6 +227,14 @@ fn edit_file(
     new_str: &str,
     replace_all: bool,
 ) -> Result<String> {
+    // B-01: an empty old_str "matches" between every character; with
+    // replace_all it would insert new_str all over the file.
+    if old_str.is_empty() {
+        bail!(
+            "old_str is empty: give the exact text to replace (copy it from the file). \
+             To create or fully rewrite a file, use the write tool."
+        );
+    }
     let abs = resolve(workspace, path);
     let text = std::fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
     let matches = text.matches(old_str).count();
@@ -553,5 +561,23 @@ mod tests {
         let t = html_to_text("<html><script>alert(1)</script><p>Hi &amp; bye</p></html>");
         assert!(!t.contains("alert"));
         assert!(t.contains("Hi & bye"));
+    }
+}
+
+#[cfg(test)]
+mod b01_tests {
+    use super::*;
+
+    #[test]
+    fn edit_refuses_empty_old_str() {
+        let ws = std::env::temp_dir().join(format!("ocrs-b01-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("f.txt"), "abc").unwrap();
+        for replace_all in [false, true] {
+            let err = edit_file(&ws, "f.txt", "", "X", replace_all).unwrap_err().to_string();
+            assert!(err.contains("old_str is empty"), "{err}");
+        }
+        assert_eq!(std::fs::read_to_string(ws.join("f.txt")).unwrap(), "abc", "file untouched");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }
