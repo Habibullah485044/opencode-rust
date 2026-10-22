@@ -11,7 +11,7 @@ use axum::{
     extract::{Path as AxPath, State},
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use futures::{Stream, StreamExt};
@@ -460,9 +460,16 @@ impl AppState {
 pub fn router(state: Shared) -> Router {
     Router::new()
         .route("/api/sessions", post(create_session).get(list_sessions))
+        // New (F-12): rename / delete a session.
+        .route("/api/sessions/{id}", patch(patch_session_route).delete(delete_session_route))
         .route("/api/sessions/{id}/messages", get(get_messages))
         .route("/api/sessions/{id}/prompt", post(prompt))
         .route("/api/sessions/{id}/abort", post(abort_session))
+        // New (F-12): plan/build mode, model, permission mode, waiting approvals.
+        .route("/api/sessions/{id}/mode", get(get_mode_route).put(put_mode_route))
+        .route("/api/model", get(get_model_route).put(put_model_route))
+        .route("/api/permission-mode", get(get_perm_mode_route).put(put_perm_mode_route))
+        .route("/api/approvals", get(get_approvals_route))
         .route("/api/approvals/{id}", post(decide_approval))
         .route("/api/events", get(events_sse))
         .with_state(state)
@@ -547,6 +554,126 @@ async fn decide_approval(
 ) -> Result<StatusCode, StatusCode> {
     if st.decide(&id, req.allow, req.always) {
         Ok(StatusCode::OK)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+#[derive(Deserialize)]
+struct ModeReq {
+    mode: String,
+}
+
+/// New (F-12): `GET /api/sessions/{id}/mode`.
+async fn get_mode_route(
+    State(st): State<Shared>,
+    AxPath(id): AxPath<String>,
+) -> Result<Json<Value>, StatusCode> {
+    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(json!({ "mode": st.mode_for(&id).as_str() })))
+}
+
+/// New (F-12): `PUT /api/sessions/{id}/mode`.
+async fn put_mode_route(
+    State(st): State<Shared>,
+    AxPath(id): AxPath<String>,
+    Json(req): Json<ModeReq>,
+) -> Result<Json<Value>, StatusCode> {
+    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    let mode = AgentMode::parse(&req.mode).ok_or(StatusCode::BAD_REQUEST)?;
+    st.set_mode(&id, mode);
+    Ok(Json(json!({ "mode": mode.as_str() })))
+}
+
+#[derive(Deserialize)]
+struct ModelReq {
+    model: String,
+}
+
+/// New (F-12): `GET /api/model`. `available` is empty when the provider
+/// cannot list its models.
+async fn get_model_route(State(st): State<Shared>) -> Json<Value> {
+    Json(json!({
+        "current": st.current_model().await,
+        "available": st.available_models().await,
+    }))
+}
+
+/// New (F-12): `PUT /api/model`.
+async fn put_model_route(
+    State(st): State<Shared>,
+    Json(req): Json<ModelReq>,
+) -> Result<Json<Value>, StatusCode> {
+    let model = req.model.trim();
+    if model.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    st.set_model(model).await;
+    Ok(Json(json!({ "current": st.current_model().await })))
+}
+
+/// New (F-12): `GET /api/permission-mode`.
+async fn get_perm_mode_route(State(st): State<Shared>) -> Json<Value> {
+    Json(json!({ "mode": st.perm_mode().as_str() }))
+}
+
+/// New (F-12): `PUT /api/permission-mode`. `released` lists the approvals
+/// that turbo answered on the spot.
+async fn put_perm_mode_route(
+    State(st): State<Shared>,
+    Json(req): Json<ModeReq>,
+) -> Result<Json<Value>, StatusCode> {
+    let mode = PermissionMode::parse(&req.mode).ok_or(StatusCode::BAD_REQUEST)?;
+    let released = st.set_perm_mode(mode);
+    Ok(Json(json!({ "mode": mode.as_str(), "released": released })))
+}
+
+/// New (F-12): `GET /api/approvals` — every approval still waiting, as the
+/// same `ApprovalNeeded` events the event stream sent.
+async fn get_approvals_route(State(st): State<Shared>) -> Json<Vec<ServerEvent>> {
+    Json(st.pending_approvals())
+}
+
+#[derive(Deserialize)]
+struct RenameReq {
+    title: String,
+}
+
+/// New (F-12): `PATCH /api/sessions/{id}` — rename.
+async fn patch_session_route(
+    State(st): State<Shared>,
+    AxPath(id): AxPath<String>,
+    Json(req): Json<RenameReq>,
+) -> Result<Json<Session>, StatusCode> {
+    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    let title = req.title.trim();
+    if title.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    st.db.set_session_title(&id, title).map_err(internal)?;
+    let s = st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(s))
+}
+
+/// New (F-12): `DELETE /api/sessions/{id}`. A running run is stopped first,
+/// and the session is deleted only once that run has ended, so nothing is
+/// written to a deleted session. 409 when the run does not end in 10 s.
+async fn delete_session_route(
+    State(st): State<Shared>,
+    AxPath(id): AxPath<String>,
+) -> Result<StatusCode, StatusCode> {
+    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    if st.abort_run(&id).await {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while st.run_active(&id).await {
+            if std::time::Instant::now() >= deadline {
+                return Err(StatusCode::CONFLICT);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    if st.db.delete_session(&id).map_err(internal)? {
+        Ok(StatusCode::NO_CONTENT)
     } else {
         Err(StatusCode::NOT_FOUND)
     }
@@ -2945,6 +3072,132 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// F-12: a server with the token "t" and a client for it.
+    async fn f12_server() -> (Shared, String, reqwest::Client) {
+        let st =
+            build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let addr = serve_with_token(st.clone(), 0, "t".into()).await.unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        (st, format!("http://{addr}"), http)
+    }
+
+    /// F-12: every new route needs the token.
+    #[tokio::test]
+    async fn f12_routes_need_the_token() {
+        let (st, base, http) = f12_server().await;
+        let s = st.db.create_session("x", None).unwrap();
+        let routes = [
+            (reqwest::Method::GET, format!("/api/sessions/{}/mode", s.id)),
+            (reqwest::Method::PUT, format!("/api/sessions/{}/mode", s.id)),
+            (reqwest::Method::GET, "/api/model".to_string()),
+            (reqwest::Method::PUT, "/api/model".to_string()),
+            (reqwest::Method::GET, "/api/permission-mode".to_string()),
+            (reqwest::Method::PUT, "/api/permission-mode".to_string()),
+            (reqwest::Method::GET, "/api/approvals".to_string()),
+            (reqwest::Method::PATCH, format!("/api/sessions/{}", s.id)),
+            (reqwest::Method::DELETE, format!("/api/sessions/{}", s.id)),
+        ];
+        for (m, p) in routes {
+            let r = http.request(m.clone(), format!("{base}{p}")).send().await.unwrap();
+            assert_eq!(r.status().as_u16(), 401, "{m} {p} without a token");
+        }
+        assert!(st.db.get_session(&s.id).unwrap().is_some(), "nothing was deleted");
+    }
+
+    /// F-12: session mode, model and permission mode, good and bad requests.
+    #[tokio::test]
+    async fn f12_mode_model_and_permission_routes() {
+        let (st, base, http) = f12_server().await;
+        let s = st.db.create_session("x", None).unwrap();
+        let mode_url = format!("{base}/api/sessions/{}/mode", s.id);
+
+        let r: Value = http.get(&mode_url).bearer_auth("t").send().await.unwrap().json().await.unwrap();
+        assert_eq!(r["mode"], "build");
+        let r = http.put(&mode_url).bearer_auth("t").json(&json!({"mode": "plan"})).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(st.mode_for(&s.id), AgentMode::Plan);
+        let r = http.put(&mode_url).bearer_auth("t").json(&json!({"mode": "fly"})).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 400, "unknown mode");
+        let r = http
+            .get(format!("{base}/api/sessions/ses_nope/mode"))
+            .bearer_auth("t")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 404, "unknown session");
+
+        let r = http.put(format!("{base}/api/model")).bearer_auth("t").json(&json!({"model": "m2"})).send().await.unwrap();
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["current"], "m2");
+        let v: Value = http.get(format!("{base}/api/model")).bearer_auth("t").send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["current"], "m2");
+        assert!(v["available"].is_array());
+        let r = http.put(format!("{base}/api/model")).bearer_auth("t").json(&json!({"model": " "})).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 400, "empty model id");
+
+        let perm_url = format!("{base}/api/permission-mode");
+        let v: Value = http.get(&perm_url).bearer_auth("t").send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["mode"], "default");
+        let v: Value = http
+            .put(&perm_url)
+            .bearer_auth("t")
+            .json(&json!({"mode": "manual"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["mode"], "manual");
+        assert!(v["released"].as_array().unwrap().is_empty());
+        assert_eq!(st.perm_mode(), PermissionMode::Manual);
+        let r = http.put(&perm_url).bearer_auth("t").json(&json!({"mode": "yolo"})).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 400, "unknown permission mode");
+
+        let v: Value = http.get(format!("{base}/api/approvals")).bearer_auth("t").send().await.unwrap().json().await.unwrap();
+        assert_eq!(v, json!([]), "nothing waits");
+    }
+
+    /// F-12: rename and delete; DELETE stops a running run before it deletes.
+    #[tokio::test]
+    async fn f12_rename_and_delete_sessions() {
+        let (st, base, http) = f12_server().await;
+        let s = st.db.create_session("old", None).unwrap();
+        st.db.add_message(&s.id, "user", &[Part::Text { text: "hi".into() }]).unwrap();
+        let url = format!("{base}/api/sessions/{}", s.id);
+
+        let v: Value = http.patch(&url).bearer_auth("t").json(&json!({"title": "new"})).send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["title"], "new");
+        let r = http.patch(&url).bearer_auth("t").json(&json!({"title": "  "})).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 400, "empty title");
+        let r = http
+            .patch(format!("{base}/api/sessions/ses_nope"))
+            .bearer_auth("t")
+            .json(&json!({"title": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 404);
+
+        // A run that stops only when aborted.
+        let stopped = Arc::new(AtomicBool::new(false));
+        let seen = stopped.clone();
+        st.kick_task(s.id.clone(), move |_st, _sid, abort| async move {
+            while !abort.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            seen.store(true, Ordering::SeqCst);
+        })
+        .await;
+        let r = http.delete(&url).bearer_auth("t").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 204);
+        assert!(stopped.load(Ordering::SeqCst), "the run ended before the delete");
+        assert!(st.db.get_session(&s.id).unwrap().is_none(), "session gone");
+        assert!(st.db.messages(&s.id).unwrap().is_empty(), "messages gone");
+        let r = http.delete(&url).bearer_auth("t").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 404, "already deleted");
+    }
 
     /// P-04: common names, methods and mere mentions give no reuse hint.
     #[test]

@@ -209,6 +209,17 @@ impl Db {
         Ok(())
     }
 
+    /// New (F-12): delete a session and its messages in one transaction.
+    /// False when the id is unknown.
+    pub fn delete_session(&self, id: &str) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM messages WHERE session_id=?1", params![id])?;
+        let n = tx.execute("DELETE FROM sessions WHERE id=?1", params![id])?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let conn = self.conn.lock().unwrap();
         let s = conn
