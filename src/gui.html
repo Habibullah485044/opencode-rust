@@ -1267,6 +1267,11 @@
   .ap-btn:hover { filter: brightness(1.12); }
   .ap-btn.allow { background: var(--sky-gradient); color: #04101e; border-color: transparent; }
   .ap-btn.deny:hover { background: #ef4444; color: #ffffff; border-color: transparent; }
+  /* B-13: "Always allow" asks for a second click; chat label; queue note. */
+  .ap-btn.confirm { background: rgba(245, 158, 11, 0.18); border-color: rgba(245, 158, 11, 0.55); color: #fbbf24; }
+  .ap-chat { font-size: 11.5px; color: var(--warning); }
+  .ap-queue { font-size: 11.5px; color: var(--text-dim); }
+  .ap-card:focus { outline: none; }
 </style>
 </head>
 <body>
@@ -1419,16 +1424,18 @@
 
 <!-- D1: tool-approval modal. Not part of #app so it can sit above everything. -->
 <div id="approval" hidden>
-  <div class="ap-card" role="dialog" aria-modal="true" aria-labelledby="ap-title">
+  <div class="ap-card" id="ap-card" role="dialog" aria-modal="true" aria-labelledby="ap-title" tabindex="-1">
     <div class="ap-head">
       <span class="ap-badge" id="ap-tool">tool</span>
+      <span class="ap-chat" id="ap-chat" hidden></span>
       <span class="ap-count" id="ap-count"></span>
     </div>
     <div class="ap-title" id="ap-title">Habi needs your permission</div>
     <pre class="ap-detail" id="ap-detail"></pre>
+    <div class="ap-queue" id="ap-queue" hidden></div>
     <div class="ap-actions">
       <button class="ap-btn deny" id="ap-deny">Deny <kbd>n</kbd></button>
-      <button class="ap-btn" id="ap-always">Always allow <kbd>a</kbd></button>
+      <button class="ap-btn" id="ap-always" title="Allow this exact tool call from now on, without asking">Always allow <kbd>Shift+A</kbd></button>
       <button class="ap-btn allow" id="ap-allow">Allow once <kbd>y</kbd></button>
     </div>
   </div>
@@ -1445,6 +1452,10 @@
   var lastRectSig = "";
   var rectQueued = false;
   var currentApproval = null;
+  // B-13: the approval we answered last (a late repaint must not reopen it)
+  // and until when a first click on "Always allow" stays armed.
+  var answeredApprovalId = "";
+  var alwaysArmedUntil = 0;
   // Set by initApp; render() uses it to surface the panel when an agent
   // navigates (a browser action must not happen invisibly).
   var panelApi = null;
@@ -1467,6 +1478,18 @@
     } catch (e) {
       console.warn("IPC postMessage error:", e);
     }
+  }
+
+  // B-13: put the "Always allow" button back to its first-click state.
+  function resetAlwaysButton() {
+    alwaysArmedUntil = 0;
+    var b = document.getElementById("ap-always");
+    if (!b) return;
+    b.classList.remove("confirm");
+    b.textContent = "Always allow ";
+    var kb = document.createElement("kbd");
+    kb.textContent = "Shift+A";
+    b.appendChild(kb);
   }
 
   // Escape HTML to prevent injection
@@ -1812,19 +1835,51 @@
     // ---- D1: approval modal ----
     // The run is blocked on this; it must survive every repaint intact.
     var ap = d.approval || null;
+    // B-13: a repaint that was already on its way must not bring back an
+    // approval we have just answered.
+    if (ap && ap.id === answeredApprovalId) ap = null;
+    var isNew = !!ap && (!currentApproval || currentApproval.id !== ap.id);
     currentApproval = ap;
     var apEl = document.getElementById("approval");
     if (apEl) {
+      var wasShown = !apEl.hidden;
       if (ap) {
         var apTool = document.getElementById("ap-tool");
         if (apTool) apTool.textContent = ap.tool || "tool";
         var apDetail = document.getElementById("ap-detail");
         if (apDetail) apDetail.textContent = ap.detail || "";
         var apCount = document.getElementById("ap-count");
-        if (apCount) apCount.textContent = (ap.secs_left | 0) + "s";
+        var left = ap.secs_left | 0;
+        if (apCount) apCount.textContent = left > 0 ? left + "s" : "expired";
+        // Which chat asks, when it is not the open one (B-12 sends this).
+        var apChat = document.getElementById("ap-chat");
+        if (apChat) {
+          apChat.hidden = !ap.other_chat;
+          apChat.textContent = ap.other_chat ? "from: " + (ap.chat || "another chat") : "";
+        }
+        var apQueue = document.getElementById("ap-queue");
+        if (apQueue) {
+          var queued = ap.queued | 0;
+          apQueue.hidden = queued === 0;
+          apQueue.textContent = queued === 1
+            ? "1 more request is waiting"
+            : queued + " more requests are waiting";
+        }
         apEl.hidden = false;
+        if (isNew) {
+          resetAlwaysButton();
+          // Take keyboard focus, so y / n / Shift+A work at once.
+          var apCard = document.getElementById("ap-card");
+          if (apCard) apCard.focus();
+        }
       } else {
         apEl.hidden = true;
+        // The modal went away on its own (timeout, other client): give the
+        // keyboard back to the composer.
+        if (wasShown) {
+          var composerEl = document.getElementById("input");
+          if (composerEl) composerEl.focus();
+        }
       }
     }
 
@@ -2101,6 +2156,11 @@
       if (!currentApproval) return;
       var id = currentApproval.id;
       currentApproval = null;
+      answeredApprovalId = id;
+      resetAlwaysButton();
+      var apBox = document.getElementById("approval");
+      if (apBox) apBox.hidden = true;
+      if (input) input.focus();
       postToRust(allow
         ? { type: "approve", id: id, always: !!always }
         : { type: "deny", id: id });
@@ -2108,17 +2168,29 @@
     var apAllow = document.getElementById("ap-allow");
     if (apAllow) apAllow.addEventListener("click", function () { answerApproval(true, false); });
     var apAlways = document.getElementById("ap-always");
-    if (apAlways) apAlways.addEventListener("click", function () { answerApproval(true, true); });
+    if (apAlways) apAlways.addEventListener("click", function () {
+      // B-13: "always" is permanent, so the button needs a second click.
+      if (Date.now() < alwaysArmedUntil) { answerApproval(true, true); return; }
+      alwaysArmedUntil = Date.now() + 4000;
+      apAlways.classList.add("confirm");
+      apAlways.textContent = "Click again to always allow";
+      setTimeout(function () {
+        if (alwaysArmedUntil && Date.now() >= alwaysArmedUntil) resetAlwaysButton();
+      }, 4100);
+    });
     var apDeny = document.getElementById("ap-deny");
     if (apDeny) apDeny.addEventListener("click", function () { answerApproval(false, false); });
     document.addEventListener("keydown", function (ev) {
       if (!currentApproval) return;
       var t = ev.target;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
-      var k = String(ev.key || "").toLowerCase();
-      if (k === "y") { ev.preventDefault(); answerApproval(true, false); }
-      else if (k === "a") { ev.preventDefault(); answerApproval(true, true); }
-      else if (k === "n") { ev.preventDefault(); answerApproval(false, false); }
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      var k = String(ev.key || "");
+      // B-13: Shift+A for "always"; a plain "a" does nothing.
+      if (k === "A" && ev.shiftKey) { ev.preventDefault(); answerApproval(true, true); }
+      else if (k === "y" && !ev.shiftKey) { ev.preventDefault(); answerApproval(true, false); }
+      else if (k === "n" && !ev.shiftKey) { ev.preventDefault(); answerApproval(false, false); }
+      else if (k === "Escape") { ev.preventDefault(); answerApproval(false, false); }
     });
 
     // Toggle Collapsible Browser Panel. Start collapsed — `panelOpen` already

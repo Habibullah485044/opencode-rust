@@ -201,6 +201,30 @@ impl GuiState {
         Self::default()
     }
 
+    /// New (B-13): drop approvals the core must have timed out already —
+    /// their `ApprovalResolved` event may have been lost. `now` is a
+    /// parameter so tests can use a fixed clock. Returns true when one went.
+    pub fn expire_stale_approval(&mut self, now: Instant) -> bool {
+        let grace = Duration::from_secs(self.approval_timeout_secs + 5);
+        let stale: Vec<String> = self
+            .approval
+            .iter()
+            .chain(self.approval_queue.iter())
+            .filter(|a| now.saturating_duration_since(a.started) > grace)
+            .map(|a| a.id.clone())
+            .collect();
+        for id in &stale {
+            self.finish_approval(id);
+        }
+        if !stale.is_empty() {
+            self.push(
+                EntryKind::System,
+                "An approval got no answer in time and was denied.".to_string(),
+            );
+        }
+        !stale.is_empty()
+    }
+
     /// New (B-12): true when chat `id` is the one on screen.
     pub fn is_current(&self, id: &str) -> bool {
         self.session.as_deref() == Some(id)
@@ -393,6 +417,29 @@ impl GuiState {
             }
             ServerEvent::EditPreview { path, .. } | ServerEvent::EditApplied { path, .. } => {
                 self.push(EntryKind::System, format!("[edit] {path}"));
+            }
+            // B-13: the core says this approval is over (answered here or by
+            // another client, timed out, aborted, or released by turbo).
+            ServerEvent::ApprovalResolved { approval_id, reason, .. } => {
+                let tool = self
+                    .approval
+                    .as_ref()
+                    .filter(|a| a.id == approval_id && self.is_current(&a.session_id))
+                    .map(|a| a.tool.clone());
+                self.finish_approval(&approval_id);
+                if let Some(tool) = tool {
+                    match reason.as_str() {
+                        "timeout" => self.push(
+                            EntryKind::System,
+                            format!("No answer in time — `{tool}` was denied."),
+                        ),
+                        "abort" => self.push(
+                            EntryKind::System,
+                            format!("Run stopped — `{tool}` was not run."),
+                        ),
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }
@@ -1208,6 +1255,11 @@ pub async fn run(
                 }
                 // Requests that never get an answer must not hang the run.
                 bridge.expire();
+                // B-13: a modal whose timeout passed long ago cannot block the
+                // window forever, even if its "resolved" event was lost.
+                if gs.expire_stale_approval(Instant::now()) {
+                    changed = true;
+                }
                 // A live countdown forces a repaint on every timed wake.
                 if gs.approval.is_some() {
                     changed = true;
@@ -1891,6 +1943,55 @@ mod tests {
             parse_ipc(r#"{"type":"deny","id":"apr_1"}"#),
             Some(IpcMsg::Deny("apr_1".into()))
         );
+    }
+
+    /// Built from JSON so the helper works with or without optional fields
+    /// (task B-22 adds `preview` to this event).
+    fn approval_for(sid: &str, id: &str) -> ServerEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "approval_needed",
+            "session_id": sid,
+            "approval_id": id,
+            "tool": "bash",
+            "detail": "ls"
+        }))
+        .unwrap()
+    }
+
+    /// B-13: the core's "resolved" event closes the modal, whoever answered.
+    #[test]
+    fn approval_resolved_closes_the_modal_and_explains_timeouts() {
+        let mut g = GuiState::new();
+        g.session = Some("s".into());
+        g.on_event(approval_for("s", "apr_1"));
+        g.on_event(ServerEvent::ApprovalResolved {
+            session_id: "s".into(),
+            approval_id: "apr_other".into(),
+            allowed: true,
+            reason: "user".into(),
+        });
+        assert!(g.approval.is_some(), "another id leaves the modal alone");
+        g.on_event(ServerEvent::ApprovalResolved {
+            session_id: "s".into(),
+            approval_id: "apr_1".into(),
+            allowed: false,
+            reason: "timeout".into(),
+        });
+        assert!(g.approval.is_none());
+        assert!(!g.browser.covered);
+        assert!(g.entries.iter().any(|(_, t)| t.contains("denied")), "{:?}", g.entries);
+    }
+
+    /// B-13: a modal long past its timeout goes away even without an event.
+    #[test]
+    fn a_long_expired_modal_is_dropped_without_an_event() {
+        let mut g = GuiState::new();
+        g.approval_timeout_secs = 2;
+        g.on_event(approval_for("s", "apr_1"));
+        let started = g.approval.as_ref().unwrap().started;
+        assert!(!g.expire_stale_approval(started + Duration::from_secs(3)), "still in the grace time");
+        assert!(g.expire_stale_approval(started + Duration::from_secs(60)));
+        assert!(g.approval.is_none());
     }
 
     /// A-B4: `allow_remote = false` must keep the panel on this machine.

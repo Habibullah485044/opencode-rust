@@ -235,10 +235,30 @@
   ok("answering twice posts nothing", count("approve") === 0);
 
   window.render(withApproval({ id: "apr_10", tool: "write", detail: "src/main.rs", secs_left: 300 }));
+  ok("modal takes keyboard focus", !!document.activeElement && document.activeElement.id === "ap-card",
+    document.activeElement && document.activeElement.id);
   sent = [];
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true, cancelable: true }));
-  ok("'a' always-allows", !!last("approve") && last("approve").always === true &&
+  ok("plain 'a' does not always-allow", count("approve") === 0, JSON.stringify(sent));
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "A", shiftKey: true, bubbles: true, cancelable: true }));
+  ok("Shift+A always-allows", !!last("approve") && last("approve").always === true &&
     last("approve").id === "apr_10", JSON.stringify(last("approve")));
+
+  window.render(withApproval({ id: "apr_10b", tool: "bash", detail: "make", secs_left: 300 }));
+  sent = [];
+  click("ap-always");
+  ok("first click on Always only arms it", count("approve") === 0);
+  click("ap-always");
+  ok("second click always-allows", !!last("approve") && last("approve").always === true &&
+    last("approve").id === "apr_10b", JSON.stringify(last("approve")));
+
+  window.render(withApproval({ id: "apr_10c", tool: "bash", detail: "ls", secs_left: 0,
+    other_chat: true, chat: "Docs chat", queued: 2 }));
+  ok("expired countdown says so", document.getElementById("ap-count").textContent === "expired",
+    document.getElementById("ap-count").textContent);
+  ok("modal names the other chat", !document.getElementById("ap-chat").hidden &&
+    /Docs chat/.test(document.getElementById("ap-chat").textContent));
+  ok("modal counts waiting requests", /2 more/.test(document.getElementById("ap-queue").textContent));
 
   window.render(withApproval({ id: "apr_11", tool: "bash", detail: "rm -rf /tmp/x", secs_left: 90 }));
   sent = [];
