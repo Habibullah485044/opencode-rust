@@ -600,6 +600,8 @@ pub enum IpcMsg {
     Mode(PermissionMode),
     /// An uncaught JS error in the page (`window.onerror`).
     PageError(String),
+    /// New (F-06): the Stop button — abort the run of the chat on screen.
+    Stop,
 }
 
 /// Callbacks from the preview child webview itself (not from the page).
@@ -655,6 +657,7 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "deny" => Some(IpcMsg::Deny(v.get("id")?.as_str()?.to_string())),
         "mode" => Some(IpcMsg::Mode(PermissionMode::parse(v.get("mode")?.as_str()?)?)),
         "page_error" => Some(IpcMsg::PageError(v.get("msg")?.as_str()?.to_string())),
+        "stop" => Some(IpcMsg::Stop),
         _ => None,
     }
 }
@@ -817,10 +820,27 @@ fn submit_and_name(gs: &mut GuiState, st: &server::AppState) -> Option<String> {
     let content = gs.submit()?;
     if gs.title() == NEW_CHAT {
         let sid = gs.session.clone().unwrap_or_default();
-        let _ = st.db.set_session_title(&sid, &clip(&content, 40));
+        // F-06: the composer is multi-line; name the chat after line one.
+        let first_line = content.lines().next().unwrap_or("").trim();
+        let _ = st.db.set_session_title(&sid, &clip(first_line, 40));
         refresh_sessions(gs, st);
     }
     Some(content)
+}
+
+/// New (F-06): ask the run of chat `session_id` to stop. Same effect as
+/// `POST /api/sessions/{id}/abort`: set the run's abort flag. A run started
+/// a moment ago may not be registered yet, so look for up to one second.
+/// Returns false when no run showed up.
+async fn request_stop(st: &server::AppState, session_id: &str) -> bool {
+    for _ in 0..10 {
+        if let Some(flag) = st.busy.read().await.get(session_id) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
 }
 
 /// Wake-up sent by the SSE forwarder so the event loop drains promptly.
@@ -1097,6 +1117,19 @@ pub async fn run(
                             window.set_maximized(!maxed);
                         }
                         UiMsg::Ipc(IpcMsg::Close) => *control_flow = ControlFlow::Exit,
+                        UiMsg::Ipc(IpcMsg::Stop) => {
+                            // F-06: the same abort as the HTTP route.
+                            if let Some(sid) = gs.session.clone() {
+                                gs.push(EntryKind::System, "Stopping…".to_string());
+                                let st = st.clone();
+                                rt.spawn(async move {
+                                    if !request_stop(&st, &sid).await {
+                                        eprintln!("[gui] stop: no run found for {sid}");
+                                    }
+                                });
+                                changed = true;
+                            }
+                        }
                         UiMsg::Ipc(IpcMsg::Approve { id, always }) => {
                             let answered = st.decide(&id, true, always);
                             settle_approval(&mut gs, &id, answered);
@@ -1660,6 +1693,23 @@ mod tests {
         );
         assert_eq!(parse_ipc(r#"{"type":"mode","mode":"yolo"}"#), None, "unknown mode dropped");
         assert_eq!(parse_ipc(r#"{"type":"mode"}"#), None, "mode without value dropped");
+    }
+
+    /// F-06: the Stop button's IPC verb.
+    #[test]
+    fn ipc_parses_stop() {
+        assert_eq!(parse_ipc(r#"{"type":"stop"}"#), Some(IpcMsg::Stop));
+    }
+
+    /// F-06: Stop sets the same abort flag as `POST /api/sessions/{id}/abort`.
+    #[tokio::test]
+    async fn stop_sets_the_runs_abort_flag() {
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
+            .await;
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        st.busy.write().await.insert("ses_run".into(), flag.clone());
+        assert!(request_stop(&st, "ses_run").await);
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

@@ -328,6 +328,39 @@
   ok("manual clears the turbo styling",
     !document.getElementById("comp").classList.contains("turbo"));
 
+  // --- F-06: multiline composer, IME guard, Stop button ---
+  var ta = document.getElementById("input");
+  window.render(payload(basePage));
+  ok("composer is a textarea", ta.tagName === "TEXTAREA", ta.tagName);
+  ta.focus();
+  ta.value = "line one";
+  sent = [];
+  ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", shiftKey: true, bubbles: true, cancelable: true }));
+  ok("Shift+Enter does not send", count("send") === 0);
+  ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", isComposing: true, bubbles: true, cancelable: true }));
+  ok("Enter while an IME composes does not send", count("send") === 0);
+  ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  ok("Enter sends", count("send") === 1 && last("send").text === "line one", JSON.stringify(last("send")));
+
+  var busyPage = payload(basePage);
+  busyPage.busy = true;
+  window.render(busyPage);
+  ok("send turns into Stop while busy", document.getElementById("send").classList.contains("stop"));
+  sent = [];
+  click("send");
+  ok("Stop posts stop", count("stop") === 1, JSON.stringify(sent));
+  ta.value = "follow-up";
+  sent = [];
+  ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  ok("Enter while busy does not replace the run", count("send") === 0);
+  ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true }));
+  ok("Ctrl+Enter while busy sends", count("send") === 1);
+  sent = [];
+  ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  ok("Escape while busy posts stop", count("stop") === 1);
+  window.render(payload(basePage));
+  ok("Stop turns back into send", !document.getElementById("send").classList.contains("stop"));
+
   } catch (e) {
     ok("harness ran to completion", false, "threw: " + (e && e.message));
   }

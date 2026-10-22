@@ -845,6 +845,12 @@
     font-size: 14px;
     line-height: 1.5;
     padding: 4px 0 6px;
+    /* F-06: a textarea that grows with its text (see autoGrow). */
+    display: block;
+    resize: none;
+    min-height: 27px;
+    max-height: 200px;
+    overflow-y: auto;
   }
 
   #input::placeholder {
@@ -980,6 +986,19 @@
     transform: scale(1.1);
     box-shadow: 0 4px 16px rgba(56, 189, 248, 0.5) !important;
   }
+
+  /* F-06: while a run is going the send button is a Stop button. */
+  #send .ic-stop { display: none; }
+  #send.stop .ic-send { display: none; }
+  #send.stop .ic-stop { display: block; }
+  #send.stop {
+    background: rgba(248, 113, 113, 0.18) !important;
+    color: #fca5a5 !important;
+    cursor: pointer !important;
+    box-shadow: none !important;
+  }
+  .comp-hints .flash { color: var(--warning); }
+  .e-bubble-u { white-space: pre-wrap; }
 
   /* ---- Collapsible Webview / Browser Panel ---- */
   #browser {
@@ -1365,7 +1384,7 @@
       <!-- Floating Composer Dock -->
       <div id="compwrap">
         <div id="comp">
-          <input id="input" placeholder="Message Habi or ask a question…" autocomplete="off" spellcheck="false">
+          <textarea id="input" rows="1" placeholder="Message Habi or ask a question…" autocomplete="off" spellcheck="false"></textarea>
           <div class="comp-bottom-row">
             <div class="mode-switch" id="mode-switch" role="radiogroup" aria-label="Permission mode">
               <button type="button" class="mode-btn on" data-mode="default" role="radio" aria-checked="true"
@@ -1378,10 +1397,11 @@
             <div class="comp-hints">
               <span class="mode-hint" id="mode-hint">Approvals on · writes and commands ask first</span>
               <span>·</span>
-              <span><kbd>Enter</kbd> to send</span>
+              <span id="send-hint">Enter send · Shift+Enter new line</span>
             </div>
-            <button id="send" title="Send (Enter)">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+            <button id="send" title="Send (Enter)" aria-label="Send">
+              <svg class="ic-send" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+              <svg class="ic-stop" width="12" height="12" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2" fill="currentColor"/></svg>
             </button>
           </div>
         </div>
@@ -1448,6 +1468,8 @@
   // ---- Preview panel state, shared by render() and the init wiring ----
   var curUrl = "";
   var devServerUrl = "";
+  // F-06: true while the chat on screen has a run going (from the payload).
+  var busyNow = false;
   var panelOpen = false;
   var lastRectSig = "";
   var rectQueued = false;
@@ -1682,6 +1704,21 @@
         cstatus.className = "";
         cstatus.appendChild(document.createTextNode("Ready"));
       }
+    }
+
+    // ---- F-06: while a run is going the send button becomes Stop ----
+    busyNow = !!d.busy;
+    var sendBtn = document.getElementById("send");
+    if (sendBtn) {
+      sendBtn.classList.toggle("stop", busyNow);
+      sendBtn.title = busyNow ? "Stop the run (Esc)" : "Send (Enter)";
+      sendBtn.setAttribute("aria-label", busyNow ? "Stop" : "Send");
+    }
+    var sendHint = document.getElementById("send-hint");
+    if (sendHint) {
+      sendHint.textContent = busyNow
+        ? "Working · Esc stops · Ctrl+Enter stops and sends"
+        : "Enter send · Shift+Enter new line";
     }
 
     // ---- Permission mode selector (default / manual / turbo) ----
@@ -1995,6 +2032,14 @@
       } else {
         send.classList.remove("on");
       }
+      autoGrow();
+    }
+
+    // F-06: the composer grows with its text, up to its CSS max-height.
+    function autoGrow() {
+      if (!input) return;
+      input.style.height = "auto";
+      input.style.height = input.scrollHeight + "px";
     }
 
     function submitMessage() {
@@ -2007,15 +2052,42 @@
       input.focus();
     }
 
+    // F-06: stop the run of the chat on screen.
+    function stopRun() {
+      postToRust({ type: "stop" });
+    }
+
+    // F-06: Enter while busy would replace the running work; point at the
+    // keys that do something instead.
+    function flashBusyHint() {
+      var h = document.getElementById("send-hint");
+      if (!h) return;
+      h.classList.add("flash");
+      setTimeout(function () { h.classList.remove("flash"); }, 1200);
+    }
+
     if (input) {
       input.addEventListener("input", refreshSend);
       input.addEventListener("keyup", refreshSend);
       input.addEventListener("change", refreshSend);
       input.addEventListener("keydown", function (ev) {
-        if (ev.key === "Enter" && !ev.shiftKey) {
+        // F-06: never act on Enter while an IME is composing a word
+        // (Chinese, Japanese and Korean input confirm with Enter).
+        if (ev.isComposing || ev.keyCode === 229) return;
+        if (ev.key === "Escape" && busyNow) {
           ev.preventDefault();
-          submitMessage();
+          stopRun();
+          return;
         }
+        if (ev.key !== "Enter" || ev.shiftKey) return; // Shift+Enter = new line
+        ev.preventDefault();
+        if (busyNow && !(ev.ctrlKey || ev.metaKey)) {
+          flashBusyHint();
+          return;
+        }
+        // Not busy: send. Busy + Ctrl+Enter: send anyway; the core stops
+        // the running work first (`kick_run` replaces it).
+        submitMessage();
       });
       input.focus();
     }
@@ -2023,7 +2095,8 @@
     if (send) {
       send.addEventListener("click", function (ev) {
         ev.preventDefault();
-        submitMessage();
+        if (busyNow) stopRun();
+        else submitMessage();
       });
     }
 
