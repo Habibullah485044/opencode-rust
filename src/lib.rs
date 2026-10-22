@@ -23,3 +23,5 @@ pub mod team;
 pub mod todo;
 pub mod tools;
 pub mod tui;
+
+pub mod worktree;

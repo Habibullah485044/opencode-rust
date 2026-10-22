@@ -131,12 +131,24 @@ pub async fn spawn_subagent(
     };
     agent_status(st, &agent, "working", "starting…".into());
 
+    // F-05: with `agent.isolate_workers`, a `worker` runs in its own git
+    // worktree and keeps to the built-in tools.
+    let iso = (st.cfg.agent.isolate_workers && name == "worker")
+        .then(|| crate::worktree::Isolation::start(&st.workspace, &st.state_dir, "worker"));
+    let iso_ws = iso.as_ref().and_then(|i| i.workspace());
+    let mut system = system;
+    let mut allow = def.tools.map(|t| t.iter().map(|s| s.to_string()).collect());
+    if let Some(ws) = &iso_ws {
+        system.push_str(&crate::worktree::isolation_prompt(ws));
+        allow = Some(crate::worktree::local_tool_names());
+    }
     let opts = LoopOpts {
         system,
         emit_activity: false, // activity goes to the agents panel instead
-        allow: def.tools.map(|t| t.iter().map(|s| s.to_string()).collect()),
+        allow,
         can_spawn: false, // no recursive spawning
         agent: Some(agent.clone()),
+        workspace: iso_ws,
     };
     let out = match run_loop(st, &session.id, &opts, abort).await {
         Ok(out) => out,
@@ -154,6 +166,17 @@ pub async fn spawn_subagent(
     let mut summary = summary;
     if summary.chars().count() > 4000 {
         summary = summary.chars().take(4000).collect::<String>() + "…";
+    }
+    // F-05: report what the worktree produced, or why there was none. The
+    // user sees it as a note too. An aborted worker's changes are dropped.
+    if let Some(iso) = iso.filter(|_| !abort.load(std::sync::atomic::Ordering::SeqCst)) {
+        let report = iso.finish(&st.state_dir);
+        let _ = st.events.send(crate::server::ServerEvent::Note {
+            session_id: parent_session_id.to_string(),
+            text: format!("worker {}: {report}", session.id),
+        });
+        summary.push_str("\n\n");
+        summary.push_str(&report);
     }
     agent_status(
         st,
@@ -368,6 +391,7 @@ data: [DONE]
             emit_activity: false,
             allow: None,
             can_spawn: true,
+            workspace: None,
             agent: None,
         };
         assert!(!tool_allowed(crate::agents::AgentMode::Plan, &opts, "spawn"));
@@ -479,6 +503,85 @@ data: [DONE]
             .collect();
         assert_eq!(done.len(), 2, "both agents reached done: {evs:?}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F-05: with `agent.isolate_workers`, a `worker` edits its own git
+    /// worktree. The real workspace stays untouched, the summary carries a
+    /// patch that applies, and no worktree is left behind.
+    #[tokio::test]
+    async fn isolated_worker_returns_a_patch_and_leaves_the_workspace_alone() {
+        use axum::{routing::post, Router};
+        // The worker's model: a `write` call first, then (after the result) text.
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: axum::extract::Json<Value>| async move {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                let last_role = msgs.last().and_then(|m| m["role"].as_str()).unwrap_or("");
+                let payload = if last_role == "tool" {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"wrote it\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                        .to_string()
+                } else {
+                    let args = json!({"path": "from_worker.txt", "content": "hi\n"}).to_string();
+                    let frame = json!({"choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call_w",
+                        "function": {"name": "write", "arguments": args}
+                    }]}, "finish_reason": null}]});
+                    format!(
+                        "data: {frame}\n\n\
+                         data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
+                         data: [DONE]\n\n"
+                    )
+                };
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    payload,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let dir = std::env::temp_dir().join(format!("ocrs-iso-worker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| crate::gitsnap::git(&dir, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.autocrlf", "false"]); // exact bytes on Windows too
+        std::fs::write(dir.join("readme.txt"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.isolate_workers = true;
+        cfg.permissions.defaults.insert("write".into(), "allow".into());
+        cfg.permissions.approval_timeout_secs = 2;
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = crate::server::build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("main", None).unwrap();
+        let args = json!({"subagent": "worker", "task": "write the file"});
+        let out = spawn_subagent(&st, &s.id, &args, &AtomicBool::new(false)).await.unwrap();
+
+        assert!(!dir.join("from_worker.txt").exists(), "the real workspace is untouched");
+        assert!(out.contains("[isolated worktree]") && out.contains("from_worker.txt"), "{out}");
+        let patch = out
+            .lines()
+            .find_map(|l| l.strip_prefix("Patch: "))
+            .expect("patch path in the summary")
+            .to_string();
+        git(&["apply", &patch]);
+        assert_eq!(std::fs::read_to_string(dir.join("from_worker.txt")).unwrap(), "hi\n");
+        let list = git(&["worktree", "list", "--porcelain"]);
+        let count = list.lines().filter(|l| l.starts_with("worktree ")).count();
+        assert_eq!(count, 1, "only the main worktree is left: {list}");
+        let _ = std::fs::remove_file(&patch);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

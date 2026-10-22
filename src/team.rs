@@ -271,14 +271,42 @@ async fn run_worker_agent(
         system.push_str(&format!("\n\n## Skill: {} — always active\n\n", s.name));
         system.push_str(s.body.trim());
     }
+    // F-05: with `agent.isolate_workers`, each team worker runs in its own
+    // git worktree. The prompt names the folder it really works in.
+    let iso = st
+        .cfg
+        .agent
+        .isolate_workers
+        .then(|| crate::worktree::Isolation::start(&st.workspace, &st.state_dir, "team"));
+    let iso_ws = iso.as_ref().and_then(|i| i.workspace());
+    if let Some(ws) = &iso_ws {
+        system.push_str(&crate::worktree::isolation_prompt(ws));
+    }
     let opts = crate::server::LoopOpts {
         agent: None,
         system,
         emit_activity: false,
-        allow: None,
+        // F-05: an isolated worker keeps to the built-in tools.
+        allow: iso_ws.as_ref().map(|_| crate::worktree::local_tool_names()),
         can_spawn: false,
+        workspace: iso_ws,
     };
-    crate::server::run_loop(st, session_id, &opts, abort).await
+    let out = crate::server::run_loop(st, session_id, &opts, abort).await?;
+    // F-05: report what the worktree produced, or why there was none. The
+    // report goes first, so a later size cap cannot cut it off, and the user
+    // sees it as a note in the parent session. An aborted worker's changes
+    // are dropped.
+    let Some(iso) = iso.filter(|_| !abort.load(std::sync::atomic::Ordering::SeqCst)) else {
+        return Ok(out);
+    };
+    let report = iso.finish(&st.state_dir);
+    if let Some(parent) = st.db.get_session(session_id).ok().flatten().and_then(|s| s.parent_id) {
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: parent,
+            text: format!("team worker {session_id}: {report}"),
+        });
+    }
+    Ok(format!("{report}\n\n{out}"))
 }
 
 #[cfg(test)]
@@ -370,6 +398,38 @@ mod tests {
             });
             Self { url: format!("http://{addr}/v1") }
         }
+    }
+
+    /// F-05: with `agent.isolate_workers`, team workers run in git worktrees.
+    /// The mock worker changes nothing, so its report says so.
+    #[tokio::test]
+    async fn team_workers_run_isolated_in_a_git_repo() {
+        let dir = std::env::temp_dir().join(format!("ocrs-team-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| crate::gitsnap::git(&dir, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.autocrlf", "false"]); // exact bytes on Windows too
+        std::fs::write(dir.join("readme.txt"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.isolate_workers = true;
+        let mock = MockLlm::start().await;
+        cfg.provider.base_url = mock.url.clone();
+        cfg.provider.model = "mock".into();
+        let st = crate::server::build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("team", None).unwrap();
+        let abort = Arc::new(AtomicBool::new(false));
+        let out = run_team(&st, &s.id, "say hi", abort).await.unwrap();
+        assert!(out.contains("[isolated worktree] no file changes."), "{out}");
+        let list = git(&["worktree", "list", "--porcelain"]);
+        let count = list.lines().filter(|l| l.starts_with("worktree ")).count();
+        assert_eq!(count, 1, "only the main worktree is left: {list}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

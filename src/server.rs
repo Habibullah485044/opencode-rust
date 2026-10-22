@@ -1164,6 +1164,7 @@ async fn agent_inner(
         emit_activity: true,
         allow: None,
         can_spawn: true,
+        workspace: None,
         agent: None,
     };
     run_loop(st, session_id, &opts, abort).await
@@ -1190,6 +1191,9 @@ pub struct LoopOpts {
     pub allow: Option<Vec<String>>,
     /// May this run call the `spawn` tool? Only the top-level agent can.
     pub can_spawn: bool,
+    /// F-05: run this loop's file and shell tools in another folder (an
+    /// isolated worker's git worktree). `None` = the session workspace.
+    pub workspace: Option<PathBuf>,
     /// M7: this run is a spawned subagent — status goes to the agents panel.
     pub agent: Option<AgentInfo>,
 }
@@ -1698,7 +1702,7 @@ pub async fn run_loop(
         // auto-trait proof for the run_loop ↔ spawn recursion.)
         let mut spawns = Vec::new();
         for (id, name, input) in calls {
-            let detail = tool_detail(st, &name, &input);
+            let detail = tool_detail_for(st, opts, &name, &input);
             tool_started(st, opts, session_id, &id, &name, &detail);
             // New (B-06): once the run is aborted, the remaining calls of this
             // turn are not run (each still gets a result, so the history
@@ -1735,7 +1739,7 @@ pub async fn run_loop(
             }
             let (output, ok) = match denied {
                 Some(m) => (m, false),
-                None => execute_routed(st, session_id, &name, &input, abort).await,
+                None => execute_for(st, session_id, opts, &name, &input, abort).await,
             };
             finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
         }
@@ -2026,6 +2030,7 @@ pub async fn run_review(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) 
         emit_activity: false,
         allow: Some(vec!["read".to_string(), "glob".to_string(), "grep".to_string()]),
         can_spawn: false,
+        workspace: None,
         agent: None,
     };
     run_loop(st, session_id, &opts, abort).await
@@ -2311,6 +2316,43 @@ async fn execute_routed(
     match tools::execute(name, input, &st.workspace, abort).await {
         Ok(out) => (out, true),
         Err(e) => (format!("error: {e}"), false),
+    }
+}
+
+/// F-05: built-in tools that take the workspace folder (cwd for `bash`,
+/// base for relative paths). Only these are moved into a worker's worktree.
+const WORKSPACE_TOOLS: [&str; 7] = ["bash", "read", "write", "edit", "glob", "grep", "list"];
+
+/// F-05: like `execute_routed`, but a run with its own workspace (an
+/// isolated worker) runs the workspace tools in that folder.
+async fn execute_for(
+    st: &Shared,
+    session_id: &str,
+    opts: &LoopOpts,
+    name: &str,
+    input: &Value,
+    abort: &AtomicBool,
+) -> (String, bool) {
+    if let Some(ws) = &opts.workspace {
+        if WORKSPACE_TOOLS.contains(&name) {
+            return match tools::execute(name, input, ws, abort).await {
+                Ok(out) => (out, true),
+                Err(e) => (format!("error: {e}"), false),
+            };
+        }
+    }
+    execute_routed(st, session_id, name, input, abort).await
+}
+
+/// F-05: like `tool_detail`, but paths are made relative to the run's own
+/// workspace when it has one, so permission rules like `src/*` still match.
+fn tool_detail_for(st: &Shared, opts: &LoopOpts, tool: &str, input: &Value) -> String {
+    match (&opts.workspace, tool) {
+        (Some(ws), "read" | "write" | "edit" | "glob" | "grep") => {
+            let p = input.get("path").and_then(Value::as_str).unwrap_or("");
+            normalize_path_detail(ws, p)
+        }
+        _ => tool_detail(st, tool, input),
     }
 }
 
@@ -3104,6 +3146,7 @@ data: [DONE]
             emit_activity: true,
             allow: None,
             can_spawn: false,
+            workspace: None,
             agent: None,
         };
 

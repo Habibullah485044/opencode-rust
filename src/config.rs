@@ -253,6 +253,10 @@ pub struct AgentCfg {
     pub ponytail: bool,
     /// Automatically run a ponytail review after runs that changed files.
     pub auto_review: bool,
+    /// F-05: give each `worker` subagent and team worker its own git
+    /// worktree. Their changes come back as a patch file instead of landing
+    /// in the workspace. Off by default.
+    pub isolate_workers: bool,
     /// F-08: command that checks the work after a run that changed files,
     /// for example "cargo test". Unset (the default) = no check.
     pub verify_command: Option<String>,
@@ -275,6 +279,7 @@ impl Default for AgentCfg {
             max_steps: 40,
             system_prompt: None,
             ponytail: true,
+            isolate_workers: false,
             verify_command: None,
             verify_max_rounds: 2,
             verify_timeout_secs: 600,
