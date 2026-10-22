@@ -28,28 +28,32 @@ written so a coding AI can follow it one task at a time.
 
 ## Progress status
 
-*Updated 22 Oct 2026, checked against the code in `opencode-rust/` (git `2ccb80b`).*
+*Updated 23 Oct 2026, checked against the code in `opencode-rust/` (git `02ab198`).*
 
-**21 of 92 tasks done (23%).** Phase 1 is complete. Phase 2 has 7 of its 28 tasks done.
-Each finished task has its own commit, and its code changes and new tests are in the code.
+**42 of 92 tasks done (46%).** Each finished task has its own commit; its code
+changes and new tests are in the code.
 
-- **Build:** `cargo build` gives 0 warnings (Windows).
-- **Tests:** `cargo test` gives **238 passed, 0 failed** on Windows (185 original + 53 new).
-  `bash_timeout_kills_background_children` is Unix-only, so it does not run here.
-- **Next task:** `B-07` (CLI: the prompt must not pick up option values), then `B-09` → `B-08` → `B-22` …
-- **Not checked yet for finished tasks:** the manual checks (real terminal, real desktop window, real model APIs)
-  were not run. CI (H-03) has not run on GitHub, because nothing was pushed.
+- **Build:** `cargo build` gives 0 warnings (Windows), with and without the `gui` feature.
+- **Tests:** `cargo test` gives **289 passed, 0 failed** on Windows (282 library + 7 binary); 254 with `--no-default-features`. `tests/gui/run.sh` (Edge) gives 0 FAIL. A few new tests are Unix-only and do not run here.
+- **Next task:** `B-23` (TUI subscribes to events too late (startup race)), then `B-24` → `B-25` → `B-26` …
+- **Not checked yet:** the manual checks in finished tasks that need a real terminal, the
+  desktop window, MCP servers, Kaggle or real model APIs. Headless checks were run against
+  local mock servers where a task asked for them. CI (H-03) has not run on GitHub, because
+  nothing was pushed.
+- **Change from the plan:** S-14's test repo sets `core.autocrlf=false`, because Git for
+  Windows checks files out with CRLF and two byte-exact asserts failed. The product code is
+  as written in the plan.
 
 | Phase | Done | Status |
 |---|---|---|
 | Phase 1 — Safety and quick wins (do these first) | 14 / 14 | done |
-| Phase 2 — Stop losing work, make runs reliable | 7 / 28 | in progress |
+| Phase 2 — Stop losing work, make runs reliable | 28 / 28 | done |
 | Phase 3 — Quality: remaining bugs and ponytail fixes | 0 / 26 | not started |
 | Phase 4 — New features | 0 / 8 | not started |
 | Phase 5 — Polish | 0 / 16 | not started |
 
 The **Status** column in 2.2 lists every task, with the commit that did it.
-`PLAN_PROGRESS.md` has one line per finished task with its test count.
+`PLAN_PROGRESS.md` has one line per finished task with its test count and anything that was not checked.
 
 ---
 
@@ -468,41 +472,41 @@ Do the phases in order. Inside a phase, go left to right. A task's
 | S-05 | Keep the provider API key out of child processes | P0 | S | — | ✅ done (`374ee2c`) |
 | S-06 | webfetch: public addresses only, checked redirects, size cap | P0 | M | — | ✅ done (`a38c995`) |
 | S-07 | Scope "Always allow" to the workspace and stop duplicate approvals | P0 | M | — | ✅ done (`e6006cd`) |
-| S-08 | Bash permission rules must check every part of a chained command | P1 | M | — | ⬜ to do |
-| S-09 | Deterministic permission defaults, merged with built-ins, invalid actions rejected | P1 | M | — | ⬜ to do |
+| S-08 | Bash permission rules must check every part of a chained command | P1 | M | — | ✅ done (`1e2f796`) |
+| S-09 | Deterministic permission defaults, merged with built-ins, invalid actions rejected | P1 | M | — | ✅ done (`e30d1d3`) |
 | S-10 | GUI `is_local_url`: parse URLs properly (userinfo etc.) | P0 | S | — | ✅ done (`df30858`) |
-| S-11 | GUI: enforce `allow_remote` on every navigation path | P1 | M | — | ⬜ to do |
+| S-11 | GUI: enforce `allow_remote` on every navigation path | P1 | M | — | ✅ done (`5aab021`) |
 | S-12 | GUI preview bridge: unguessable request ids, bounded queue | P2 | M | — | ⬜ to do |
-| S-13 | Browser snapshot must not return password, one-time-code or card values | P1 | S | — | ⬜ to do |
-| S-14 | gitsnap: validate stored paths, never follow symlinks, literal pathspecs | P1 | M | — | ⬜ to do |
-| S-15 | Inline `/edit`: obey permission rules, refuse symlink escapes, no headless auto-apply | P1 | M | S-02, S-03 | ⬜ to do |
+| S-13 | Browser snapshot must not return password, one-time-code or card values | P1 | S | — | ✅ done (`d45a851`) |
+| S-14 | gitsnap: validate stored paths, never follow symlinks, literal pathspecs | P1 | M | — | ✅ done (`722861b`) |
+| S-15 | Inline `/edit`: obey permission rules, refuse symlink escapes, no headless auto-apply | P1 | M | S-02, S-03 | ✅ done (`e6e8566`) |
 | S-16 | `/export`: stay inside the workspace, no silent overwrite | P2 | S | — | ⬜ to do |
 | S-17 | Skill install: treat downloaded text as untrusted, robust verdict, permission checks | P2 | M | — | ⬜ to do |
 | S-18 | GUI hardening: devtools only in debug, CSP, no external fonts, lock main webview navigation, preview clipboard | P2 | M | — | ⬜ to do |
-| S-19 | kaggle_setup_cell.py: no shell strings from remote data, token check in front of the tunnel | P1 | M | — | ⬜ to do |
+| S-19 | kaggle_setup_cell.py: no shell strings from remote data, token check in front of the tunnel | P1 | M | — | ✅ done (`6b82a57`) |
 | B-01 | `edit` tool: reject an empty `old_str` | P0 | S | — | ✅ done (`511adca`) |
 | B-02 | `/edit` must not cut Markdown files or drop the last newline | P0 | S | — | ✅ done (`6ceb57e`) |
 | B-03 | Cut-off replies (`finish_reason: "length"`) are treated as complete | P1 | M | — | ✅ done (`d0ef53f`) |
 | B-04 | Repair chat history before sending it to the provider | P1 | M | — | ✅ done (`3161de2`) |
 | B-05 | Compaction: safe split point, never delete new messages, one transaction, role labels | P1 | M | — | ✅ done (`d56b1ff`) |
 | B-06 | Abort really stops: between tool calls, inside bash, for every run kind | P1 | L | — | ✅ done (`2ccb80b`) |
-| B-07 | CLI: the prompt must not pick up option values | P1 | S | — | ⏭️ next |
-| B-08 | Heartbeat: send the API key, match the comment, skip it in headless mode | P1 | S | — | ⬜ to do |
-| B-09 | Event bus: survive lag, recover pending approvals, limit headless time | P1 | M | S-02, B-06, B-07 | ⬜ to do |
+| B-07 | CLI: the prompt must not pick up option values | P1 | S | — | ✅ done (`0cc42de`) |
+| B-08 | Heartbeat: send the API key, match the comment, skip it in headless mode | P1 | S | — | ✅ done (`c3129ec`) |
+| B-09 | Event bus: survive lag, recover pending approvals, limit headless time | P1 | M | S-02, B-06, B-07 | ✅ done (`8457c3d`) |
 | B-10 | New event `ApprovalResolved` (answered, timed out, aborted, released by turbo) | P1 | M | — | ✅ done (`a73fc48`) |
-| B-11 | GUI: `covered` flag never hides the native preview view | P1 | S | — | ⬜ to do |
-| B-12 | GUI: events from other sessions leak into the open chat | P1 | M | — | ⬜ to do |
-| B-13 | GUI: approval modal lingers, hotkeys need focus, one-key always-allow | P1 | M | B-10 (adds `ServerEvent::ApprovalResolved`), B-12 (adds `PendingApproval::session_id`, `GuiState::finish_approval`, `approval_queue` and the payload keys `other_chat`, `chat`, `queued`) | ⬜ to do |
-| B-14 | TUI transcript: show the newest lines even when lines wrap | P1 | M | — | ⬜ to do |
-| B-15 | TUI approval overlay: full detail, queue, safe keys, always on top | P1 | M | B-10, S-07, B-22 | ⬜ to do |
-| B-16 | TUI: give the terminal back on errors and panics | P1 | S | — | ⬜ to do |
+| B-11 | GUI: `covered` flag never hides the native preview view | P1 | S | — | ✅ done (`0f9d65f`) |
+| B-12 | GUI: events from other sessions leak into the open chat | P1 | M | — | ✅ done (`2028a35`) |
+| B-13 | GUI: approval modal lingers, hotkeys need focus, one-key always-allow | P1 | M | B-10 (adds `ServerEvent::ApprovalResolved`), B-12 (adds `PendingApproval::session_id`, `GuiState::finish_approval`, `approval_queue` and the payload keys `other_chat`, `chat`, `queued`) | ✅ done (`9a48e27`) |
+| B-14 | TUI transcript: show the newest lines even when lines wrap | P1 | M | — | ✅ done (`03b6105`) |
+| B-15 | TUI approval overlay: full detail, queue, safe keys, always on top | P1 | M | B-10, S-07, B-22 | ✅ done (`60cc5aa`) |
+| B-16 | TUI: give the terminal back on errors and panics | P1 | S | — | ✅ done (`b086c06`) |
 | B-17 | Make the `..\evil.rs` test assertion correct on every OS | P1 | S | — | ✅ done (`69d17d2`) |
-| B-18 | /team: plan-mode gate, subtask cap, honest fallback, abort status | P1 | M | — | ⬜ to do |
-| B-19 | MCP: startup can hang; provider-safe tool names; output cap | P1 | M | — | ⬜ to do |
-| B-20 | MCP: one global lock serializes every call | P1 | M | B-19 (uses its `resolve_tool_name`) | ⬜ to do |
+| B-18 | /team: plan-mode gate, subtask cap, honest fallback, abort status | P1 | M | — | ✅ done (`02ab198`) |
+| B-19 | MCP: startup can hang; provider-safe tool names; output cap | P1 | M | — | ✅ done (`76ebc64`) |
+| B-20 | MCP: one global lock serializes every call | P1 | M | B-19 (uses its `resolve_tool_name`) | ✅ done (`3d0e534`) |
 | B-21 | Provider stream: error frames, early end, missing delta, ids, `content: null` | P1 | M | — | ✅ done (`f67317a`) |
-| B-22 | Write/edit approvals must show what will change | P1 | M | B-09 (only the order: apply B-09 first if you do both; both edit `check_permission`) | ⬜ to do |
-| B-23 | TUI subscribes to events too late (startup race) | P2 | S | — | ⬜ to do |
+| B-22 | Write/edit approvals must show what will change | P1 | M | B-09 (only the order: apply B-09 first if you do both; both edit `check_permission`) | ✅ done (`0aaa81c`) |
+| B-23 | TUI subscribes to events too late (startup race) | P2 | S | — | ⏭️ next |
 | B-24 | Turbo: one run until the last continuation, and a cap that really holds | P2 | M | B-06 | ⬜ to do |
 | B-25 | `/parallel`: real parallelism, current model, no hidden approval waits | P2 | M | — | ⬜ to do |
 | B-26 | Say so when a run stops at `max_steps` | P2 | S | — | ⬜ to do |
@@ -539,7 +543,7 @@ Do the phases in order. Inside a phase, go left to right. A task's
 | F-03 | MCP servers over Streamable HTTP | P2 | L | B-19, B-20 (uses B-19's `cap_result` and `tool_fn_name`, and B-20's `Live` struct) | ⬜ to do |
 | F-04 | `browser_screenshot` tool | P2 | M | H-02 (makes `tao`/`wry` optional and adds the `gui` feature; this task adds two Windows-only crates to that feature) | ⬜ to do |
 | F-05 | Git-worktree isolation for worker subagents and team workers | P2 | L | B-06 (one call passes B-06's abort flag; see the note in step 9) | ⬜ to do |
-| F-06 | GUI: Stop button, multiline composer, IME guard | P1 | M | — | ⬜ to do |
+| F-06 | GUI: Stop button, multiline composer, IME guard | P1 | M | — | ✅ done (`b6df206`) |
 | F-07 | Automatic compaction near the context limit | P2 | M | B-05 (safe compaction; this task calls `compact::compact` from the agent loop and edits a line B-05 wrote) | ⬜ to do |
 | F-08 | Verification loop (`agent.verify_command`) | P2 | M | — | ⬜ to do |
 | F-09 | Loop guard: refuse the third identical tool call in a row | P2 | M | — | ⬜ to do |
