@@ -1,0 +1,19 @@
+opencode-rust
+Copyright (c) 2026 Habibullah485044
+Licensed under the MIT License (see LICENSE).
+
+This project includes third-party material:
+
+1. Ponytail — https://github.com/DietrichGebert/ponytail
+   Files:   src/prompts/ponytail.md
+            src/prompts/ponytail-review.md
+            .opencode/skills/ponytail/SKILL.md
+            .opencode/skills/ponytail-review/SKILL.md
+   License: MIT, Copyright (c) DietrichGebert.
+            Full text: third_party/ponytail/LICENSE
+
+Not included:
+
+- MiroFish (https://github.com/666ghj/MiroFish) is AGPL-3.0. The skill in
+  .opencode/skills/mirofish only talks to it as a separate program. Its source
+  is never part of this repository (vendor/ is git-ignored).

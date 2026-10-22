@@ -21,3 +21,7 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+
+# Third-party projects cloned for local use (e.g. MiroFish, AGPL-3.0).
+# Never commit them into this MIT repository.
+vendor/
