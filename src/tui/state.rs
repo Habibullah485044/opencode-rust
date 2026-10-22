@@ -866,6 +866,9 @@ impl App {
             ServerEvent::Note { text, .. } => {
                 self.push(EntryKind::System, text);
             }
+            // New (B-10): the approval ended elsewhere. B-15 closes the
+            // overlay here.
+            ServerEvent::ApprovalResolved { .. } => {}
             ServerEvent::Stats {
                 added, deleted, hints, ..
             } => {

@@ -93,6 +93,15 @@ pub enum ServerEvent {
         tool: String,
         detail: String,
     },
+    /// An approval request is no longer pending (answered, timed out,
+    /// aborted, or released by turbo). UIs drop the matching modal.
+    ApprovalResolved {
+        session_id: String,
+        approval_id: String,
+        allowed: bool,
+        /// "user" | "always" | "timeout" | "abort" | "turbo"
+        reason: String,
+    },
     RunFinished { session_id: String, ok: bool, message: Option<String> },
     SessionCreated { session_id: String, title: String },
     /// M2: a fork/resume switched the client's session — full replay + mode.
@@ -161,8 +170,17 @@ pub struct RunStats {
     pub hints: u64,
 }
 
+/// New (B-10): how a pending approval ended. Sent through the approval's
+/// channel so the waiting run can report it in `ApprovalResolved`.
+#[derive(Debug, Clone, Copy)]
+pub struct Resolution {
+    pub allowed: bool,
+    /// "user" | "always" | "turbo"
+    pub reason: &'static str,
+}
+
 pub struct ApprovalEntry {
-    pub tx: oneshot::Sender<bool>,
+    pub tx: oneshot::Sender<Resolution>,
     pub tool: String,
     pub detail: String,
 }
@@ -287,7 +305,8 @@ impl AppState {
             let ws = crate::db::workspace_key(&self.workspace);
             let _ = self.db.add_approval(&ws, &entry.tool, &entry.detail, "session");
         }
-        entry.tx.send(allow).is_ok()
+        let reason = if allow && always { "always" } else { "user" };
+        entry.tx.send(Resolution { allowed: allow, reason }).is_ok()
     }
 
     /// Plan/build mode for a session (defaults to Build).
@@ -324,7 +343,7 @@ impl AppState {
         };
         let mut ids = Vec::with_capacity(drained.len());
         for (id, entry) in drained {
-            let _ = entry.tx.send(true);
+            let _ = entry.tx.send(Resolution { allowed: true, reason: "turbo" });
             ids.push(id);
         }
         ids
@@ -1674,20 +1693,32 @@ async fn check_permission(
         detail: detail.to_string(),
     });
     let timeout = std::time::Duration::from_secs(st.cfg.permissions.approval_timeout_secs);
-    let result = tokio::select! {
-        r = rx => r.unwrap_or(false),
-        _ = tokio::time::sleep(timeout) => false,
+    let (allowed, reason) = tokio::select! {
+        r = rx => match r {
+            Ok(res) => (res.allowed, res.reason),
+            // The entry was removed without an answer.
+            Err(_) => (false, "abort"),
+        },
+        _ = tokio::time::sleep(timeout) => (false, "timeout"),
         _ = async {
             while !abort.load(Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-        } => false,
+        } => (false, "abort"),
     };
     // Always clean up the pending entry.
     if let Ok(mut map) = st.approvals.lock() {
         map.remove(&approval_id);
     }
-    result
+    // New (B-10): exactly one "no longer pending" event per request, whoever
+    // ended it, so every UI can close its modal.
+    let _ = st.events.send(ServerEvent::ApprovalResolved {
+        session_id: session_id.to_string(),
+        approval_id,
+        allowed,
+        reason: reason.to_string(),
+    });
+    allowed
 }
 
 /// Build OpenAI-format messages: system + persisted history including tool calls/results.
@@ -2044,6 +2075,65 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// B-10: every way an approval ends is announced once, with its reason.
+    #[tokio::test]
+    async fn approval_resolved_reports_every_outcome() {
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:9".into();
+        cfg.provider.model = "stub".into();
+        cfg.permissions.approval_timeout_secs = 1;
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        st.set_perm_mode(PermissionMode::Manual);
+        let mut rx = st.events.subscribe();
+
+        // Start one approval wait; `abort` lets the test cancel it.
+        let wait = |detail: &'static str, abort: Arc<AtomicBool>| {
+            let st2 = st.clone();
+            tokio::spawn(async move { check_permission(&st2, "s1", "read", detail, &abort).await })
+        };
+        let no_abort = || Arc::new(AtomicBool::new(false));
+
+        // 1. The user says yes.
+        let h = wait("a.txt", no_abort());
+        let id = pending_approval_id(&st).await;
+        assert!(st.decide(&id, true, false));
+        assert!(h.await.unwrap());
+        // 2. The user says "always".
+        let h = wait("b.txt", no_abort());
+        let id = pending_approval_id(&st).await;
+        assert!(st.decide(&id, true, true));
+        assert!(h.await.unwrap());
+        // 3. Nobody answers (1 s timeout).
+        assert!(!wait("c.txt", no_abort()).await.unwrap());
+        // 4. The run is aborted while it waits.
+        let abort = no_abort();
+        let h = wait("d.txt", abort.clone());
+        let _ = pending_approval_id(&st).await;
+        abort.store(true, Ordering::SeqCst);
+        assert!(!h.await.unwrap());
+        // 5. Turbo releases it.
+        let h = wait("e.txt", no_abort());
+        let _ = pending_approval_id(&st).await;
+        st.set_perm_mode(PermissionMode::Turbo);
+        assert!(h.await.unwrap());
+
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::ApprovalResolved { session_id, reason, allowed, .. } = ev {
+                assert_eq!(session_id, "s1");
+                seen.push((reason, allowed));
+            }
+        }
+        let expected: Vec<(String, bool)> = vec![
+            ("user".into(), true),
+            ("always".into(), true),
+            ("timeout".into(), false),
+            ("abort".into(), false),
+            ("turbo".into(), true),
+        ];
+        assert_eq!(seen, expected);
+    }
 
     // B-04 helpers: build chat messages in a few words.
     fn hmsg(role: &str, content: Option<&str>) -> ChatMsg {
