@@ -235,6 +235,7 @@ OPTIONS:
   --yes            Headless only: approve tool calls without asking (default: deny)
   --gui            Desktop app window (WebView2; needs the `gui` feature)
   --port N         Server port (default: ephemeral, printed at start)
+  --timeout N      Headless only: give up after N seconds, exit code 124 (default 7200, 0 = none)
   --base-url URL   OpenAI-compatible provider base URL (…/v1)
   --model NAME     Model id at the provider
   -V, --version    Print version
@@ -581,8 +582,38 @@ async fn headless_run(
 
     let mut out = std::io::stdout();
     let mut thinking_open = false;
+    // New (B-09): a time limit for the whole command, and a check after
+    // every 2 s of silence that our run is still alive (its RunFinished may
+    // have been lost if we fell behind the event bus).
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let limit_env = std::env::var("OPENCODE_RUST_HEADLESS_TIMEOUT").ok();
+    let limit = headless_timeout(&argv, limit_env.as_deref());
+    let started = tokio::time::Instant::now();
     loop {
-        match rx.recv().await {
+        if let Some(limit) = limit {
+            if started.elapsed() >= limit {
+                state.abort_run(&session.id).await;
+                eprintln!(
+                    "\n[error] headless run timed out after {}s (raise it with --timeout N; 0 = no limit)",
+                    limit.as_secs()
+                );
+                std::process::exit(124);
+            }
+        }
+        let next = match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+            Ok(next) => next,
+            Err(_) => {
+                if !state.run_active(&session.id).await {
+                    eprintln!(
+                        "\n[error] the run ended but its result was lost; see session {} for the transcript",
+                        session.id
+                    );
+                    std::process::exit(3);
+                }
+                continue;
+            }
+        };
+        match next {
             Ok(server::ServerEvent::AssistantDelta { text, .. }) => {
                 if thinking_open {
                     eprintln!();
@@ -640,10 +671,41 @@ async fn headless_run(
             }
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            Err(_) => continue,
+            // New (B-09): we fell behind and lost events. Answer every
+            // approval we may have missed (same rule as above, see S-02);
+            // the liveness check notices a lost RunFinished.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                eprintln!("\n[warn] {n} event(s) were dropped (output too slow)");
+                let approve = headless_auto_approve();
+                for ev in state.pending_approvals() {
+                    if let server::ServerEvent::ApprovalNeeded { approval_id, tool, detail, .. } = ev {
+                        eprintln!(
+                            "[approval] {tool}: {detail} → {}",
+                            if approve { "auto-approved (--yes)" } else { "denied (pass --yes to allow)" }
+                        );
+                        let _ = state.decide(&approval_id, approve, false);
+                    }
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// New (B-09): how long a whole headless run may take. `--timeout N`
+/// (seconds) or OPENCODE_RUST_HEADLESS_TIMEOUT; default 2 hours; 0 = no
+/// limit. A value that is not a number falls back to the default.
+fn headless_timeout(args: &[String], env: Option<&str>) -> Option<std::time::Duration> {
+    let from_args = args
+        .iter()
+        .position(|a| a == "--timeout")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str);
+    let secs = from_args
+        .or(env)
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(7200);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
 async fn tui_run(
@@ -676,6 +738,7 @@ async fn tui_run(
     // SSE forwarder task.
     {
         let mut rx = state.events.subscribe();
+        let st_fwd = state.clone();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -684,7 +747,13 @@ async fn tui_run(
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // New (B-09): the TUI fell behind and lost events. Re-send
+                    // every pending approval so no prompt is silently lost.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        for ev in st_fwd.pending_approvals() {
+                            let _ = evt_tx.send(ev);
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -1169,5 +1238,27 @@ mod cli_args_tests {
     fn unknown_options_are_reported() {
         let err = positional_prompt(&args(&["--headles", "hi"])).unwrap_err();
         assert!(err.contains("--headles"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod headless_timeout_tests {
+    use super::headless_timeout;
+    use std::time::Duration;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn timeout_default_flag_env_and_zero() {
+        assert_eq!(headless_timeout(&args(&["--headless"]), None), Some(Duration::from_secs(7200)));
+        assert_eq!(
+            headless_timeout(&args(&["--timeout", "30"]), Some("99")),
+            Some(Duration::from_secs(30)),
+            "the flag beats the environment"
+        );
+        assert_eq!(headless_timeout(&args(&[]), Some("45")), Some(Duration::from_secs(45)));
+        assert_eq!(headless_timeout(&args(&["--timeout", "0"]), None), None, "0 = no limit");
     }
 }

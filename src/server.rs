@@ -183,6 +183,9 @@ pub struct ApprovalEntry {
     pub tx: oneshot::Sender<Resolution>,
     pub tool: String,
     pub detail: String,
+    /// New (B-09): the `ApprovalNeeded` event that announced this request,
+    /// kept so `pending_approvals` can send it again.
+    pub request: ServerEvent,
 }
 
 pub struct AppState {
@@ -218,12 +221,28 @@ pub struct AppState {
 
 pub type Shared = Arc<AppState>;
 
+/// New (B-09): how many events the bus keeps for a slow client. Every
+/// streamed text piece is one event, so 256 was easy to overrun.
+pub const EVENT_BUFFER: usize = 4096;
+
+impl AppState {
+    /// New (B-09): every approval request still waiting for an answer, as
+    /// the `ApprovalNeeded` events that announced them. A client that fell
+    /// behind the event bus calls this to show the prompts again.
+    pub fn pending_approvals(&self) -> Vec<ServerEvent> {
+        self.approvals
+            .lock()
+            .map(|m| m.values().map(|e| e.request.clone()).collect())
+            .unwrap_or_default()
+    }
+}
+
 pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
     let state_dir = crate::config::default_state_dir();
     let db = Db::open(&state_dir.join("opencode.db"))?;
     let engine = Engine::new(&cfg.permissions);
     let client = Client::from_cfg(&cfg.effective_base_url()?, &cfg.provider)?;
-    let (events, _) = broadcast::channel(256);
+    let (events, _) = broadcast::channel(EVENT_BUFFER);
     let mut mcp = crate::mcp::Registry::default();
     mcp.start_all(&cfg.mcp.servers).await;
     let skill_base = skills::skill_base(&state_dir);
@@ -264,7 +283,7 @@ pub async fn build_state_ephemeral_skills(
     skill_base: PathBuf,
 ) -> Shared {
     let engine = Engine::new(&cfg.permissions);
-    let (events, _) = broadcast::channel(256);
+    let (events, _) = broadcast::channel(EVENT_BUFFER);
     let client = Client::from_cfg(cfg.provider.base_url.trim().trim_end_matches('/'), &cfg.provider)
         .unwrap_or_else(|_| Client::new("http://127.0.0.1:9", "", "stub", 5).expect("stub"));
     let mut mcp = crate::mcp::Registry::default();
@@ -497,15 +516,30 @@ async fn events_sse(
     State(st): State<Shared>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = st.events.subscribe();
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
+    // New (B-09): events waiting to be sent before the next live one.
+    let queue: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
+    let stream = futures::stream::unfold((rx, queue, st), |(mut rx, mut queue, st)| async move {
         loop {
+            if let Some(ev) = queue.pop_front() {
+                return Some((Ok(ev), (rx, queue, st)));
+            }
             match rx.recv().await {
                 Ok(ev) => {
                     if let Ok(data) = serde_json::to_string(&ev) {
-                        return Some((Ok(Event::default().data(data)), rx));
+                        return Some((Ok(Event::default().data(data)), (rx, queue, st)));
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // New (B-09): this client fell behind and lost events. Say so
+                // (SSE event "lagged", data = how many) and send every
+                // approval that still waits, so no prompt is lost.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    queue.push_back(Event::default().event("lagged").data(n.to_string()));
+                    for ev in st.pending_approvals() {
+                        if let Ok(data) = serde_json::to_string(&ev) {
+                            queue.push_back(Event::default().data(data));
+                        }
+                    }
+                }
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
         }
@@ -1734,6 +1768,15 @@ async fn check_permission(
 
     let (tx, rx) = oneshot::channel();
     let approval_id = crate::db::new_id("apr");
+    // New (B-09): build the request first and keep a copy in the pending
+    // map, so a client that missed it can get it again
+    // (`AppState::pending_approvals`).
+    let request = ServerEvent::ApprovalNeeded {
+        session_id: session_id.to_string(),
+        approval_id: approval_id.clone(),
+        tool: tool.to_string(),
+        detail: detail.to_string(),
+    };
     {
         let mut map = match st.approvals.lock() {
             Ok(m) => m,
@@ -1741,15 +1784,15 @@ async fn check_permission(
         };
         map.insert(
             approval_id.clone(),
-            ApprovalEntry { tx, tool: tool.to_string(), detail: detail.to_string() },
+            ApprovalEntry {
+                tx,
+                tool: tool.to_string(),
+                detail: detail.to_string(),
+                request: request.clone(),
+            },
         );
     }
-    let _ = st.events.send(ServerEvent::ApprovalNeeded {
-        session_id: session_id.to_string(),
-        approval_id: approval_id.clone(),
-        tool: tool.to_string(),
-        detail: detail.to_string(),
-    });
+    let _ = st.events.send(request);
     let timeout = std::time::Duration::from_secs(st.cfg.permissions.approval_timeout_secs);
     let (allowed, reason) = tokio::select! {
         r = rx => match r {
@@ -2133,6 +2176,38 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// B-09: a waiting approval can be fetched again (after a lag) and is
+    /// gone once it was answered.
+    #[tokio::test]
+    async fn pending_approvals_lists_waiting_requests() {
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:9".into();
+        cfg.provider.model = "stub".into();
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        st.set_perm_mode(PermissionMode::Manual);
+        assert!(st.pending_approvals().is_empty());
+        let st2 = st.clone();
+        let waiting = tokio::spawn(async move {
+            let abort = AtomicBool::new(false);
+            check_permission(&st2, "s1", "read", "src/lib.rs", &abort).await
+        });
+        let id = pending_approval_id(&st).await;
+        let pending = st.pending_approvals();
+        assert_eq!(pending.len(), 1);
+        match &pending[0] {
+            ServerEvent::ApprovalNeeded { approval_id, session_id, tool, detail, .. } => {
+                assert_eq!(approval_id, &id);
+                assert_eq!(session_id, "s1");
+                assert_eq!(tool, "read");
+                assert_eq!(detail, "src/lib.rs");
+            }
+            other => panic!("expected ApprovalNeeded, got {other:?}"),
+        }
+        assert!(st.decide(&id, true, false));
+        assert!(waiting.await.unwrap());
+        assert!(st.pending_approvals().is_empty(), "answered requests are gone");
+    }
 
     /// B-06: any run kind can be registered, stopped with `abort_run`, and
     /// its slot is released when it ends.
