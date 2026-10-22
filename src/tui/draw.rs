@@ -103,7 +103,8 @@ pub fn draw(f: &mut Frame, app: &App) {
             Style::default().fg(FB_SECONDARY),
         ));
     }
-    let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
+    // B-35: terminal columns, not characters.
+    let right_w = right.iter().map(|s| s.width()).sum::<usize>().min(u16::MAX as usize) as u16;
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(right_w)])
@@ -202,10 +203,12 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else {
         " type your message…"
     };
-    let input_text = if app.input.is_empty() {
-        placeholder.to_string()
+    // B-35: show the slice around the cursor, measured in terminal columns.
+    let input_w = chunks[2].width.saturating_sub(2) as usize;
+    let (input_text, cursor_col) = if app.input.is_empty() {
+        (placeholder.to_string(), 0)
     } else {
-        app.input.clone()
+        super::state::input_view(&app.input, app.cursor, input_w)
     };
     let input = Paragraph::new(Span::styled(
         input_text,
@@ -228,7 +231,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     );
     f.render_widget(input, chunks[2]);
     if !app.busy {
-        let x = chunks[2].x + 1 + app.cursor as u16;
+        let x = chunks[2].x + 1 + cursor_col.min(u16::MAX as usize) as u16;
         let y = chunks[2].y + 1;
         if x < chunks[2].right().saturating_sub(1) {
             f.set_cursor_position((x, y));
@@ -432,7 +435,8 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Line::from(format!(
                     " {fork} {} {}",
                     truncate_str(&s.id, 20),
-                    truncate_str(&s.title, 44)
+                    // B-35: one row per session — line breaks would merge text.
+                    truncate_str(&s.title.replace(['\r', '\n'], " "), 44)
                 ))
                 .style(if sel {
                     Style::default()
@@ -601,13 +605,24 @@ fn draw_agent_card(
     );
 }
 
+/// Cut `s` to at most `max` terminal columns and add `…` when something was
+/// cut (B-35: display width, so wide characters count double).
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max).collect();
-        format!("{cut}…")
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= max {
+        return s.to_string();
     }
+    let mut cut = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > max {
+            break;
+        }
+        cut.push(c);
+        used += w;
+    }
+    format!("{cut}…")
 }
 
 fn centered_rect(pct_x: u16, pct_y: u16, r: Rect) -> Rect {

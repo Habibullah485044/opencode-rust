@@ -256,15 +256,26 @@ pub fn wrap_n(s: &str, width: usize, max_lines: usize) -> Vec<String> {
             break;
         }
         let w = words.next().unwrap_or("");
-        let need = cur.chars().count() + if cur.is_empty() { 0 } else { 1 } + w.chars().count();
+        // B-35: terminal columns (wide characters count double).
+        let need = unicode_width::UnicodeWidthStr::width(cur.as_str())
+            + usize::from(!cur.is_empty())
+            + unicode_width::UnicodeWidthStr::width(w);
         if need <= width {
             if !cur.is_empty() {
                 cur.push(' ');
             }
             cur.push_str(w);
         } else if cur.is_empty() {
-            // One over-long word: hard-cut it.
-            let cut: String = w.chars().take(width.saturating_sub(1)).collect();
+            // One over-long word: hard-cut it to width - 1 columns (B-35).
+            let mut cut = String::new();
+            for ch in w.chars() {
+                let next = unicode_width::UnicodeWidthStr::width(cut.as_str())
+                    + unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if next > width.saturating_sub(1) {
+                    break;
+                }
+                cut.push(ch);
+            }
             cur.push_str(&cut);
             cur.push('…');
             lines.push(std::mem::take(&mut cur));
@@ -280,6 +291,44 @@ pub fn wrap_n(s: &str, width: usize, max_lines: usize) -> Vec<String> {
         lines.push(String::new());
     }
     lines
+}
+
+/// B-35: the part of `input` that fits in `width` terminal columns with
+/// the cursor visible, and the cursor's column inside that part. Columns
+/// are display widths (日 = 2). A line break shows as ⏎, a tab as →.
+pub fn input_view(input: &str, cursor: usize, width: usize) -> (String, usize) {
+    use unicode_width::UnicodeWidthChar;
+    let shown: Vec<(char, usize)> = input
+        .chars()
+        .map(|c| {
+            let c = match c {
+                '\n' => '⏎',
+                '\t' => '→',
+                c if c.is_control() => '·',
+                c => c,
+            };
+            (c, c.width().unwrap_or(0))
+        })
+        .collect();
+    let width = width.max(1);
+    let before: usize = shown.iter().take(cursor).map(|(_, w)| w).sum();
+    // Skip whole characters from the left until the cursor fits.
+    let need = before.saturating_sub(width - 1);
+    let (mut start, mut skipped) = (0, 0);
+    while start < shown.len() && skipped < need {
+        skipped += shown[start].1;
+        start += 1;
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for (c, w) in &shown[start..] {
+        if used + w > width {
+            break;
+        }
+        out.push(*c);
+        used += w;
+    }
+    (out, before - skipped)
 }
 
 pub struct App {
@@ -654,6 +703,13 @@ impl App {
                 None
             }
             KeyCode::Char(c) => {
+                // B-35: Ctrl+key and Alt+key are shortcuts, not text.
+                // Ctrl+Alt together is AltGr on Windows (@ { [ \), which types.
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
+                if ctrl != alt {
+                    return None;
+                }
                 let byte = self
                     .input
                     .char_indices()
@@ -667,6 +723,29 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    /// B-35: insert pasted text at the cursor. Line breaks are kept (the
+    /// message may span lines); CRLF and a lone CR become `\n`.
+    pub fn on_paste(&mut self, text: &str) {
+        let overlay = self.approval.is_some()
+            || self.pending_edit.is_some()
+            || self.mission_picker.is_some()
+            || self.sessions.is_some()
+            || self.help;
+        if overlay {
+            return; // overlays take keys, not text
+        }
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let byte = self
+            .input
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len());
+        self.input.insert_str(byte, &text);
+        self.cursor += text.chars().count();
+        self.refresh_palette();
     }
 
     /// M3: inline-edit preview keys: y = apply, n/Esc = reject.

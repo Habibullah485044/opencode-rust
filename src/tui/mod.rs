@@ -34,6 +34,7 @@ fn restore_terminal() {
     if release_terminal() {
         let _ = disable_raw_mode();
         let mut out = std::io::stdout();
+        let _ = out.execute(crossterm::event::DisableBracketedPaste);
         let _ = out.execute(LeaveAlternateScreen);
         let _ = out.execute(crossterm::cursor::Show);
     }
@@ -77,6 +78,8 @@ pub async fn run(
     // From here on, any early return (`?`) restores the terminal.
     let _guard = TerminalGuard;
     stdout.execute(EnterAlternateScreen)?;
+    // B-35: a paste arrives as one `Event::Paste`, not as typed keys.
+    stdout.execute(crossterm::event::EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
 
@@ -93,12 +96,16 @@ pub async fn run(
 
         // Poll for a key with a short timeout so server events stay responsive.
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Some(action) = app.on_key(key) {
                         let _ = action_tx.send(action);
                     }
                 }
+                // B-35: pasted text is inserted as it is; its line breaks
+                // stay inside the message instead of pressing Enter.
+                Event::Paste(text) => app.on_paste(&text),
+                _ => {}
             }
         }
 

@@ -32,6 +32,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # TUI
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
+# B-35: display width of characters in the input box (already in Cargo.lock)
+unicode-width = "0.2"
 
 # file discovery respecting .gitignore (ripgrep's walker) + regex
 ignore = "0.4"

@@ -994,3 +994,42 @@
         });
         assert!(app.team.is_none());
     }
+
+    // ---- B-35: input keys and paste ----
+
+    #[test]
+    fn ctrl_and_alt_letters_do_not_type_but_altgr_does() {
+        let mut app = App::new();
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert!(app.input.is_empty());
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        app.on_key(KeyEvent::new(KeyCode::Char('@'), altgr));
+        assert_eq!(app.input, "@", "AltGr characters still type");
+    }
+
+    #[test]
+    fn paste_keeps_line_breaks_in_one_message() {
+        let mut app = App::new();
+        app.on_paste("line one\r\nline two");
+        assert_eq!(app.input, "line one\nline two");
+        assert_eq!(app.cursor, 17);
+        let a = app.on_key(key(KeyCode::Enter));
+        assert!(matches!(a, Some(InputAction::Prompt(ref p)) if p == "line one\nline two"));
+    }
+
+    #[test]
+    fn input_view_scrolls_and_counts_wide_characters() {
+        // The cursor at the end of a long line: the tail is shown.
+        assert_eq!(input_view("abcdefghij", 10, 5), ("ghij".to_string(), 4));
+        // Wide characters take two columns each.
+        assert_eq!(input_view("日本語", 3, 10), ("日本語".to_string(), 6));
+        // A line break is visible.
+        assert_eq!(input_view("a\nb", 3, 10), ("a⏎b".to_string(), 3));
+    }
+
+    #[test]
+    fn wrap_n_measures_wide_characters_in_columns() {
+        // Each word is 6 columns wide: two of them do not fit in 7.
+        assert_eq!(wrap_n("日本語 日本語", 7, 2), vec!["日本語", "日本語"]);
+    }
