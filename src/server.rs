@@ -1216,6 +1216,8 @@ pub async fn run_loop(
     };
 
     let mut final_text = String::new();
+    // New (B-26): set when the model stopped asking for tools by itself.
+    let mut finished = false;
     for _step in 0..st.cfg.agent.max_steps {
         if abort.load(Ordering::SeqCst) {
             return Ok("aborted".into());
@@ -1332,6 +1334,7 @@ pub async fn run_loop(
 
         if calls.is_empty() {
             final_text = text;
+            finished = true;
             break;
         }
 
@@ -1390,6 +1393,20 @@ pub async fn run_loop(
         {
             finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
         }
+    }
+    // New (B-26): the steps ran out while the model still wanted tools. Say
+    // so instead of ending with an empty, "successful" answer.
+    if !finished {
+        let msg = format!(
+            "stopped after {} steps (agent.max_steps) — the task may be unfinished. \
+             Send a message to continue, or raise agent.max_steps in the config.",
+            st.cfg.agent.max_steps
+        );
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: msg.clone(),
+        });
+        return Ok(msg);
     }
     Ok(final_text)
 }
@@ -2343,6 +2360,57 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// B-26: running out of steps is reported, not a silent empty answer.
+    #[tokio::test]
+    async fn max_steps_exhaustion_is_reported() {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|_body: axum::extract::Json<Value>| async move {
+                let payload = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"todo","arguments":"{\"op\":\"list\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#;
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        cfg.agent.max_steps = 2;
+        cfg.permissions.defaults.insert("todo".into(), "allow".into());
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        let s = st.db.create_session("steps", None).unwrap();
+        st.db.add_message(&s.id, "user", &[Part::Text { text: "loop".into() }]).unwrap();
+        let mut rx = st.events.subscribe();
+        let opts = LoopOpts {
+            system: "s".into(),
+            emit_activity: true,
+            allow: None,
+            can_spawn: false,
+            agent: None,
+        };
+
+        let out = run_loop(&st, &s.id, &opts, &AtomicBool::new(false)).await.unwrap();
+
+        assert!(out.contains("stopped after 2 steps"), "{out}");
+        let mut noted = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::Note { text, .. } = ev {
+                noted |= text.contains("agent.max_steps");
+            }
+        }
+        assert!(noted, "a note tells the user");
+    }
 
     /// B-25: /parallel workers use the model the session switched to.
     #[tokio::test]
