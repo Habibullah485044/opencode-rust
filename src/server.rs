@@ -709,9 +709,14 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
 /// ponytail discipline.
 pub async fn install_skill_flow(st: &Shared, source: &str, abort: &AtomicBool) -> Result<String> {
     let raw = if source.starts_with("http://") || source.starts_with("https://") {
-        crate::tools::execute("webfetch", &serde_json::json!({ "url": source }), &st.workspace)
-            .await
-            .with_context(|| format!("fetching {source}"))?
+        crate::tools::execute(
+            "webfetch",
+            &serde_json::json!({ "url": source }),
+            &st.workspace,
+            abort,
+        )
+        .await
+        .with_context(|| format!("fetching {source}"))?
     } else {
         let p = st.workspace.join(source);
         std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
@@ -867,27 +872,75 @@ impl AppState {
     /// the TUI action bridge, the CLI pre-prompt) goes through here so a
     /// stuck run can always be replaced by the next message.
     pub async fn kick_run(self: &Shared, session_id: String, user_content: String) {
-        let flag = {
-            let mut busy = self.busy.write().await;
-            if let Some(old) = busy.remove(&session_id) {
-                old.store(true, Ordering::SeqCst);
-            }
-            let flag = Arc::new(AtomicBool::new(false));
-            busy.insert(session_id.clone(), flag.clone());
-            flag
-        };
+        let flag = self.claim_run(&session_id).await;
         let st2 = self.clone();
         tokio::spawn(async move {
             let _ = run_agent(&st2, &session_id, &user_content, flag.clone()).await;
             // Remove only OUR flag — a newer run may own the slot already.
-            let mut busy = st2.busy.write().await;
-            if busy
-                .get(&session_id)
-                .map(|f| Arc::ptr_eq(f, &flag))
-                .unwrap_or(false)
-            {
-                busy.remove(&session_id);
+            st2.release_run(&session_id, &flag).await;
+        });
+    }
+}
+
+/// New (B-06): the "busy slot" API. Every kind of run registers its abort
+/// flag in `busy`, so `/abort`, a new prompt, the TUI and the GUI can stop it.
+impl AppState {
+    /// Register a new run for `session_id` and return its abort flag. A run
+    /// already active on the session is told to stop (it is replaced).
+    pub async fn claim_run(&self, session_id: &str) -> Arc<AtomicBool> {
+        let mut busy = self.busy.write().await;
+        if let Some(old) = busy.remove(session_id) {
+            old.store(true, Ordering::SeqCst);
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        busy.insert(session_id.to_string(), flag.clone());
+        flag
+    }
+
+    /// Free the session's slot, but only while `flag` still owns it.
+    pub async fn release_run(&self, session_id: &str, flag: &Arc<AtomicBool>) {
+        let mut busy = self.busy.write().await;
+        if busy.get(session_id).map(|f| Arc::ptr_eq(f, flag)).unwrap_or(false) {
+            busy.remove(session_id);
+        }
+    }
+
+    /// True when a newer run took the session's slot from `flag`.
+    pub async fn is_superseded(&self, session_id: &str, flag: &Arc<AtomicBool>) -> bool {
+        let busy = self.busy.read().await;
+        busy.get(session_id).map(|f| !Arc::ptr_eq(f, flag)).unwrap_or(false)
+    }
+
+    /// Ask the session's active run to stop. False when nothing runs.
+    pub async fn abort_run(&self, session_id: &str) -> bool {
+        let busy = self.busy.read().await;
+        match busy.get(session_id) {
+            Some(flag) => {
+                flag.store(true, Ordering::SeqCst);
+                true
             }
+            None => false,
+        }
+    }
+
+    /// True while a run is registered for the session.
+    pub async fn run_active(&self, session_id: &str) -> bool {
+        self.busy.read().await.contains_key(session_id)
+    }
+
+    /// Run `work` as the session's current run: registered in `busy`,
+    /// replacing any active run, released when it ends. `work` gets the
+    /// state, the session id and the run's abort flag.
+    pub async fn kick_task<F, Fut>(self: &Shared, session_id: String, work: F)
+    where
+        F: FnOnce(Shared, String, Arc<AtomicBool>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let flag = self.claim_run(&session_id).await;
+        let st = self.clone();
+        tokio::spawn(async move {
+            work(st.clone(), session_id.clone(), flag.clone()).await;
+            st.release_run(&session_id, &flag).await;
         });
     }
 }
@@ -1219,7 +1272,12 @@ pub async fn run_loop(
         for (id, name, input) in calls {
             let detail = tool_detail(st, &name, &input);
             tool_started(st, opts, session_id, &id, &name, &detail);
-            let denied = if !tool_allowed(mode, opts, &name) {
+            // New (B-06): once the run is aborted, the remaining calls of this
+            // turn are not run (each still gets a result, so the history
+            // stays valid).
+            let denied = if abort.load(Ordering::SeqCst) {
+                Some("not run: the run was aborted".to_string())
+            } else if !tool_allowed(mode, opts, &name) {
                 Some("tool blocked: not allowed in this mode/role".to_string())
             } else if !check_permission(st, session_id, &name, &detail, abort).await {
                 Some("permission denied by user".to_string())
@@ -1622,7 +1680,7 @@ async fn execute_routed(
             None => (format!("error: unknown browser tool {name}"), false),
         };
     }
-    match tools::execute(name, input, &st.workspace).await {
+    match tools::execute(name, input, &st.workspace, abort).await {
         Ok(out) => (out, true),
         Err(e) => (format!("error: {e}"), false),
     }
@@ -2076,6 +2134,97 @@ mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
 
+    /// B-06: any run kind can be registered, stopped with `abort_run`, and
+    /// its slot is released when it ends.
+    #[tokio::test]
+    async fn kick_task_registers_and_abort_run_stops_it() {
+        let st =
+            build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let sid = "ses_task".to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        st.kick_task(sid.clone(), move |_st, _sid, abort| async move {
+            while !abort.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let _ = tx.send(());
+        })
+        .await;
+        assert!(st.run_active(&sid).await, "registered while it runs");
+        assert!(st.abort_run(&sid).await, "abort reaches the task");
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the task saw the abort")
+            .unwrap();
+        for _ in 0..100 {
+            if !st.run_active(&sid).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!st.run_active(&sid).await, "slot released");
+        assert!(!st.abort_run(&sid).await, "nothing left to abort");
+    }
+    /// B-06: after an abort, the remaining tool calls of the turn do not run,
+    /// but each one still gets a tool result.
+    #[tokio::test]
+    async fn abort_skips_the_remaining_tool_calls() {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|_body: axum::extract::Json<Value>| async move {
+                let payload = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"todo","arguments":"{\"op\":\"add\",\"content\":\"A\"}"}},{"index":1,"id":"c2","function":{"name":"todo","arguments":"{\"op\":\"add\",\"content\":\"B\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#;
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let dir = std::env::temp_dir().join(format!("ocrs-b06-skip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        st.set_perm_mode(PermissionMode::Manual);
+        let s = st.db.create_session("abort", None).unwrap();
+        let abort = Arc::new(AtomicBool::new(false));
+        let (st2, sid2, a2) = (st.clone(), s.id.clone(), abort.clone());
+        let run = tokio::spawn(async move { run_agent(&st2, &sid2, "add two todos", a2).await });
+
+        let _ = pending_approval_id(&st).await; // the first call waits
+        abort.store(true, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("the run stops")
+            .unwrap();
+
+        let outputs: Vec<String> = st
+            .db
+            .messages(&s.id)
+            .unwrap()
+            .into_iter()
+            .flat_map(|m| m.parts)
+            .filter_map(|p| match p {
+                Part::ToolResult { output, .. } => Some(output),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 2, "both calls got a result: {outputs:?}");
+        assert!(outputs[1].contains("not run"), "{outputs:?}");
+        let TodoResult::Listed { items } = st.todo_store.exec(&s.id, TodoOp::List) else {
+            panic!("expected a list")
+        };
+        assert!(items.is_empty(), "no todo was added: {items:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// B-10: every way an approval ends is announced once, with its reason.
     #[tokio::test]
     async fn approval_resolved_reports_every_outcome() {

@@ -313,8 +313,11 @@ async fn headless_run(
                 return Ok(());
             }
             Cmd::Compact => {
-                let abort = Arc::new(AtomicBool::new(false));
-                match opencode_rust::compact::compact(&state, &session.id, &abort).await {
+                // New (B-06): registered while it runs, so it can be aborted.
+                let abort = state.claim_run(&session.id).await;
+                let res = opencode_rust::compact::compact(&state, &session.id, &abort).await;
+                state.release_run(&session.id, &abort).await;
+                match res {
                     Ok(o) => println!("[compact] {} message(s) -> 1 summary + {} kept", o.removed, o.kept),
                     Err(e) => { eprintln!("[compact] failed: {e}"); std::process::exit(1); }
                 }
@@ -372,16 +375,21 @@ async fn headless_run(
                 return Ok(());
             }
             Cmd::Team(goal) => {
-                let st2 = state.clone();
-                let sid2 = session.id.clone();
-                let abort = Arc::new(AtomicBool::new(false));
-                tokio::spawn(async move {
-                    let (ok, message) = match opencode_rust::team::run_team(&st2, &sid2, &goal, abort).await {
-                        Ok(s) => (true, Some(s.lines().last().unwrap_or("team done").to_string())),
-                        Err(e) => (false, Some(format!("team failed: {e}"))),
-                    };
-                    let _ = st2.events.send(server::ServerEvent::RunFinished { session_id: sid2, ok, message });
-                });
+                // New (B-06): registered in `busy`, so it can be aborted.
+                state
+                    .kick_task(session.id.clone(), move |st2, sid2, abort| async move {
+                        let (ok, message) =
+                            match opencode_rust::team::run_team(&st2, &sid2, &goal, abort).await {
+                                Ok(s) => (true, Some(s.lines().last().unwrap_or("team done").to_string())),
+                                Err(e) => (false, Some(format!("team failed: {e}"))),
+                            };
+                        let _ = st2.events.send(server::ServerEvent::RunFinished {
+                            session_id: sid2,
+                            ok,
+                            message,
+                        });
+                    })
+                    .await;
                 team_spawned = true;
             }
             // M6: discoverability + control commands, straight to stdout.
@@ -478,12 +486,8 @@ async fn headless_run(
                     effort: opencode_rust::mission::Effort::default(),
                     goal,
                 };
-                let st = state.clone();
-                let sid = session.id.clone();
-                tokio::spawn(async move {
-                    server::run_agent(&st, &sid, &mission.briefing(), Arc::new(AtomicBool::new(false)))
-                        .await;
-                });
+                // New (B-06): kick_run registers the run in `busy`.
+                state.kick_run(session.id.clone(), mission.briefing()).await;
                 team_spawned = true;
             }
             Cmd::Turbo { prompt } => {
@@ -500,20 +504,19 @@ async fn headless_run(
                 );
                 match prompt {
                     Some(p) => {
-                        let st = state.clone();
-                        let sid = session.id.clone();
-                        tokio::spawn(async move {
-                            server::run_agent(&st, &sid, &p, Arc::new(AtomicBool::new(false)))
-                                .await;
-                        });
+                        // New (B-06): kick_run registers the run in `busy`.
+                        state.kick_run(session.id.clone(), p).await;
                         team_spawned = true;
                     }
                     None => return Ok(()),
                 }
             }
             Cmd::SkillInstall(src) => {
-                let abort = Arc::new(AtomicBool::new(false));
-                match opencode_rust::server::install_skill_flow(&state, &src, &abort).await {
+                // New (B-06): registered while it runs, so it can be aborted.
+                let abort = state.claim_run(&session.id).await;
+                let res = opencode_rust::server::install_skill_flow(&state, &src, &abort).await;
+                state.release_run(&session.id, &abort).await;
+                match res {
                     Ok(report) => println!("[skill] {report}"),
                     Err(e) => {
                         eprintln!("[skill] install failed: {e:#}");
@@ -528,14 +531,10 @@ async fn headless_run(
             }
         }
     }
-    let abort = Arc::new(AtomicBool::new(false));
     if !team_spawned {
-        let st = state.clone();
-        let sid = session.id.clone();
-        let a2 = abort.clone();
-        tokio::spawn(async move {
-            server::run_agent(&st, &sid, &prompt, a2).await;
-        });
+        // New (B-06): kick_run registers the run in `busy`, so it can be
+        // aborted (POST /api/sessions/{id}/abort) and replaced.
+        state.kick_run(session.id.clone(), prompt).await;
     }
 
     let mut out = std::io::stdout();
@@ -691,12 +690,9 @@ async fn tui_run(
                         }
                     }
                     tui::InputAction::SkillInstall(src) => {
-                        let st2 = st.clone();
-                        let sid2 = sid.clone();
-                        let abort = Arc::new(AtomicBool::new(false));
-                        tokio::spawn(async move {
-                            match opencode_rust::server::install_skill_flow(&st2, &src, &abort).await
-                            {
+                        // New (B-06): registered in `busy`, so it can be stopped.
+                        st.kick_task(sid.clone(), move |st2, sid2, abort| async move {
+                            match opencode_rust::server::install_skill_flow(&st2, &src, &abort).await {
                                 Ok(report) => {
                                     let _ = st2.events.send(server::ServerEvent::AssistantDelta {
                                         session_id: sid2,
@@ -711,13 +707,13 @@ async fn tui_run(
                                     });
                                 }
                             }
-                        });
+                        })
+                        .await;
                     }
                     tui::InputAction::Team(goal) => {
-                        let st2 = st.clone();
-                        let sid2 = sid.clone();
-                        let abort = Arc::new(AtomicBool::new(false));
-                        tokio::spawn(async move {
+                        // New (B-06): registered, so a new prompt or an abort
+                        // stops it instead of running in parallel.
+                        st.kick_task(sid.clone(), move |st2, sid2, abort| async move {
                             match opencode_rust::team::run_team(&st2, &sid2, &goal, abort).await {
                                 Ok(summary) => {
                                     let _ = st2.events.send(server::ServerEvent::RunFinished {
@@ -734,17 +730,16 @@ async fn tui_run(
                                     });
                                 }
                             }
-                        });
+                        })
+                        .await;
                     }
                     tui::InputAction::SetMode(m) => {
                         // Core is the authority; the TUI already flipped its display.
                         st.set_mode(&sid, m);
                     }
                     tui::InputAction::Compact => {
-                        let st2 = st.clone();
-                        let sid2 = sid.clone();
-                        tokio::spawn(async move {
-                            let abort = Arc::new(AtomicBool::new(false));
+                        // New (B-06): registered in `busy`, so it can be stopped.
+                        st.kick_task(sid.clone(), |st2, sid2, abort| async move {
                             let (ok, message) =
                                 match opencode_rust::compact::compact(&st2, &sid2, &abort).await {
                                     Ok(o) => (
@@ -761,7 +756,8 @@ async fn tui_run(
                                 ok,
                                 message: Some(message),
                             });
-                        });
+                        })
+                        .await;
                     }
                     tui::InputAction::Undo => {
                         let st2 = st.clone();

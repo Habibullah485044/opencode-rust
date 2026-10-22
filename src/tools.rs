@@ -71,7 +71,17 @@ pub fn all_specs() -> Vec<crate::provider::ToolSpec> {
 
 /// Execute a tool by name. `workspace` is the cwd for relative paths.
 /// Permission checks happen *before* this in server.rs; this is the raw executor.
-pub async fn execute(name: &str, args: &Value, workspace: &Path) -> Result<String> {
+/// New (B-06): `abort` is the run's stop flag. Nothing starts once it is
+/// set; `bash` then kills its whole process tree and `webfetch` gives up.
+pub async fn execute(
+    name: &str,
+    args: &Value,
+    workspace: &Path,
+    abort: &std::sync::atomic::AtomicBool,
+) -> Result<String> {
+    if abort.load(std::sync::atomic::Ordering::SeqCst) {
+        bail!("not run: the run was aborted");
+    }
     match name {
         "bash" => {
             let cmd = arg_str(args, "command")?;
@@ -80,7 +90,7 @@ pub async fn execute(name: &str, args: &Value, workspace: &Path) -> Result<Strin
                 .and_then(Value::as_u64)
                 .unwrap_or(120)
                 .clamp(1, 600);
-            bash(cmd, workspace, Duration::from_secs(timeout)).await
+            bash(cmd, workspace, Duration::from_secs(timeout), abort).await
         }
         "read" => read_file(
             workspace,
@@ -107,7 +117,14 @@ pub async fn execute(name: &str, args: &Value, workspace: &Path) -> Result<Strin
             args.get("path").and_then(Value::as_str),
             args.get("case_insensitive").and_then(Value::as_bool).unwrap_or(false),
         ),
-        "webfetch" => webfetch(arg_str(args, "url")?).await,
+        "webfetch" => {
+            let url = arg_str(args, "url")?;
+            // New (B-06): stop waiting for a slow page when the run is aborted.
+            tokio::select! {
+                r = webfetch(url) => r,
+                _ = wait_for_abort(abort) => Err(anyhow!("aborted while fetching {url}")),
+            }
+        }
         "list" => list_dir(workspace, args.get("path").and_then(Value::as_str).unwrap_or(".")),
         other => Err(anyhow!("unknown tool: {other}")),
     }
@@ -131,7 +148,12 @@ pub fn scrub_secrets(cmd: &mut tokio::process::Command) -> &mut tokio::process::
     cmd
 }
 
-async fn bash(command: &str, workspace: &Path, timeout: Duration) -> Result<String> {
+async fn bash(
+    command: &str,
+    workspace: &Path,
+    timeout: Duration,
+    abort: &std::sync::atomic::AtomicBool,
+) -> Result<String> {
     #[cfg(windows)]
     let mut child = {
         let mut c = tokio::process::Command::new("cmd");
@@ -152,25 +174,76 @@ async fn bash(command: &str, workspace: &Path, timeout: Duration) -> Result<Stri
         .kill_on_drop(true);
     // S-05: the shell never sees our provider key or API token.
     scrub_secrets(&mut child);
-    let child = child.spawn().context("spawning shell")?;
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    match result {
-        Ok(Ok(out)) => {
-            let mut s = String::new();
-            let code = out.status.code().unwrap_or(-1);
-            s.push_str(&format!("exit code: {code}\n"));
-            if !out.stdout.is_empty() {
+    // New (B-06): on Linux/macOS the shell leads its own process group, so
+    // abort and timeout can stop everything it started, not just the shell.
+    #[cfg(unix)]
+    child.process_group(0);
+    let mut child = child.spawn().context("spawning shell")?;
+    let pid = child.id();
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    // Read both pipes to the end, then reap the shell (like wait_with_output).
+    let work = async move {
+        let (out, err) = tokio::join!(read_pipe(&mut stdout), read_pipe(&mut stderr));
+        (child.wait().await, out, err)
+    };
+    tokio::pin!(work);
+    let stopped = tokio::select! {
+        (status, out, err) = &mut work => {
+            let status = status.map_err(|e| anyhow!("command failed to run: {e}"))?;
+            let mut s = format!("exit code: {}\n", status.code().unwrap_or(-1));
+            if !out.is_empty() {
                 s.push_str("--- stdout ---\n");
-                s.push_str(&truncate(&String::from_utf8_lossy(&out.stdout), 60_000));
+                s.push_str(&truncate(&String::from_utf8_lossy(&out), 60_000));
             }
-            if !out.stderr.is_empty() {
+            if !err.is_empty() {
                 s.push_str("\n--- stderr ---\n");
-                s.push_str(&truncate(&String::from_utf8_lossy(&out.stderr), 20_000));
+                s.push_str(&truncate(&String::from_utf8_lossy(&err), 20_000));
             }
-            Ok(s)
+            return Ok(s);
         }
-        Ok(Err(e)) => Err(anyhow!("command failed to run: {e}")),
-        Err(_) => Err(anyhow!("command timed out after {}s", timeout.as_secs())),
+        _ = tokio::time::sleep(timeout) => format!("command timed out after {}s", timeout.as_secs()),
+        _ = wait_for_abort(abort) => "command aborted".to_string(),
+    };
+    // Abort or timeout: kill the whole process tree while the shell still
+    // exists (`work` keeps it alive until this function returns).
+    kill_tree(pid).await;
+    Err(anyhow!("{stopped} (process tree killed)"))
+}
+
+/// New (B-06): read a child's pipe to the end (empty when there is none).
+async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Some(p) = pipe.as_mut() {
+        let _ = tokio::io::AsyncReadExt::read_to_end(p, &mut buf).await;
+    }
+    buf
+}
+
+/// New (B-06): kill a shell and everything it started. Linux/macOS: signal
+/// the shell's process group (see `bash`). Windows: taskkill walks the tree.
+async fn kill_tree(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("taskkill");
+        c.args(["/T", "/F", "/PID", &pid.to_string()]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("kill");
+        c.args(["-s", "KILL", "--", &format!("-{pid}")]);
+        c
+    };
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let _ = cmd.status().await;
+}
+
+/// New (B-06): resolves once `abort` is set (checked every 100 ms).
+async fn wait_for_abort(abort: &std::sync::atomic::AtomicBool) {
+    while !abort.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -664,6 +737,48 @@ mod tests {
     use super::*;
     use tempfile_dir::TempDir;
 
+    /// B-06: an abort stops a long command quickly.
+    #[tokio::test]
+    async fn bash_abort_stops_a_long_command() {
+        let dir = TempDir::new("bash-abort");
+        #[cfg(windows)]
+        let cmd = "ping -n 30 127.0.0.1 > nul";
+        #[cfg(not(windows))]
+        let cmd = "sleep 30";
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let t0 = std::time::Instant::now();
+        let err = bash(cmd, dir.path(), Duration::from_secs(60), &abort).await.unwrap_err();
+        assert!(err.to_string().contains("aborted"), "{err}");
+        assert!(t0.elapsed() < Duration::from_secs(10), "abort must not wait for the command");
+    }
+
+    /// B-06: a timeout kills the whole process tree, not only the shell.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_timeout_kills_background_children() {
+        let dir = TempDir::new("bash-tree");
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        let cmd = "(sleep 2; echo late > marker.txt) & sleep 30";
+        let err = bash(cmd, dir.path(), Duration::from_secs(1), &abort).await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!dir.path().join("marker.txt").exists(), "the background child must die too");
+    }
+
+    /// B-06: nothing starts once the run is aborted.
+    #[tokio::test]
+    async fn execute_refuses_after_abort() {
+        let dir = TempDir::new("exec-abort");
+        let abort = std::sync::atomic::AtomicBool::new(true);
+        let err = execute("list", &json!({}), dir.path(), &abort).await.unwrap_err();
+        assert!(err.to_string().contains("aborted"), "{err}");
+    }
+
     // Minimal temp dir helper to avoid extra deps.
     mod tempfile_dir {
         use std::path::PathBuf;
@@ -736,10 +851,8 @@ mod tests {
     #[tokio::test]
     async fn bash_runs() {
         let dir = TempDir::new("bash");
-        #[cfg(windows)]
-        let out = bash("echo hi", dir.path(), Duration::from_secs(10)).await.unwrap();
-        #[cfg(not(windows))]
-        let out = bash("echo hi", dir.path(), Duration::from_secs(10)).await.unwrap();
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        let out = bash("echo hi", dir.path(), Duration::from_secs(10), &abort).await.unwrap();
         assert!(out.contains("hi"));
     }
 
@@ -945,6 +1058,7 @@ mod s05_tests {
             "echo \"key=${OPENCODE_RUST_API_KEY:-unset}\"",
             &std::env::temp_dir(),
             Duration::from_secs(10),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
         std::env::remove_var("OPENCODE_RUST_API_KEY");
@@ -962,6 +1076,7 @@ mod s05_tests {
             "if defined OPENCODE_RUST_API_KEY (echo LEAKED) else (echo CLEAN)",
             &std::env::temp_dir(),
             Duration::from_secs(10),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
         std::env::remove_var("OPENCODE_RUST_API_KEY");
