@@ -186,13 +186,73 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn resolve(workspace: &Path, path: &str) -> PathBuf {
-    let p = Path::new(path);
-    if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
+/// S-03: turn a path the model gave into an absolute path that is guaranteed
+/// to be inside the workspace, or an error the model can act on.
+/// 1. Relative paths are joined onto the workspace.
+/// 2. `.` and `..` are applied as text first, so `src/../../x` cannot climb out.
+/// 3. The part that exists on disk is resolved with `canonicalize` (follows
+///    symlinks). A symlink leading outside, or a broken symlink, is refused.
+/// 4. The result keeps the workspace prefix as `workspace` spells it (no
+///    `\\?\` prefix on Windows).
+pub fn confine_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
+    let outside = || {
+        anyhow!(
+            "`{raw}` is outside the workspace ({}). File tools only work inside the \
+             workspace: use a path relative to it, for example `src/main.rs`.",
+            workspace.display()
+        )
+    };
+    // On Windows both `/` and `\` separate folders. Use `\` everywhere so a
+    // `\\?\` path cannot hide a `/` inside one path part.
+    #[cfg(windows)]
+    let raw_owned = raw.replace('/', "\\");
+    #[cfg(windows)]
+    let raw: &str = &raw_owned;
+    let root = workspace
+        .canonicalize()
+        .with_context(|| format!("workspace {} is not accessible", workspace.display()))?;
+    let base = std::path::absolute(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let given = Path::new(raw);
+    let joined = if given.is_absolute() { given.to_path_buf() } else { base.join(given) };
+    // Step 2: apply `.` and `..` without touching the disk.
+    let mut norm = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !norm.pop() {
+                    return Err(outside());
+                }
+            }
+            other => norm.push(other.as_os_str()),
+        }
+    }
+    // Step 3: find the longest part that exists (a symlink counts as
+    // existing, even a broken one) and resolve it.
+    let mut existing = norm.clone();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    while std::fs::symlink_metadata(&existing).is_err() {
+        match existing.file_name() {
+            Some(name) => {
+                missing.push(name.to_os_string());
+                existing.pop();
+            }
+            None => break,
+        }
+    }
+    let mut real = existing
+        .canonicalize()
+        .map_err(|_| anyhow!("cannot resolve `{raw}` (broken symlink or unreadable folder)"))?;
+    for name in missing.iter().rev() {
+        real.push(name);
+    }
+    // Step 4: the resolved path must still be inside the workspace.
+    let inside = real.strip_prefix(&root).map_err(|_| outside())?;
+    Ok(workspace.join(inside))
 }
 
 fn read_file(workspace: &Path, path: &str, offset: i64, limit: i64) -> Result<String> {
-    let abs = resolve(workspace, path);
+    let abs = confine_path(workspace, path)?;
     if abs.is_dir() {
         bail!("{path} is a directory — use the list tool to see its contents");
     }
@@ -218,7 +278,7 @@ fn read_file(workspace: &Path, path: &str, offset: i64, limit: i64) -> Result<St
 }
 
 fn write_file(workspace: &Path, path: &str, content: &str) -> Result<String> {
-    let abs = resolve(workspace, path);
+    let abs = confine_path(workspace, path)?;
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -249,7 +309,7 @@ fn edit_file(
              To create or fully rewrite a file, use the write tool."
         );
     }
-    let abs = resolve(workspace, path);
+    let abs = confine_path(workspace, path)?;
     let text = std::fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
     let matches = text.matches(old_str).count();
     if matches == 0 {
@@ -276,7 +336,7 @@ fn edit_file(
 
 fn glob_files(workspace: &Path, pattern: &str, sub: Option<&str>) -> Result<String> {
     use ignore::WalkBuilder;
-    let root = resolve(workspace, sub.unwrap_or("."));
+    let root = confine_path(workspace, sub.unwrap_or("."))?;
     let mut matches = Vec::new();
     // require_git(false): honor .gitignore even in non-git workspaces.
     for entry in WalkBuilder::new(&root).hidden(false).require_git(false).build().flatten() {
@@ -345,7 +405,7 @@ fn grep_files(
         b.case_insensitive(case_insensitive);
         b.build().with_context(|| format!("invalid regex `{pattern}`"))?
     };
-    let root = resolve(workspace, sub.unwrap_or("."));
+    let root = confine_path(workspace, sub.unwrap_or("."))?;
     let mut out: Vec<String> = Vec::new();
     // require_git(false): honor .gitignore even in non-git workspaces.
     for entry in WalkBuilder::new(&root).hidden(false).require_git(false).build().flatten() {
@@ -455,7 +515,7 @@ fn utf8_len(b: u8) -> usize {
 }
 
 fn list_dir(workspace: &Path, path: &str) -> Result<String> {
-    let abs = resolve(workspace, path);
+    let abs = confine_path(workspace, path)?;
     let rd = std::fs::read_dir(&abs).with_context(|| format!("listing {}", abs.display()))?;
     let mut dirs = Vec::new();
     let mut files = Vec::new();
@@ -592,6 +652,78 @@ mod b01_tests {
             assert!(err.contains("old_str is empty"), "{err}");
         }
         assert_eq!(std::fs::read_to_string(ws.join("f.txt")).unwrap(), "abc", "file untouched");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+}
+
+#[cfg(test)]
+mod s03_confine_tests {
+    use super::*;
+
+    pub fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let p = std::env::temp_dir().join(format!("ocrs-s03-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn confine_path_keeps_inside_paths() {
+        let ws = temp_dir("inside");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        let p = confine_path(&ws, "src/../src/main.rs").unwrap();
+        assert!(p.starts_with(&ws) && p.ends_with("src/main.rs"), "{}", p.display());
+        // A file that does not exist yet (write creates it) is fine.
+        assert!(confine_path(&ws, "new/dir/file.txt").unwrap().starts_with(&ws));
+        // An absolute path inside the workspace is fine.
+        let abs = ws.join("src").join("lib.rs");
+        assert!(confine_path(&ws, abs.to_str().unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn confine_path_rejects_escapes() {
+        let ws = temp_dir("escape");
+        let other = temp_dir("other");
+        for bad in ["..", "../x.txt", "src/../../x.txt"] {
+            let err = confine_path(&ws, bad).unwrap_err().to_string();
+            assert!(err.contains("outside the workspace"), "{bad}: {err}");
+        }
+        assert!(confine_path(&ws, other.join("x.txt").to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confine_path_rejects_symlinks_that_leave() {
+        let ws = temp_dir("link");
+        let other = temp_dir("target");
+        std::fs::write(other.join("secret.txt"), "s").unwrap();
+        std::os::unix::fs::symlink(&other, ws.join("out")).unwrap();
+        std::os::unix::fs::symlink(other.join("missing.txt"), ws.join("dangling")).unwrap();
+        assert!(confine_path(&ws, "out/secret.txt").is_err());
+        assert!(confine_path(&ws, "out/new.txt").is_err());
+        assert!(confine_path(&ws, "dangling").is_err());
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+}
+
+#[cfg(test)]
+mod s03_tools_tests {
+    use super::*;
+
+    #[test]
+    fn file_tools_refuse_outside_paths() {
+        let ws = super::s03_confine_tests::temp_dir("tools");
+        assert!(read_file(&ws, "../x.txt", 0, 10).is_err());
+        assert!(write_file(&ws, "../s03-must-not-exist.txt", "x").is_err());
+        assert!(!ws.parent().unwrap().join("s03-must-not-exist.txt").exists());
+        assert!(edit_file(&ws, "../x.txt", "a", "b", false).is_err());
+        assert!(list_dir(&ws, "..").is_err());
+        assert!(glob_files(&ws, "*", Some("..")).is_err());
+        assert!(grep_files(&ws, "x", Some(".."), false).is_err());
         let _ = std::fs::remove_dir_all(&ws);
     }
 }
