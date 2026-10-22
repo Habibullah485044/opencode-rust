@@ -14,6 +14,10 @@ pub struct Client {
     /// Without it a wedged provider (dead tunnel, stuck backend) freezes the
     /// agent loop until the total request timeout fires — or forever.
     stall: std::time::Duration,
+    /// Extra tries after a failed request (`provider.max_retries`).
+    max_retries: u32,
+    /// Wait before the first retry; doubles each time. Tests make it tiny.
+    retry_base: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,7 +131,73 @@ impl Client {
             api_key: api_key.to_string(),
             model: model.to_string(),
             stall,
+            max_retries: 0,
+            retry_base: std::time::Duration::from_secs(1),
         })
+    }
+
+    /// Build the client from the `[provider]` config section.
+    pub fn from_cfg(base_url: &str, p: &crate::config::ProviderCfg) -> Result<Self> {
+        let mut c = Self::new(base_url, &p.api_key, &p.model, p.request_timeout_secs)?;
+        c.max_retries = p.max_retries;
+        Ok(c)
+    }
+
+    /// Send a request; return the response once its status is 2xx.
+    /// Temporary failures (connection errors, 429/500/502/503/504/529) are
+    /// sent again up to `max_retries` times, after 1s, 2s, 4s … (max 30s)
+    /// plus jitter, or after the `Retry-After` seconds the server asked for.
+    /// `build` makes a fresh request each time (a request is sent only once).
+    /// Never prints: stderr output would corrupt the TUI.
+    async fn send_with_retry(
+        &self,
+        url: &str,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        let attempts = self.max_retries.saturating_add(1);
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            // Each arm gives: error text, "worth retrying?", server's Retry-After.
+            let (mut msg, retryable, retry_after) = match build().send().await {
+                Ok(resp) if resp.status().is_success() => return Ok(resp),
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = retry_after_secs(resp.headers());
+                    let text = resp.text().await.unwrap_or_default();
+                    let msg = format!(
+                        "provider returned {status}: {}",
+                        text.chars().take(400).collect::<String>()
+                    );
+                    (msg, is_retryable_status(status.as_u16()), retry_after)
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "provider request to {url} failed: {e:?} \
+                         (tunnel down or endpoint unreachable — check the base URL / heartbeat in the header)"
+                    );
+                    (msg, is_retryable_send_error(&e), None)
+                }
+            };
+            if !retryable || attempt >= attempts {
+                if attempt > 1 {
+                    msg.push_str(&format!(" (gave up after {attempt} attempts)"));
+                }
+                return Err(anyhow!(msg));
+            }
+            let wait = match retry_after {
+                Some(secs) if secs > MAX_RETRY_WAIT.as_secs() => {
+                    msg.push_str(&format!(
+                        " (the provider asked to wait {secs}s before retrying; \
+                         not waiting that long; gave up after {attempt} attempt(s))"
+                    ));
+                    return Err(anyhow!(msg));
+                }
+                Some(secs) => std::time::Duration::from_secs(secs),
+                None => backoff_delay(self.retry_base, attempt) + jitter(),
+            };
+            tokio::time::sleep(wait).await;
+        }
     }
 
     /// Stream a chat completion. `tools` may be empty for plain chat.
@@ -141,23 +211,17 @@ impl Client {
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)?;
         }
-        let mut req = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .json(&body);
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
-        }
-        let resp = req.send().await.map_err(|e| anyhow!(
-            "provider request to {}/chat/completions failed: {e:?} \
-             (tunnel down or endpoint unreachable — check the base URL / heartbeat in the header)",
-            self.base_url
-        ))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("provider returned {status}: {}", text.chars().take(400).collect::<String>()));
-        }
+        let url = format!("{}/chat/completions", self.base_url);
+        let resp = self
+            .send_with_retry(&url, || {
+                let req = self.http.post(&url).json(&body);
+                if self.api_key.is_empty() {
+                    req
+                } else {
+                    req.bearer_auth(&self.api_key)
+                }
+            })
+            .await?;
     let byte_stream = resp.bytes_stream();
     let event_stream = Box::pin(sse_event_stream(byte_stream, self.stall));
     Ok(event_stream)
@@ -427,6 +491,47 @@ impl ToolCallAccumulator {
     }
 }
 
+/// Longest wait between two retries. A longer `Retry-After` is not waited
+/// out: the request fails at once and the error says why.
+const MAX_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// "Busy, try again soon": rate limit, server errors, Anthropic's 529.
+/// Anything else (400, 401, 404 …) means the request itself is wrong.
+fn is_retryable_status(code: u16) -> bool {
+    matches!(code, 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+/// The connection failed or broke before the response headers. Not
+/// retried: a full request timeout (it already waited) and a bad URL.
+fn is_retryable_send_error(e: &reqwest::Error) -> bool {
+    e.is_connect() || (e.is_request() && !e.is_timeout())
+}
+
+/// `Retry-After: <seconds>`. The rare HTTP-date form is ignored.
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// Wait before retry number `attempt` (1, 2, 3 …): base, 2×base, 4×base …
+fn backoff_delay(base: std::time::Duration, attempt: u32) -> std::time::Duration {
+    let factor = 1u32 << attempt.saturating_sub(1).min(16);
+    base.saturating_mul(factor).min(MAX_RETRY_WAIT)
+}
+
+/// 0–249 ms extra, so many clients do not retry at the same moment.
+/// `RandomState` is randomly keyed per process: enough for jitter.
+fn jitter() -> std::time::Duration {
+    use std::hash::BuildHasher;
+    let n = std::collections::hash_map::RandomState::new().hash_one(std::time::SystemTime::now());
+    std::time::Duration::from_millis(n % 250)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,5 +791,105 @@ mod b21_calls_tests {
         let v = serde_json::to_value(&msg).unwrap();
         assert!(v.as_object().unwrap().contains_key("content"), "{v}");
         assert!(v["content"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod f01_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn retry_rules() {
+        let s = Duration::from_secs;
+        assert_eq!(backoff_delay(s(1), 1), s(1));
+        assert_eq!(backoff_delay(s(1), 3), s(4));
+        assert_eq!(backoff_delay(s(1), 6), s(30), "capped at 30s");
+        assert_eq!(backoff_delay(s(1), 99), s(30), "no overflow");
+        assert!([429, 500, 502, 503, 504, 529].iter().all(|c| is_retryable_status(*c)));
+        assert!([400, 401, 403, 404].iter().all(|c| !is_retryable_status(*c)));
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_secs(&h), None);
+        h.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+        assert_eq!(retry_after_secs(&h), Some(7));
+        assert!(jitter() < Duration::from_millis(250));
+    }
+
+    /// Request N gets `script[N]` (a status and an optional Retry-After);
+    /// after that, a valid streamed reply "hello". Returns base URL + hit count.
+    async fn scripted_provider(script: Vec<(u16, Option<&'static str>)>) -> (String, Arc<AtomicUsize>) {
+        use axum::http::{header, HeaderValue, StatusCode};
+        use axum::{response::IntoResponse, routing::post, Router};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let step = script.get(counter.fetch_add(1, Ordering::SeqCst)).copied();
+                async move {
+                    if let Some((code, retry_after)) = step {
+                        let mut resp = (StatusCode::from_u16(code).unwrap(), "busy").into_response();
+                        if let Some(v) = retry_after {
+                            resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static(v));
+                        }
+                        return resp;
+                    }
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1"), hits)
+    }
+
+    fn fast_client(base: &str, max_retries: u32) -> Client {
+        let mut c = Client::new(base, "", "stub", 30).unwrap();
+        c.max_retries = max_retries;
+        c.retry_base = Duration::from_millis(10);
+        c
+    }
+
+    #[tokio::test]
+    async fn retries_503_twice_then_streams_the_reply() {
+        // The first 503 has no Retry-After (backoff path), the second says 0s.
+        let (base, hits) = scripted_provider(vec![(503, None), (503, Some("0"))]).await;
+        let client = fast_client(&base, 3);
+        let mut s = client.stream("stub", &[], &[]).await.expect("third try succeeds");
+        let mut text = String::new();
+        while let Some(ev) = s.next().await {
+            if let StreamEvent::Text(t) = ev.unwrap() {
+                text.push_str(&t);
+            }
+        }
+        assert_eq!(text, "hello");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_retries_and_counts_attempts() {
+        let (base, hits) = scripted_provider(vec![(503, None); 10]).await;
+        let err = fast_client(&base, 2).stream("stub", &[], &[]).await.err().expect("fails");
+        assert!(err.to_string().contains("gave up after 3 attempts"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "1 try + 2 retries");
+    }
+
+    #[tokio::test]
+    async fn bad_request_and_long_retry_after_are_not_retried() {
+        let (base, hits) = scripted_provider(vec![(400, None)]).await;
+        let err = fast_client(&base, 3).stream("stub", &[], &[]).await.err().expect("fails");
+        assert!(err.to_string().contains("400"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let (base, hits) = scripted_provider(vec![(429, Some("120"))]).await;
+        let err = fast_client(&base, 3).stream("stub", &[], &[]).await.err().expect("fails");
+        assert!(err.to_string().contains("120s"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a 2-minute Retry-After is not waited out");
     }
 }

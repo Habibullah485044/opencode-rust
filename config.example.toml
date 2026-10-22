@@ -24,6 +24,10 @@ model = "openai/gpt-4o"
 # small_model = "openai/gpt-4o-mini"
 request_timeout_secs = 600
 
+# Retries when the provider is busy or unreachable (HTTP 429/5xx or a
+# connection error), waiting 1s, 2s, 4s... between tries. 0 = no retries.
+max_retries = 3
+
 [agent]
 max_steps = 40
 ponytail = true

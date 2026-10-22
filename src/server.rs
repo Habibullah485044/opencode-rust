@@ -204,12 +204,7 @@ pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
     let state_dir = crate::config::default_state_dir();
     let db = Db::open(&state_dir.join("opencode.db"))?;
     let engine = Engine::new(&cfg.permissions);
-    let client = Client::new(
-        &cfg.effective_base_url()?,
-        &cfg.provider.api_key,
-        &cfg.provider.model,
-        cfg.provider.request_timeout_secs,
-    )?;
+    let client = Client::from_cfg(&cfg.effective_base_url()?, &cfg.provider)?;
     let (events, _) = broadcast::channel(256);
     let mut mcp = crate::mcp::Registry::default();
     mcp.start_all(&cfg.mcp.servers).await;
@@ -252,13 +247,8 @@ pub async fn build_state_ephemeral_skills(
 ) -> Shared {
     let engine = Engine::new(&cfg.permissions);
     let (events, _) = broadcast::channel(256);
-    let client = Client::new(
-        cfg.provider.base_url.trim().trim_end_matches('/'),
-        &cfg.provider.api_key,
-        &cfg.provider.model,
-        cfg.provider.request_timeout_secs,
-    )
-    .unwrap_or_else(|_| Client::new("http://127.0.0.1:9", "", "stub", 5).expect("stub"));
+    let client = Client::from_cfg(cfg.provider.base_url.trim().trim_end_matches('/'), &cfg.provider)
+        .unwrap_or_else(|_| Client::new("http://127.0.0.1:9", "", "stub", 5).expect("stub"));
     let mut mcp = crate::mcp::Registry::default();
     mcp.start_all(&cfg.mcp.servers).await;
     Arc::new(AppState {
@@ -2297,6 +2287,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut cfg = crate::config::Config::default();
         cfg.provider.base_url = "http://127.0.0.1:9".into(); // fails fast
+        cfg.provider.max_retries = 0; // F-01: no retry waits in this timing test
         cfg.provider.model = "stub".into();
         let st = build_state_ephemeral(cfg, dir).await;
         let sid = "ses_kick".to_string();

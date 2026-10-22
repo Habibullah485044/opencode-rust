@@ -89,6 +89,9 @@ pub struct ProviderCfg {
     /// Optional cheaper model for hidden tasks (compaction, planning).
     pub small_model: Option<String>,
     pub request_timeout_secs: u64,
+    /// Extra tries for a failed provider request (connection error,
+    /// HTTP 429/500/502/503/504/529). 0 = no retries.
+    pub max_retries: u32,
 }
 
 impl Default for ProviderCfg {
@@ -99,6 +102,7 @@ impl Default for ProviderCfg {
             model: String::new(),
             small_model: None,
             request_timeout_secs: 600,
+            max_retries: 3,
         }
     }
 }
@@ -305,5 +309,19 @@ mod tests {
         assert_eq!(c.mcp.servers[0].args, vec!["srv.js", "--flag"]);
         // Default config has no MCP servers.
         assert!(Config::default().mcp.servers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod f01_tests {
+    use super::*;
+
+    #[test]
+    fn provider_max_retries_defaults_to_3() {
+        assert_eq!(Config::default().provider.max_retries, 3);
+        let c: Config = toml::from_str("[provider]\nmax_retries = 0\n").unwrap();
+        assert_eq!(c.provider.max_retries, 0);
+        let c: Config = toml::from_str("[provider]\nmodel = 'm'\n").unwrap();
+        assert_eq!(c.provider.max_retries, 3, "a missing key keeps the default");
     }
 }
