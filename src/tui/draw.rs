@@ -307,7 +307,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Line::from(format!("Input: {}", truncate_str(&ap.detail, 200)))
                 .style(Style::default().fg(FB_MUTED)),
             Line::from(""),
-            Line::from("[y] allow once   [a] always (session)   [n] deny")
+            Line::from("[y] allow once   [a] always (this workspace)   [n] deny")
                 .style(Style::default().fg(FB_GREEN)),
         ];
         let block = Paragraph::new(text)

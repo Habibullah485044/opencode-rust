@@ -65,6 +65,53 @@ pub fn new_id(prefix: &str) -> String {
     format!("{prefix}_{:016x}", h.finish())
 }
 
+/// Approvals table (S-07): one row per (workspace, tool, pattern).
+const APPROVALS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS approvals (
+    id TEXT PRIMARY KEY,
+    workspace TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    pattern TEXT NOT NULL,
+    scope TEXT NOT NULL,   -- 'once' | 'session'
+    created_at INTEGER NOT NULL,
+    UNIQUE (workspace, tool, pattern)
+);";
+
+/// Bring the approvals table to the S-07 layout. A table from an older
+/// build has no `workspace` column: it is renamed to `approvals_unscoped`
+/// and never read again, so approvals saved before this change no longer
+/// apply anywhere (the user is simply asked again).
+fn migrate_approvals(conn: &Connection) -> Result<()> {
+    let has_workspace_column = {
+        let mut stmt = conn.prepare("PRAGMA table_info(approvals)")?;
+        let names = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        // No rows means the table does not exist yet.
+        names.is_empty() || names.iter().any(|n| n == "workspace")
+    };
+    if !has_workspace_column {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS approvals_unscoped;
+             ALTER TABLE approvals RENAME TO approvals_unscoped;",
+        )?;
+    }
+    conn.execute_batch(APPROVALS_SCHEMA)?;
+    Ok(())
+}
+
+/// The key "always allow" approvals are stored under: the workspace's
+/// canonical path (symlinks and `..` resolved; lower-case on Windows), so
+/// two spellings of one folder share their approvals.
+pub fn workspace_key(workspace: &Path) -> String {
+    let p = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let s = p.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -89,15 +136,9 @@ impl Db {
                 parts TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
-            CREATE TABLE IF NOT EXISTS approvals (
-                id TEXT PRIMARY KEY,
-                tool TEXT NOT NULL,
-                pattern TEXT NOT NULL,
-                scope TEXT NOT NULL,   -- 'once' | 'session'
-                created_at INTEGER NOT NULL
-            );",
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);",
         )?;
+        migrate_approvals(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -119,15 +160,9 @@ impl Db {
                 parts TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
-            CREATE TABLE IF NOT EXISTS approvals (
-                id TEXT PRIMARY KEY,
-                tool TEXT NOT NULL,
-                pattern TEXT NOT NULL,
-                scope TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );",
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);",
         )?;
+        migrate_approvals(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -286,20 +321,25 @@ impl Db {
         Ok(out)
     }
 
-    /// Session-scope remembered approvals ("always" during this session).
-    pub fn add_approval(&self, tool: &str, pattern: &str, scope: &str) -> Result<()> {
+    /// Remember an "always allow" answer for one workspace. `workspace` is
+    /// [`workspace_key`] of the workspace. Saving the same approval twice
+    /// keeps one row (UNIQUE constraint + INSERT OR IGNORE).
+    pub fn add_approval(&self, workspace: &str, tool: &str, pattern: &str, scope: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT OR IGNORE INTO approvals (id, tool, pattern, scope, created_at) VALUES (?1,?2,?3,?4,?5)",
-            params![new_id("apr"), tool, pattern, scope, now_ms()],
+            "INSERT OR IGNORE INTO approvals (id, workspace, tool, pattern, scope, created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![new_id("apr"), workspace, tool, pattern, scope, now_ms()],
         )?;
         Ok(())
     }
 
-    pub fn has_approval(&self, tool: &str, pattern: &str) -> Result<bool> {
+    /// True when this workspace has an "always allow" for (tool, pattern).
+    /// Approvals saved for other workspaces never count.
+    pub fn has_approval(&self, workspace: &str, tool: &str, pattern: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM approvals WHERE tool=?1 AND pattern=?2",
-            params![tool, pattern],
+            "SELECT COUNT(*) FROM approvals WHERE workspace=?1 AND tool=?2 AND pattern=?3",
+            params![workspace, tool, pattern],
             |r| r.get(0),
         )?;
         Ok(n > 0)
@@ -410,8 +450,67 @@ mod tests {
         db.create_session("a", None).unwrap();
         db.create_session("b", None).unwrap();
         assert_eq!(db.list_sessions().unwrap().len(), 2);
-        db.add_approval("bash", "git status", "session").unwrap();
-        assert!(db.has_approval("bash", "git status").unwrap());
-        assert!(!db.has_approval("bash", "rm -rf /").unwrap());
+        db.add_approval("/ws/one", "bash", "git status", "session").unwrap();
+        assert!(db.has_approval("/ws/one", "bash", "git status").unwrap());
+        assert!(!db.has_approval("/ws/one", "bash", "rm -rf /").unwrap());
+    }
+
+    #[test]
+    fn approvals_are_scoped_to_one_workspace() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_approval("/ws/one", "write", "notes.txt", "session").unwrap();
+        assert!(db.has_approval("/ws/one", "write", "notes.txt").unwrap());
+        assert!(
+            !db.has_approval("/ws/two", "write", "notes.txt").unwrap(),
+            "another workspace must not inherit the approval"
+        );
+    }
+
+    #[test]
+    fn duplicate_approvals_keep_one_row() {
+        let db = Db::open_in_memory().unwrap();
+        for _ in 0..3 {
+            db.add_approval("/ws/one", "bash", "cargo test", "session").unwrap();
+        }
+        let n: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn old_unscoped_approvals_stop_applying() {
+        let path = std::env::temp_dir().join(format!(
+            "ocrs-approvals-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        {
+            // A database written by the previous version (no workspace column).
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE approvals (id TEXT PRIMARY KEY, tool TEXT NOT NULL, \
+                 pattern TEXT NOT NULL, scope TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 INSERT INTO approvals VALUES ('apr_1', 'bash', 'ls', 'session', 0);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert!(!db.has_approval("/any", "bash", "ls").unwrap(), "old grant is not used");
+        db.add_approval("/any", "bash", "ls", "session").unwrap();
+        assert!(db.has_approval("/any", "bash", "ls").unwrap());
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn workspace_key_is_the_same_for_two_spellings() {
+        let dir = std::env::temp_dir();
+        assert_eq!(workspace_key(&dir), workspace_key(&dir.join(".")));
     }
 }

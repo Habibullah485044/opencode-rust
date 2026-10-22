@@ -294,7 +294,8 @@ impl AppState {
         };
         let Some(entry) = entry else { return false };
         if allow && always {
-            let _ = self.db.add_approval(&entry.tool, &entry.detail, "session");
+            let ws = crate::db::workspace_key(&self.workspace);
+            let _ = self.db.add_approval(&ws, &entry.tool, &entry.detail, "session");
         }
         entry.tx.send(allow).is_ok()
     }
@@ -1593,7 +1594,9 @@ async fn check_permission(
     detail: &str,
     abort: &AtomicBool,
 ) -> bool {
-    let remembered = |t: &str, d: &str| st.db.has_approval(t, d).unwrap_or(false);
+    // "Always allow" answers belong to this workspace only (S-07).
+    let ws_key = crate::db::workspace_key(&st.workspace);
+    let remembered = |t: &str, d: &str| st.db.has_approval(&ws_key, t, d).unwrap_or(false);
     let decision = st.engine.evaluate(tool, detail, remembered);
     // Hard `deny` rules are policy, not prompts: they survive every mode.
     if matches!(decision.action, Action::Deny) {
@@ -2319,7 +2322,7 @@ data: [DONE]
         assert!(!denied.await.unwrap(), "a no keeps it from running");
 
         // "Always allow" is the user's own grant — it survives manual mode.
-        st.db.add_approval("write", "made.txt", "session").unwrap();
+        st.db.add_approval(&crate::db::workspace_key(&st.workspace), "write", "made.txt", "session").unwrap();
         let abort = AtomicBool::new(false);
         assert!(
             check_permission(&st, "s1", "write", "made.txt", &abort).await,
