@@ -749,7 +749,9 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
     if !superseded {
         // Auto ponytail review: any run that changed files gets the
         // outside-the-diff senior-dev pass BEFORE the turn is declared done.
-        if ok && touched && st.cfg.agent.auto_review {
+        // New (P-03): never after an abort; the user asked us to stop.
+        let aborted = matches!(result.as_deref(), Ok("aborted"));
+        if ok && touched && !aborted && st.cfg.agent.auto_review {
             let _ = st.events.send(ServerEvent::Note {
                 session_id: session_id.to_string(),
                 text: "ponytail review — checking the change and what it may have \
@@ -2394,6 +2396,67 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// P-03: an aborted run gets no automatic review, even after a write.
+    #[tokio::test]
+    async fn aborted_run_gets_no_review() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::AtomicUsize;
+        let dir = std::env::temp_dir().join(format!("ocrs-p03-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let abort = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (abort_m, calls_m) = (abort.clone(), calls.clone());
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |_body: axum::extract::Json<Value>| {
+                let (abort, calls) = (abort_m.clone(), calls_m.clone());
+                async move {
+                    let payload = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_w1\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"made.txt\\\",\\\"content\\\":\\\"hello\\\\n\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    } else {
+                        // The user presses stop while the model answers.
+                        abort.store(true, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"late\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                    };
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        cfg.permissions.defaults.insert("write".into(), "allow".into());
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("p03", None).unwrap();
+        let mut rx = st.events.subscribe();
+
+        run_agent(&st, &s.id, "make a file", abort.clone()).await;
+
+        assert!(dir.join("made.txt").exists(), "the write happened before the abort");
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::Note { text, .. } = ev {
+                assert!(!text.contains("ponytail review"), "no review after an abort: {text}");
+            }
+        }
+        let review_prompt = st.db.messages(&s.id).unwrap().iter().any(|m| {
+            m.role == "user"
+                && m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.contains("Review the current uncommitted changes")))
+        });
+        assert!(!review_prompt, "no dangling review prompt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// P-02 helper: a git repo with one commit, and a mock that asks for one
     /// `bash` call (`command`) and then answers with text. Returns the state.
