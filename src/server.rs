@@ -302,7 +302,13 @@ pub async fn build_state_ephemeral_skills(
         db: Db::open_in_memory().expect("in-memory db"),
         cfg,
         workspace,
-        state_dir: crate::config::default_state_dir(),
+        // New (B-25): unit tests must not write snapshots or worktrees into
+        // the user's real state folder.
+        state_dir: if cfg!(test) {
+            std::env::temp_dir().join(format!("ocrs-test-state-{}", std::process::id()))
+        } else {
+            crate::config::default_state_dir()
+        },
         modes: Mutex::new(HashMap::new()),
         client: AsyncMutex::new(client),
         todo_store: TodoStore::default(),
@@ -1652,6 +1658,10 @@ pub async fn run_review(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) 
 }
 
 /// Run `task` twice, in two isolated git worktrees, and summarize the results.
+/// New (B-25): both workers run at the same time, use the model the session
+/// uses now, and follow the session's permission mode. Workers have no
+/// screen for an approval prompt, so an `ask` is refused at once instead of
+/// waiting out the approval timeout.
 async fn run_parallel(st: &Shared, task: &str, abort: &Arc<AtomicBool>) -> Result<String> {
     // Requires a git repo to branch from.
     crate::gitsnap::git(&st.workspace, &["rev-parse", "HEAD"])
@@ -1662,7 +1672,16 @@ async fn run_parallel(st: &Shared, task: &str, abort: &Arc<AtomicBool>) -> Resul
         .unwrap_or(0);
     let root = st.state_dir.join("parallel").join(format!("t{stamp}"));
     std::fs::create_dir_all(&root)?;
-    let mut rows: Vec<String> = Vec::new();
+    // New (B-25): worker settings: no nested reviews, the model the session
+    // uses now (`/model` may have switched it), and no approval waits —
+    // nobody can answer a worker's prompt, so an `ask` is refused at once.
+    let mut cfg = st.cfg.clone();
+    cfg.agent.auto_review = false;
+    cfg.provider.model = st.current_model().await;
+    cfg.permissions.approval_timeout_secs = 0;
+    let mode = st.perm_mode();
+    // Create the worktrees one after the other (git locks the repository).
+    let mut workers = Vec::new();
     for n in 1..=2u8 {
         if abort.load(Ordering::SeqCst) {
             break;
@@ -1672,17 +1691,26 @@ async fn run_parallel(st: &Shared, task: &str, abort: &Arc<AtomicBool>) -> Resul
         let wt_str = wt.to_string_lossy().to_string();
         crate::gitsnap::git(&st.workspace, &["worktree", "add", "-b", &branch, &wt_str])
             .map_err(|e| anyhow::anyhow!("git worktree add failed: {e}"))?;
-        let mut cfg = st.cfg.clone();
-        cfg.agent.auto_review = false; // no nested reviews in workers
-        let worker = build_state_ephemeral(cfg, wt.clone()).await;
-        let sid = worker
-            .db
-            .create_session(&format!("parallel-w{n}"), None)
-            .map_err(|e| anyhow::anyhow!("worker session: {e}"))?
-            .id;
-        let answer = agent_inner(&worker, &sid, task, abort)
-            .await
-            .unwrap_or_else(|e| format!("error: {e}"));
+        workers.push((n, wt, branch));
+    }
+    // New (B-25): run the workers at the same time, each in the session's
+    // permission mode (turbo stays turbo).
+    let answers = futures::future::join_all(workers.iter().map(|(n, wt, _)| {
+        let cfg = cfg.clone();
+        async move {
+            let worker = build_state_ephemeral(cfg, wt.clone()).await;
+            let _ = worker.set_perm_mode(mode);
+            match worker.db.create_session(&format!("parallel-w{n}"), None) {
+                Ok(s) => agent_inner(&worker, &s.id, task, abort)
+                    .await
+                    .unwrap_or_else(|e| format!("error: {e}")),
+                Err(e) => format!("error: worker session: {e}"),
+            }
+        }
+    }))
+    .await;
+    let mut rows: Vec<String> = Vec::new();
+    for ((n, wt, branch), answer) in workers.iter().zip(answers) {
         let stat = crate::gitsnap::git(&wt, &["diff", "--shortstat", "HEAD"])
             .unwrap_or_default()
             .trim()
@@ -1701,10 +1729,21 @@ async fn run_parallel(st: &Shared, task: &str, abort: &Arc<AtomicBool>) -> Resul
             wt.display()
         ));
     }
-    Ok(format!(
+    let mut out = format!(
         "parallel results (2 worktrees) — inspect, then merge the winner:\n{}",
         rows.join("\n")
-    ))
+    );
+    // New (B-25): how to clean up, and why a tool may have been refused.
+    out.push_str(
+        "\nremove a worktree you do not keep: git worktree remove <dir> && git branch -D <branch>",
+    );
+    if mode != PermissionMode::Turbo {
+        out.push_str(
+            "\nnote: workers cannot show approval prompts, so tools that need approval are \
+             refused there; switch on /turbo first or allow those tools in the config",
+        );
+    }
+    Ok(out)
 }
 
 /// Route a permitted tool call: MCP server, subagent spawn, or local tool.
@@ -2304,6 +2343,47 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// B-25: /parallel workers use the model the session switched to.
+    #[tokio::test]
+    async fn parallel_workers_use_the_current_model() {
+        use axum::{routing::post, Router};
+        let dir = std::env::temp_dir().join(format!("ocrs-b25-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| crate::gitsnap::git(&dir, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("hello.txt"), "hi\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: axum::extract::Json<Value>| async move {
+                let model = body["model"].as_str().unwrap_or("?").to_string();
+                let payload = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"model={model}\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+                );
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "first".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        st.set_model("switched").await;
+
+        let out = run_parallel(&st, "say OK", &Arc::new(AtomicBool::new(false))).await.unwrap();
+        assert_eq!(out.matches("model=switched").count(), 2, "{out}");
+        assert!(out.contains("git worktree remove"), "{out}");
+    }
 
     /// B-24: the automatic review prompt neither counts nor breaks the streak.
     #[tokio::test]
