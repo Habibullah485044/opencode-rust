@@ -1,6 +1,5 @@
 # Cargo build output
 target/
-separate_demo/target/
 
 # Logs and local run artifacts
 *.log
