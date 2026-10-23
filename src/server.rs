@@ -2430,18 +2430,7 @@ async fn run_verify_command(
     timeout: std::time::Duration,
     abort: &AtomicBool,
 ) -> Result<(Option<i32>, String)> {
-    #[cfg(windows)]
-    let mut command = {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(cmd);
-        c
-    };
-    #[cfg(not(windows))]
-    let mut command = {
-        let mut c = tokio::process::Command::new("sh");
-        c.arg("-c").arg(cmd);
-        c
-    };
+    let mut command = crate::tools::shell_command(cmd);
     command
         .current_dir(workspace)
         // S-05 spirit: child processes never get the provider API key.
@@ -5277,10 +5266,10 @@ data: [DONE]
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // The check passes only once `fixed.txt` exists.
-        #[cfg(windows)]
-        let check = "dir fixed.txt";
-        #[cfg(not(windows))]
-        let check = "test -f fixed.txt";
+        let check = match crate::tools::shell_kind() {
+            crate::permissions::Shell::Posix => "test -f fixed.txt",
+            crate::permissions::Shell::Cmd => "dir fixed.txt",
+        };
         let mut cfg = crate::config::Config::default();
         cfg.agent.auto_review = false;
         cfg.agent.verify_command = Some(check.to_string());

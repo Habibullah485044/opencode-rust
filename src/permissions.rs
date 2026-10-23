@@ -193,8 +193,8 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     m(pattern.as_bytes(), text.as_bytes())
 }
 
-/// The shell that runs `bash` tool commands: `sh -c` on Unix, `cmd /C` on
-/// Windows (see `tools.rs`). They split command lines differently.
+/// The shell that runs `bash` tool commands: `sh -c` on Unix, Git Bash or
+/// `cmd /C` on Windows (see `tools::shell_command`). They split command lines differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
     Posix,
@@ -202,13 +202,10 @@ pub enum Shell {
 }
 
 impl Shell {
-    /// The shell the `bash` tool uses on this machine.
+    /// The shell the `bash` tool uses on this machine (Git Bash counts as
+    /// POSIX on Windows).
     pub fn current() -> Self {
-        if cfg!(windows) {
-            Shell::Cmd
-        } else {
-            Shell::Posix
-        }
+        crate::tools::shell_kind()
     }
 }
 

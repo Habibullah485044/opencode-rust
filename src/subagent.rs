@@ -385,16 +385,27 @@ async fn wait_flag(flag: &AtomicBool) {
 fn report(st: &Shared, id: &str, run: &Run, state: &str, summary: &str) -> String {
     let mut calls = 0;
     let mut files: Vec<String> = Vec::new();
+    // Paths of write/edit calls by call id; listed once their result is ok.
+    let mut writes: HashMap<String, String> = HashMap::new();
     for m in st.db.messages(id).unwrap_or_default() {
         for p in m.parts {
-            if let Part::ToolCall { name, input, .. } = p {
-                calls += 1;
-                let path = input.get("path").and_then(Value::as_str);
-                if let (true, Some(path)) = (matches!(name.as_str(), "write" | "edit"), path) {
-                    if !files.iter().any(|f| f == path) {
-                        files.push(path.to_string());
+            match p {
+                Part::ToolCall { id, name, input } => {
+                    calls += 1;
+                    let path = input.get("path").and_then(Value::as_str);
+                    if let (true, Some(path)) = (matches!(name.as_str(), "write" | "edit"), path) {
+                        writes.insert(id, path.to_string());
                     }
                 }
+                Part::ToolResult { tool_id, output, is_error } => {
+                    let ok = !is_error && !output.starts_with("error");
+                    if let Some(path) = writes.remove(&tool_id).filter(|_| ok) {
+                        if !files.contains(&path) {
+                            files.push(path);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }

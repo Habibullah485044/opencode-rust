@@ -16,7 +16,11 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
     vec![
         spec(
             "bash",
-            "Run a shell command in the workspace. Prefer specialized tools (grep/glob) over raw commands.",
+            &format!(
+                "Run a shell command in the workspace with {}. Prefer specialized tools \
+                 (read/write/edit/grep/glob) over raw commands.",
+                shell_label()
+            ),
             json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer"}},"required":["command"]}),
         ),
         spec(
@@ -148,24 +152,96 @@ pub fn scrub_secrets(cmd: &mut tokio::process::Command) -> &mut tokio::process::
     cmd
 }
 
+/// Git Bash on Windows, when it is installed: models write POSIX shell
+/// (`ls`, `rm -f`, `;`, `$?`, quotes), and `cmd.exe` reads all of that
+/// differently. `OPENCODE_RUST_SHELL=cmd` keeps `cmd.exe`; a path to a
+/// `bash.exe` picks that one.
+#[cfg(windows)]
+fn git_bash() -> Option<&'static Path> {
+    static FOUND: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let mut tries = Vec::new();
+            match std::env::var("OPENCODE_RUST_SHELL") {
+                Ok(v) if v.eq_ignore_ascii_case("cmd") => return None,
+                Ok(v) if !v.trim().is_empty() => tries.push(PathBuf::from(v.trim())),
+                _ => {}
+            }
+            for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+                if let Ok(dir) = std::env::var(var) {
+                    tries.push(Path::new(&dir).join(r"Git\bin\bash.exe"));
+                }
+            }
+            if let Ok(dir) = std::env::var("LOCALAPPDATA") {
+                tries.push(Path::new(&dir).join(r"Programs\Git\bin\bash.exe"));
+            }
+            // `git` on PATH lives in `<Git>\cmd` or `<Git>\bin`. Never the
+            // `bash.exe` in System32: that is WSL, a different file system.
+            for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+                if dir.join("git.exe").is_file() {
+                    if let Some(git) = dir.parent() {
+                        tries.push(git.join(r"bin\bash.exe"));
+                    }
+                }
+            }
+            tries.into_iter().find(|p| p.is_file())
+        })
+        .as_deref()
+}
+
+/// The shell that runs `bash` tool commands on this machine.
+pub fn shell_kind() -> crate::permissions::Shell {
+    #[cfg(windows)]
+    if git_bash().is_none() {
+        return crate::permissions::Shell::Cmd;
+    }
+    crate::permissions::Shell::Posix
+}
+
+/// Shell name for the `bash` tool description, so the model writes the
+/// right syntax.
+fn shell_label() -> &'static str {
+    match shell_kind() {
+        crate::permissions::Shell::Posix if cfg!(windows) => {
+            "bash (Git Bash on Windows: POSIX syntax and tools; drive C: is /c/)"
+        }
+        crate::permissions::Shell::Posix => "sh",
+        crate::permissions::Shell::Cmd => {
+            "Windows cmd.exe (cmd syntax: dir, type, del, `&&` between commands — not ls/rm/`;`)"
+        }
+    }
+}
+
+/// A command that runs `line` in the shell `shell_kind` names.
+pub fn shell_command(line: &str) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        if let Some(bash) = git_bash() {
+            let mut c = tokio::process::Command::new(bash);
+            c.arg("-c").arg(line);
+            return c;
+        }
+        // `cmd /C` does its own parsing: pass the line as typed. `arg` would
+        // add `\"` escapes that cmd does not understand.
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/S").arg("/C").raw_arg(format!("\"{line}\""));
+        c
+    }
+    #[cfg(not(windows))]
+    {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(line);
+        c
+    }
+}
+
 async fn bash(
     command: &str,
     workspace: &Path,
     timeout: Duration,
     abort: &std::sync::atomic::AtomicBool,
 ) -> Result<String> {
-    #[cfg(windows)]
-    let mut child = {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(command);
-        c
-    };
-    #[cfg(not(windows))]
-    let mut child = {
-        let mut c = tokio::process::Command::new("sh");
-        c.arg("-c").arg(command);
-        c
-    };
+    let mut child = shell_command(command);
     child
         .current_dir(workspace)
         .stdin(Stdio::null())
@@ -858,10 +934,7 @@ mod tests {
     #[tokio::test]
     async fn bash_abort_stops_a_long_command() {
         let dir = TempDir::new("bash-abort");
-        #[cfg(windows)]
-        let cmd = "ping -n 30 127.0.0.1 > nul";
-        #[cfg(not(windows))]
-        let cmd = "sleep 30";
+        let cmd = if cfg!(windows) { "ping -n 30 127.0.0.1" } else { "sleep 30" };
         let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = abort.clone();
         tokio::spawn(async move {
@@ -1184,13 +1257,34 @@ mod s05_tests {
         assert!(!out.contains("s05-test-secret"), "{out}");
     }
 
-    /// Same check on Windows: `cmd /C` must not see the key either.
+    /// Quotes reach the shell as typed: no `\"` escapes are added (they
+    /// broke `python -c "…"` and quoted paths under `cmd`).
+    #[tokio::test]
+    async fn bash_passes_quotes_as_typed() {
+        let out = bash(
+            r#"echo "two words""#,
+            &std::env::temp_dir(),
+            Duration::from_secs(10),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("two words") && !out.contains('\\'), "{out}");
+    }
+
+    /// Same check on Windows (Git Bash or `cmd /C`): no key either.
     #[cfg(windows)]
     #[tokio::test]
     async fn bash_child_does_not_see_the_api_key() {
         std::env::set_var("OPENCODE_RUST_API_KEY", "s05-test-secret");
+        let line = match shell_kind() {
+            crate::permissions::Shell::Posix => {
+                r#"if [ -n "$OPENCODE_RUST_API_KEY" ]; then echo LEAKED; else echo CLEAN; fi"#
+            }
+            crate::permissions::Shell::Cmd => "if defined OPENCODE_RUST_API_KEY (echo LEAKED) else (echo CLEAN)",
+        };
         let out = bash(
-            "if defined OPENCODE_RUST_API_KEY (echo LEAKED) else (echo CLEAN)",
+            line,
             &std::env::temp_dir(),
             Duration::from_secs(10),
             &std::sync::atomic::AtomicBool::new(false),
