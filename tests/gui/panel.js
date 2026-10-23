@@ -505,6 +505,43 @@
   window.render(payload(basePage));
   ok("Stop turns back into send", !document.getElementById("send").classList.contains("stop"));
 
+  // --- A4: agents panel ---
+  try { localStorage.removeItem("habi.agents.collapsed"); } catch (e) { /* ignore */ }
+  var agentsEl = document.getElementById("agents");
+  ok("no agents panel without agents", agentsEl.hidden);
+  var withAgents = payload(basePage);
+  withAgents.agents = [
+    { id: "ses_a", name: "explore", task: "map the auth code", state: "working", detail: "grep(login)", secs: 12 },
+    { id: "ses_b", name: "worker", task: "fix the parser", state: "queued", detail: "waiting for a free place…", secs: 3 },
+    { id: "ses_c", name: "review", task: "check the diff", state: "done", detail: "looks good", secs: 75 }
+  ];
+  window.render(withAgents);
+  var agCards = document.querySelectorAll("#ag-list .ag-card");
+  ok("one card per agent", !agentsEl.hidden && agCards.length === 3, agCards.length);
+  ok("the head counts running and finished agents",
+    document.getElementById("ag-count").textContent === "2 running · 1 finished",
+    document.getElementById("ag-count").textContent);
+  ok("a card shows role, task, current tool and time",
+    agCards[0].querySelector(".ag-role").textContent === "explore" &&
+    agCards[0].querySelector(".ag-task").textContent === "map the auth code" &&
+    agCards[0].querySelector(".ag-detail").textContent === "grep(login)" &&
+    agCards[2].querySelector(".ag-time").textContent === "1m 15s");
+  ok("only running agents have Stop",
+    !!agCards[0].querySelector(".ag-btn.stop") && !!agCards[1].querySelector(".ag-btn.stop") &&
+    !agCards[2].querySelector(".ag-btn.stop"));
+  sent = [];
+  agCards[0].querySelector(".ag-btn.stop").click();
+  ok("Stop posts agent_stop with the id", (last("agent_stop") || {}).id === "ses_a", JSON.stringify(sent));
+  agCards[2].querySelector(".ag-btn").click();
+  ok("Open loads the agent's transcript", (last("load") || {}).id === "ses_c", JSON.stringify(sent));
+  click("ag-head");
+  ok("the head collapses the list", document.getElementById("ag-box").classList.contains("collapsed"));
+  window.render(withAgents);
+  ok("collapsed stays collapsed across paints", document.getElementById("ag-box").classList.contains("collapsed"));
+  click("ag-head");
+  window.render(payload(basePage));
+  ok("another chat without agents hides the panel", agentsEl.hidden);
+
   } catch (e) {
     ok("harness ran to completion", false, "threw: " + (e && e.message));
   }

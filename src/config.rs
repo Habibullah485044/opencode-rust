@@ -200,6 +200,11 @@ impl Default for PermissionsCfg {
         for t in ["browser_click", "browser_type"] {
             defaults.insert(t.to_string(), "ask".to_string());
         }
+        // Starting and managing subagents is safe by itself: each child still
+        // asks before its own writes and commands.
+        for t in ["spawn", "agent_wait", "agent_send", "agent_stop", "agent_list"] {
+            defaults.insert(t.to_string(), "allow".to_string());
+        }
         Self { defaults, rules: Vec::new(), approval_timeout_secs: 300 }
     }
 }
@@ -288,6 +293,9 @@ pub struct AgentCfg {
     /// worktree. Their changes come back as a patch file instead of landing
     /// in the workspace. Off by default.
     pub isolate_workers: bool,
+    /// Most subagents one chat runs at the same time; more spawns wait in
+    /// line for a free place.
+    pub max_subagents: usize,
     /// F-08: command that checks the work after a run that changed files,
     /// for example "cargo test". Unset (the default) = no check.
     pub verify_command: Option<String>,
@@ -311,6 +319,7 @@ impl Default for AgentCfg {
             system_prompt: None,
             ponytail: true,
             isolate_workers: false,
+            max_subagents: 4,
             verify_command: None,
             verify_max_rounds: 2,
             verify_timeout_secs: 600,

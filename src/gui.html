@@ -945,6 +945,95 @@
   .chip-d { font-size: 12px; color: var(--text-muted); line-height: 1.4; }
 
   /* ---- Composer ---- */
+  /* ---- A4: spawned agents for this chat ---- */
+  #agents {
+    max-width: 820px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 0 32px;
+    flex: none;
+  }
+  #agents[hidden] { display: none; }
+  .ag-box {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .ag-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px 7px 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+    cursor: pointer;
+    user-select: none;
+  }
+  .ag-head:hover { color: var(--text-soft); }
+  .ag-title { color: var(--text-soft); font-weight: 600; }
+  .ag-count { flex: 1; }
+  .ag-chev { transition: transform .15s var(--ease); }
+  .ag-box.collapsed .ag-chev { transform: rotate(-90deg); }
+  .ag-box.collapsed .ag-list { display: none; }
+  .ag-list {
+    border-top: 1px solid var(--line);
+    max-height: 196px;
+    overflow-y: auto;
+  }
+  .ag-card {
+    display: grid;
+    grid-template-columns: 8px auto 1fr auto auto;
+    grid-template-rows: auto auto;
+    column-gap: 9px;
+    row-gap: 2px;
+    align-items: center;
+    padding: 7px 10px 7px 12px;
+    border-top: 1px solid var(--line);
+    font-size: 12.5px;
+  }
+  .ag-card:first-child { border-top: none; }
+  .ag-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); }
+  .ag-card.working .ag-dot { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); animation: agPulse 1.4s ease-in-out infinite; }
+  .ag-card.queued .ag-dot { background: var(--warn); }
+  .ag-card.done .ag-dot { background: var(--ok); }
+  .ag-card.failed .ag-dot { background: var(--bad); }
+  @keyframes agPulse { 50% { opacity: .45; } }
+  .ag-role {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent-strong);
+    background: var(--accent-soft);
+    border-radius: 999px;
+    padding: 1px 8px;
+  }
+  .ag-task { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .ag-time { color: var(--text-dim); font-variant-numeric: tabular-nums; font-size: 11.5px; }
+  .ag-acts { display: flex; gap: 4px; }
+  .ag-btn {
+    border: 1px solid var(--line-strong);
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 11.5px;
+    border-radius: var(--radius-s);
+    padding: 2px 8px;
+    cursor: pointer;
+  }
+  .ag-btn:hover { color: var(--text); background: var(--surface-2); }
+  .ag-btn.stop:hover { color: var(--bad); border-color: var(--bad); background: var(--bad-soft); }
+  .ag-detail {
+    grid-column: 3 / 6;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .ag-card.failed .ag-detail { color: var(--bad); }
+
   #compwrap {
     padding: 8px 32px 18px;
     max-width: 820px;
@@ -1313,6 +1402,7 @@
     .tb-brand { width: 186px; }
     #log { padding: 22px 18px; }
     #compwrap { padding: 8px 18px 14px; }
+    #agents { padding: 0 18px; }
     #empty .chips { grid-template-columns: 1fr; width: min(360px, 100%); }
     .comp-hints #send-hint, .comp-hints > span:nth-child(2) { display: none; }
   }
@@ -1410,6 +1500,18 @@
               <span class="chip-d">How subagents split up work</span>
             </button>
           </div>
+        </div>
+      </div>
+
+      <!-- A4: spawned agents of this chat -->
+      <div id="agents" hidden>
+        <div class="ag-box" id="ag-box">
+          <div class="ag-head" id="ag-head" role="button" tabindex="0" aria-expanded="true">
+            <svg class="ag-chev" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+            <span class="ag-title">Agents</span>
+            <span class="ag-count" id="ag-count"></span>
+          </div>
+          <div class="ag-list" id="ag-list"></div>
         </div>
       </div>
 
@@ -2438,8 +2540,105 @@
   }
 
   // Called by Rust: window.render(d)
+  // ---- A4: agents panel ----
+  var agentsData = [];
+  var agentsAt = 0;
+  var agentsCollapsed = false;
+  try { agentsCollapsed = localStorage.getItem("habi.agents.collapsed") === "1"; } catch (e) {}
+  var AG_STATE = { queued: "Waiting for a free place", working: "Working", done: "Done", failed: "Stopped" };
+
+  function agentRunning(a) { return a.state === "working" || a.state === "queued"; }
+
+  function agentTime(a) {
+    var s = a.secs + (agentRunning(a) ? Math.floor((Date.now() - agentsAt) / 1000) : 0);
+    return s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s";
+  }
+
+  function agentButton(label, title, cls, msg) {
+    var b = document.createElement("button");
+    b.className = "ag-btn" + (cls ? " " + cls : "");
+    b.textContent = label;
+    b.title = title;
+    b.addEventListener("click", function () { postToRust(msg); });
+    return b;
+  }
+
+  function renderAgents() {
+    var wrap = document.getElementById("agents");
+    var list = document.getElementById("ag-list");
+    var box = document.getElementById("ag-box");
+    if (!wrap || !list || !box) return;
+    wrap.hidden = agentsData.length === 0;
+    if (!agentsData.length) return;
+    var running = agentsData.filter(agentRunning).length;
+    var finished = agentsData.length - running;
+    var parts = [];
+    if (running) parts.push(running + " running");
+    if (finished) parts.push(finished + " finished");
+    document.getElementById("ag-count").textContent = parts.join(" · ");
+    box.classList.toggle("collapsed", agentsCollapsed);
+    document.getElementById("ag-head").setAttribute("aria-expanded", agentsCollapsed ? "false" : "true");
+    list.textContent = "";
+    agentsData.forEach(function (a) {
+      var card = document.createElement("div");
+      card.className = "ag-card " + a.state;
+      card.setAttribute("data-id", a.id);
+      var dot = document.createElement("span");
+      dot.className = "ag-dot";
+      dot.title = AG_STATE[a.state] || a.state;
+      var role = document.createElement("span");
+      role.className = "ag-role";
+      role.textContent = a.name;
+      var task = document.createElement("span");
+      task.className = "ag-task";
+      task.textContent = a.task;
+      task.title = a.task;
+      var time = document.createElement("span");
+      time.className = "ag-time";
+      time.textContent = agentTime(a);
+      var acts = document.createElement("span");
+      acts.className = "ag-acts";
+      acts.appendChild(agentButton("Open", "Open this agent's transcript", "", { type: "load", id: a.id }));
+      if (agentRunning(a)) {
+        acts.appendChild(agentButton("Stop", "Stop this agent", "stop", { type: "agent_stop", id: a.id }));
+      }
+      var detail = document.createElement("span");
+      detail.className = "ag-detail";
+      detail.textContent = a.detail || AG_STATE[a.state] || "";
+      detail.title = a.detail || "";
+      card.appendChild(dot);
+      card.appendChild(role);
+      card.appendChild(task);
+      card.appendChild(time);
+      card.appendChild(acts);
+      card.appendChild(detail);
+      list.appendChild(card);
+    });
+  }
+
+  function toggleAgents() {
+    agentsCollapsed = !agentsCollapsed;
+    try { localStorage.setItem("habi.agents.collapsed", agentsCollapsed ? "1" : "0"); } catch (e) {}
+    renderAgents();
+  }
+
+  // Running agents' clocks tick between paints.
+  setInterval(function () {
+    if (!agentsData.some(agentRunning)) return;
+    var cards = document.querySelectorAll("#ag-list .ag-card");
+    for (var i = 0; i < cards.length; i++) {
+      var a = agentsData[i];
+      var t = cards[i].querySelector(".ag-time");
+      if (a && t) t.textContent = agentTime(a);
+    }
+  }, 1000);
+
   window.render = function (d) {
     if (!d) return;
+
+    agentsData = d.agents || [];
+    agentsAt = Date.now();
+    renderAgents();
 
     // Window and header title
     var title = d.title || "New chat";
@@ -2849,6 +3048,16 @@
           sideQuery = "";
           renderSidebar();
           sideSearch.blur();
+        }
+      });
+    }
+    var agHead = document.getElementById("ag-head");
+    if (agHead) {
+      agHead.addEventListener("click", toggleAgents);
+      agHead.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          toggleAgents();
         }
       });
     }

@@ -93,7 +93,7 @@ pub fn parse_md(path: &Path, text: &str) -> Doc {
 
 /// `---` as the whole first line, then everything up to the next line that
 /// is exactly `---` (trailing spaces allowed). Returns (frontmatter, body).
-fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
     let rest = text.strip_prefix("---")?;
     let rest = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n'))?;
     let mut offset = 0;

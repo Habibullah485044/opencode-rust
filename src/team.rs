@@ -285,6 +285,8 @@ async fn run_worker_agent(
         system.push_str(&crate::worktree::isolation_prompt(ws));
     }
     let opts = crate::server::LoopOpts {
+        model: None,
+        max_steps: None,
         agent: None,
         system,
         emit_activity: false,

@@ -1,192 +1,592 @@
-//! M2: subagent spawn — the `spawn` tool runs a named subagent
-//! (`explore`/`worker`) in a child session with a restricted toolset and
-//! returns its summary to the parent as a tool result.
+//! M2/A3: subagents. The `spawn` tool starts a role (built-in, or from a
+//! role file — see `agents::load_subagents`) in a child session with its own
+//! tools, model and step limit. A plain spawn waits and returns the child's
+//! report; `background: true` returns at once, and the parent manages the
+//! child with `agent_wait`, `agent_send`, `agent_stop` and `agent_list`.
+//! At most `agent.max_subagents` children of one chat run at the same time;
+//! the rest wait in line.
 
-use crate::agents;
+use crate::agents::{self, SubagentDef};
 use crate::db::Part;
 use crate::provider::{ToolFnSpec, ToolSpec};
 use crate::server::{agent_status, run_loop, AgentInfo, LoopOpts, Shared};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::sync::atomic::AtomicBool;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+fn spec(name: &str, description: &str, parameters: Value) -> ToolSpec {
+    ToolSpec {
+        kind: "function".into(),
+        function: ToolFnSpec { name: name.into(), description: description.into(), parameters },
+    }
+}
 
 /// Model-facing spec for the `spawn` tool (only present for top-level
 /// build-mode runs; plan mode and subagents never see it).
-pub fn spawn_spec() -> ToolSpec {
-    let names: Vec<&str> = agents::builtin_subagents().iter().map(|d| d.name).collect();
-    ToolSpec {
-        kind: "function".into(),
-        function: ToolFnSpec {
-            name: "spawn".into(),
-            description: "Run a subagent on an isolated task in a child session. \
-                 `explore` is read-only (search/read/report); `worker` has the full \
-                 toolset. Returns the subagent's summary. Use for work that can be \
-                 done independently of the current conversation. When the user asks \
-                 to spawn agents or to work on several things at once, call spawn \
-                 right away — one spawn per independent piece — instead of \
-                 exploring serially yourself."
-                .into(),
-            parameters: json!({
+pub fn spawn_spec(roles: &[SubagentDef]) -> ToolSpec {
+    let names: Vec<&str> = roles.iter().map(|d| d.name.as_str()).collect();
+    spec(
+        "spawn",
+        &format!(
+            "Run a subagent on one self-contained task in its own child session. Roles:\n{}\n\n\
+             Split work that has independent parts and spawn one agent per part in the same \
+             turn — they run in parallel. Give each a complete task: the goal, the files or \
+             area, what done looks like, and what to report back; the agent cannot see this \
+             conversation. Give workers separate files. With `background: true` the call \
+             returns at once; collect the reports later with agent_wait. When the user asks to \
+             spawn agents or to work on several things at once, call spawn right away instead \
+             of exploring serially yourself.",
+            agents::subagent_index(roles)
+        ),
+        json!({
+            "type": "object",
+            "properties": {
+                "subagent": { "type": "string", "enum": names, "description": "Which role to run" },
+                "task": { "type": "string", "description": "The complete, self-contained task" },
+                "background": { "type": "boolean", "description": "Return at once and keep working; collect the report with agent_wait (default false)" }
+            },
+            "required": ["subagent", "task"]
+        }),
+    )
+}
+
+/// Tools for managing spawned agents (offered together with `spawn`).
+pub const AGENT_TOOLS: &[&str] = &["agent_wait", "agent_send", "agent_stop", "agent_list"];
+
+pub fn is_agent_tool(name: &str) -> bool {
+    AGENT_TOOLS.contains(&name)
+}
+
+pub fn agent_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        spec(
+            "agent_wait",
+            "Wait for spawned agents to finish and get their reports. Without `ids`, waits for \
+             every agent of this chat whose report you have not read yet.",
+            json!({
                 "type": "object",
                 "properties": {
-                    "subagent": { "type": "string", "enum": names, "description": "Which subagent to run" },
-                    "task": { "type": "string", "description": "The complete, self-contained task" }
-                },
-                "required": ["subagent", "task"]
-            }),
-        },
-    }
-}
-
-/// Most subagents one parent session may run at the same time (B-27).
-pub const MAX_RUNNING_SUBAGENTS: usize = 4;
-
-/// Running children per parent session (B-27).
-fn running() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
-    static RUNNING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
-        std::sync::OnceLock::new();
-    RUNNING.get_or_init(Default::default)
-}
-
-/// One running child (B-27). The slot is given back when this value is
-/// dropped, also on error, abort or panic.
-struct SpawnSlot(String);
-
-impl SpawnSlot {
-    fn take(parent: &str) -> Result<Self> {
-        let mut map = running().lock().map_err(|_| anyhow!("subagent counter is poisoned"))?;
-        let count = map.entry(parent.to_string()).or_insert(0);
-        if *count >= MAX_RUNNING_SUBAGENTS {
-            return Err(anyhow!(
-                "too many subagents at once: at most {MAX_RUNNING_SUBAGENTS} can run for this \
-                 session. Wait for their results, then spawn the rest."
-            ));
-        }
-        *count += 1;
-        Ok(SpawnSlot(parent.to_string()))
-    }
-}
-
-impl Drop for SpawnSlot {
-    fn drop(&mut self) {
-        if let Ok(mut map) = running().lock() {
-            if let Some(count) = map.get_mut(&self.0) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    map.remove(&self.0);
+                    "ids": { "type": "array", "items": { "type": "string" }, "description": "Agent ids (session ids) to wait for" },
+                    "timeout_secs": { "type": "integer", "description": "Stop waiting after this many seconds and say who is still running (default 600)" }
                 }
-            }
-        }
+            }),
+        ),
+        spec(
+            "agent_send",
+            "Send a message to a spawned agent: more instructions, a correction, or a follow-up \
+             task. A running agent reads it before its next step; a finished one starts again \
+             with it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The agent id" },
+                    "message": { "type": "string", "description": "What to tell the agent" }
+                },
+                "required": ["id", "message"]
+            }),
+        ),
+        spec(
+            "agent_stop",
+            "Stop a spawned agent that is no longer needed.",
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": "The agent id" } },
+                "required": ["id"]
+            }),
+        ),
+        spec(
+            "agent_list",
+            "List this chat's spawned agents with their role, state and running time.",
+            json!({ "type": "object", "properties": {} }),
+        ),
+    ]
+}
+
+/// One spawned agent, from start until the app closes.
+#[derive(Clone)]
+struct Run {
+    parent: String,
+    role: SubagentDef,
+    task: String,
+    /// queued | working | done | failed | stopped
+    state: &'static str,
+    started: Instant,
+    ended: Option<Instant>,
+    report: Option<String>,
+    abort: Arc<AtomicBool>,
+    /// Messages from the parent, read before the child's next step.
+    inbox: Vec<String>,
+    background: bool,
+    /// The parent has read the latest report.
+    delivered: bool,
+}
+
+impl Run {
+    fn running(&self) -> bool {
+        matches!(self.state, "queued" | "working")
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.ended.unwrap_or_else(Instant::now).duration_since(self.started)
     }
 }
 
-/// Execute a `spawn` call: child session + restricted loop, summary back.
+/// Every spawned agent, by child session id.
+fn runs() -> &'static Mutex<HashMap<String, Run>> {
+    static RUNS: OnceLock<Mutex<HashMap<String, Run>>> = OnceLock::new();
+    RUNS.get_or_init(Default::default)
+}
+
+fn with_runs<T>(f: impl FnOnce(&mut HashMap<String, Run>) -> T) -> T {
+    let mut map = runs().lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut map)
+}
+
+/// The running places of each parent chat: `agent.max_subagents` permits,
+/// so extra spawns wait in line instead of failing.
+fn slots(parent: &str, max: usize) -> Arc<tokio::sync::Semaphore> {
+    static SLOTS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> = OnceLock::new();
+    let mut map = SLOTS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(parent.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(max.max(1))))
+        .clone()
+}
+
+fn info(id: &str, run: &Run) -> AgentInfo {
+    AgentInfo {
+        id: id.to_string(),
+        parent: run.parent.clone(),
+        name: run.role.name.clone(),
+        task: run.task.clone(),
+    }
+}
+
+/// Execute a `spawn` call. A plain spawn waits for the child and returns its
+/// report; `background: true` returns the child's id at once.
 pub async fn spawn_subagent(
     st: &Shared,
     parent_session_id: &str,
     args: &Value,
     abort: &AtomicBool,
 ) -> Result<String> {
+    let roles = agents::load_subagents(&st.workspace_for(parent_session_id));
+    let names = || roles.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
     let name = args
         .get("subagent")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("missing `subagent` (one of: explore, worker)"))?;
+        .ok_or_else(|| anyhow!("missing `subagent` (one of: {})", names()))?;
     let task = args
         .get("task")
         .and_then(Value::as_str)
         .filter(|t| !t.trim().is_empty())
         .ok_or_else(|| anyhow!("missing `task` — give the subagent a complete task"))?;
-    let def = agents::find_subagent(name)
-        .ok_or_else(|| anyhow!("unknown subagent `{name}` (available: explore, worker)"))?;
-    // B-27: held until this function returns.
-    let _slot = SpawnSlot::take(parent_session_id)?;
+    let role = roles
+        .iter()
+        .find(|r| r.name == name)
+        .cloned()
+        .ok_or_else(|| anyhow!("unknown subagent `{name}` (available: {})", names()))?;
+    let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
+    let id = start(st, parent_session_id, role, task, background)?;
+    if background {
+        return Ok(format!(
+            "[subagent `{name}` → session {id} · started in the background]\n\
+             It works on its own now. Collect its report with agent_wait (ids: [\"{id}\"]); \
+             send it more instructions with agent_send."
+        ));
+    }
+    wait_for(&[id.clone()], None, abort).await;
+    if abort.load(Ordering::SeqCst) {
+        stop(&id);
+        // Give the child a moment to end, so its last status is out.
+        wait_for(&[id.clone()], Some(Duration::from_secs(5)), &AtomicBool::new(false)).await;
+        return Err(anyhow!("subagent `{name}` was aborted before it finished"));
+    }
+    let run = with_runs(|m| {
+        let run = m.get_mut(&id)?;
+        run.delivered = true;
+        Some(run.clone())
+    })
+    .ok_or_else(|| anyhow!("subagent `{name}` disappeared"))?;
+    match run.state {
+        "done" => Ok(run.report.unwrap_or_default()),
+        _ => Err(anyhow!("{}", run.report.unwrap_or_else(|| format!("subagent `{name}` {}", run.state)))),
+    }
+}
 
-    let session = st.db.create_session(&format!("sub:{name}"), Some(parent_session_id))?;
+/// Create the child session, register the run and start it. Returns the
+/// child's id (its session id).
+fn start(st: &Shared, parent: &str, role: SubagentDef, task: &str, background: bool) -> Result<String> {
+    let session = st.db.create_session(&format!("sub:{}", role.name), Some(parent))?;
     st.db
         .add_message(&session.id, "user", &[Part::Text { text: task.to_string() }])?;
+    let run = Run {
+        parent: parent.to_string(),
+        role,
+        task: task.to_string(),
+        state: "queued",
+        started: Instant::now(),
+        ended: None,
+        report: None,
+        abort: Arc::new(AtomicBool::new(false)),
+        inbox: Vec::new(),
+        background,
+        delivered: false,
+    };
+    agent_status(st, &info(&session.id, &run), "queued", "waiting for a free place…".into());
+    with_runs(|m| m.insert(session.id.clone(), run));
+    launch(st.clone(), session.id.clone());
+    Ok(session.id)
+}
 
-    // Restricted system prompt: def.system as base + project instructions.
-    // The child works in its parent chat's project folder.
-    let project_ws = st.workspace_for(&session.id);
+/// Run the child as its own task. Deliberately NOT async (like
+/// `spawn_claimed_run`): it keeps run_loop → spawn → run_loop from being one
+/// recursive future type.
+fn launch(st: Shared, id: String) {
+    tokio::spawn(async move {
+        let (state, report) = match run_child(&st, &id).await {
+            Ok((state, report)) => (state, report),
+            Err(e) => ("failed", format!("error: {e:#}")),
+        };
+        finish(&st, &id, state, report);
+    });
+}
+
+/// Record how a run ended and tell the agents panel (and, for a background
+/// agent, the parent chat).
+fn finish(st: &Shared, id: &str, state: &'static str, report: String) {
+    let Some(run) = with_runs(|m| {
+        let run = m.get_mut(id)?;
+        run.state = state;
+        run.ended = Some(Instant::now());
+        run.report = Some(report.clone());
+        Some(run.clone())
+    }) else {
+        return;
+    };
+    let first = report.lines().nth(1).or(report.lines().next()).unwrap_or("");
+    agent_status(st, &info(id, &run), if state == "stopped" { "failed" } else { state }, first.to_string());
+    if run.background {
+        let _ = st.events.send(crate::server::ServerEvent::Note {
+            session_id: run.parent.clone(),
+            text: format!("background agent `{}` ({id}) {state}", run.role.name),
+        });
+    }
+}
+
+/// Wait for a place, run the role's loop (again while messages arrive), and
+/// build the report. Returns the end state and the report.
+async fn run_child(st: &Shared, id: &str) -> Result<(&'static str, String)> {
+    let run = with_runs(|m| m.get(id).cloned()).ok_or_else(|| anyhow!("unknown agent {id}"))?;
+    let abort = run.abort.clone();
+    let role = run.role.clone();
+    let agent = info(id, &run);
+    let sem = slots(&run.parent, st.cfg.agent.max_subagents);
+    let _permit = tokio::select! {
+        p = sem.acquire_owned() => p.ok(),
+        _ = wait_flag(&abort) => None,
+    };
+    if abort.load(Ordering::SeqCst) {
+        return Ok(("stopped", report(st, id, &run, "stopped", "stopped before it started")));
+    }
+    with_runs(|m| m.get_mut(id).map(|r| r.state = "working"));
+    agent_status(st, &agent, "working", "starting…".into());
+
+    // The child works in its parent chat's project folder, with the project
+    // instructions and the role's prompt.
+    let project_ws = st.workspace_for(id);
     let agents_md = crate::skills::load_agents_md(&project_ws);
     let system = agents::compose_system(agents::PromptInputs {
         workspace: &project_ws,
         mode: crate::agents::AgentMode::Build,
-        configured: Some(def.system),
+        configured: Some(&role.system),
         agents_md: agents_md.as_deref(),
         skills: &[],
         subagents: &[],
-        ponytail: st.ponytail_level(parent_session_id), // P-05: parent's level
+        ponytail: st.ponytail_level(&run.parent), // P-05: parent's level
         baked: &crate::skills::load_baked(&st.skill_base),
     });
     // B-27: the shared prompt says "ask when unclear"; a child has nobody to ask.
     const CHILD_RULES: &str = "\n\n## Running as a subagent\n\n\
         Nobody can answer questions during this run. Do not ask clarifying \
         questions: make the most reasonable assumption, say which one in your \
-        summary, and finish the task.";
-    let system = format!("{system}{CHILD_RULES}");
-    // M7: the agents panel watches this run through `AgentStatus` events.
-    let agent = AgentInfo {
-        id: session.id.clone(),
-        name: name.to_string(),
-        task: task.to_string(),
-    };
-    agent_status(st, &agent, "working", "starting…".into());
+        summary, and finish the task. End with a short report: what you found \
+        or changed (with file paths), how you checked it, and anything left open.";
+    let mut system = format!("{system}{CHILD_RULES}");
 
-    // F-05: with `agent.isolate_workers`, a `worker` runs in its own git
-    // worktree and keeps to the built-in tools.
-    let iso = (st.cfg.agent.isolate_workers && name == "worker")
-        .then(|| crate::worktree::Isolation::start(&project_ws, &st.state_dir, "worker"));
+    // F-05: an isolated role runs in its own git worktree and keeps to the
+    // built-in tools.
+    let isolate = role.isolate.unwrap_or(st.cfg.agent.isolate_workers && role.name == "worker");
+    let iso = isolate.then(|| crate::worktree::Isolation::start(&project_ws, &st.state_dir, &role.name));
     let iso_ws = iso.as_ref().and_then(|i| i.workspace());
-    let mut system = system;
-    let mut allow = def.tools.map(|t| t.iter().map(|s| s.to_string()).collect());
+    let mut allow = role.tools.clone();
     if let Some(ws) = &iso_ws {
         system.push_str(&crate::worktree::isolation_prompt(ws));
         allow = Some(crate::worktree::local_tool_names());
     }
+    // A read-only role may use the cheaper small model.
+    let model = role.model.clone().or_else(|| {
+        role.read_only.then(|| st.cfg.provider.small_model.clone()).flatten()
+    });
     let opts = LoopOpts {
         system,
         emit_activity: false, // activity goes to the agents panel instead
         allow,
         can_spawn: false, // no recursive spawning
         agent: Some(agent.clone()),
-        workspace: iso_ws.or_else(|| st.run_workspace(&session.id)),
+        workspace: iso_ws.or_else(|| st.run_workspace(id)),
+        model,
+        max_steps: role.max_steps,
     };
-    let out = match run_loop(st, &session.id, &opts, abort).await {
-        Ok(out) => out,
-        Err(e) => {
-            agent_status(st, &agent, "failed", format!("{e:#}"));
-            return Err(e);
-        }
-    };
-    // B-27: run_loop returns "aborted" when stopped; that is not a result.
-    if abort.load(std::sync::atomic::Ordering::SeqCst) || out.trim() == "aborted" {
-        agent_status(st, &agent, "failed", "aborted".into());
-        return Err(anyhow!("subagent `{name}` was aborted before it finished"));
+    let mut out = run_loop(st, id, &opts, &abort).await;
+    // A message that came in after the last step starts another round.
+    while out.is_ok() && !abort.load(Ordering::SeqCst) {
+        let Some(text) = take_inbox(id) else { break };
+        st.db.add_message(id, "user", &[Part::Text { text }])?;
+        out = run_loop(st, id, &opts, &abort).await;
     }
-    let summary = if out.trim().is_empty() { "(no summary)".into() } else { out };
-    let mut summary = summary;
+    let aborted = abort.load(Ordering::SeqCst);
+    let (state, mut summary) = match out {
+        // B-27: run_loop returns "aborted" when stopped; that is not a result.
+        _ if aborted => ("stopped", "stopped before it finished".to_string()),
+        Ok(text) if text.trim() == "aborted" => ("stopped", "stopped before it finished".to_string()),
+        Ok(text) if text.trim().is_empty() => ("done", "(no summary)".to_string()),
+        Ok(text) => ("done", text),
+        Err(e) => ("failed", format!("error: {e:#}")),
+    };
     if summary.chars().count() > 4000 {
         summary = summary.chars().take(4000).collect::<String>() + "…";
     }
     // F-05: report what the worktree produced, or why there was none. The
-    // user sees it as a note too. An aborted worker's changes are dropped.
-    if let Some(iso) = iso.filter(|_| !abort.load(std::sync::atomic::Ordering::SeqCst)) {
-        let report = iso.finish(&st.state_dir);
+    // user sees it as a note too. A stopped worker's changes are dropped.
+    if let Some(iso) = iso.filter(|_| !aborted) {
+        let made = iso.finish(&st.state_dir);
         let _ = st.events.send(crate::server::ServerEvent::Note {
-            session_id: parent_session_id.to_string(),
-            text: format!("worker {}: {report}", session.id),
+            session_id: run.parent.clone(),
+            text: format!("{} {id}: {made}", role.name),
         });
         summary.push_str("\n\n");
-        summary.push_str(&report);
+        summary.push_str(&made);
     }
-    agent_status(
-        st,
-        &agent,
-        "done",
-        summary.lines().next().unwrap_or("").to_string(),
+    Ok((state, report(st, id, &run, state, &summary)))
+}
+
+/// Resolves once `flag` is set.
+async fn wait_flag(flag: &AtomicBool) {
+    while !flag.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The report the parent reads: one header line with the facts, the files
+/// the child wrote, then its own summary.
+fn report(st: &Shared, id: &str, run: &Run, state: &str, summary: &str) -> String {
+    let mut calls = 0;
+    let mut files: Vec<String> = Vec::new();
+    for m in st.db.messages(id).unwrap_or_default() {
+        for p in m.parts {
+            if let Part::ToolCall { name, input, .. } = p {
+                calls += 1;
+                let path = input.get("path").and_then(Value::as_str);
+                if let (true, Some(path)) = (matches!(name.as_str(), "write" | "edit"), path) {
+                    if !files.iter().any(|f| f == path) {
+                        files.push(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut head = format!(
+        "[subagent `{}` → session {id} · {state} · {:.1}s · {calls} tool call{}",
+        run.role.name,
+        run.elapsed().as_secs_f64(),
+        if calls == 1 { "" } else { "s" },
     );
-    Ok(format!("[subagent `{name}` → session {}]\n{}", session.id, summary))
+    if let Ok(u) = st.db.usage_totals(Some(id), None) {
+        if u.input + u.output > 0 {
+            head.push_str(&format!(" · {} tokens", u.input + u.output));
+        }
+    }
+    head.push(']');
+    if !files.is_empty() {
+        head.push_str(&format!("\nFiles written: {}", files.join(", ")));
+    }
+    format!("{head}\n{summary}")
+}
+
+/// Wait until none of `ids` is queued or working, `timeout` passes, or
+/// `abort` is set.
+async fn wait_for(ids: &[String], timeout: Option<Duration>, abort: &AtomicBool) {
+    let until = timeout.map(|t| Instant::now() + t);
+    loop {
+        let busy = with_runs(|m| ids.iter().any(|id| m.get(id).is_some_and(Run::running)));
+        if !busy || abort.load(Ordering::SeqCst) || until.is_some_and(|u| Instant::now() >= u) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Ask one agent to stop. False when it is not running.
+pub fn stop(id: &str) -> bool {
+    with_runs(|m| match m.get(id) {
+        Some(run) if run.running() => {
+            run.abort.store(true, Ordering::SeqCst);
+            true
+        }
+        _ => false,
+    })
+}
+
+/// Stop every running agent of a parent chat (the user stopped its run).
+pub fn stop_children(parent: &str) {
+    with_runs(|m| {
+        for run in m.values().filter(|r| r.parent == parent && r.running()) {
+            run.abort.store(true, Ordering::SeqCst);
+        }
+    });
+}
+
+fn take_inbox(id: &str) -> Option<String> {
+    with_runs(|m| {
+        let run = m.get_mut(id)?;
+        if run.inbox.is_empty() {
+            return None;
+        }
+        let msgs = std::mem::take(&mut run.inbox);
+        Some(format!("Message from the parent agent:\n\n{}", msgs.join("\n\n")))
+    })
+}
+
+/// Mail for a run before its next step: a child's messages from its parent,
+/// or a parent's finished background reports it has not read yet.
+pub fn take_mail(session_id: &str) -> Option<String> {
+    if let Some(text) = take_inbox(session_id) {
+        return Some(text);
+    }
+    let reports: Vec<String> = with_runs(|m| {
+        m.values_mut()
+            .filter(|r| r.parent == session_id && r.background && !r.delivered && !r.running())
+            .map(|r| {
+                r.delivered = true;
+                r.report.clone().unwrap_or_default()
+            })
+            .collect()
+    });
+    (!reports.is_empty())
+        .then(|| format!("Background agents finished:\n\n{}", reports.join("\n\n---\n\n")))
+}
+
+/// Execute `agent_wait`, `agent_send`, `agent_stop` or `agent_list` for the
+/// agents of `parent`.
+pub async fn agent_tool(st: &Shared, parent: &str, name: &str, input: &Value, abort: &AtomicBool) -> (String, bool) {
+    match agent_tool_inner(st, parent, name, input, abort).await {
+        Ok(out) => (out, true),
+        Err(e) => (format!("error: {e:#}"), false),
+    }
+}
+
+async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, abort: &AtomicBool) -> Result<String> {
+    let mine = |id: &str| with_runs(|m| m.get(id).filter(|r| r.parent == parent).cloned());
+    let id_arg = || {
+        let id = input.get("id").and_then(Value::as_str).ok_or_else(|| anyhow!("missing `id`"))?;
+        mine(id).map(|run| (id.to_string(), run)).ok_or_else(|| {
+            anyhow!("no agent `{id}` in this chat — agent_list shows the ids")
+        })
+    };
+    match name {
+        "agent_list" => {
+            let mut rows: Vec<(Instant, String)> = with_runs(|m| {
+                m.iter()
+                    .filter(|(_, r)| r.parent == parent)
+                    .map(|(id, r)| {
+                        let task: String = r.task.chars().take(80).collect();
+                        (r.started, format!("{id} · {} · {} · {:.0}s · {task}", r.role.name, r.state, r.elapsed().as_secs_f64()))
+                    })
+                    .collect()
+            });
+            rows.sort_by_key(|(t, _)| *t);
+            Ok(if rows.is_empty() {
+                "no agents spawned in this chat".into()
+            } else {
+                rows.into_iter().map(|(_, r)| r).collect::<Vec<_>>().join("\n")
+            })
+        }
+        "agent_stop" => {
+            let (id, _) = id_arg()?;
+            Ok(if stop(&id) { format!("stopping {id}") } else { format!("{id} is not running") })
+        }
+        "agent_send" => {
+            let (id, run) = id_arg()?;
+            let message = input
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| anyhow!("missing `message`"))?;
+            if run.running() {
+                with_runs(|m| m.get_mut(&id).map(|r| r.inbox.push(message.to_string())));
+                return Ok(format!("sent; {id} reads it before its next step"));
+            }
+            st.db.add_message(&id, "user", &[Part::Text { text: message.to_string() }])?;
+            with_runs(|m| {
+                m.get_mut(&id).map(|r| {
+                    r.state = "queued";
+                    r.ended = None;
+                    r.delivered = false;
+                    r.abort = Arc::new(AtomicBool::new(false));
+                })
+            });
+            agent_status(st, &info(&id, &run), "queued", "new message…".into());
+            launch(st.clone(), id.clone());
+            Ok(format!("sent; {id} started again — collect its report with agent_wait"))
+        }
+        "agent_wait" => {
+            let ids: Vec<String> = match input.get("ids").and_then(Value::as_array) {
+                Some(list) => {
+                    let ids: Vec<String> = list.iter().filter_map(Value::as_str).map(String::from).collect();
+                    if let Some(bad) = ids.iter().find(|id| mine(id).is_none()) {
+                        return Err(anyhow!("no agent `{bad}` in this chat — agent_list shows the ids"));
+                    }
+                    ids
+                }
+                None => with_runs(|m| {
+                    m.iter()
+                        .filter(|(_, r)| r.parent == parent && (r.running() || !r.delivered))
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                }),
+            };
+            if ids.is_empty() {
+                return Ok("no agents to wait for: every report has been read".into());
+            }
+            let secs = input.get("timeout_secs").and_then(Value::as_u64).unwrap_or(600).clamp(1, 3600);
+            wait_for(&ids, Some(Duration::from_secs(secs)), abort).await;
+            let mut done = Vec::new();
+            let mut busy = Vec::new();
+            with_runs(|m| {
+                for id in &ids {
+                    let Some(r) = m.get_mut(id) else { continue };
+                    if r.running() {
+                        busy.push(format!("{id} ({}, {}, {:.0}s)", r.role.name, r.state, r.elapsed().as_secs_f64()));
+                    } else {
+                        r.delivered = true;
+                        done.push(r.report.clone().unwrap_or_default());
+                    }
+                }
+            });
+            let mut out = done.join("\n\n---\n\n");
+            if !busy.is_empty() {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("Still running: {}", busy.join(", ")));
+            }
+            Ok(out)
+        }
+        other => Err(anyhow!("unknown agent tool `{other}`")),
+    }
 }
 
 #[cfg(test)]
@@ -240,12 +640,12 @@ data: [DONE]
 
     #[test]
     fn spawn_spec_shape() {
-        let s = spawn_spec();
+        let s = spawn_spec(&agents::builtin_subagents());
         assert_eq!(s.function.name, "spawn");
         assert_eq!(s.function.parameters["required"], json!(["subagent", "task"]));
         let names = s.function.parameters["properties"]["subagent"]["enum"].as_array().unwrap();
         let names: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
-        assert_eq!(names, vec!["explore", "worker"]);
+        assert_eq!(names, vec!["explore", "research", "plan", "worker", "review"]);
     }
 
     #[tokio::test]
@@ -377,7 +777,7 @@ data: [DONE]
         // Build the same spec list run_loop builds, via the public pieces.
         let mut specs = crate::tools::tool_specs();
         specs.extend(st.mcp.lock().await.specs());
-        specs.push(spawn_spec());
+        specs.push(spawn_spec(&agents::builtin_subagents()));
         let kept: Vec<String> = crate::agents::AgentMode::Plan
             .filter_specs(specs)
             .into_iter()
@@ -389,6 +789,8 @@ data: [DONE]
 
         // And the mode gate blocks a direct call, even with can_spawn.
         let opts = LoopOpts {
+            model: None,
+            max_steps: None,
             system: "s".into(),
             emit_activity: false,
             allow: None,
@@ -592,16 +994,120 @@ data: [DONE]
 mod b27_tests {
     use super::*;
 
-    #[test]
-    fn running_subagents_are_capped_per_parent() {
-        let parent = format!("ses_b27_cap_{}", std::process::id());
-        let slots: Vec<SpawnSlot> =
-            (0..MAX_RUNNING_SUBAGENTS).map(|_| SpawnSlot::take(&parent).unwrap()).collect();
-        let err = SpawnSlot::take(&parent).err().expect("cap reached").to_string();
-        assert!(err.contains("at most"), "{err}");
-        assert!(SpawnSlot::take("ses_b27_other").is_ok(), "other sessions are not affected");
-        drop(slots);
-        assert!(SpawnSlot::take(&parent).is_ok(), "slots come back when children finish");
+    /// Mock provider: waits `delay_ms`, then answers "got: <last user text>".
+    async fn echo_llm(delay_ms: u64) -> String {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<Value>| async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                let last = msgs
+                    .iter()
+                    .rev()
+                    .find(|m| m["role"] == "user")
+                    .and_then(|m| m["content"].as_str())
+                    .unwrap_or("")
+                    .lines()
+                    .last()
+                    .unwrap_or("")
+                    .to_string();
+                let frame = json!({"choices": [{"delta": {"content": format!("got: {last}")}, "finish_reason": "stop"}]});
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    format!("data: {frame}\n\ndata: [DONE]\n\n"),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/v1")
+    }
+
+    async fn state_with(delay_ms: u64, max: usize, tag: &str) -> (Shared, String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ocrs-a3-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = echo_llm(delay_ms).await;
+        cfg.provider.model = "mock".into();
+        cfg.agent.max_subagents = max;
+        let st = crate::server::build_state_ephemeral(cfg, dir.clone()).await;
+        let parent = st.db.create_session("p", None).unwrap().id;
+        (st, parent, dir)
+    }
+
+    fn states(parent: &str) -> Vec<&'static str> {
+        let mut v: Vec<_> = with_runs(|m| m.values().filter(|r| r.parent == parent).map(|r| r.state).collect());
+        v.sort();
+        v
+    }
+
+    async fn bg(st: &Shared, parent: &str, task: &str) -> String {
+        let args = json!({"subagent": "explore", "task": task, "background": true});
+        let out = spawn_subagent(st, parent, &args, &AtomicBool::new(false)).await.unwrap();
+        assert!(out.contains("started in the background"), "{out}");
+        out.split("session ").nth(1).unwrap().split(' ').next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn extra_spawns_wait_in_line_instead_of_failing() {
+        let (st, parent, dir) = state_with(400, 1, "queue").await;
+        let a = bg(&st, &parent, "first").await;
+        let b = bg(&st, &parent, "second").await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(states(&parent), ["queued", "working"], "one place: the second waits");
+        let no = AtomicBool::new(false);
+        let (out, ok) = agent_tool(&st, &parent, "agent_wait", &json!({}), &no).await;
+        assert!(ok, "{out}");
+        assert!(out.contains(&format!("session {a} · done")) && out.contains("got: first"), "{out}");
+        assert!(out.contains(&format!("session {b} · done")) && out.contains("got: second"), "{out}");
+        assert!(out.contains("1 tool call") || out.contains("0 tool calls"), "structured header: {out}");
+        let (out, _) = agent_tool(&st, &parent, "agent_wait", &json!({}), &no).await;
+        assert!(out.contains("every report has been read"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn background_agents_take_messages_and_report_to_the_parent() {
+        let (st, parent, dir) = state_with(50, 4, "send").await;
+        let id = bg(&st, &parent, "look around").await;
+        let no = AtomicBool::new(false);
+        wait_for(&[id.clone()], Some(Duration::from_secs(10)), &no).await;
+        // Not collected with agent_wait: it arrives as mail before the
+        // parent's next step, once.
+        let mail = take_mail(&parent).expect("finished background report");
+        assert!(mail.contains("got: look around"), "{mail}");
+        assert!(take_mail(&parent).is_none(), "delivered once");
+
+        // A finished agent starts again with the new message.
+        let (out, ok) = agent_tool(&st, &parent, "agent_send", &json!({"id": id, "message": "now check tests"}), &no).await;
+        assert!(ok && out.contains("started again"), "{out}");
+        let (out, _) = agent_tool(&st, &parent, "agent_wait", &json!({"ids": [id]}), &no).await;
+        assert!(out.contains("got: now check tests"), "{out}");
+        let (list, _) = agent_tool(&st, &parent, "agent_list", &json!({}), &no).await;
+        assert!(list.contains(&id) && list.contains("explore · done"), "{list}");
+        let (out, _) = agent_tool(&st, &parent, "agent_stop", &json!({"id": id}), &no).await;
+        assert!(out.contains("is not running"), "{out}");
+        // Another chat cannot reach this chat's agents.
+        let (out, ok) = agent_tool(&st, "ses_other", "agent_stop", &json!({"id": id}), &no).await;
+        assert!(!ok && out.contains("no agent"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stopping_the_parent_stops_its_agents() {
+        let (st, parent, dir) = state_with(3000, 4, "stop").await;
+        let id = bg(&st, &parent, "slow work").await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        st.abort_run(&parent).await;
+        let no = AtomicBool::new(false);
+        let (out, _) = agent_tool(&st, &parent, "agent_wait", &json!({"timeout_secs": 10}), &no).await;
+        assert!(out.contains(&format!("session {id} · stopped")), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

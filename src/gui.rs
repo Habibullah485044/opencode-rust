@@ -66,12 +66,39 @@ pub struct GuiState {
     /// Autonomy mode shown by the composer selector. The core owns the real
     /// value; this mirrors it for the page.
     pub perm_mode: PermissionMode,
+    /// A4: spawned agents, oldest first (the open chat's are shown).
+    pub agents: Vec<AgentCard>,
     /// New (B-37): the entries as the page last received them, and for which
     /// chat, so a paint only sends what changed. `RefCell` because painting
     /// only has `&GuiState`.
     sent: std::cell::RefCell<Vec<(EntryKind, String)>>,
     sent_session: std::cell::RefCell<Option<String>>,
 }
+
+/// A4: one spawned agent in the agents panel.
+#[derive(Debug, Clone)]
+pub struct AgentCard {
+    pub id: String,
+    /// The chat that spawned it.
+    pub parent: String,
+    pub name: String,
+    pub task: String,
+    /// queued | working | done | failed
+    pub state: String,
+    /// Current tool, or the first line of the result.
+    pub detail: String,
+    pub started: std::time::Instant,
+    pub ended: Option<std::time::Instant>,
+}
+
+impl AgentCard {
+    fn running(&self) -> bool {
+        matches!(self.state.as_str(), "queued" | "working")
+    }
+}
+
+/// Most agent cards kept; the oldest finished ones go first.
+const MAX_AGENT_CARDS: usize = 60;
 
 /// One chat in the sidebar.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -133,6 +160,7 @@ impl Default for GuiState {
             approval_timeout_secs: 300,
             usage: HashMap::new(),
             perm_mode: PermissionMode::Default,
+            agents: Vec::new(),
             sent: std::cell::RefCell::new(Vec::new()),
             sent_session: std::cell::RefCell::new(None),
         }
@@ -366,6 +394,9 @@ impl GuiState {
             self.usage.insert(session_id.clone(), *session);
             return;
         }
+        if let ServerEvent::AgentStatus { agent_id, parent_id, name, task, state, detail } = ev {
+            return self.on_agent(agent_id, parent_id, name, task, state, detail);
+        }
         // A chat was created or switched by another client: refresh the
         // sidebar, but never take over the chat the user is looking at.
         if matches!(ev, ServerEvent::SessionCreated { .. } | ServerEvent::SessionLoaded { .. }) {
@@ -397,6 +428,42 @@ impl GuiState {
             self.apply_event(ev);
             std::mem::swap(&mut self.entries, &mut live);
             self.background.insert(sid, live);
+        }
+    }
+
+    /// A4: upsert the agent's card.
+    fn on_agent(&mut self, id: String, parent: String, name: String, task: String, state: String, detail: String) {
+        let now = std::time::Instant::now();
+        let ended = !matches!(state.as_str(), "queued" | "working");
+        match self.agents.iter_mut().find(|a| a.id == id) {
+            Some(card) => {
+                if ended && card.ended.is_none() {
+                    card.ended = Some(now);
+                }
+                if !ended {
+                    // A message from the parent wakes a finished agent.
+                    card.ended = None;
+                }
+                card.state = state;
+                card.detail = detail;
+            }
+            None => {
+                self.agents.push(AgentCard {
+                    id,
+                    parent,
+                    name,
+                    task,
+                    state,
+                    detail,
+                    started: now,
+                    ended: ended.then_some(now),
+                });
+                if self.agents.len() > MAX_AGENT_CARDS {
+                    if let Some(i) = self.agents.iter().position(|a| !a.running()) {
+                        self.agents.remove(i);
+                    }
+                }
+            }
         }
     }
 
@@ -607,6 +674,22 @@ impl GuiState {
                 })
             })
             .collect();
+        let agents: Vec<serde_json::Value> = self
+            .agents
+            .iter()
+            .filter(|a| self.session.as_deref() == Some(a.parent.as_str()))
+            .map(|a| {
+                let secs = a.ended.unwrap_or_else(std::time::Instant::now).duration_since(a.started).as_secs();
+                serde_json::json!({
+                    "id": a.id,
+                    "name": a.name,
+                    "task": a.task,
+                    "state": a.state,
+                    "detail": a.detail,
+                    "secs": secs,
+                })
+            })
+            .collect();
         let projects: Vec<serde_json::Value> = self
             .projects
             .iter()
@@ -619,6 +702,7 @@ impl GuiState {
             "perm_mode": self.perm_mode.as_str(),
             "api": self.api.map(|(ok, ms)| serde_json::json!([ok, ms])),
             "sessions": sessions,
+            "agents": agents,
             "projects": projects,
             "current_project": self.current_project(),
             "entries": entries,
@@ -724,6 +808,8 @@ pub enum IpcMsg {
     PageError(String),
     /// New (F-06): the Stop button — abort the run of the chat on screen.
     Stop,
+    /// A4: stop one spawned agent.
+    AgentStop(String),
     /// Projects sidebar: a new chat inside project `id`.
     NewInProject(String),
     /// Add a project: this folder, or (no path) ask with a folder picker.
@@ -797,6 +883,7 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "mode" => Some(IpcMsg::Mode(PermissionMode::parse(v.get("mode")?.as_str()?)?)),
         "page_error" => Some(IpcMsg::PageError(v.get("msg")?.as_str()?.to_string())),
         "stop" => Some(IpcMsg::Stop),
+        "agent_stop" => Some(IpcMsg::AgentStop(v.get("id")?.as_str()?.to_string())),
         "new_in_project" => Some(IpcMsg::NewInProject(v.get("project")?.as_str()?.to_string())),
         "add_project" => Some(IpcMsg::AddProject(
             v.get("path").and_then(|p| p.as_str()).map(str::to_string).filter(|p| !p.trim().is_empty()),
@@ -1576,6 +1663,9 @@ pub async fn run(
                                 });
                                 changed = true;
                             }
+                        }
+                        UiMsg::Ipc(IpcMsg::AgentStop(id)) => {
+                            crate::subagent::stop(&id);
                         }
                         UiMsg::Ipc(IpcMsg::Approve { id, always }) => {
                             let answered = st.decide(&id, true, always);

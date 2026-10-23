@@ -69,6 +69,8 @@ reuse_gate = true
 # Their changes come back as patch files; nothing lands in your files until
 # the main agent (or you) applies the patch.
 # isolate_workers = false
+# Most subagents one chat runs at once; extra spawns wait their turn.
+# max_subagents = 4
 
 # F-08: check the work after every run that changed files (unset = off).
 # On failure the agent gets the output and up to verify_max_rounds tries to fix it.

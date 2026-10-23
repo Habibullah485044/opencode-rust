@@ -1149,10 +1149,10 @@ impl App {
                 }
                 self.push(EntryKind::System, text); // B-33: busy unchanged
             }
-            ServerEvent::AgentStatus { agent_id, name, task, state, detail } => {
+            ServerEvent::AgentStatus { agent_id, name, task, state, detail, .. } => {
                 let state = match state.as_str() {
                     "done" => TeamStatus::Done,
-                    "failed" => TeamStatus::Failed,
+                    "failed" | "stopped" => TeamStatus::Failed,
                     _ => TeamStatus::Working,
                 };
                 // Upsert by agent id: one card per spawned agent.
@@ -1162,6 +1162,10 @@ impl App {
                         // B-41: stop the card's clock the first time it ends.
                         if state != TeamStatus::Working && card.finished.is_none() {
                             card.finished = Some(std::time::Instant::now());
+                        }
+                        // A message from the parent wakes a finished agent.
+                        if state == TeamStatus::Working {
+                            card.finished = None;
                         }
                         card.state = state;
                         card.detail = detail;

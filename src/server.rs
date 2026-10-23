@@ -144,6 +144,9 @@ pub enum ServerEvent {
     /// `state` is "working", "done" or "failed".
     AgentStatus {
         agent_id: String,
+        /// The chat that spawned it.
+        #[serde(default)]
+        parent_id: String,
         name: String,
         task: String,
         state: String,
@@ -1277,6 +1280,8 @@ impl AppState {
 
     /// Ask the session's active run to stop. False when nothing runs.
     pub async fn abort_run(&self, session_id: &str) -> bool {
+        // Its spawned agents stop with it.
+        crate::subagent::stop_children(session_id);
         let busy = self.busy.read().await;
         match busy.get(session_id) {
             Some(flag) => {
@@ -1329,6 +1334,8 @@ async fn agent_inner(
     }
     let system = st.composed_system(session_id);
     let opts = LoopOpts {
+        model: None,
+        max_steps: None,
         system,
         emit_activity: true,
         allow: None,
@@ -1344,6 +1351,8 @@ async fn agent_inner(
 #[derive(Clone)]
 pub struct AgentInfo {
     pub id: String,
+    /// The chat that spawned it.
+    pub parent: String,
     pub name: String,
     pub task: String,
 }
@@ -1365,6 +1374,11 @@ pub struct LoopOpts {
     pub workspace: Option<PathBuf>,
     /// M7: this run is a spawned subagent — status goes to the agents panel.
     pub agent: Option<AgentInfo>,
+    /// Model for this run (a subagent role's own model). `None` = the
+    /// configured model.
+    pub model: Option<String>,
+    /// Most model calls in this run. `None` = `agent.max_steps`.
+    pub max_steps: Option<usize>,
 }
 
 impl AppState {
@@ -1421,7 +1435,7 @@ impl AppState {
             configured: self.cfg.agent.system_prompt.as_deref(),
             agents_md: agents_md.as_deref(),
             skills: &skills_list,
-            subagents: &agents::builtin_subagents(),
+            subagents: &agents::load_subagents(&workspace),
             ponytail: self.ponytail_level(session_id),
             baked: &baked,
         })
@@ -1633,7 +1647,7 @@ pub(crate) fn tool_allowed(mode: AgentMode, opts: &LoopOpts, name: &str) -> bool
     if !mode.allows_tool(name) {
         return false;
     }
-    if name == "spawn" && !opts.can_spawn {
+    if (name == "spawn" || crate::subagent::is_agent_tool(name)) && !opts.can_spawn {
         return false;
     }
     match &opts.allow {
@@ -1811,7 +1825,9 @@ pub async fn run_loop(
     }
     specs.extend(st.mcp.lock().await.specs());
     if opts.can_spawn {
-        specs.push(crate::subagent::spawn_spec());
+        let roles = agents::load_subagents(&st.workspace_for(session_id));
+        specs.push(crate::subagent::spawn_spec(&roles));
+        specs.extend(crate::subagent::agent_tool_specs());
     }
     let specs = mode.filter_specs(specs);
     let specs: Vec<_> = match &opts.allow {
@@ -1825,16 +1841,23 @@ pub async fn run_loop(
     let mut final_text = String::new();
     // New (B-26): set when the model stopped asking for tools by itself.
     let mut finished = false;
-    for _step in 0..st.cfg.agent.max_steps {
+    let max_steps = opts.max_steps.unwrap_or(st.cfg.agent.max_steps);
+    for _step in 0..max_steps {
         if abort.load(Ordering::SeqCst) {
             return Ok("aborted".into());
+        }
+        // A3: messages for a subagent from its parent, or finished
+        // background reports for a parent, arrive before the next step.
+        if let Some(text) = crate::subagent::take_mail(session_id) {
+            st.db.add_message(session_id, "user", &[Part::Text { text }])?;
         }
         // F-07: compact first when the context is nearly full.
         auto_compact_if_needed(st, session_id, &opts.system, &specs, abort).await;
         let msgs = build_chat_messages(st, session_id, &opts.system)?;
         // B-29: copy the client out of the lock; never hold it while waiting.
         let client = st.client.lock().await.clone();
-        let mut stream = client.stream(&client.model, &msgs, &specs).await?;
+        let model = opts.model.as_deref().unwrap_or(&client.model);
+        let mut stream = client.stream(model, &msgs, &specs).await?;
 
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -2012,9 +2035,8 @@ pub async fn run_loop(
     // so instead of ending with an empty, "successful" answer.
     if !finished {
         let msg = format!(
-            "stopped after {} steps (agent.max_steps) — the task may be unfinished. \
-             Send a message to continue, or raise agent.max_steps in the config.",
-            st.cfg.agent.max_steps
+            "stopped after {max_steps} steps (agent.max_steps) — the task may be unfinished. \
+             Send a message to continue, or raise agent.max_steps in the config."
         );
         let _ = st.events.send(ServerEvent::Note {
             session_id: session_id.to_string(),
@@ -2110,6 +2132,7 @@ fn finish_tool_call(
 pub(crate) fn agent_status(st: &Shared, a: &AgentInfo, state: &str, detail: String) {
     let _ = st.events.send(ServerEvent::AgentStatus {
         agent_id: a.id.clone(),
+        parent_id: a.parent.clone(),
         name: a.name.clone(),
         task: a.task.clone(),
         state: state.to_string(),
@@ -2318,6 +2341,8 @@ pub async fn run_review(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) 
         st.workspace_for(session_id).display()
     );
     let opts = LoopOpts {
+        model: None,
+        max_steps: None,
         system,
         emit_activity: false,
         allow: Some(vec!["read".to_string(), "glob".to_string(), "grep".to_string()]),
@@ -2579,6 +2604,9 @@ async fn execute_routed(
             Ok(out) => (out, true),
             Err(e) => (format!("error: {e:#}"), false),
         };
+    }
+    if crate::subagent::is_agent_tool(name) {
+        return crate::subagent::agent_tool(st, session_id, name, input, abort).await;
     }
     if name == "todo" {
         let op: crate::todo::TodoOp = match serde_json::from_value(input.clone()) {
@@ -3705,6 +3733,8 @@ data: [DONE]
         st.db.add_message(&s.id, "user", &[Part::Text { text: "loop".into() }]).unwrap();
         let mut rx = st.events.subscribe();
         let opts = LoopOpts {
+            model: None,
+            max_steps: None,
             system: "s".into(),
             emit_activity: true,
             allow: None,

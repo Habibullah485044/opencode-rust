@@ -72,39 +72,185 @@ impl AgentMode {
     }
 }
 
-/// One built-in subagent (Claude's Explore/Scout idea, MiniMax worker idea).
+/// A subagent role: who the child is, what it may use, how far it may go.
+/// Built-in roles are below; a project adds or overrides roles with
+/// Markdown files (see `load_subagents`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubagentDef {
-    pub name: &'static str,
-    pub description: &'static str,
-    /// Subagent system prompt.
-    pub system: &'static str,
-    /// Restricted tool list; `None` = all tools (except spawn itself).
-    pub tools: Option<&'static [&'static str]>,
+    pub name: String,
+    /// One line the parent model reads to pick the role.
+    pub description: String,
+    /// The role's system prompt.
+    pub system: String,
+    /// Allowed tools; `None` = every tool (except spawning).
+    pub tools: Option<Vec<String>>,
+    /// Model for this role (`None` = the chat's model; read-only built-in
+    /// roles use `provider.small_model` when one is set).
+    pub model: Option<String>,
+    /// Most model calls for one run of this role (`None` = agent.max_steps).
+    pub max_steps: Option<usize>,
+    /// Run in its own git worktree (`None` = agent.isolate_workers for
+    /// `worker`, off otherwise).
+    pub isolate: Option<bool>,
+    /// Never edits files: may use the cheaper `small_model`.
+    pub read_only: bool,
+    /// The file this role came from (`None` = built in).
+    pub source: Option<std::path::PathBuf>,
 }
+
+impl SubagentDef {
+    fn builtin(name: &str, description: &str, system: &str, tools: Option<&[&str]>, read_only: bool) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            system: system.into(),
+            tools: tools.map(|t| t.iter().map(|s| s.to_string()).collect()),
+            model: None,
+            max_steps: None,
+            isolate: None,
+            read_only,
+            source: None,
+        }
+    }
+}
+
+const READ_TOOLS: &[&str] = &["read", "list", "glob", "grep", "webfetch"];
 
 pub fn builtin_subagents() -> Vec<SubagentDef> {
     vec![
-        SubagentDef {
-            name: "explore",
-            description: "Read-only investigator: searches and reads code, reports findings, never modifies anything.",
-            system: "You are a read-only exploration subagent. Search and read the workspace, \
-                     then answer with precise findings (file paths and line references). You \
-                     cannot modify files — do not try.",
-            tools: Some(&["read", "list", "glob", "grep", "webfetch"]),
-        },
-        SubagentDef {
-            name: "worker",
-            description: "General-purpose subagent: completes an isolated task with the full toolset.",
-            system: "You are a focused worker subagent. Complete only the task you were given in \
-                     the workspace provided. Use tools as needed. Reply with a 1-2 sentence \
-                     summary of the outcome when done.",
-            tools: None,
-        },
+        SubagentDef::builtin(
+            "explore",
+            "Read-only investigator: searches and reads code, reports findings with file:line references. Never modifies anything.",
+            "You are a read-only exploration subagent. Search and read the workspace, then \
+             answer with precise findings (file paths and line references). You cannot modify \
+             files — do not try.",
+            Some(READ_TOOLS),
+            true,
+        ),
+        SubagentDef::builtin(
+            "research",
+            "Researcher: reads documentation and web pages (and the code when useful) and reports facts with their sources. Never modifies anything.",
+            "You are a research subagent. Find out what the task asks by reading documentation, \
+             web pages and the code. Report concrete facts, each with where you found it (URL or \
+             file:line). Say clearly what you could not confirm. You cannot modify files.",
+            Some(&["read", "list", "glob", "grep", "webfetch", "browser_navigate", "browser_snapshot", "browser_wait"]),
+            true,
+        ),
+        SubagentDef::builtin(
+            "plan",
+            "Planner: reads the code and returns a step-by-step plan (files to change, order, risks, how to check each step). Never modifies anything.",
+            "You are a planning subagent. Read the relevant code, then return a numbered plan: \
+             each step names the files it changes, what changes, and how to check it worked \
+             (a test, a command, something to look at). Flag risks and open questions. Keep it \
+             short and concrete. You cannot modify files.",
+            Some(READ_TOOLS),
+            true,
+        ),
+        SubagentDef::builtin(
+            "worker",
+            "Builder: completes one well-defined change with the full toolset (edit files, run commands). Give each worker its own files.",
+            "You are a focused worker subagent. Complete only the task you were given. Change \
+             only the files the task is about. Check your work (build, test or run it) before \
+             you finish. End with what you changed and how you checked it.",
+            None,
+            false,
+        ),
+        SubagentDef::builtin(
+            "review",
+            "Reviewer: checks a change against the task — reads the diff and code, runs tests or the build — and reports concrete problems. Does not edit.",
+            "You are a review subagent. Check the work described in the task: read the changed \
+             code, run the tests or the build when you can, and compare the result with what was \
+             asked. Report each real problem with file:line and how to fix it, most serious \
+             first. If it is good, say so in one line. Do not edit files.",
+            Some(&["read", "list", "glob", "grep", "bash"]),
+            true,
+        ),
     ]
 }
 
 pub fn find_subagent(name: &str) -> Option<SubagentDef> {
     builtin_subagents().into_iter().find(|d| d.name == name)
+}
+
+/// Every role for `workspace`: the built-in ones, then Markdown role files
+/// from the user's config (`<config>/opencode-rust/agents/`), the project's
+/// `.claude/agents/` and `.opencode/agents/` — a later file with the same
+/// name replaces the earlier role.
+pub fn load_subagents(workspace: &Path) -> Vec<SubagentDef> {
+    let mut roles = builtin_subagents();
+    let user = crate::config::default_config_path().parent().map(|p| p.join("agents"));
+    let dirs = user
+        .into_iter()
+        .chain([workspace.join(".claude").join("agents"), workspace.join(".opencode").join("agents")]);
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+            .collect();
+        files.sort();
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            if let Some(role) = parse_role_file(&path, &text) {
+                roles.retain(|r| r.name != role.name);
+                roles.push(role);
+            }
+        }
+    }
+    roles
+}
+
+/// A role file: `---` frontmatter, then the role's system prompt.
+///
+/// ```text
+/// ---
+/// name: security
+/// description: Looks for security problems in a change
+/// tools: read, grep, glob, bash      (or [read, grep]; leave out for all tools)
+/// model: anthropic/claude-sonnet-5-5 (optional)
+/// max_steps: 20                      (optional; max_turns also works)
+/// isolation: worktree                (optional: worktree | none)
+/// ---
+/// You are a security reviewer…
+/// ```
+/// `None` when there is no name or no prompt.
+pub fn parse_role_file(path: &Path, text: &str) -> Option<SubagentDef> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let (front, body) = crate::skills::split_frontmatter(text)?;
+    let mut role = SubagentDef::builtin("", "", body.trim(), None, false);
+    role.source = Some(path.to_path_buf());
+    for line in front.lines() {
+        let Some((key, value)) = line.split_once(':') else { continue };
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        match key.trim().to_ascii_lowercase().as_str() {
+            "name" => role.name = value.to_string(),
+            "description" => role.description = value.to_string(),
+            "tools" => {
+                let list: Vec<String> = value
+                    .trim_matches(|c| c == '[' || c == ']')
+                    .split(',')
+                    .map(|t| t.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                if !list.is_empty() && !list.iter().any(|t| t == "*" || t == "all") {
+                    role.read_only = !list.iter().any(|t| matches!(t.as_str(), "write" | "edit" | "bash"));
+                    role.tools = Some(list);
+                }
+            }
+            "model" if !value.is_empty() && value != "inherit" => role.model = Some(value.to_string()),
+            "max_steps" | "max_turns" => role.max_steps = value.parse().ok().filter(|n| *n > 0),
+            "isolation" => role.isolate = Some(value.eq_ignore_ascii_case("worktree")),
+            _ => {}
+        }
+    }
+    if role.name.is_empty() || role.system.is_empty() {
+        return None;
+    }
+    if role.description.is_empty() {
+        role.description = format!("Custom role from {}", path.display());
+    }
+    Some(role)
 }
 
 /// `- name: description` lines for the system prompt.
@@ -500,14 +646,51 @@ mod tests {
     #[test]
     fn subagent_roster() {
         let defs = builtin_subagents();
-        assert_eq!(defs.len(), 2);
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["explore", "research", "plan", "worker", "review"]);
         let explore = find_subagent("explore").unwrap();
         let tools = explore.tools.unwrap();
-        assert!(tools.contains(&"read"));
-        assert!(!tools.contains(&"write"));
-        assert!(!tools.contains(&"bash"));
+        assert!(tools.iter().any(|t| t == "read"));
+        assert!(!tools.iter().any(|t| t == "write" || t == "bash"));
+        assert!(explore.read_only);
         assert!(find_subagent("worker").unwrap().tools.is_none());
+        assert!(!find_subagent("worker").unwrap().read_only);
         assert!(find_subagent("nope").is_none());
         assert!(subagent_index(&defs).contains("- worker:"));
+    }
+
+    #[test]
+    fn role_files_add_and_replace_roles() {
+        let ws = std::env::temp_dir().join(format!("ocrs-roles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let dir = ws.join(".opencode").join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("security.md"),
+            "---\nname: security\ndescription: Finds security bugs\ntools: [read, grep]\n\
+             model: big/model\nmax_turns: 12\n---\nYou hunt for security bugs.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("worker.md"),
+            "---\nname: worker\ndescription: Our worker\nisolation: worktree\n---\nHouse rules.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("broken.md"), "no frontmatter here").unwrap();
+        let roles = load_subagents(&ws);
+        let sec = roles.iter().find(|r| r.name == "security").expect("file role loaded");
+        assert_eq!(sec.description, "Finds security bugs");
+        assert_eq!(sec.system, "You hunt for security bugs.");
+        assert_eq!(sec.tools.as_deref(), Some(&["read".to_string(), "grep".to_string()][..]));
+        assert!(sec.read_only);
+        assert_eq!(sec.model.as_deref(), Some("big/model"));
+        assert_eq!(sec.max_steps, Some(12));
+        let worker: Vec<_> = roles.iter().filter(|r| r.name == "worker").collect();
+        assert_eq!(worker.len(), 1, "the file replaces the built-in role");
+        assert_eq!(worker[0].system, "House rules.");
+        assert_eq!(worker[0].isolate, Some(true));
+        assert!(worker[0].tools.is_none() && !worker[0].read_only);
+        assert!(roles.iter().any(|r| r.name == "explore"), "built-ins stay");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

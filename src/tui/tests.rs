@@ -671,6 +671,7 @@
     fn agent_ev(id: &str, name: &str, state: &str, detail: &str) -> ServerEvent {
         ServerEvent::AgentStatus {
             agent_id: id.into(),
+            parent_id: "s".into(),
             name: name.into(),
             task: "inspect the tree".into(),
             state: state.into(),
