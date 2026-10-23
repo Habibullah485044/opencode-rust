@@ -30,6 +30,11 @@ pub struct Client {
     max_retries: u32,
     /// Wait before the first retry; doubles each time. Tests make it tiny.
     retry_base: std::time::Duration,
+    /// Longest total wait for a rate limit (`provider.rate_limit_wait_secs`).
+    rate_limit_wait: std::time::Duration,
+    /// Shared by all clones: when one request hits a rate limit, every
+    /// request of the app waits until it is over.
+    gate: std::sync::Arc<RateGate>,
     /// When to send prompt-caching markers (`provider.prompt_cache`).
     prompt_cache: crate::config::PromptCache,
     /// Ask OpenAI-style servers for usage at the end (`provider.stream_usage`).
@@ -186,6 +191,8 @@ impl Client {
             stall,
             max_retries: 0,
             retry_base: std::time::Duration::from_secs(1),
+            rate_limit_wait: std::time::Duration::ZERO,
+            gate: Default::default(),
             prompt_cache: crate::config::PromptCache::Auto,
             stream_usage: true,
         })
@@ -195,6 +202,7 @@ impl Client {
     pub fn from_cfg(base_url: &str, p: &crate::config::ProviderCfg) -> Result<Self> {
         let mut c = Self::new(base_url, &p.api_key, &p.model, p.request_timeout_secs)?;
         c.max_retries = p.max_retries;
+        c.rate_limit_wait = std::time::Duration::from_secs(p.rate_limit_wait_secs);
         c.api = p.api;
         c.max_tokens = p.max_tokens;
         c.prompt_cache = p.prompt_cache;
@@ -215,10 +223,14 @@ impl Client {
     ) -> Result<reqwest::Response> {
         let attempts = self.max_retries.saturating_add(1);
         let mut attempt: u32 = 0;
+        let started = std::time::Instant::now();
         loop {
+            // Another request of the app hit a rate limit: wait it out too.
+            self.gate.wait().await;
             attempt += 1;
-            // Each arm gives: error text, "worth retrying?", server's Retry-After.
-            let (mut msg, retryable, retry_after) = match build().send().await {
+            // Each arm gives: error text, "worth retrying?", server's wait,
+            // "rate limited?".
+            let (mut msg, retryable, retry_after, limited) = match build().send().await {
                 Ok(resp) if resp.status().is_success() => return Ok(resp),
                 Ok(resp) => {
                     let status = resp.status();
@@ -228,16 +240,37 @@ impl Client {
                         "provider returned {status}: {}",
                         text.chars().take(400).collect::<String>()
                     );
-                    (msg, is_retryable_status(status.as_u16()), retry_after)
+                    (msg, is_retryable_status(status.as_u16()), retry_after, status.as_u16() == 429)
                 }
                 Err(e) => {
                     let msg = format!(
                         "provider request to {url} failed: {e:?} \
                          (tunnel down or endpoint unreachable — check the base URL / heartbeat in the header)"
                     );
-                    (msg, is_retryable_send_error(&e), None)
+                    (msg, is_retryable_send_error(&e), None, false)
                 }
             };
+            // A rate limit is waited out (all requests together) for up to
+            // `rate_limit_wait` in total, however many tries that takes.
+            if limited && !self.rate_limit_wait.is_zero() {
+                let wait = retry_after
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or_else(|| backoff_delay(self.retry_base, attempt) + jitter());
+                let waited = started.elapsed();
+                if waited + wait > self.rate_limit_wait {
+                    msg.push_str(&format!(
+                        " (rate limited: the provider needs {}s more; waited {}s of the \
+                         {}s allowed by provider.rate_limit_wait_secs. Try again later, \
+                         or use another model or provider)",
+                        wait.as_secs(),
+                        waited.as_secs(),
+                        self.rate_limit_wait.as_secs()
+                    ));
+                    return Err(anyhow!(msg));
+                }
+                self.gate.pause(wait);
+                continue;
+            }
             if !retryable || attempt >= attempts {
                 if attempt > 1 {
                     msg.push_str(&format!(" (gave up after {attempt} attempts)"));
@@ -632,6 +665,34 @@ impl ToolCallAccumulator {
                 (id, name, v)
             })
             .collect()
+    }
+}
+
+/// When the app may send its next request (B: shared rate-limit wait).
+#[derive(Default)]
+pub struct RateGate {
+    until: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl RateGate {
+    /// Hold every request for `wait` from now (a longer pause stays).
+    fn pause(&self, wait: std::time::Duration) {
+        let mut until = self.until.lock().unwrap_or_else(|e| e.into_inner());
+        let end = std::time::Instant::now() + wait;
+        if until.is_none_or(|u| u < end) {
+            *until = Some(end);
+        }
+    }
+
+    /// Return once no pause is in force.
+    async fn wait(&self) {
+        loop {
+            let until = *self.until.lock().unwrap_or_else(|e| e.into_inner());
+            match until {
+                Some(u) if u > std::time::Instant::now() => tokio::time::sleep_until(u.into()).await,
+                _ => return,
+            }
+        }
     }
 }
 
@@ -1045,6 +1106,35 @@ mod f01_tests {
         let err = fast_client(&base, 2).stream("stub", &[], &[]).await.err().expect("fails");
         assert!(err.to_string().contains("gave up after 3 attempts"), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 3, "1 try + 2 retries");
+    }
+
+    #[tokio::test]
+    async fn rate_limits_are_waited_out_beyond_max_retries() {
+        let (base, hits) = scripted_provider(vec![(429, Some("0")), (429, None), (429, Some("0"))]).await;
+        let mut c = fast_client(&base, 0);
+        c.rate_limit_wait = Duration::from_secs(10);
+        assert!(c.stream("stub", &[], &[]).await.is_ok(), "the reply comes after the limit");
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+
+        let (base, hits) = scripted_provider(vec![(429, Some("120"))]).await;
+        let mut c = fast_client(&base, 3);
+        c.rate_limit_wait = Duration::from_secs(10);
+        let err = c.stream("stub", &[], &[]).await.err().expect("fails");
+        assert!(err.to_string().contains("rate_limit_wait_secs"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a wait beyond the budget fails at once");
+    }
+
+    #[tokio::test]
+    async fn one_rate_limit_holds_every_request() {
+        let gate = RateGate::default();
+        gate.pause(Duration::from_millis(300));
+        gate.pause(Duration::from_millis(50)); // a shorter pause does not cut it
+        let t = std::time::Instant::now();
+        gate.wait().await;
+        assert!(t.elapsed() >= Duration::from_millis(250), "{:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        gate.wait().await;
+        assert!(t.elapsed() < Duration::from_millis(50), "no pause, no wait");
     }
 
     #[tokio::test]

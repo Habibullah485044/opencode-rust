@@ -916,6 +916,7 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
     if let Ok(Err(e)) = snap {
         core_log(&format!("[snapshot] {e:#}"));
     }
+    let scratch = prepare_scratch(&st.workspace_for(session_id));
     let before = snapshot_stats(st, session_id);
     // New (P-02): fingerprint the git working tree first, so a run that only
     // ran read-only commands (ls, cargo test, git log) gets no review.
@@ -985,11 +986,41 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
             spawn_claimed_run(st.clone(), session_id.to_string(), next, flag);
             return;
         }
+        // Another run in the same project may still use the scratch folder.
+        if st.busy.read().await.len() <= 1 {
+            clear_scratch(&scratch);
+        }
         let _ = st.events.send(ServerEvent::RunFinished {
             session_id: session_id.to_string(),
             ok,
             message,
         });
+    }
+}
+
+/// A run's temporary files live in `<project>/.opencode/scratch/`: git
+/// ignores it (its own `.gitignore`), and it is removed when the run ends.
+pub fn scratch_dir(workspace: &std::path::Path) -> PathBuf {
+    workspace.join(".opencode").join("scratch")
+}
+
+/// Create the scratch folder. Returns it, and whether `.opencode` was made
+/// for it (then that goes too, so a project is left as it was).
+fn prepare_scratch(workspace: &std::path::Path) -> (PathBuf, bool) {
+    let dir = scratch_dir(workspace);
+    let made_parent = !workspace.join(".opencode").exists();
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join(".gitignore"), "*\n");
+    }
+    (dir, made_parent)
+}
+
+fn clear_scratch((dir, made_parent): &(PathBuf, bool)) {
+    let _ = std::fs::remove_dir_all(dir);
+    if *made_parent {
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::remove_dir(parent); // only when empty
+        }
     }
 }
 
@@ -1857,7 +1888,15 @@ pub async fn run_loop(
         // B-29: copy the client out of the lock; never hold it while waiting.
         let client = st.client.lock().await.clone();
         let model = opts.model.as_deref().unwrap_or(&client.model);
-        let mut stream = client.stream(model, &msgs, &specs).await?;
+        // A rate-limit wait can be long: Stop must still end it.
+        let mut stream = tokio::select! {
+            s = client.stream(model, &msgs, &specs) => s?,
+            _ = async {
+                while !abort.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } => return Ok("aborted".into()),
+        };
 
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -3687,6 +3726,35 @@ mod tests {
         assert!(debt.contains("+0"), "{debt}");
         assert!(debt.contains("0 write(s)"), "{debt}");
         assert_eq!(calls.load(Ordering::SeqCst), 2, "no review run was started");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run gets a scratch folder git ignores, and the project is left as
+    /// it was when the run ends — also when the run fails.
+    #[tokio::test]
+    async fn the_scratch_folder_is_gone_after_a_run() {
+        let dir = std::env::temp_dir().join(format!("ocrs-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let made = prepare_scratch(&dir);
+        assert_eq!(std::fs::read_to_string(made.0.join(".gitignore")).unwrap(), "*\n");
+        std::fs::write(made.0.join("probe.py"), "print(1)").unwrap();
+        clear_scratch(&made);
+        assert!(!dir.join(".opencode").exists(), "a .opencode made for scratch goes too");
+
+        std::fs::create_dir_all(dir.join(".opencode").join("agents")).unwrap();
+        let made = prepare_scratch(&dir);
+        clear_scratch(&made);
+        assert!(dir.join(".opencode").join("agents").exists(), "the project's own .opencode stays");
+        assert!(!scratch_dir(&dir).exists());
+
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:9".into(); // the run fails
+        cfg.provider.max_retries = 0;
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("s", None).unwrap();
+        run_agent(&st, &s.id, "hi", Arc::new(AtomicBool::new(false))).await;
+        assert!(!scratch_dir(&dir).exists(), "cleared after a failed run");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

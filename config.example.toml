@@ -41,6 +41,11 @@ request_timeout_secs = 600
 # connection error), waiting 1s, 2s, 4s... between tries. 0 = no retries.
 max_retries = 3
 
+# Rate limits (HTTP 429) are waited out for up to this many seconds in
+# total; every agent waits together, so parallel agents slow down instead
+# of failing. 0 = handle 429 like the errors above.
+rate_limit_wait_secs = 300
+
 # Prompt caching. Every request repeats the system prompt, the tool list and
 # the chat so far; providers can keep that start in a cache and bill it at a
 # fraction of the input price (Anthropic ~10%, OpenAI/DeepSeek 10-50%).

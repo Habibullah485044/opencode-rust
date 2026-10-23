@@ -424,7 +424,18 @@ fn report(st: &Shared, id: &str, run: &Run, state: &str, summary: &str) -> Strin
     if !files.is_empty() {
         head.push_str(&format!("\nFiles written: {}", files.join(", ")));
     }
-    format!("{head}\n{summary}")
+    // A failed agent's work so far stays in its session: tell the parent
+    // how to go on instead of leaving it at the error.
+    let next = if state == "failed" {
+        format!(
+            "\n\nThis agent did not finish; its work so far is kept. Next: resume it with \
+             agent_send {{\"id\": \"{id}\", \"message\": \"continue the task\"}}, or do the \
+             rest yourself — do not start over."
+        )
+    } else {
+        String::new()
+    };
+    format!("{head}\n{summary}{next}")
 }
 
 /// Wait until none of `ids` is queued or working, `timeout` passes, or
@@ -1118,6 +1129,22 @@ mod b27_tests {
         let no = AtomicBool::new(false);
         let (out, _) = agent_tool(&st, &parent, "agent_wait", &json!({"timeout_secs": 10}), &no).await;
         assert!(out.contains(&format!("session {id} · stopped")), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_agent_tells_the_parent_how_to_go_on() {
+        let dir = std::env::temp_dir().join(format!("ocrs-a3-failed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:9".into(); // nothing listens
+        cfg.provider.max_retries = 0;
+        let st = crate::server::build_state_ephemeral(cfg, dir.clone()).await;
+        let parent = st.db.create_session("p", None).unwrap();
+        let args = json!({"subagent": "explore", "task": "look around"});
+        let err = spawn_subagent(&st, &parent.id, &args, &AtomicBool::new(false)).await.unwrap_err();
+        let err = err.to_string();
+        assert!(err.contains("· failed ·") && err.contains("agent_send"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -369,7 +369,11 @@ pub fn compose_system(p: PromptInputs<'_>) -> String {
          Reply directly in chat, with no tool calls, when the user greets you, makes \
          small talk, thanks you, or asks something you can answer from what you \
          already know. Tools and file changes are for requests that ask for work. \
-         If a request is ambiguous, ask one short clarifying question instead of guessing.",
+         If a request is ambiguous, ask one short clarifying question instead of guessing.\n\n\
+         ## Temporary files\n\n\
+         Scratch scripts, test data and manual test runs go in `.opencode/scratch/` (git \
+         ignores it; it is deleted when the run ends). Run manual checks from inside it, \
+         not in the project folder. Leave no temporary files in the project.",
     );
 
     if let Some(md) = p.agents_md.filter(|s| !s.trim().is_empty()) {

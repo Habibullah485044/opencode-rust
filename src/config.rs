@@ -124,6 +124,11 @@ pub struct ProviderCfg {
     /// Extra tries for a failed provider request (connection error,
     /// HTTP 429/500/502/503/504/529). 0 = no retries.
     pub max_retries: u32,
+    /// How long to keep waiting out a rate limit (HTTP 429) before a
+    /// request fails, in seconds. Every agent of the app waits together, so
+    /// parallel agents do not keep hitting the limit. 0 = treat 429 like
+    /// any other retryable error (`max_retries`).
+    pub rate_limit_wait_secs: u64,
     /// Prompt caching markers: "auto" (default), "on" or "off". Most
     /// providers (OpenAI, DeepSeek, Gemini, Ollama, llama.cpp) reuse a
     /// repeated prompt start on their own; Anthropic models need markers
@@ -160,6 +165,7 @@ impl Default for ProviderCfg {
             small_model: None,
             request_timeout_secs: 600,
             max_retries: 3,
+            rate_limit_wait_secs: 300,
             prompt_cache: PromptCache::Auto,
             stream_usage: true,
         }
