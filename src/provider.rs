@@ -39,6 +39,8 @@ pub struct Client {
     prompt_cache: crate::config::PromptCache,
     /// Ask OpenAI-style servers for usage at the end (`provider.stream_usage`).
     stream_usage: bool,
+    /// `provider.reasoning_effort`, sent when set.
+    reasoning_effort: Option<String>,
 }
 
 /// Token counts of one reply, normalised across providers. `input` is the
@@ -195,6 +197,7 @@ impl Client {
             gate: Default::default(),
             prompt_cache: crate::config::PromptCache::Auto,
             stream_usage: true,
+            reasoning_effort: None,
         })
     }
 
@@ -207,6 +210,7 @@ impl Client {
         c.max_tokens = p.max_tokens;
         c.prompt_cache = p.prompt_cache;
         c.stream_usage = p.stream_usage;
+        c.reasoning_effort = p.reasoning_effort.clone().filter(|e| !e.trim().is_empty());
         Ok(c)
     }
 
@@ -308,6 +312,15 @@ impl Client {
         }
         if self.stream_usage {
             body["stream_options"] = json!({ "include_usage": true });
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            // OpenAI's own API takes `reasoning_effort`; OpenRouter and most
+            // routers take `reasoning.effort`.
+            if self.base_url.contains("api.openai.com") {
+                body["reasoning_effort"] = json!(effort);
+            } else {
+                body["reasoning"] = json!({ "effort": effort });
+            }
         }
         if self.cache_markers(model) {
             add_openai_cache_markers(&mut body);
@@ -1122,6 +1135,35 @@ mod f01_tests {
         let err = c.stream("stub", &[], &[]).await.err().expect("fails");
         assert!(err.to_string().contains("rate_limit_wait_secs"), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "a wait beyond the budget fails at once");
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_is_sent_only_when_set() {
+        use axum::{routing::post, Router};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let log = seen.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<Value>| {
+                let log = log.clone();
+                async move {
+                    log.lock().unwrap().push(body.0);
+                    "data: [DONE]\n\n"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut c = fast_client(&format!("http://{addr}/v1"), 0);
+        c.stream("stub", &[], &[]).await.unwrap();
+        c.reasoning_effort = Some("low".into());
+        c.stream("stub", &[], &[]).await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].get("reasoning").is_none(), "unset: nothing extra is sent");
+        assert_eq!(seen[1]["reasoning"]["effort"], "low");
     }
 
     #[tokio::test]

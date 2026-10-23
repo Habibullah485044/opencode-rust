@@ -46,6 +46,11 @@ max_retries = 3
 # of failing. 0 = handle 429 like the errors above.
 rate_limit_wait_secs = 300
 
+# How hard a reasoning model thinks before answering: "low", "medium" or
+# "high". Thinking is billed as output tokens; "low" is much cheaper and
+# faster for routine coding. Unset = the model's default.
+# reasoning_effort = "low"
+
 # Prompt caching. Every request repeats the system prompt, the tool list and
 # the chat so far; providers can keep that start in a cache and bill it at a
 # fraction of the input price (Anthropic ~10%, OpenAI/DeepSeek 10-50%).

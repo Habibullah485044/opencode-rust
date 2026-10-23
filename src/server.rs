@@ -925,6 +925,7 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
     } else {
         None
     };
+    let started = std::time::Instant::now();
     let result = agent_inner(st, session_id, user_content, &abort).await;
     // Laziness Meter: did this run change the workspace at all? Successful
     // write/edit calls always count. New (P-02): bash counts only when the
@@ -959,7 +960,10 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
         // outside-the-diff senior-dev pass BEFORE the turn is declared done.
         // New (P-03): never after an abort; the user asked us to stop.
         let aborted = matches!(result.as_deref(), Ok("aborted"));
-        if ok && touched && !aborted && st.cfg.agent.auto_review {
+        // A `review` agent already checked this run's work: a second review
+        // would only repeat it at the cost of another full agent loop.
+        let reviewed = crate::subagent::reviewed_since(session_id, started);
+        if ok && touched && !aborted && !reviewed && st.cfg.agent.auto_review {
             let _ = st.events.send(ServerEvent::Note {
                 session_id: session_id.to_string(),
                 text: "ponytail review — checking the change and what it may have \
@@ -1466,7 +1470,6 @@ impl AppState {
             configured: self.cfg.agent.system_prompt.as_deref(),
             agents_md: agents_md.as_deref(),
             skills: &skills_list,
-            subagents: &agents::load_subagents(&workspace),
             ponytail: self.ponytail_level(session_id),
             baked: &baked,
         })
@@ -1615,6 +1618,25 @@ impl AppState {
     /// `/usage`: tokens for this chat, the last 7 days and all time, and how
     /// much of the input was read from the provider's prompt cache (billed
     /// at a fraction of the normal input price).
+    /// Rough size in tokens of what every main-agent request of this chat
+    /// starts with: the system prompt and the tool list (about 4 characters
+    /// per token). The part the conversation does not change.
+    pub fn request_overhead(&self, session_id: &str) -> (usize, usize, usize) {
+        let mut specs = tools::tool_specs();
+        if self.browser.lock().map(|g| g.is_some()).unwrap_or(false) {
+            specs.extend(crate::browser::specs());
+        }
+        if let Ok(mcp) = self.mcp.try_lock() {
+            specs.extend(mcp.specs());
+        }
+        let roles = agents::load_subagents(&self.workspace_for(session_id));
+        specs.push(crate::subagent::spawn_spec(&roles));
+        specs.extend(crate::subagent::agent_tool_specs());
+        let specs = self.mode_for(session_id).filter_specs(specs);
+        let tools_chars = serde_json::to_string(&specs).map_or(0, |s| s.len());
+        (self.composed_system(session_id).len() / 4, tools_chars / 4, specs.len())
+    }
+
     pub fn usage_report(&self, session_id: &str) -> String {
         let rows = [
             ("This chat", self.db.usage_totals(Some(session_id), None)),
@@ -1655,6 +1677,14 @@ impl AppState {
                 short_count(week.output)
             ));
         }
+        let (system, tools, count) = self.request_overhead(session_id);
+        out.push_str(&format!(
+            "
+Each request of this chat starts with about {} tokens before the conversation:              instructions {}, tool list {} ({count} tools).",
+            short_count((system + tools) as u64),
+            short_count(system as u64),
+            short_count(tools as u64),
+        ));
         out
     }
 
@@ -1860,7 +1890,12 @@ pub async fn run_loop(
         specs.push(crate::subagent::spawn_spec(&roles));
         specs.extend(crate::subagent::agent_tool_specs());
     }
-    let specs = mode.filter_specs(specs);
+    let mut specs = mode.filter_specs(specs);
+    // A subagent skips `todo`: the plan list belongs to the chat, and the
+    // spec is sent with every request.
+    if opts.agent.is_some() {
+        specs.retain(|s| s.function.name != "todo");
+    }
     let specs: Vec<_> = match &opts.allow {
         Some(allow) => specs
             .into_iter()
@@ -2363,6 +2398,9 @@ fn defines(text: &str, sym: &str) -> bool {
 /// uncommitted changes, with the vendored ponytail-review discipline (which
 /// explicitly hunts for callers broken OUTSIDE the diff). Streams into the
 /// transcript like a normal run.
+/// Most model calls one automatic review may make.
+const REVIEW_MAX_STEPS: usize = 10;
+
 pub async fn run_review(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) -> Result<String> {
     st.db.add_message(
         session_id,
@@ -2379,9 +2417,11 @@ pub async fn run_review(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) 
         crate::agents::ponytail_review_rules(),
         st.workspace_for(session_id).display()
     );
+    // Read-only work: the small model when one is set, and a short leash
+    // (the review resends the chat's history with every step).
     let opts = LoopOpts {
-        model: None,
-        max_steps: None,
+        model: st.cfg.provider.small_model.clone(),
+        max_steps: Some(REVIEW_MAX_STEPS.min(st.cfg.agent.max_steps)),
         system,
         emit_activity: false,
         allow: Some(vec!["read".to_string(), "glob".to_string(), "grep".to_string()]),
@@ -2634,7 +2674,7 @@ async fn execute_routed(
         };
     }
     if crate::subagent::is_agent_tool(name) {
-        return crate::subagent::agent_tool(st, session_id, name, input, abort).await;
+        return crate::subagent::agent_tool(st, session_id, input, abort).await;
     }
     if name == "todo" {
         let op: crate::todo::TodoOp = match serde_json::from_value(input.clone()) {
@@ -5599,4 +5639,24 @@ fn short_count(n: u64) -> String {
 /// `part` as a whole percent of `whole` (0 when `whole` is 0).
 fn percent(part: u64, whole: u64) -> u64 {
     if whole == 0 { 0 } else { part * 100 / whole }
+}
+
+#[cfg(test)]
+mod prompt_budget_tests {
+    /// Every request starts with the system prompt and the tool list, so
+    /// their size is paid on every step of every run. This keeps it from
+    /// growing back unnoticed (measured: ~2.8K tokens before the cut, ~2K
+    /// after). Raise the limit only for something worth its cost.
+    #[tokio::test]
+    async fn the_fixed_part_of_a_request_stays_small() {
+        let dir = std::env::temp_dir().join(format!("ocrs-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = super::build_state_ephemeral(crate::config::Config::default(), dir.clone()).await;
+        let s = st.db.create_session("m", None).unwrap();
+        let (system, tools, count) = st.request_overhead(&s.id);
+        assert!(system <= 900, "system prompt ~{system} tokens");
+        assert!(tools <= 1150, "tool list ~{tools} tokens ({count} tools)");
+        assert!(st.usage_report(&s.id).contains("Each request of this chat starts with about"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

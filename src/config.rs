@@ -129,6 +129,10 @@ pub struct ProviderCfg {
     /// parallel agents do not keep hitting the limit. 0 = treat 429 like
     /// any other retryable error (`max_retries`).
     pub rate_limit_wait_secs: u64,
+    /// How hard a reasoning model thinks before it answers: "low",
+    /// "medium" or "high" (OpenAI-style servers; OpenRouter passes it on).
+    /// Thinking is billed as output. Unset = the model's default.
+    pub reasoning_effort: Option<String>,
     /// Prompt caching markers: "auto" (default), "on" or "off". Most
     /// providers (OpenAI, DeepSeek, Gemini, Ollama, llama.cpp) reuse a
     /// repeated prompt start on their own; Anthropic models need markers
@@ -166,6 +170,7 @@ impl Default for ProviderCfg {
             request_timeout_secs: 600,
             max_retries: 3,
             rate_limit_wait_secs: 300,
+            reasoning_effort: None,
             prompt_cache: PromptCache::Auto,
             stream_usage: true,
         }
@@ -208,7 +213,7 @@ impl Default for PermissionsCfg {
         }
         // Starting and managing subagents is safe by itself: each child still
         // asks before its own writes and commands.
-        for t in ["spawn", "agent_wait", "agent_send", "agent_stop", "agent_list"] {
+        for t in ["spawn", "agent"] {
             defaults.insert(t.to_string(), "allow".to_string());
         }
         Self { defaults, rules: Vec::new(), approval_timeout_secs: 300 }

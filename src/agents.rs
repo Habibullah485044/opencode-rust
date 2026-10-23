@@ -120,7 +120,7 @@ pub fn builtin_subagents() -> Vec<SubagentDef> {
     vec![
         SubagentDef::builtin(
             "explore",
-            "Read-only investigator: searches and reads code, reports findings with file:line references. Never modifies anything.",
+            "Read-only: searches and reads code, reports findings with file:line.",
             "You are a read-only exploration subagent. Search and read the workspace, then \
              answer with precise findings (file paths and line references). You cannot modify \
              files — do not try.",
@@ -129,7 +129,7 @@ pub fn builtin_subagents() -> Vec<SubagentDef> {
         ),
         SubagentDef::builtin(
             "research",
-            "Researcher: reads documentation and web pages (and the code when useful) and reports facts with their sources. Never modifies anything.",
+            "Read-only: reads docs and web pages, reports facts with sources.",
             "You are a research subagent. Find out what the task asks by reading documentation, \
              web pages and the code. Report concrete facts, each with where you found it (URL or \
              file:line). Say clearly what you could not confirm. You cannot modify files.",
@@ -138,7 +138,7 @@ pub fn builtin_subagents() -> Vec<SubagentDef> {
         ),
         SubagentDef::builtin(
             "plan",
-            "Planner: reads the code and returns a step-by-step plan (files to change, order, risks, how to check each step). Never modifies anything.",
+            "Read-only: returns a step-by-step plan with files, risks and checks.",
             "You are a planning subagent. Read the relevant code, then return a numbered plan: \
              each step names the files it changes, what changes, and how to check it worked \
              (a test, a command, something to look at). Flag risks and open questions. Keep it \
@@ -148,7 +148,7 @@ pub fn builtin_subagents() -> Vec<SubagentDef> {
         ),
         SubagentDef::builtin(
             "worker",
-            "Builder: completes one well-defined change with the full toolset (edit files, run commands). Give each worker its own files.",
+            "Makes one well-defined change with all tools (edits, commands).",
             "You are a focused worker subagent. Complete only the task you were given. Change \
              only the files the task is about. Check your work (build, test or run it) before \
              you finish. End with what you changed and how you checked it.",
@@ -157,7 +157,7 @@ pub fn builtin_subagents() -> Vec<SubagentDef> {
         ),
         SubagentDef::builtin(
             "review",
-            "Reviewer: checks a change against the task — reads the diff and code, runs tests or the build — and reports concrete problems. Does not edit.",
+            "Checks a change against the task, runs tests, reports problems. No edits.",
             "You are a review subagent. Check the work described in the task: read the changed \
              code, run the tests or the build when you can, and compare the result with what was \
              asked. Report each real problem with file:line and how to fix it, most serious \
@@ -307,7 +307,6 @@ pub struct PromptInputs<'a> {
     /// Contents of the workspace `AGENTS.md`, if present.
     pub agents_md: Option<&'a str>,
     pub skills: &'a [skills::Doc],
-    pub subagents: &'a [SubagentDef],
     /// Ponytail rules level (P-05): `Off` leaves them out, `Lite`/`Ultra`
     /// add a one-line level note after them.
     pub ponytail: PonytailLevel,
@@ -339,11 +338,43 @@ pub fn ponytail_section(level: PonytailLevel) -> String {
         return String::new();
     }
     let mut out = String::from("\n\n## Ponytail — lazy senior dev discipline\n\n");
-    out.push_str(ponytail_rules().trim());
+    out.push_str(ponytail_prompt_rules());
     if level != PonytailLevel::Full {
         out.push_str(&format!("\n\nPonytail level: {}", level.as_str()));
+        if let Some(how) = ponytail_level_rule(level) {
+            out.push_str(&format!(" — {how}"));
+        }
     }
     out
+}
+
+/// The part of the vendored rules the model needs. Sent with every request,
+/// so the licence header, the frontmatter, the "how to switch levels" line
+/// (the app handles `/ponytail`) and the levels table (only the active
+/// level's row is added) stay out.
+fn ponytail_prompt_rules() -> &'static str {
+    static RULES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RULES.get_or_init(|| {
+        let text = ponytail_rules();
+        let body = text.split_once("\n---\n").and_then(|(_, rest)| rest.split_once("\n---\n"));
+        let body = body.map_or(text, |(_, b)| b);
+        let body = body.split("\n## Levels").next().unwrap_or(body);
+        body.lines()
+            .filter(|l| !l.starts_with("# Ponytail") && !l.starts_with("Active for the whole session"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .replace("\n\n\n", "\n\n")
+    })
+}
+
+/// The levels table row for `level`, e.g. "Build what was asked. …".
+fn ponytail_level_rule(level: PonytailLevel) -> Option<String> {
+    let key = format!("**{}**", level.as_str());
+    ponytail_rules().lines().find(|l| l.contains(&key)).and_then(|row| {
+        let cell = row.trim().trim_matches('|').split('|').nth(1)?.trim();
+        (!cell.is_empty()).then(|| cell.to_string())
+    })
 }
 
 /// Compose the system prompt: base + AGENTS.md + skills index + subagent
@@ -395,10 +426,8 @@ pub fn compose_system(p: PromptInputs<'_>) -> String {
         ));
         out.push_str(&skills::skill_index(p.skills));
     }
-    if !p.subagents.is_empty() {
-        out.push_str("\n\n## Subagents\n\nAvailable subagents (use the spawn tool):\n");
-        out.push_str(&subagent_index(p.subagents));
-    }
+    // The subagent roles are listed once, in the `spawn` tool description:
+    // repeating them here cost every request ~200 tokens.
     out.push_str(&ponytail_section(p.ponytail));
     for s in p.baked {
         out.push_str(&format!("\n\n## Skill: {} — always active\n\n", s.name));
@@ -425,7 +454,6 @@ mod tests {
                 configured: None,
                 agents_md: None,
                 skills: &[],
-                subagents: &[],
                 ponytail: level,
                 baked: &[],
             })
@@ -433,7 +461,10 @@ mod tests {
         assert!(!text(PonytailLevel::Off).contains("lazy senior developer"), "off drops the rules");
         let full = text(PonytailLevel::Full);
         assert!(full.contains("lazy senior developer") && !full.contains("Ponytail level:"));
-        assert!(text(PonytailLevel::Lite).contains("Ponytail level: lite"));
+        assert!(text(PonytailLevel::Lite).contains("Ponytail level: lite — Build what was asked."));
+        assert!(!full.contains("MIT License") && !full.contains("homepage:") && !full.contains("| Level |"),
+            "licence header, frontmatter and the levels table stay out of the prompt");
+        assert!(full.contains("Never cut:") && full.contains("## The smallest complete change"));
         assert!(text(PonytailLevel::Ultra).contains("Ponytail level: ultra"));
         assert_eq!(PonytailLevel::parse(" Ultra "), Some(PonytailLevel::Ultra));
         assert_eq!(PonytailLevel::parse("max"), None);
@@ -457,7 +488,6 @@ mod tests {
             configured: None,
             agents_md: None,
             skills: &skills,
-            subagents: &[],
             ponytail: PonytailLevel::Full,
             baked: &[],
         });
@@ -531,7 +561,6 @@ mod tests {
             configured: None,
             agents_md: Some("Always run fmt."),
             skills: &skills,
-            subagents: &builtin_subagents(),
             ponytail: PonytailLevel::Off,
             baked: &[],
         });
@@ -539,7 +568,7 @@ mod tests {
         assert!(text.contains("Project instructions (AGENTS.md)"));
         assert!(text.contains("Always run fmt."));
         assert!(text.contains("- deploy: Ship it"));
-        assert!(text.contains("- explore:"));
+        assert!(!text.contains("- explore:"), "roles are listed in the spawn tool only");
         assert!(text.contains("PLAN MODE"));
         // Mode instructions are last so they stay salient.
         assert!(text.trim_end().ends_with("numbered plan."));
@@ -553,7 +582,6 @@ mod tests {
             configured: Some("CUSTOM BASE"),
             agents_md: None,
             skills: &[],
-            subagents: &[],
             ponytail: PonytailLevel::Full,
             baked: &[],
         });
@@ -588,7 +616,6 @@ mod tests {
                 body: "body".into(),
                 path: "deploy.md".into(),
             }],
-            subagents: &[],
             ponytail: PonytailLevel::Full,
             baked: &[],
         });
@@ -611,7 +638,6 @@ mod tests {
             configured: None,
             agents_md: None,
             skills: &[],
-            subagents: &[],
             ponytail: PonytailLevel::Off,
             baked: &[],
         });
@@ -633,7 +659,6 @@ mod tests {
             configured: None,
             agents_md: None,
             skills: &[],
-            subagents: &[],
             ponytail: PonytailLevel::Off,
             baked: &baked,
         });

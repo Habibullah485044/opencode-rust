@@ -25,7 +25,7 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "read",
-            "Read a text file. Returns numbered lines. offset = first line number to show (1-based, as printed); limit = how many lines (default 2000). For directories, use list instead.",
+            "Read a text file. Returns numbered lines. offset = first line number to show (1-based, as printed); limit = how many lines (default 500). For directories, use list instead.",
             json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}),
         ),
         spec(
@@ -100,7 +100,7 @@ pub async fn execute(
             workspace,
             arg_str(args, "path")?,
             args.get("offset").and_then(Value::as_i64).unwrap_or(0),
-            args.get("limit").and_then(Value::as_i64).unwrap_or(2000),
+            args.get("limit").and_then(Value::as_i64).unwrap_or(500),
         ),
         "write" => write_file(workspace, arg_str(args, "path")?, arg_str(args, "content")?),
         "edit" => edit_file(
@@ -270,11 +270,11 @@ async fn bash(
             let mut s = format!("exit code: {}\n", status.code().unwrap_or(-1));
             if !out.is_empty() {
                 s.push_str("--- stdout ---\n");
-                s.push_str(&truncate(&String::from_utf8_lossy(&out), 60_000));
+                s.push_str(&truncate_middle(&String::from_utf8_lossy(&out), 3_000, 9_000));
             }
             if !err.is_empty() {
                 s.push_str("\n--- stderr ---\n");
-                s.push_str(&truncate(&String::from_utf8_lossy(&err), 20_000));
+                s.push_str(&truncate_middle(&String::from_utf8_lossy(&err), 2_000, 6_000));
             }
             return Ok(s);
         }
@@ -321,6 +321,24 @@ async fn wait_for_abort(abort: &std::sync::atomic::AtomicBool) {
     while !abort.load(std::sync::atomic::Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Keep the first `head` and the last `tail` bytes of long command output.
+/// Output is resent with every later request of the run, and what matters
+/// (the error, the test summary) is usually at the end.
+fn truncate_middle(s: &str, head: usize, tail: usize) -> String {
+    if s.len() <= head + tail {
+        return s.to_string();
+    }
+    let mut a = head;
+    while !s.is_char_boundary(a) {
+        a -= 1;
+    }
+    let mut b = s.len() - tail;
+    while !s.is_char_boundary(b) {
+        b += 1;
+    }
+    format!("{}\n… [{} bytes cut from the middle] …\n{}", &s[..a], b - a, &s[b..])
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -825,7 +843,7 @@ async fn fetch_checked(url: &str, allowed: fn(std::net::IpAddr) -> bool) -> Resu
             }
             body.extend_from_slice(&chunk);
         }
-        let mut text = truncate(&html_to_text(&String::from_utf8_lossy(&body)), 40_000);
+        let mut text = truncate(&html_to_text(&String::from_utf8_lossy(&body)), 20_000);
         if cut {
             text.push_str(&format!(
                 "\n… [page is larger than {WEBFETCH_MAX_BYTES} bytes; only the start was read]"
@@ -1255,6 +1273,17 @@ mod s05_tests {
         let out = out.unwrap();
         assert!(out.contains("key=unset"), "{out}");
         assert!(!out.contains("s05-test-secret"), "{out}");
+    }
+
+    /// Long output keeps its start and its end (where errors and test
+    /// summaries are) and says how much was cut.
+    #[test]
+    fn long_output_keeps_head_and_tail() {
+        let s = format!("START{}END", "é".repeat(10_000));
+        let out = truncate_middle(&s, 100, 200);
+        assert!(out.starts_with("START") && out.ends_with("END"), "{out}");
+        assert!(out.contains("bytes cut from the middle") && out.len() < 400, "{}", out.len());
+        assert_eq!(truncate_middle("short", 100, 200), "short");
     }
 
     /// Quotes reach the shell as typed: no `\"` escapes are added (they

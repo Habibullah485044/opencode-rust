@@ -31,78 +31,50 @@ pub fn spawn_spec(roles: &[SubagentDef]) -> ToolSpec {
     spec(
         "spawn",
         &format!(
-            "Run a subagent on one self-contained task in its own child session. Roles:\n{}\n\n\
-             Split work that has independent parts and spawn one agent per part in the same \
-             turn — they run in parallel. Give each a complete task: the goal, the files or \
-             area, what done looks like, and what to report back; the agent cannot see this \
-             conversation. Give workers separate files. With `background: true` the call \
-             returns at once; collect the reports later with agent_wait. When the user asks to \
-             spawn agents or to work on several things at once, call spawn right away instead \
-             of exploring serially yourself.",
+            "Run a subagent on one task in its own session. Roles:\n{}\n\n\
+             Independent parts: one spawn each, in the same turn (they run in parallel). \
+             The agent cannot see this chat: give the goal, the files, what done looks like. \
+             Workers get separate files. Asked for agents: spawn at once. Small tasks: do them \
+             yourself, spawning costs more.",
             agents::subagent_index(roles)
         ),
         json!({
             "type": "object",
             "properties": {
-                "subagent": { "type": "string", "enum": names, "description": "Which role to run" },
-                "task": { "type": "string", "description": "The complete, self-contained task" },
-                "background": { "type": "boolean", "description": "Return at once and keep working; collect the report with agent_wait (default false)" }
+                "subagent": { "type": "string", "enum": names },
+                "task": { "type": "string" },
+                "background": { "type": "boolean", "description": "Return at once; get the report with agent wait" }
             },
             "required": ["subagent", "task"]
         }),
     )
 }
 
-/// Tools for managing spawned agents (offered together with `spawn`).
-pub const AGENT_TOOLS: &[&str] = &["agent_wait", "agent_send", "agent_stop", "agent_list"];
-
+/// The tool for managing spawned agents (offered together with `spawn`).
+/// One tool with an `action`, not four: the tool list is sent with every
+/// request.
 pub fn is_agent_tool(name: &str) -> bool {
-    AGENT_TOOLS.contains(&name)
+    name == "agent"
 }
 
 pub fn agent_tool_specs() -> Vec<ToolSpec> {
-    vec![
-        spec(
-            "agent_wait",
-            "Wait for spawned agents to finish and get their reports. Without `ids`, waits for \
-             every agent of this chat whose report you have not read yet.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ids": { "type": "array", "items": { "type": "string" }, "description": "Agent ids (session ids) to wait for" },
-                    "timeout_secs": { "type": "integer", "description": "Stop waiting after this many seconds and say who is still running (default 600)" }
-                }
-            }),
-        ),
-        spec(
-            "agent_send",
-            "Send a message to a spawned agent: more instructions, a correction, or a follow-up \
-             task. A running agent reads it before its next step; a finished one starts again \
-             with it.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "The agent id" },
-                    "message": { "type": "string", "description": "What to tell the agent" }
-                },
-                "required": ["id", "message"]
-            }),
-        ),
-        spec(
-            "agent_stop",
-            "Stop a spawned agent that is no longer needed.",
-            json!({
-                "type": "object",
-                "properties": { "id": { "type": "string", "description": "The agent id" } },
-                "required": ["id"]
-            }),
-        ),
-        spec(
-            "agent_list",
-            "List this chat's spawned agents with their role, state and running time.",
-            json!({ "type": "object", "properties": {} }),
-        ),
-    ]
+    vec![spec(
+        "agent",
+        "Manage spawned agents. wait: block until they finish and get their reports (no ids = \
+         every unread one). send: message an agent; a finished one starts again with it. \
+         stop: stop one. list: ids, roles, states.",
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["wait", "send", "stop", "list"] },
+                "ids": { "type": "array", "items": { "type": "string" } },
+                "id": { "type": "string" },
+                "message": { "type": "string" },
+                "timeout_secs": { "type": "integer", "description": "wait: default 600" }
+            },
+            "required": ["action"]
+        }),
+    )]
 }
 
 /// One spawned agent, from start until the app closes.
@@ -193,8 +165,7 @@ pub async fn spawn_subagent(
     if background {
         return Ok(format!(
             "[subagent `{name}` → session {id} · started in the background]\n\
-             It works on its own now. Collect its report with agent_wait (ids: [\"{id}\"]); \
-             send it more instructions with agent_send."
+             Get its report with agent {{\"action\": \"wait\", \"ids\": [\"{id}\"]}}."
         ));
     }
     wait_for(&[id.clone()], None, abort).await;
@@ -304,7 +275,6 @@ async fn run_child(st: &Shared, id: &str) -> Result<(&'static str, String)> {
         configured: Some(&role.system),
         agents_md: agents_md.as_deref(),
         skills: &[],
-        subagents: &[],
         ponytail: st.ponytail_level(&run.parent), // P-05: parent's level
         baked: &crate::skills::load_baked(&st.skill_base),
     });
@@ -429,8 +399,8 @@ fn report(st: &Shared, id: &str, run: &Run, state: &str, summary: &str) -> Strin
     let next = if state == "failed" {
         format!(
             "\n\nThis agent did not finish; its work so far is kept. Next: resume it with \
-             agent_send {{\"id\": \"{id}\", \"message\": \"continue the task\"}}, or do the \
-             rest yourself — do not start over."
+             agent {{\"action\": \"send\", \"id\": \"{id}\", \"message\": \"continue the task\"}}, \
+             or do the rest yourself — do not start over."
         )
     } else {
         String::new()
@@ -459,6 +429,15 @@ pub fn stop(id: &str) -> bool {
             true
         }
         _ => false,
+    })
+}
+
+/// True when a `review` agent of `parent` finished its work after `since`.
+pub fn reviewed_since(parent: &str, since: Instant) -> bool {
+    with_runs(|m| {
+        m.values().any(|r| {
+            r.parent == parent && r.role.name == "review" && r.state == "done" && r.started >= since
+        })
     })
 }
 
@@ -501,10 +480,11 @@ pub fn take_mail(session_id: &str) -> Option<String> {
         .then(|| format!("Background agents finished:\n\n{}", reports.join("\n\n---\n\n")))
 }
 
-/// Execute `agent_wait`, `agent_send`, `agent_stop` or `agent_list` for the
-/// agents of `parent`.
-pub async fn agent_tool(st: &Shared, parent: &str, name: &str, input: &Value, abort: &AtomicBool) -> (String, bool) {
-    match agent_tool_inner(st, parent, name, input, abort).await {
+/// Execute the `agent` tool (wait, send, stop, list) for the agents of
+/// `parent`.
+pub async fn agent_tool(st: &Shared, parent: &str, input: &Value, abort: &AtomicBool) -> (String, bool) {
+    let action = input.get("action").and_then(Value::as_str).unwrap_or("");
+    match agent_tool_inner(st, parent, action, input, abort).await {
         Ok(out) => (out, true),
         Err(e) => (format!("error: {e:#}"), false),
     }
@@ -515,11 +495,11 @@ async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, 
     let id_arg = || {
         let id = input.get("id").and_then(Value::as_str).ok_or_else(|| anyhow!("missing `id`"))?;
         mine(id).map(|run| (id.to_string(), run)).ok_or_else(|| {
-            anyhow!("no agent `{id}` in this chat — agent_list shows the ids")
+            anyhow!("no agent `{id}` in this chat — action list shows the ids")
         })
     };
     match name {
-        "agent_list" => {
+        "list" => {
             let mut rows: Vec<(Instant, String)> = with_runs(|m| {
                 m.iter()
                     .filter(|(_, r)| r.parent == parent)
@@ -536,11 +516,11 @@ async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, 
                 rows.into_iter().map(|(_, r)| r).collect::<Vec<_>>().join("\n")
             })
         }
-        "agent_stop" => {
+        "stop" => {
             let (id, _) = id_arg()?;
             Ok(if stop(&id) { format!("stopping {id}") } else { format!("{id} is not running") })
         }
-        "agent_send" => {
+        "send" => {
             let (id, run) = id_arg()?;
             let message = input
                 .get("message")
@@ -562,14 +542,14 @@ async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, 
             });
             agent_status(st, &info(&id, &run), "queued", "new message…".into());
             launch(st.clone(), id.clone());
-            Ok(format!("sent; {id} started again — collect its report with agent_wait"))
+            Ok(format!("sent; {id} started again — collect its report with agent wait"))
         }
-        "agent_wait" => {
+        "wait" => {
             let ids: Vec<String> = match input.get("ids").and_then(Value::as_array) {
                 Some(list) => {
                     let ids: Vec<String> = list.iter().filter_map(Value::as_str).map(String::from).collect();
                     if let Some(bad) = ids.iter().find(|id| mine(id).is_none()) {
-                        return Err(anyhow!("no agent `{bad}` in this chat — agent_list shows the ids"));
+                        return Err(anyhow!("no agent `{bad}` in this chat — action list shows the ids"));
                     }
                     ids
                 }
@@ -607,7 +587,7 @@ async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, 
             }
             Ok(out)
         }
-        other => Err(anyhow!("unknown agent tool `{other}`")),
+        other => Err(anyhow!("unknown action `{other}` (wait, send, stop or list)")),
     }
 }
 
@@ -1083,12 +1063,12 @@ mod b27_tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(states(&parent), ["queued", "working"], "one place: the second waits");
         let no = AtomicBool::new(false);
-        let (out, ok) = agent_tool(&st, &parent, "agent_wait", &json!({}), &no).await;
+        let (out, ok) = agent_tool(&st, &parent, &json!({"action": "wait"}), &no).await;
         assert!(ok, "{out}");
         assert!(out.contains(&format!("session {a} · done")) && out.contains("got: first"), "{out}");
         assert!(out.contains(&format!("session {b} · done")) && out.contains("got: second"), "{out}");
         assert!(out.contains("1 tool call") || out.contains("0 tool calls"), "structured header: {out}");
-        let (out, _) = agent_tool(&st, &parent, "agent_wait", &json!({}), &no).await;
+        let (out, _) = agent_tool(&st, &parent, &json!({"action": "wait"}), &no).await;
         assert!(out.contains("every report has been read"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1106,17 +1086,29 @@ mod b27_tests {
         assert!(take_mail(&parent).is_none(), "delivered once");
 
         // A finished agent starts again with the new message.
-        let (out, ok) = agent_tool(&st, &parent, "agent_send", &json!({"id": id, "message": "now check tests"}), &no).await;
+        let (out, ok) = agent_tool(&st, &parent, &json!({"action": "send", "id": id, "message": "now check tests"}), &no).await;
         assert!(ok && out.contains("started again"), "{out}");
-        let (out, _) = agent_tool(&st, &parent, "agent_wait", &json!({"ids": [id]}), &no).await;
+        let (out, _) = agent_tool(&st, &parent, &json!({"action": "wait", "ids": [id]}), &no).await;
         assert!(out.contains("got: now check tests"), "{out}");
-        let (list, _) = agent_tool(&st, &parent, "agent_list", &json!({}), &no).await;
+        let (list, _) = agent_tool(&st, &parent, &json!({"action": "list"}), &no).await;
         assert!(list.contains(&id) && list.contains("explore · done"), "{list}");
-        let (out, _) = agent_tool(&st, &parent, "agent_stop", &json!({"id": id}), &no).await;
+        let (out, _) = agent_tool(&st, &parent, &json!({"action": "stop", "id": id}), &no).await;
         assert!(out.contains("is not running"), "{out}");
         // Another chat cannot reach this chat's agents.
-        let (out, ok) = agent_tool(&st, "ses_other", "agent_stop", &json!({"id": id}), &no).await;
+        let (out, ok) = agent_tool(&st, "ses_other", &json!({"action": "stop", "id": id}), &no).await;
         assert!(!ok && out.contains("no agent"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_finished_review_agent_counts_as_this_runs_review() {
+        let (st, parent, dir) = state_with(10, 4, "reviewed").await;
+        let started = Instant::now();
+        assert!(!reviewed_since(&parent, started));
+        let args = json!({"subagent": "review", "task": "check the change"});
+        spawn_subagent(&st, &parent, &args, &AtomicBool::new(false)).await.unwrap();
+        assert!(reviewed_since(&parent, started), "the automatic review is skipped");
+        assert!(!reviewed_since(&parent, Instant::now()), "a later run is reviewed again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1127,7 +1119,7 @@ mod b27_tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         st.abort_run(&parent).await;
         let no = AtomicBool::new(false);
-        let (out, _) = agent_tool(&st, &parent, "agent_wait", &json!({"timeout_secs": 10}), &no).await;
+        let (out, _) = agent_tool(&st, &parent, &json!({"action": "wait", "timeout_secs": 10}), &no).await;
         assert!(out.contains(&format!("session {id} · stopped")), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1144,7 +1136,7 @@ mod b27_tests {
         let args = json!({"subagent": "explore", "task": "look around"});
         let err = spawn_subagent(&st, &parent.id, &args, &AtomicBool::new(false)).await.unwrap_err();
         let err = err.to_string();
-        assert!(err.contains("· failed ·") && err.contains("agent_send"), "{err}");
+        assert!(err.contains("· failed ·") && err.contains("\"action\": \"send\""), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
