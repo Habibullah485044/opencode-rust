@@ -319,6 +319,30 @@ pub struct PromptInputs<'a> {
     /// Lessons from checks that failed and were fixed in this project
     /// (see `server::record_lesson`).
     pub lessons: Option<&'a str>,
+    /// The chat is about a web page: add the web design rules.
+    pub web: bool,
+}
+
+/// Rules for web pages (measurable ones, from what v0, bolt and the
+/// frontend-design guidance share), added only to chats about a page.
+const WEB_GUIDE: &str = "\n\n## Web pages\n\n\
+- Start from a reset: `*{box-sizing:border-box}`, `img,svg{max-width:100%}`, \
+`nav ul{list-style:none;margin:0;padding:0}`.\n\
+- Mobile first. Layouts that wrap (flex-wrap, grid with minmax(0,1fr)); no fixed width \
+over 320px; no sideways scrolling anywhere from 360 to 1440px.\n\
+- 4-6 colour tokens on :root with one accent, a type scale, spacing on an 8px grid, text \
+contrast at least 4.5:1, touch targets at least 44px.\n\
+- A phone menu is a <button aria-controls aria-expanded> with a visible three-bar icon, \
+toggled by the script.\n\
+- Use names from the request exactly as written. After building, run check_page and fix \
+everything it reports.";
+
+/// True when a request is about building or changing a web page.
+pub fn is_web_task(text: &str) -> bool {
+    let t = text.to_lowercase();
+    ["website", "web site", "homepage", "home page", "landing page", "web page", "webpage", "html", "css", "frontend", "front-end"]
+        .iter()
+        .any(|k| t.contains(k))
 }
 
 /// Vendored Ponytail rules — "lazy senior dev" discipline: the smallest
@@ -439,6 +463,9 @@ pub fn compose_system(p: PromptInputs<'_>) -> String {
         out.push_str(&format!("\n\n## Skill: {} — always active\n\n", s.name));
         out.push_str(s.body.trim());
     }
+    if p.web {
+        out.push_str(WEB_GUIDE);
+    }
     if let Some(lessons) = p.lessons.filter(|l| !l.trim().is_empty()) {
         out.push_str(
             "\n\n## Lessons from earlier runs in this project\n\n\
@@ -459,6 +486,13 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn web_tasks_are_spotted() {
+        assert!(is_web_task("Build a landing page for my bakery"));
+        assert!(is_web_task("fix the CSS on the homepage"));
+        assert!(!is_web_task("fix the failing parser test"));
+    }
+
+    #[test]
     fn ponytail_level_controls_the_rules() {
         let text = |level| {
             compose_system(PromptInputs {
@@ -470,6 +504,7 @@ mod tests {
                 ponytail: level,
                 baked: &[],
                 lessons: None,
+                web: false,
             })
         };
         assert!(!text(PonytailLevel::Off).contains("lazy senior developer"), "off drops the rules");
@@ -505,6 +540,7 @@ mod tests {
             ponytail: PonytailLevel::Full,
             baked: &[],
             lessons: None,
+            web: false,
         });
         assert!(text.contains("lazy senior developer"), "the rules are still active");
         let index = crate::skills::skill_index(&skills);
@@ -579,6 +615,7 @@ mod tests {
             ponytail: PonytailLevel::Off,
             baked: &[],
             lessons: None,
+            web: false,
         });
         assert!(text.contains("opencode-rust"), "default base");
         assert!(text.contains("Project instructions (AGENTS.md)"));
@@ -601,6 +638,7 @@ mod tests {
             ponytail: PonytailLevel::Full,
             baked: &[],
             lessons: None,
+            web: false,
         });
         assert!(
             text.contains("lazy senior developer"),
@@ -636,6 +674,7 @@ mod tests {
             ponytail: PonytailLevel::Full,
             baked: &[],
             lessons: None,
+            web: false,
         });
         assert!(
             !text.contains(".openclaw"),
@@ -659,6 +698,7 @@ mod tests {
             ponytail: PonytailLevel::Off,
             baked: &[],
             lessons: None,
+            web: false,
         });
         assert!(text.contains("no tool calls"), "explicit no-tools rule");
         assert!(text.to_lowercase().contains("greets you"), "greeting named");
@@ -681,6 +721,7 @@ mod tests {
             ponytail: PonytailLevel::Off,
             baked: &baked,
             lessons: None,
+            web: false,
         });
         assert!(
             text.contains("## Skill: deploy — always active"),

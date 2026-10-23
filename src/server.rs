@@ -1482,6 +1482,19 @@ impl AppState {
             ponytail: self.ponytail_level(session_id),
             baked: &baked,
             lessons: lessons.as_deref(),
+            web: self.first_request(session_id).is_some_and(|t| agents::is_web_task(&t)),
+        })
+    }
+
+    /// The chat's first user message (what the chat is about). Fixed for
+    /// the chat, so prompt additions based on it keep the cached prefix.
+    pub fn first_request(&self, session_id: &str) -> Option<String> {
+        let msgs = self.db.messages(session_id).ok()?;
+        msgs.iter().find(|m| m.role == "user").and_then(|m| {
+            m.parts.iter().find_map(|p| match p {
+                Part::Text { text } => Some(text.clone()),
+                _ => None,
+            })
         })
     }
 

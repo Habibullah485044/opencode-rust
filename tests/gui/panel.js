@@ -718,6 +718,45 @@
   window.render(payload(basePage));
   ok("another chat without agents hides the panel", agentsEl.hidden);
 
+  // Next steps after a run, and the git chip.
+  var nextBox = document.getElementById("next-box");
+  ok("no next steps without followups", nextBox.hidden);
+  var withNext = Object.assign(payload(basePage), {
+    followups: [{ label: "Show the changes", text: "@changes" }, { label: "Review the work", text: "/review" }],
+    git: { branch: "feature/x", changed: 3 }
+  });
+  window.render(withNext);
+  var nexts = nextBox.querySelectorAll(".next-opt");
+  ok("followups render as buttons", !nextBox.hidden && nexts.length === 2 && nexts[0].textContent === "Show the changes");
+  sent = [];
+  nexts[0].click();
+  ok("@changes opens the Changes view", count("load_changes") === 1 && count("send") === 0, JSON.stringify(sent));
+  window.render(withNext);
+  sent = [];
+  nextBox.querySelectorAll(".next-opt")[1].click();
+  ok("a command followup is sent as typed", (last("send") || {}).text === "/review" && nextBox.hidden, JSON.stringify(sent));
+  window.render(Object.assign({}, withNext, { question: { text: "Which?", options: ["A"] } }));
+  ok("an open question hides the next steps", nextBox.hidden);
+  window.render(withNext);
+  ok("git chip shows the branch and count", !document.getElementById("git-wrap").hidden &&
+    document.getElementById("git-branch").textContent === "feature/x" &&
+    document.getElementById("git-count").textContent.indexOf("3") >= 0);
+  click("git-chip");
+  ok("git chip opens its menu", !document.getElementById("git-menu").hidden);
+  document.querySelector('.git-item[data-git="new"]').click();
+  ok("New branch shows the name box", !document.getElementById("git-new").hidden);
+  document.getElementById("git-new-name").value = "fix/login";
+  sent = [];
+  key(document.getElementById("git-new-name"), "Enter");
+  ok("Enter makes the branch", (last("new_branch") || {}).name === "fix/login" && document.getElementById("git-menu").hidden, JSON.stringify(sent));
+  click("git-chip");
+  sent = [];
+  document.querySelector('.git-item[data-git="commit"]').click();
+  ok("Commit sends a commit request", /^Commit all the changes/.test((last("send") || {}).text || ""), JSON.stringify(sent));
+  window.render(payload(basePage));
+  ok("no git hides the chip", document.getElementById("git-wrap").hidden);
+  ok("six starter templates", document.querySelectorAll("#empty .chip").length === 6);
+
   } catch (e) {
     ok("harness ran to completion", false, "threw: " + (e && e.message));
   }

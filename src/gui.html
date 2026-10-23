@@ -1122,6 +1122,60 @@
   }
   .ask-opt:hover { background: var(--accent); color: var(--on-accent); }
 
+  /* ---- next steps after a run ---- */
+  #next-box { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+  #next-box[hidden] { display: none; }
+  .next-opt {
+    border: 1px solid var(--line-strong);
+    background: var(--panel);
+    color: var(--text-soft);
+    font: inherit;
+    font-size: 12px;
+    border-radius: 999px;
+    padding: 3px 11px;
+    cursor: pointer;
+  }
+  .next-opt:hover { border-color: var(--accent-line); color: var(--text); background: var(--accent-soft); }
+
+  /* ---- git branch chip and its menu ---- */
+  #git-wrap { position: relative; flex: none; }
+  #git-wrap[hidden] { display: none; }
+  #git-chip {
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 11.5px;
+    padding: 3px 6px;
+    border-radius: var(--radius-s);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 180px;
+  }
+  #git-chip:hover { color: var(--text); background: var(--surface-2); }
+  #git-branch { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #git-count { color: var(--warn); }
+  #git-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    min-width: 220px;
+    border: 1px solid var(--line-strong);
+    background: var(--panel);
+    border-radius: var(--radius);
+    padding: 4px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+    z-index: 20;
+  }
+  #git-menu[hidden] { display: none; }
+  .git-item { display: block; width: 100%; text-align: left; border: 0; background: transparent; color: var(--text-soft); font: inherit; font-size: 12.5px; padding: 6px 8px; border-radius: var(--radius-s); cursor: pointer; }
+  .git-item:hover { background: var(--accent-soft); color: var(--text); }
+  #git-new { display: flex; gap: 4px; padding: 4px; }
+  #git-new[hidden] { display: none; }
+  #git-new input { flex: 1; min-width: 0; font: inherit; font-size: 12px; padding: 4px 6px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--text); border-radius: var(--radius-s); }
+
   /* ---- message queued while a run is going ---- */
   #queue-chip {
     display: flex;
@@ -1696,20 +1750,35 @@
           <h1>What are we working on?</h1>
           <p>Habi reads and edits your code, runs commands, and asks before anything risky. Every run can be undone with /undo.</p>
           <div class="chips">
-            <button class="chip" data-s="Summarize this repository architecture and active files">
+            <button class="chip" data-s="Summarize this repository: what it does, how it is laid out, the main entry points and the files that matter most. Keep it short.">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/></svg>
               <span class="chip-t">Summarize this repo</span>
               <span class="chip-d">Architecture and the files that matter</span>
             </button>
-            <button class="chip" data-s="Inspect git status and run tests to find issues">
+            <button class="chip" data-s="Run the project's tests (find the right command first). For each failure, find the cause, fix it with the smallest change, and run the tests again until they pass.">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
               <span class="chip-t">Find &amp; fix a bug</span>
-              <span class="chip-d">Check git status and run the tests</span>
+              <span class="chip-d">Run the tests, fix what fails</span>
             </button>
-            <button class="chip" data-s="Explain how the subagent team orchestration works">
+            <button class="chip" data-s="Build a landing page for [what it is for] in index.html, styles.css and script.js: a header with a phone menu, a hero with one clear call to action, three feature cards and a footer. Then check it with check_page.">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/></svg>
+              <span class="chip-t">Build a landing page</span>
+              <span class="chip-d">index.html, styles.css, script.js</span>
+            </button>
+            <button class="chip" data-s="Add this feature: [describe it]. First read the code it touches and list a short plan, then build it, add a test, and run the tests.">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              <span class="chip-t">Add a feature</span>
+              <span class="chip-d">Plan, build, test</span>
+            </button>
+            <button class="chip" data-s="Find the most important code in this project that has no tests, write focused tests for it in the project's existing test style, and run them.">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+              <span class="chip-t">Write tests</span>
+              <span class="chip-d">For code that has none</span>
+            </button>
+            <button class="chip" data-s="Review the uncommitted changes in this project (git diff): list real bugs and risks with file and line, most serious first. Do not change files.">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-              <span class="chip-t">Explore the agent team</span>
-              <span class="chip-d">How subagents split up work</span>
+              <span class="chip-t">Review my changes</span>
+              <span class="chip-d">Bugs and risks in the diff</span>
             </button>
           </div>
         </div>
@@ -1734,6 +1803,7 @@
           <div id="ask-text"></div>
           <div id="ask-options"></div>
         </div>
+        <div id="next-box" hidden></div>
         <div id="queue-chip" hidden>
           <span class="queue-label">Queued — sends when this run ends:</span>
           <span id="queue-text"></span>
@@ -1745,6 +1815,19 @@
             <button type="button" id="attach-btn" title="Attach files (you can also paste or drop screenshots)" aria-label="Attach files">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21.4 11.1l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8l8.5-8.5a3.7 3.7 0 0 1 5.2 5.2l-8.5 8.5a1.8 1.8 0 0 1-2.6-2.6l7.8-7.8"/></svg>
             </button>
+            <div id="git-wrap" hidden>
+              <button type="button" id="git-chip" title="Git branch: new branch, commit, pull request" aria-haspopup="menu">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 7v10M18 10c0 4-6 3-11 7"/></svg>
+                <span id="git-branch"></span><span id="git-count"></span>
+              </button>
+              <div id="git-menu" role="menu" hidden>
+                <button type="button" class="git-item" data-git="new">New branch…</button>
+                <div id="git-new" hidden><input id="git-new-name" placeholder="branch-name" spellcheck="false"><button type="button" class="next-opt" id="git-new-ok">Make</button></div>
+                <button type="button" class="git-item" data-git="changes">Show changes</button>
+                <button type="button" class="git-item" data-git="commit">Commit the changes</button>
+                <button type="button" class="git-item" data-git="pr">Push and open a pull request</button>
+              </div>
+            </div>
             <div class="mode-switch" id="mode-switch" role="radiogroup" aria-label="Permission mode">
               <button type="button" class="mode-btn on" data-mode="default" role="radio" aria-checked="true"
                       title="Default: safe reads run, anything that writes or runs a command asks first">Default</button>
@@ -1936,6 +2019,19 @@
     if (input) { input.value = ""; input.dispatchEvent(new Event("input")); }
     renderQueue();
   }
+  // A next-step button: "@changes" opens the Changes view, anything else is
+  // sent like a typed message (slash commands included).
+  function runFollowup(text) {
+    var nb = document.getElementById("next-box");
+    if (nb) nb.hidden = true;
+    if (text === "@changes") { postToRust({ type: "load_changes" }); return; }
+    postToRust({ type: "send", text: text });
+    rememberPrompt(text);
+  }
+  var GIT_PROMPTS = {
+    commit: "Commit all the changes in this project with a short, clear commit message (look at git diff first). Do not push.",
+    pr: "Push the current branch and open a pull request for it with gh: a clear title and a short description of what changed and how it was tested. If gh is missing or not signed in, tell me the exact command to run instead."
+  };
   function sendQueued() {
     if (!queuedMsg) return;
     postToRust({ type: "send", text: queuedMsg.text });
@@ -3314,6 +3410,36 @@
         ta.focus();
       }
     }
+    // Next steps after a run (worked out locally, no model call).
+    var nextBox = document.getElementById("next-box");
+    if (nextBox) {
+      var fu = d.followups || [];
+      var fkey = fu.map(function (f) { return f.label + "\t" + f.text; }).join("\n");
+      nextBox.hidden = !fu.length || !!d.question;
+      if (nextBox.getAttribute("data-key") !== fkey) {
+        nextBox.setAttribute("data-key", fkey);
+        nextBox.textContent = "";
+        fu.forEach(function (f) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.className = "next-opt";
+          b.textContent = f.label;
+          b.title = f.text;
+          b.addEventListener("click", function () { runFollowup(f.text); });
+          nextBox.appendChild(b);
+        });
+      }
+    }
+    var gitWrap = document.getElementById("git-wrap");
+    if (gitWrap) {
+      var g = d.git;
+      gitWrap.hidden = !g;
+      if (g) {
+        document.getElementById("git-branch").textContent = g.branch;
+        document.getElementById("git-count").textContent = g.changed ? "\u00b7 " + g.changed : "";
+        document.getElementById("git-chip").title = "On " + g.branch + (g.changed ? " \u00b7 " + g.changed + " changed file" + (g.changed === 1 ? "" : "s") : " \u00b7 nothing changed");
+      }
+    }
     // ask_user: the question with one button per answer (typing still works).
     var askBox = document.getElementById("ask-box");
     if (askBox) {
@@ -3540,10 +3666,13 @@
         lastRectSig = "";
         return;
       }
-      var sig = x + "," + y + "," + w + "," + h;
+      // devicePixelRatio tells Rust the page zoom (Ctrl+wheel), which it
+      // needs to place the native view: these are CSS pixels.
+      var dpr = window.devicePixelRatio || 1;
+      var sig = x + "," + y + "," + w + "," + h + "," + dpr;
       if (sig === lastRectSig) return;
       lastRectSig = sig;
-      postToRust({ type: "panel_rect", x: x, y: y, w: w, h: h });
+      postToRust({ type: "panel_rect", x: x, y: y, w: w, h: h, dpr: dpr });
     }
 
     function queueRect() {
@@ -3986,6 +4115,48 @@
         var btn = ev.target && ev.target.closest ? ev.target.closest(".copy-btn") : null;
         if (btn && btn.getAttribute("data-copy")) copyCode(btn.getAttribute("data-copy"), btn);
       });
+    }
+
+    // Git chip menu
+    var gitChip = document.getElementById("git-chip");
+    var gitMenu = document.getElementById("git-menu");
+    if (gitChip && gitMenu) {
+      gitChip.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        gitMenu.hidden = !gitMenu.hidden;
+        document.getElementById("git-new").hidden = true;
+      });
+      document.addEventListener("click", function (ev) {
+        if (!gitMenu.hidden && !(ev.target && ev.target.closest && ev.target.closest("#git-wrap"))) gitMenu.hidden = true;
+      });
+      var makeBranch = function () {
+        var nameEl = document.getElementById("git-new-name");
+        var name = (nameEl.value || "").trim();
+        if (!name) return;
+        postToRust({ type: "new_branch", name: name });
+        nameEl.value = "";
+        gitMenu.hidden = true;
+      };
+      document.getElementById("git-new-ok").addEventListener("click", makeBranch);
+      document.getElementById("git-new-name").addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") { ev.preventDefault(); makeBranch(); }
+        if (ev.key === "Escape") gitMenu.hidden = true;
+      });
+      var items = gitMenu.querySelectorAll(".git-item");
+      for (var gi = 0; gi < items.length; gi++) {
+        items[gi].addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          var what = this.getAttribute("data-git");
+          if (what === "new") {
+            document.getElementById("git-new").hidden = false;
+            document.getElementById("git-new-name").focus();
+            return;
+          }
+          gitMenu.hidden = true;
+          if (what === "changes") postToRust({ type: "load_changes" });
+          else runFollowup(GIT_PROMPTS[what]);
+        });
+      }
     }
 
     // Starter Prompt Chips

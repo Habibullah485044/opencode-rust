@@ -74,6 +74,13 @@ pub struct GuiState {
     pub commands: Vec<(String, String)>,
     /// `@` autocomplete: the last query and its matching files.
     pub file_matches: (String, Vec<String>),
+    /// Next-step buttons after a run: (label, what to send; `@changes`
+    /// opens the Changes view).
+    pub followups: Vec<(String, String)>,
+    /// The project's git branch and how many files changed, if git.
+    pub git: Option<(String, usize)>,
+    /// Read the git state again (after a run, a chat switch).
+    pub git_stale: bool,
     /// The open chat's `ask_user` question and its answer buttons.
     pub question: Option<(String, Vec<String>)>,
     /// What the Settings page shows.
@@ -193,6 +200,9 @@ impl Default for GuiState {
             editors: Vec::new(),
             commands: Vec::new(),
             file_matches: (String::new(), Vec::new()),
+            followups: Vec::new(),
+            git: None,
+            git_stale: true,
             question: None,
             settings: GuiSettings::default(),
             attach: (0, Vec::new()),
@@ -223,6 +233,12 @@ impl PanelRect {
     /// A rect we can actually show a view in (finite, non-degenerate).
     pub fn is_usable(self) -> bool {
         [self.x, self.y, self.w, self.h].iter().all(|v| v.is_finite()) && self.w >= 1.0 && self.h >= 1.0
+    }
+
+    /// The rect multiplied by the page zoom (Ctrl+wheel in the app window
+    /// makes one CSS pixel `z` logical pixels).
+    pub fn scaled(self, z: f64) -> Self {
+        Self { x: self.x * z, y: self.y * z, w: self.w * z, h: self.h * z }
     }
 
     /// CSS pixels -> wry `Rect`, with no manual DPI math.
@@ -477,6 +493,31 @@ impl GuiState {
         }
     }
 
+    /// Next-step buttons for the end of a run: no model call, just the usual
+    /// next moves (and a retry after a failure).
+    fn next_steps(&self, ok: bool) -> Vec<(String, String)> {
+        let s = |a: &str, b: &str| (a.to_string(), b.to_string());
+        if !ok {
+            let last = self
+                .entries
+                .iter()
+                .rev()
+                .find(|(k, _)| matches!(k, EntryKind::User))
+                .map(|(_, t)| t.trim_start_matches('\u{203a}').trim().to_string());
+            let mut v = vec![s("Explain the error", "Explain the error above in plain words and how to fix it.")];
+            if let Some(t) = last.filter(|t| !t.is_empty()) {
+                v.insert(0, ("Try again".into(), t));
+            }
+            return v;
+        }
+        let mut v = vec![s("Show the changes", "@changes"), s("Review the work", "/review")];
+        if self.git.as_ref().is_some_and(|(_, n)| *n > 0) {
+            v.push(s("Commit it", "Commit all the changes with a short, clear commit message. Do not push."));
+        }
+        v.push(s("Explain what you did", "Explain briefly what you changed and why, and what I should check."));
+        v
+    }
+
     /// A4: upsert the agent's card.
     fn on_agent(&mut self, id: String, parent: String, name: String, task: String, state: String, detail: String) {
         let now = std::time::Instant::now();
@@ -554,6 +595,8 @@ impl GuiState {
                     return;
                 }
                 self.busy = false;
+                self.git_stale = true;
+                self.followups = self.next_steps(ok);
                 if let Some(m) = message {
                     self.push(if ok { EntryKind::System } else { EntryKind::Error }, m);
                 }
@@ -752,6 +795,8 @@ impl GuiState {
             "editors": self.editors,
             "commands": self.commands,
             "file_matches": { "query": self.file_matches.0, "items": self.file_matches.1 },
+            "followups": self.followups.iter().map(|(l, t)| serde_json::json!({ "label": l, "text": t })).collect::<Vec<_>>(),
+            "git": self.git.as_ref().map(|(b, n)| serde_json::json!({ "branch": b, "changed": n })),
             "attach": { "seq": self.attach.0, "items": self.attach.1 },
             "question": self.question.as_ref().map(|(q, o)| serde_json::json!({ "text": q, "options": o })),
             "settings": {
@@ -854,7 +899,9 @@ pub enum IpcMsg {
     NavFwd,
     NavReload,
     /// Where the page wants the native child view, in CSS pixels.
-    PanelRect(PanelRect),
+    /// The panel's rect in CSS pixels and the page's `devicePixelRatio`
+    /// (0 when not sent), which tells the page zoom.
+    PanelRect(PanelRect, f64),
     /// Show/hide the native child view (collapsed panel, overlays, errors).
     PanelVisible(bool),
     /// The "Open Dev Server" CTA, optionally with an explicit URL.
@@ -880,6 +927,8 @@ pub enum IpcMsg {
     PickFiles,
     /// Open the Changes view (the project's diff).
     LoadChanges,
+    /// Make a new git branch in the chat's project and switch to it.
+    NewBranch(String),
     /// `@` autocomplete: project files matching the text.
     FindFiles(String),
     /// Send line comments from the Changes view to the agent.
@@ -947,7 +996,8 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "panel_rect" => {
             let num = |k: &str| v.get(k)?.as_f64();
             let rect = PanelRect { x: num("x")?, y: num("y")?, w: num("w")?, h: num("h")? };
-            if rect.is_usable() { Some(IpcMsg::PanelRect(rect)) } else { None }
+            let dpr = v.get("dpr").and_then(|d| d.as_f64()).unwrap_or(0.0);
+            if rect.is_usable() { Some(IpcMsg::PanelRect(rect, dpr)) } else { None }
         }
         "panel_visible" => Some(IpcMsg::PanelVisible(v.get("visible")?.as_bool()?)),
         "open_dev_server" => {
@@ -972,6 +1022,7 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "export" => Some(IpcMsg::Export),
         "pick_files" => Some(IpcMsg::PickFiles),
         "load_changes" => Some(IpcMsg::LoadChanges),
+        "new_branch" => Some(IpcMsg::NewBranch(v.get("name")?.as_str()?.trim().to_string())),
         "find_files" => Some(IpcMsg::FindFiles(v.get("query").and_then(|q| q.as_str()).unwrap_or("").to_string())),
         "review_comments" => Some(IpcMsg::ReviewComments(
             v.get("comments")?
@@ -1410,6 +1461,38 @@ fn find_project_files(root: &std::path::Path, query: &str, max: usize) -> Vec<St
     hits
 }
 
+/// The page zoom from the page's `devicePixelRatio` and the screen's scale
+/// (1 when the page sent none), rounded so float noise does not count.
+fn page_zoom(dpr: f64, scale_factor: f64) -> f64 {
+    if !(dpr.is_finite() && dpr > 0.0 && scale_factor > 0.0) {
+        return 1.0;
+    }
+    ((dpr / scale_factor) * 100.0).round() / 100.0
+}
+
+fn load_zoom(state_dir: &std::path::Path) -> f64 {
+    std::fs::read_to_string(state_dir.join("zoom.txt"))
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|z| (0.25..=5.0).contains(z))
+        .unwrap_or(1.0)
+}
+
+fn save_zoom(state_dir: &std::path::Path, z: f64) {
+    let _ = std::fs::write(state_dir.join("zoom.txt"), format!("{z}"));
+}
+
+/// Branch name and number of changed files, when `root` is in a git repo.
+fn git_state(root: &std::path::Path) -> Option<(String, usize)> {
+    let branch = crate::gitsnap::git(root, &["branch", "--show-current"]).ok()?;
+    let branch = branch.trim();
+    let branch = if branch.is_empty() { "detached".to_string() } else { branch.to_string() };
+    let changed = crate::gitsnap::git(root, &["status", "--porcelain", "--", "."])
+        .map(|s| s.lines().filter(|l| !l[3.min(l.len())..].starts_with(".opencode/")).count())
+        .unwrap_or(0);
+    Some((branch, changed))
+}
+
 /// The folder of the open chat's project (the start folder without one).
 fn chat_root(gs: &GuiState, st: &server::AppState) -> std::path::PathBuf {
     gs.current_project()
@@ -1487,6 +1570,86 @@ fn confirm_close(window: &tao::window::Window, gs: &GuiState) -> bool {
 #[cfg(not(windows))]
 fn confirm_close(_window: &tao::window::Window, _gs: &GuiState) -> bool {
     true
+}
+
+/// A Windows notification (a tray balloon, shown as a toast on Windows 10
+/// and 11). The tray icon is added on first use and removed by
+/// `notify_cleanup` when the app exits.
+#[cfg(windows)]
+fn notify(window: &tao::window::Window, title: &str, body: &str) {
+    use tao::platform::windows::WindowExtWindows;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{
+        Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_MODIFY, NOTIFYICONDATAW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{LoadIconW, IDI_APPLICATION};
+    fn fill(dst: &mut [u16], s: &str) {
+        let n = dst.len() - 1;
+        for (d, c) in dst.iter_mut().zip(s.encode_utf16().take(n)) {
+            *d = c;
+        }
+    }
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: HWND(window.hwnd() as _),
+        uID: 1,
+        uFlags: NIF_ICON | NIF_TIP | NIF_INFO,
+        dwInfoFlags: NIIF_INFO,
+        ..Default::default()
+    };
+    // SAFETY: a stock system icon; no module handle involved.
+    nid.hIcon = unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default();
+    fill(&mut nid.szTip, "Habi");
+    fill(&mut nid.szInfoTitle, title);
+    fill(&mut nid.szInfo, body);
+    let first = !TRAY_ADDED.swap(true, std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: `nid` is fully initialised and outlives the call.
+    unsafe {
+        let _ = Shell_NotifyIconW(if first { NIM_ADD } else { NIM_MODIFY }, &nid);
+    }
+}
+
+#[cfg(windows)]
+static TRAY_ADDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+fn notify_cleanup(window: &tao::window::Window) {
+    use tao::platform::windows::WindowExtWindows;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIM_DELETE, NOTIFYICONDATAW};
+    if !TRAY_ADDED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: HWND(window.hwnd() as _),
+        uID: 1,
+        ..Default::default()
+    };
+    // SAFETY: removes the icon `notify` added for this window.
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
+
+#[cfg(not(windows))]
+fn notify(_window: &tao::window::Window, _title: &str, _body: &str) {}
+
+#[cfg(not(windows))]
+fn notify_cleanup(_window: &tao::window::Window) {}
+
+/// What to say in a notification for an event that waits on the user (or a
+/// finished run), when the window is not in front.
+fn notice_for(ev: &ServerEvent) -> Option<(&'static str, String)> {
+    match ev {
+        ServerEvent::ApprovalNeeded { tool, .. } => Some(("Habi needs your OK", format!("Approve or deny: {tool}"))),
+        ServerEvent::Question { question, .. } => Some(("Habi has a question", clip(question, 200))),
+        ServerEvent::RunFinished { ok, message, .. } => Some((
+            if *ok { "Habi finished" } else { "Habi stopped" },
+            message.as_deref().map(|m| clip(m, 200)).unwrap_or_else(|| "The run is done.".into()),
+        )),
+        _ => None,
+    }
 }
 
 /// Code editors that can open a folder, found on this machine: (name, program).
@@ -1777,6 +1940,11 @@ pub async fn run(
                  machines need the free 'WebView2 Runtime' download)."
             )
         })?;
+    // The interface zoom (Ctrl+wheel, Ctrl+= / Ctrl+-) from last time.
+    let mut page_zoom_now = load_zoom(&state.state_dir);
+    if (page_zoom_now - 1.0).abs() > 0.001 {
+        let _ = webview.zoom(page_zoom_now);
+    }
 
     // Goal A: a real second WebView2 for the preview panel. It is a *native
     // child view*, not part of the page: it cannot be painted under HTML and
@@ -1954,10 +2122,16 @@ pub async fn run(
         match event {
             Event::UserEvent(AppEvent::Wake) | Event::MainEventsCleared => {
                 while let Ok(ev) = evt_rx.try_recv() {
-                    // Approval needed while the user looks elsewhere: flash
-                    // the taskbar button (it does not steal focus).
-                    if matches!(ev, ServerEvent::ApprovalNeeded { .. }) && !window.is_focused() {
-                        window.request_user_attention(Some(tao::window::UserAttentionType::Critical));
+                    // Something waits on the user (or a run ended) while they
+                    // look elsewhere: flash the taskbar button (it does not
+                    // steal focus) and show a notification.
+                    if !window.is_focused() {
+                        if let Some((title, body)) = notice_for(&ev) {
+                            if !matches!(ev, ServerEvent::RunFinished { .. }) {
+                                window.request_user_attention(Some(tao::window::UserAttentionType::Critical));
+                            }
+                            notify(&window, title, &body);
+                        }
                     }
                     gs.on_event(ev);
                     changed = true;
@@ -1967,6 +2141,11 @@ pub async fn run(
                     gs.sessions_stale = false;
                     refresh_sessions(&mut gs, &st);
                 }
+                if gs.git_stale {
+                    gs.git_stale = false;
+                    gs.git = git_state(&chat_root(&gs, &st));
+                    changed = true;
+                }
                 while let Ok(msg) = ui_rx.try_recv() {
                     match msg {
                         UiMsg::Ipc(IpcMsg::Send(text)) if gui_command(&mut gs, &st, &rt, &text) => {
@@ -1974,6 +2153,7 @@ pub async fn run(
                         }
                         UiMsg::Ipc(IpcMsg::Send(text)) => {
                             gs.question = None; // answered (or passed over)
+                            gs.followups.clear();
                             gs.input = text;
                             if let Some(content) = submit_and_name(&mut gs, &st) {
                                 eprintln!("[gui] run start: {}", clip(&content, 80));
@@ -2091,6 +2271,7 @@ pub async fn run(
                         }
                         UiMsg::Ipc(IpcMsg::Close) => {
                             if confirm_close(&window, &gs) {
+                                notify_cleanup(&window);
                                 *control_flow = ControlFlow::Exit;
                             }
                         }
@@ -2142,6 +2323,23 @@ pub async fn run(
                         UiMsg::Ipc(IpcMsg::FindFiles(query)) => {
                             let items = find_project_files(&chat_root(&gs, &st), &query, 12);
                             gs.file_matches = (query, items);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::NewBranch(name)) => {
+                            let root = chat_root(&gs, &st);
+                            let valid = !name.is_empty()
+                                && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'))
+                                && !name.starts_with('-');
+                            let text = if !valid {
+                                format!("\"{name}\" is not a usable branch name (letters, digits, - _ / . only)")
+                            } else {
+                                match crate::gitsnap::git(&root, &["switch", "-c", &name]) {
+                                    Ok(_) => format!("Now on a new branch: {name}"),
+                                    Err(e) => format!("Could not make the branch: {e:#}"),
+                                }
+                            };
+                            gs.push(EntryKind::System, text);
+                            gs.git_stale = true;
                             changed = true;
                         }
                         UiMsg::Ipc(IpcMsg::LoadChanges) => {
@@ -2295,8 +2493,13 @@ pub async fn run(
                         }
                         // Geometry/no-paint verbs: the page already knows its
                         // own layout, so these must not trigger a full repaint.
-                        UiMsg::Ipc(IpcMsg::PanelRect(rect)) => {
-                            gs.browser.rect = Some(rect);
+                        UiMsg::Ipc(IpcMsg::PanelRect(rect, dpr)) => {
+                            let z = page_zoom(dpr, window.scale_factor());
+                            if (z - page_zoom_now).abs() > 0.001 {
+                                page_zoom_now = z;
+                                save_zoom(&st.state_dir, z);
+                            }
+                            gs.browser.rect = Some(rect.scaled(z));
                             if let Some(wv) = &browser_webview {
                                 show_browser(wv, &gs.browser);
                             }
@@ -2416,6 +2619,7 @@ pub async fn run(
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 eprintln!("[gui] close requested");
                 if confirm_close(&window, &gs) {
+                    notify_cleanup(&window);
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -2423,6 +2627,7 @@ pub async fn run(
             // closed window can leave the process running invisibly.
             Event::LoopDestroyed => {
                 eprintln!("[gui] window closed — exiting");
+                notify_cleanup(&window);
                 *control_flow = ControlFlow::Exit;
             }
             _ => {}
@@ -2800,6 +3005,27 @@ mod tests {
         g.input = "second message".into();
         submit_and_name(&mut g, &st);
         assert_eq!(g.title(), "prefill repro marker one");
+    }
+
+    #[test]
+    fn notices_for_waiting_events() {
+        let q = ServerEvent::Question { session_id: "s".into(), question: "Which colour?".into(), options: vec![] };
+        assert_eq!(notice_for(&q), Some(("Habi has a question", "Which colour?".to_string())));
+        let done = ServerEvent::RunFinished { session_id: "s".into(), ok: true, message: None };
+        assert_eq!(notice_for(&done).map(|n| n.0), Some("Habi finished"));
+    }
+
+    #[test]
+    fn next_steps_after_a_run() {
+        let mut g = GuiState::new();
+        g.push(EntryKind::User, "\u{203a} make the button blue");
+        let ok: Vec<String> = g.next_steps(true).into_iter().map(|(_, t)| t).collect();
+        assert!(ok.contains(&"@changes".to_string()) && ok.contains(&"/review".to_string()));
+        assert!(!ok.iter().any(|t| t.starts_with("Commit")), "no git, no commit button");
+        g.git = Some(("main".into(), 2));
+        assert!(g.next_steps(true).iter().any(|(_, t)| t.starts_with("Commit")));
+        let failed = g.next_steps(false);
+        assert_eq!(failed[0], ("Try again".to_string(), "make the button blue".to_string()));
     }
 
     #[test]
@@ -3310,8 +3536,15 @@ mod tests {
         assert_eq!(parse_ipc(r#"{"type":"nav_reload"}"#), Some(IpcMsg::NavReload));
         assert_eq!(
             parse_ipc(r#"{"type":"panel_rect","x":840,"y":38,"w":440,"h":762}"#),
-            Some(IpcMsg::PanelRect(PanelRect { x: 840.0, y: 38.0, w: 440.0, h: 762.0 }))
+            Some(IpcMsg::PanelRect(PanelRect { x: 840.0, y: 38.0, w: 440.0, h: 762.0 }, 0.0))
         );
+        assert_eq!(
+            parse_ipc(r#"{"type":"panel_rect","x":1,"y":2,"w":3,"h":4,"dpr":1.25}"#),
+            Some(IpcMsg::PanelRect(PanelRect { x: 1.0, y: 2.0, w: 3.0, h: 4.0 }, 1.25))
+        );
+        assert_eq!(page_zoom(1.25, 1.0), 1.25);
+        assert_eq!(page_zoom(2.5, 2.0), 1.25, "a 200% screen at 125% page zoom");
+        assert_eq!(page_zoom(0.0, 1.5), 1.0, "no dpr sent: no zoom");
         assert_eq!(parse_ipc(r#"{"type":"panel_rect","x":1,"y":2,"w":3}"#), None, "missing h");
         assert_eq!(
             parse_ipc(r#"{"type":"panel_rect","x":0,"y":0,"w":0,"h":0}"#),
