@@ -28,5 +28,7 @@ files are left behind). They are not part of the score.
 
 First results (2026-10-23, same model): Freebuff 100/100, extra 1/3;
 opencode-rust 72/100, extra 0/3 (the run ended on an OpenRouter rate limit
-after the Windows shell bug; both fixed since). Also note for each run:
+after the Windows shell bug; both fixed since).
+
+Also note for each run:
 the time it took, and the tokens or credits it used (`/usage` in opencode-rust).
