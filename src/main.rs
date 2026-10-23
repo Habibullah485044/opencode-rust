@@ -13,6 +13,24 @@ fn main() -> Result<()> {
         // sure the reason survives when the window was started without a
         // console (double-printing it made every failure look like two bugs).
         write_crash_log(&format!("fatal: {e:#}"));
+        // The desktop app started from a shortcut or Explorer has no console
+        // to print to: without a dialog it just "does not open".
+        #[cfg(feature = "gui")]
+        if std::env::args().any(|a| a == "--gui") {
+            let msg = format!("{e:#}");
+            // The window itself already showed its own dialogs (another
+            // window open, WebView2 missing).
+            if !msg.contains("already open") && !msg.contains("WebView2") {
+                let hint = if msg.contains("no provider configured") {
+                    "\n\nCreate the file %USERPROFILE%\\.config\\opencode-rust\\config.toml with a [provider] \
+                     section (base_url, model, api_key) — see config.example.toml — so the app works \
+                     however it is started."
+                } else {
+                    ""
+                };
+                opencode_rust::gui::show_fatal_dialog("Habi could not start", &format!("{msg}{hint}"));
+            }
+        }
     }
     res
 }

@@ -1279,7 +1279,7 @@ fn single_instance_lock(state_dir: &std::path::Path) -> std::result::Result<std:
 }
 
 /// New (F-13): show a fatal error to a user who may have no console window.
-fn show_fatal_dialog(title: &str, msg: &str) {
+pub fn show_fatal_dialog(title: &str, msg: &str) {
     eprintln!("[gui] {title}: {msg}");
     #[cfg(windows)]
     {
