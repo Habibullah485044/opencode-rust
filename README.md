@@ -165,7 +165,7 @@ Plans and history: `GOALS.md`, `M2-REPORT.md` … `M6-REPORT.md`, `FIX_PLAN.md`.
 ## Credits and licenses
 
 - opencode-rust is MIT-licensed — see `LICENSE`.
-- The ponytail prompts (`src/prompts/ponytail*.md`, `.opencode/skills/ponytail*/`)
-  come from https://github.com/DietrichGebert/ponytail, MIT, © DietrichGebert —
+- The ponytail prompts (`src/prompts/ponytail*.md`, built into the system
+  prompt) come from https://github.com/DietrichGebert/ponytail, MIT, © DietrichGebert —
   see `NOTICE` and `third_party/ponytail/LICENSE`.
 - MiroFish (optional sidecar, AGPL-3.0) is **not** included; run it as a separate program.

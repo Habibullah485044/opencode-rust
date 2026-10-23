@@ -7,8 +7,6 @@ This project includes third-party material:
 1. Ponytail — https://github.com/DietrichGebert/ponytail
    Files:   src/prompts/ponytail.md
             src/prompts/ponytail-review.md
-            .opencode/skills/ponytail/SKILL.md
-            .opencode/skills/ponytail-review/SKILL.md
    License: MIT, Copyright (c) DietrichGebert.
             Full text: third_party/ponytail/LICENSE
 

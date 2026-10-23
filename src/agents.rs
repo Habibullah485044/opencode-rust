@@ -289,6 +289,33 @@ mod tests {
         assert_eq!(PonytailLevel::parse("max"), None);
     }
 
+    /// Ponytail is part of the system prompt, not a skill: this repository
+    /// lists no ponytail skill, and its rules still reach the prompt with
+    /// the skill index (where they would show up as a skill) built from it.
+    #[test]
+    fn ponytail_is_built_in_not_a_listed_skill() {
+        let ws = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let skills = crate::skills::load_skills(ws);
+        assert!(
+            !skills.iter().any(|s| s.name.starts_with("ponytail")),
+            "listed skills: {:?}",
+            skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        let text = compose_system(PromptInputs {
+            workspace: ws,
+            mode: AgentMode::Build,
+            configured: None,
+            agents_md: None,
+            skills: &skills,
+            subagents: &[],
+            ponytail: PonytailLevel::Full,
+            baked: &[],
+        });
+        assert!(text.contains("lazy senior developer"), "the rules are still active");
+        let index = crate::skills::skill_index(&skills);
+        assert!(!index.contains("ponytail"), "{index}");
+    }
+
     #[tokio::test]
     async fn session_ponytail_level_reaches_the_system_prompt() {
         let ws = std::env::temp_dir().join(format!("ocrs-ponytail-{}", std::process::id()));
