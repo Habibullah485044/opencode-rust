@@ -1908,6 +1908,9 @@ pub async fn run_loop(
     // New (B-26): set when the model stopped asking for tools by itself.
     let mut finished = false;
     let max_steps = opts.max_steps.unwrap_or(st.cfg.agent.max_steps);
+    // Replies cut off mid-stream (dropped connection, stall, error frame)
+    // that were asked again in this run.
+    let mut stream_drops = 0u32;
     for _step in 0..max_steps {
         if abort.load(Ordering::SeqCst) {
             return Ok("aborted".into());
@@ -1942,6 +1945,7 @@ pub async fn run_loop(
         let mut abort_tick =
             tokio::time::interval(std::time::Duration::from_millis(200));
         abort_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut dropped = false;
         loop {
             let ev = tokio::select! {
                 ev = stream.next() => ev,
@@ -1956,7 +1960,24 @@ pub async fn run_loop(
             if abort.load(Ordering::SeqCst) {
                 return Ok("aborted".into());
             }
-            let ev = ev?;
+            // Nothing of a cut-off reply is saved yet: ask the same step again
+            // instead of ending the run (a free provider drops streams often).
+            let ev = match ev {
+                Ok(ev) => ev,
+                Err(e) if stream_drops < MAX_STREAM_DROPS => {
+                    stream_drops += 1;
+                    let _ = st.events.send(ServerEvent::Note {
+                        session_id: session_id.to_string(),
+                        text: format!(
+                            "the model's reply broke off ({e:#}); asking again \
+                             ({stream_drops}/{MAX_STREAM_DROPS})"
+                        ),
+                    });
+                    dropped = true;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
             match &ev {
                 StreamEvent::Text(t) => {
                     text.push_str(t);
@@ -1981,6 +2002,10 @@ pub async fn run_loop(
                 }
                 _ => acc.push(&ev),
             }
+        }
+        if dropped {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
         }
 
         let calls = acc.finish();
@@ -2400,6 +2425,9 @@ fn defines(text: &str, sym: &str) -> bool {
 /// transcript like a normal run.
 /// Most model calls one automatic review may make.
 const REVIEW_MAX_STEPS: usize = 10;
+
+/// Most replies one run asks again after they broke off mid-stream.
+const MAX_STREAM_DROPS: u32 = 3;
 
 pub async fn run_review(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) -> Result<String> {
     st.db.add_message(
@@ -3796,6 +3824,56 @@ mod tests {
         run_agent(&st, &s.id, "hi", Arc::new(AtomicBool::new(false))).await;
         assert!(!scratch_dir(&dir).exists(), "cleared after a failed run");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reply that breaks off mid-stream is asked again; the run goes on.
+    #[tokio::test]
+    async fn a_reply_that_breaks_off_is_asked_again() {
+        use axum::{routing::post, Router};
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |_body: axum::extract::Json<Value>| {
+                let n = h.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let payload = if n == 0 {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"half a rep\"},\"finish_reason\":null}]}\n\n\
+                         data: {\"error\":{\"message\":\"upstream connection reset\"}}\n\n"
+                    } else {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"whole reply\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                    };
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        let s = st.db.create_session("drop", None).unwrap();
+        st.db.add_message(&s.id, "user", &[Part::Text { text: "hi".into() }]).unwrap();
+        let opts = LoopOpts {
+            model: None,
+            max_steps: None,
+            system: "s".into(),
+            emit_activity: true,
+            allow: None,
+            can_spawn: false,
+            workspace: None,
+            agent: None,
+        };
+        let out = run_loop(&st, &s.id, &opts, &AtomicBool::new(false)).await.unwrap();
+        assert_eq!(out, "whole reply");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let saved = st.db.messages(&s.id).unwrap();
+        assert!(!saved.iter().any(|m| m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.contains("half")))),
+            "the broken-off part is not kept");
     }
 
     /// B-26: running out of steps is reported, not a silent empty answer.

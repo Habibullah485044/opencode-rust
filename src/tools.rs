@@ -353,6 +353,20 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// `/c/Users/x` (Git Bash / MSYS form) → `C:/Users/x`. `None` for any
+/// other path.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn msys_to_windows(raw: &str) -> Option<String> {
+    let rest = raw.strip_prefix('/')?;
+    let mut chars = rest.chars();
+    let drive = chars.next().filter(char::is_ascii_alphabetic)?;
+    let after = chars.as_str();
+    if !(after.is_empty() || after.starts_with('/')) {
+        return None;
+    }
+    Some(format!("{}:{}", drive.to_ascii_uppercase(), if after.is_empty() { "/" } else { after }))
+}
+
 /// S-03: turn a path the model gave into an absolute path that is guaranteed
 /// to be inside the workspace, or an error the model can act on.
 /// 1. Relative paths are joined onto the workspace.
@@ -370,9 +384,10 @@ pub fn confine_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
         )
     };
     // On Windows both `/` and `\` separate folders. Use `\` everywhere so a
-    // `\\?\` path cannot hide a `/` inside one path part.
+    // `\\?\` path cannot hide a `/` inside one path part. A Git Bash path
+    // (`/c/Users/...`, what the bash tool shows) means `C:\Users\...`.
     #[cfg(windows)]
-    let raw_owned = raw.replace('/', "\\");
+    let raw_owned = msys_to_windows(raw).unwrap_or_else(|| raw.to_string()).replace('/', "\\");
     #[cfg(windows)]
     let raw: &str = &raw_owned;
     let root = workspace
@@ -1273,6 +1288,32 @@ mod s05_tests {
         let out = out.unwrap();
         assert!(out.contains("key=unset"), "{out}");
         assert!(!out.contains("s05-test-secret"), "{out}");
+    }
+
+    #[test]
+    fn git_bash_paths_become_windows_paths() {
+        assert_eq!(msys_to_windows("/c/Users/me/x.js").as_deref(), Some("C:/Users/me/x.js"));
+        assert_eq!(msys_to_windows("/d").as_deref(), Some("D:/"));
+        assert_eq!(msys_to_windows("/src/main.rs"), None, "a longer first part is not a drive");
+        assert_eq!(msys_to_windows("src/main.rs"), None);
+    }
+
+    /// The model reads a file by the Git Bash path the shell showed it.
+    #[cfg(windows)]
+    #[test]
+    fn file_tools_accept_git_bash_paths_inside_the_workspace() {
+        let ws = std::env::temp_dir().join(format!("ocrs-msys-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let dir = ws.as_path();
+        std::fs::write(dir.join("script.js"), "x").unwrap();
+        let abs = std::path::absolute(dir).unwrap().join("script.js");
+        let s = abs.to_string_lossy().replace('\\', "/");
+        let (drive, rest) = s.split_once(':').unwrap();
+        let msys = format!("/{}{}", drive.to_ascii_lowercase(), rest);
+        let got = confine_path(dir, &msys).expect("accepted");
+        assert!(got.ends_with("script.js"), "{got:?}");
+        assert!(confine_path(dir, "/c/Windows/win.ini").is_err(), "outside stays refused");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     /// Long output keeps its start and its end (where errors and test
