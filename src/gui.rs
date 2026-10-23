@@ -77,6 +77,8 @@ pub struct GuiState {
     /// Attachments to put into the composer: (counter, markers). The page
     /// inserts each batch once, by counter.
     pub attach: (u64, Vec<String>),
+    /// The Changes view waiting to be sent to the page (JSON), once.
+    pub changes_out: std::cell::RefCell<Option<String>>,
     /// New (B-37): the entries as the page last received them, and for which
     /// chat, so a paint only sends what changed. `RefCell` because painting
     /// only has `&GuiState`.
@@ -188,6 +190,7 @@ impl Default for GuiState {
             question: None,
             settings: GuiSettings::default(),
             attach: (0, Vec::new()),
+            changes_out: std::cell::RefCell::new(None),
             sent: std::cell::RefCell::new(Vec::new()),
             sent_session: std::cell::RefCell::new(None),
         }
@@ -867,6 +870,10 @@ pub enum IpcMsg {
     Export,
     /// Attach files picked in a dialog.
     PickFiles,
+    /// Open the Changes view (the project's diff).
+    LoadChanges,
+    /// Send line comments from the Changes view to the agent.
+    ReviewComments(Vec<(String, u32, String)>),
     /// Attach a pasted or dropped file (`data` is base64).
     SaveAttachment { name: String, data: String },
     /// Open the chat's project folder in a code editor (by name, or the first found).
@@ -954,6 +961,20 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "list_models" => Some(IpcMsg::ListModels),
         "export" => Some(IpcMsg::Export),
         "pick_files" => Some(IpcMsg::PickFiles),
+        "load_changes" => Some(IpcMsg::LoadChanges),
+        "review_comments" => Some(IpcMsg::ReviewComments(
+            v.get("comments")?
+                .as_array()?
+                .iter()
+                .filter_map(|c| {
+                    Some((
+                        c.get("path")?.as_str()?.to_string(),
+                        c.get("line")?.as_u64()? as u32,
+                        c.get("text")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect(),
+        )),
         "save_attachment" => Some(IpcMsg::SaveAttachment {
             name: v.get("name").and_then(|n| n.as_str()).unwrap_or("pasted.png").to_string(),
             data: v.get("data")?.as_str()?.to_string(),
@@ -1054,6 +1075,10 @@ fn normalize_url(raw: &str) -> Result<String, String> {
 /// B-37: only the entries that changed since the last paint are sent.
 fn paint(webview: &wry::WebView, gs: &GuiState) {
     let _ = webview.evaluate_script(&format!("window.render&&window.render({})", gs.paint_payload()));
+    // A Changes view is sent once, apart from the frequent repaints.
+    if let Some(json) = gs.changes_out.borrow_mut().take() {
+        let _ = webview.evaluate_script(&format!("window.showChanges&&window.showChanges({json})"));
+    }
 }
 
 /// New (S-18): may the main window go to `uri`? Only our own page: WebView2
@@ -1957,6 +1982,29 @@ pub async fn run(
                             };
                             gs.push(EntryKind::System, text);
                             changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::LoadChanges) => {
+                            let root = chat_root(&gs, &st);
+                            let json = match crate::changes::collect(&root) {
+                                Ok(files) => serde_json::json!({ "files": files, "root": root.display().to_string() }),
+                                Err(e) => serde_json::json!({ "error": format!("{e:#}"), "files": [] }),
+                            };
+                            *gs.changes_out.borrow_mut() = Some(json.to_string());
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::ReviewComments(comments)) => {
+                            if !comments.is_empty() {
+                                gs.input = crate::changes::comments_message(&comments);
+                                gs.question = None;
+                                if let Some(content) = submit_and_name(&mut gs, &st) {
+                                    let st2 = st.clone();
+                                    let sid = gs.session.clone().unwrap_or_default();
+                                    rt.spawn(async move {
+                                        st2.kick_run(sid, content).await;
+                                    });
+                                }
+                                changed = true;
+                            }
                         }
                         UiMsg::Ipc(IpcMsg::PickFiles) => {
                             let root = chat_root(&gs, &st);

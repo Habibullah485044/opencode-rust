@@ -596,6 +596,36 @@
   click("export-btn");
   ok("Export asks for the chat as Markdown", count("export") === 1);
 
+  // --- Changes view with line comments ---
+  sent = [];
+  click("changes-btn");
+  ok("Changes asks for the project's diff", count("load_changes") === 1);
+  window.showChanges({ files: [
+    { path: "src/app.js", status: "modified", diff: "diff --git a/src/app.js b/src/app.js\n--- a/src/app.js\n+++ b/src/app.js\n@@ -1,2 +1,2 @@\n keep\n-old\n+new line\n" },
+    { path: "README.md", status: "new", diff: "@@ -0,0 +1,1 @@\n+hello\n" }
+  ] });
+  var chg = document.getElementById("changes");
+  ok("the view opens with one row per file", !chg.hidden && document.querySelectorAll("#chg-files .chg-file").length === 2);
+  var rows = document.querySelectorAll("#chg-diff .dl");
+  ok("diff lines get new-file line numbers", rows.length === 4 && rows[1].querySelector(".ln").textContent === "1" &&
+    rows[3].querySelector(".ln").textContent === "2" && rows[3].classList.contains("add") && rows[2].classList.contains("del"));
+  rows[3].click();
+  var cinput = document.querySelector("#chg-diff .dcomment input");
+  ok("clicking a line opens a comment box", !!cinput);
+  cinput.value = "use a clearer name";
+  cinput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  ok("the comment is shown and counted", /clearer name/.test(document.getElementById("chg-diff").textContent) &&
+    !document.getElementById("chg-send").hidden);
+  sent = [];
+  click("chg-send");
+  var rc = last("review_comments") || {};
+  ok("sending passes path, line and text", rc.comments && rc.comments[0].path === "src/app.js" && rc.comments[0].line === 2 &&
+    rc.comments[0].text === "use a clearer name", JSON.stringify(sent));
+  ok("and closes the view", chg.hidden);
+  window.showChanges({ error: "this project is not a git repository", files: [] });
+  ok("a project without git says so", /not a git repository/.test(document.getElementById("chg-diff").textContent));
+  click("chg-close");
+
   // --- Attachments ---
   sent = [];
   click("attach-btn");

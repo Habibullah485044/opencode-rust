@@ -516,6 +516,48 @@
     animation: fadeIn 0.12s ease-out;
   }
   #settings[hidden] { display: none; }
+  #changes {
+    position: fixed;
+    inset: 0;
+    z-index: 150;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: rgba(5, 6, 8, 0.72);
+  }
+  #changes[hidden] { display: none; }
+  .chg-card { width: min(1100px, 100%); height: min(780px, 100%); display: flex; flex-direction: column; }
+  .chg-sub { color: var(--text-muted); font-size: 12px; }
+  .chg-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px 1fr; }
+  #chg-files { border-right: 1px solid var(--line); overflow-y: auto; padding: 6px; }
+  .chg-file {
+    display: flex; gap: 6px; align-items: center; width: 100%;
+    border: 0; background: transparent; color: var(--text-soft); text-align: left;
+    font: inherit; font-size: 12.5px; padding: 5px 8px; border-radius: var(--radius-s); cursor: pointer;
+  }
+  .chg-file:hover, .chg-file.on { background: var(--surface-2); color: var(--text); }
+  .chg-file .st { font-size: 10.5px; font-weight: 700; width: 14px; text-align: center; color: var(--warn); flex: none; }
+  .chg-file .st.new, .chg-file .st.added { color: var(--ok); }
+  .chg-file .st.deleted { color: var(--bad); }
+  .chg-file .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chg-file .cm { margin-left: auto; color: var(--accent-strong); font-size: 11px; }
+  #chg-diff { overflow: auto; font-family: var(--mono); font-size: 12px; line-height: 1.55; }
+  .chg-msg { padding: 24px; color: var(--text-muted); font-family: var(--font); }
+  .dl { display: grid; grid-template-columns: 48px 1fr; white-space: pre; cursor: pointer; }
+  .dl:hover { background: var(--surface-2); }
+  .dl .ln { color: var(--text-dim); text-align: right; padding-right: 10px; user-select: none; }
+  .dl.add { background: var(--ok-soft); }
+  .dl.del { background: var(--bad-soft); }
+  .dl.hunk { color: var(--accent-strong); cursor: default; background: var(--accent-soft); }
+  .dl.hunk:hover { background: var(--accent-soft); }
+  .dcomment { margin: 4px 8px 6px 48px; font-family: var(--font); display: flex; gap: 6px; }
+  .dcomment input { flex: 1; font: inherit; font-size: 12.5px; padding: 5px 8px; border-radius: var(--radius-s); border: 1px solid var(--accent-line); background: var(--surface); color: var(--text); }
+  .dcomment.saved { color: var(--accent-strong); font-size: 12.5px; }
+  #chg-send, #chg-refresh {
+    border: 1px solid var(--line-strong); background: transparent; color: var(--text-soft);
+    font: inherit; font-size: 12px; border-radius: var(--radius-s); padding: 4px 10px; cursor: pointer;
+  }
+  #chg-send { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 600; }
   .set-card { width: min(520px, 100%); }
   .set-note { color: var(--warn); font-size: 12px; }
   .set-body { display: grid; gap: 6px; padding: 14px 16px 16px; }
@@ -1615,6 +1657,7 @@
           <div id="cstatus">
             <span>Ready</span>
           </div>
+          <button class="header-btn" id="changes-btn" title="See what changed in this project, comment on lines">Changes</button>
           <button class="header-btn" id="export-btn" title="Save this chat as a Markdown file in the project">Export</button>
           <button class="header-btn" id="open-editor-btn" hidden title="Open this project's folder in your code editor">Open in editor</button>
           <button class="header-btn" id="toggle-browser-btn" title="Toggle embedded preview browser">
@@ -1749,6 +1792,24 @@
       <button class="hist-close" id="hist-close" title="Close (Esc)">&times;</button>
     </div>
     <div id="hist-list"></div>
+  </div>
+</div>
+
+<!-- Changes: the project's diff, with line comments for the agent. -->
+<div id="changes" hidden>
+  <div class="hist-card chg-card" role="dialog" aria-modal="true" aria-label="Changes">
+    <div class="hist-head">
+      <b>Changes</b>
+      <span class="chg-sub" id="chg-sub"></span>
+      <span style="flex:1"></span>
+      <button type="button" id="chg-send" hidden>Send comments</button>
+      <button type="button" id="chg-refresh" title="Load again">Refresh</button>
+      <button class="hist-close" id="chg-close" title="Close (Esc)">&times;</button>
+    </div>
+    <div class="chg-body">
+      <div id="chg-files"></div>
+      <div id="chg-diff"></div>
+    </div>
   </div>
 </div>
 
@@ -2784,6 +2845,118 @@
     overlayHooks.close();
   }
 
+  // ---- Changes view: diff per file, click a line to comment ----
+  var chgData = { files: [] };
+  var chgPick = 0;
+  var chgComments = []; // {path, line, text}
+  window.showChanges = function (data) {
+    chgData = data || { files: [] };
+    if (chgPick >= (chgData.files || []).length) chgPick = 0;
+    var box = document.getElementById("changes");
+    if (box.hidden) { box.hidden = false; overlayHooks.open(); }
+    renderChanges();
+  };
+  function closeChanges() {
+    var box = document.getElementById("changes");
+    if (!box || box.hidden) return;
+    box.hidden = true;
+    overlayHooks.close();
+  }
+  function renderChanges() {
+    var files = chgData.files || [];
+    var sub = document.getElementById("chg-sub");
+    sub.textContent = chgData.error ? "" : files.length + " file" + (files.length === 1 ? "" : "s") + " changed";
+    var send = document.getElementById("chg-send");
+    send.hidden = !chgComments.length;
+    send.textContent = "Send " + chgComments.length + " comment" + (chgComments.length === 1 ? "" : "s") + " to the agent";
+    var list = document.getElementById("chg-files");
+    list.textContent = "";
+    files.forEach(function (f, i) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "chg-file" + (i === chgPick ? " on" : "");
+      var st = document.createElement("span");
+      st.className = "st " + f.status;
+      st.textContent = { "new": "N", added: "A", deleted: "D", renamed: "R" }[f.status] || "M";
+      var nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = f.path;
+      nm.title = f.path;
+      b.appendChild(st);
+      b.appendChild(nm);
+      var n = chgComments.filter(function (c) { return c.path === f.path; }).length;
+      if (n) { var cm = document.createElement("span"); cm.className = "cm"; cm.textContent = n; b.appendChild(cm); }
+      b.addEventListener("click", function () { chgPick = i; renderChanges(); });
+      list.appendChild(b);
+    });
+    var pane = document.getElementById("chg-diff");
+    pane.textContent = "";
+    if (chgData.error || !files.length) {
+      var m = document.createElement("div");
+      m.className = "chg-msg";
+      m.textContent = chgData.error || "No changes.";
+      pane.appendChild(m);
+      return;
+    }
+    var file = files[chgPick];
+    var newLine = 0;
+    (file.diff || "").split("\n").forEach(function (line) {
+      // Empty = the end of the text (context lines start with a space).
+      if (line === "" || /^(diff --git|index |--- |\+\+\+ |new file mode|deleted file mode)/.test(line)) return;
+      var row = document.createElement("div");
+      var num = document.createElement("span");
+      num.className = "ln";
+      var code = document.createElement("span");
+      code.textContent = line || " ";
+      var h = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(line);
+      var at = 0;
+      if (h) {
+        newLine = parseInt(h[1], 10);
+        row.className = "dl hunk";
+      } else if (line.charAt(0) === "-") {
+        row.className = "dl del";
+        at = newLine;
+      } else {
+        row.className = "dl" + (line.charAt(0) === "+" ? " add" : "");
+        num.textContent = String(newLine);
+        at = newLine;
+        newLine++;
+      }
+      row.appendChild(num);
+      row.appendChild(code);
+      pane.appendChild(row);
+      if (!h && at) {
+        row.addEventListener("click", function () { openComment(row, file.path, at); });
+        chgComments.filter(function (c) { return c.path === file.path && c.line === at; }).forEach(function (c) {
+          var s = document.createElement("div");
+          s.className = "dcomment saved";
+          s.textContent = "💬 " + c.text;
+          pane.appendChild(s);
+        });
+      }
+    });
+  }
+  function openComment(row, path, line) {
+    if (row.nextSibling && row.nextSibling.classList && row.nextSibling.classList.contains("dcomment") && !row.nextSibling.classList.contains("saved")) return;
+    var box = document.createElement("div");
+    box.className = "dcomment";
+    var input = document.createElement("input");
+    input.placeholder = "Comment on " + path + ":" + line + " — Enter to add, Esc to cancel";
+    box.appendChild(input);
+    row.parentNode.insertBefore(box, row.nextSibling);
+    input.focus();
+    input.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" && input.value.trim()) {
+        ev.preventDefault();
+        chgComments.push({ path: path, line: line, text: input.value.trim() });
+        renderChanges();
+      } else if (ev.key === "Escape") {
+        ev.stopPropagation();
+        box.remove();
+      }
+    });
+  }
+
   // ---- Appearance: dark, light, or follow Windows ----
   function savedTheme() {
     try { return localStorage.getItem("habi.theme") || "system"; } catch (e) { return "system"; }
@@ -3511,6 +3684,19 @@
         for (var i = 0; i < files.length; i++) sendFile(files[i]);
       });
     }
+    var changesBtn = document.getElementById("changes-btn");
+    if (changesBtn) changesBtn.addEventListener("click", function () { postToRust({ type: "load_changes" }); });
+    document.getElementById("chg-refresh").addEventListener("click", function () { postToRust({ type: "load_changes" }); });
+    document.getElementById("chg-close").addEventListener("click", closeChanges);
+    document.getElementById("changes").addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") { ev.preventDefault(); closeChanges(); }
+    });
+    document.getElementById("chg-send").addEventListener("click", function () {
+      if (!chgComments.length) return;
+      postToRust({ type: "review_comments", comments: chgComments });
+      chgComments = [];
+      closeChanges();
+    });
     var exportBtn = document.getElementById("export-btn");
     if (exportBtn) exportBtn.addEventListener("click", function () { postToRust({ type: "export" }); });
     var editorBtn = document.getElementById("open-editor-btn");

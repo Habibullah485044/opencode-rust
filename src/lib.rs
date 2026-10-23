@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod attachments;
 pub mod browser;
+pub mod changes;
 pub mod commands;
 pub mod compact;
 pub mod config;
