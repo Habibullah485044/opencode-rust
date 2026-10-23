@@ -70,6 +70,10 @@ pub struct GuiState {
     pub agents: Vec<AgentCard>,
     /// Code editors found on this machine (for "Open in editor").
     pub editors: Vec<String>,
+    /// `/` autocomplete: built-in and project commands (name, help).
+    pub commands: Vec<(String, String)>,
+    /// `@` autocomplete: the last query and its matching files.
+    pub file_matches: (String, Vec<String>),
     /// The open chat's `ask_user` question and its answer buttons.
     pub question: Option<(String, Vec<String>)>,
     /// What the Settings page shows.
@@ -187,6 +191,8 @@ impl Default for GuiState {
             perm_mode: PermissionMode::Default,
             agents: Vec::new(),
             editors: Vec::new(),
+            commands: Vec::new(),
+            file_matches: (String::new(), Vec::new()),
             question: None,
             settings: GuiSettings::default(),
             attach: (0, Vec::new()),
@@ -744,6 +750,8 @@ impl GuiState {
             "sessions": sessions,
             "agents": agents,
             "editors": self.editors,
+            "commands": self.commands,
+            "file_matches": { "query": self.file_matches.0, "items": self.file_matches.1 },
             "attach": { "seq": self.attach.0, "items": self.attach.1 },
             "question": self.question.as_ref().map(|(q, o)| serde_json::json!({ "text": q, "options": o })),
             "settings": {
@@ -872,6 +880,8 @@ pub enum IpcMsg {
     PickFiles,
     /// Open the Changes view (the project's diff).
     LoadChanges,
+    /// `@` autocomplete: project files matching the text.
+    FindFiles(String),
     /// Send line comments from the Changes view to the agent.
     ReviewComments(Vec<(String, u32, String)>),
     /// Attach a pasted or dropped file (`data` is base64).
@@ -962,6 +972,7 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "export" => Some(IpcMsg::Export),
         "pick_files" => Some(IpcMsg::PickFiles),
         "load_changes" => Some(IpcMsg::LoadChanges),
+        "find_files" => Some(IpcMsg::FindFiles(v.get("query").and_then(|q| q.as_str()).unwrap_or("").to_string())),
         "review_comments" => Some(IpcMsg::ReviewComments(
             v.get("comments")?
                 .as_array()?
@@ -1261,6 +1272,144 @@ fn save_settings(
     Ok((path, client, !p.api_key.is_empty()))
 }
 
+/// Built-in commands the desktop app runs itself (name, arguments, help),
+/// also offered by the composer's `/` autocomplete.
+pub const GUI_COMMANDS: &[(&str, &str, &str)] = &[
+    ("help", "", "List these commands"),
+    ("new", "", "Start a new chat in this project"),
+    ("clear", "", "Clear the view (the chat's history is kept)"),
+    ("plan", "", "Plan mode: read-only, the agent proposes a plan"),
+    ("build", "", "Build mode: the agent changes files (default)"),
+    ("model", "[id]", "Show the model, or switch to another one"),
+    ("usage", "", "Tokens used, and how much came from the cache"),
+    ("compact", "", "Summarize old messages to make room"),
+    ("review", "", "Review the uncommitted changes"),
+    ("undo", "", "Put the files back as they were before the last run"),
+    ("redo", "", "Re-apply what /undo put back"),
+    ("init", "", "Write a starter AGENTS.md for this project"),
+    ("export", "[path]", "Save this chat as Markdown in the project"),
+];
+
+/// Run `line` when it is one of `GUI_COMMANDS`. False = not one of them:
+/// it goes to the agent (project commands are resolved by the core).
+fn gui_command(gs: &mut GuiState, st: &Arc<server::AppState>, rt: &tokio::runtime::Handle, line: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix('/') else { return false };
+    let (name, arg) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(n, a)| (n, a.trim()));
+    if !GUI_COMMANDS.iter().any(|(n, _, _)| *n == name) {
+        return false;
+    }
+    let sid = gs.session.clone().unwrap_or_default();
+    let root = chat_root(gs, st);
+    let say = |gs: &mut GuiState, text: String| gs.push(EntryKind::System, text);
+    gs.push(EntryKind::User, format!("\u{203a} /{rest}"));
+    match name {
+        "help" => {
+            let list: Vec<String> = GUI_COMMANDS
+                .iter()
+                .map(|(n, a, h)| format!("/{n}{}{a} — {h}", if a.is_empty() { "" } else { " " }))
+                .collect();
+            say(gs, format!("Commands:\n{}\nProject commands from .opencode/commands work too.", list.join("\n")));
+        }
+        "new" => {
+            let project = gs.current_project();
+            open_new_chat(gs, st, project);
+        }
+        "clear" => {
+            gs.entries.clear();
+            say(gs, "View cleared — the chat's history is kept.".into());
+        }
+        "plan" | "build" => {
+            let mode = if name == "plan" { crate::agents::AgentMode::Plan } else { crate::agents::AgentMode::Build };
+            st.set_mode(&sid, mode);
+            say(gs, format!("{} mode for this chat.", if name == "plan" { "Plan" } else { "Build" }));
+        }
+        "model" if arg.is_empty() => {
+            let current = gs.settings.model.clone();
+            say(gs, format!("Model: {current}. Switch with /model <id>, or open Settings (Ctrl+,)."));
+        }
+        "model" => {
+            let (st2, model) = (st.clone(), arg.to_string());
+            rt.spawn(async move { st2.set_model(&model).await });
+            gs.settings.model = arg.to_string();
+            say(gs, format!("Model switched to {arg} (until restart; Settings keeps it)."));
+        }
+        "usage" => {
+            let report = st.usage_report(&sid);
+            say(gs, report);
+        }
+        "compact" => {
+            let st2 = st.clone();
+            let sid2 = sid.clone();
+            rt.spawn(async move {
+                let abort = std::sync::atomic::AtomicBool::new(false);
+                let text = match crate::compact::compact(&st2, &sid2, &abort).await {
+                    Ok(o) => format!("Compacted: {} old message(s) summarized, {} kept.", o.removed, o.kept),
+                    Err(e) => format!("Not compacted: {e:#}"),
+                };
+                let _ = st2.events.send(ServerEvent::Note { session_id: sid2, text });
+            });
+            say(gs, "Compacting…".into());
+        }
+        "review" => {
+            let st2 = st.clone();
+            let sid2 = sid.clone();
+            rt.spawn(async move { st2.kick_review(sid2).await });
+            gs.busy = true;
+        }
+        "undo" | "redo" => {
+            let res = if name == "undo" {
+                crate::gitsnap::undo(&root, &st.state_dir)
+            } else {
+                crate::gitsnap::redo(&root, &st.state_dir)
+            };
+            let text = match res {
+                Ok(Some(m)) => format!("{} done: files are back as of snapshot {}.", if name == "undo" { "Undo" } else { "Redo" }, m.id),
+                Ok(None) => format!("Nothing to {name} (or this project is not a git repository)."),
+                Err(e) => format!("{name} failed: {e:#}"),
+            };
+            say(gs, text);
+        }
+        "init" => {
+            let text = match crate::skills::init_agents_md(&root) {
+                Ok(Some(p)) => format!("Wrote {} — edit it to tell agents how this project works.", p.display()),
+                Ok(None) => "This project already has an AGENTS.md.".into(),
+                Err(e) => format!("init failed: {e:#}"),
+            };
+            say(gs, text);
+        }
+        "export" => {
+            let text = match st.export_transcript(&sid, (!arg.is_empty()).then_some(arg)) {
+                Ok(path) => format!("Chat exported to {}", path.display()),
+                Err(e) => format!("Export failed: {e:#}"),
+            };
+            say(gs, text);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Files of the project whose path contains `query` (case-insensitive),
+/// shortest paths first; `.gitignore` is respected.
+fn find_project_files(root: &std::path::Path, query: &str, max: usize) -> Vec<String> {
+    let q = query.to_lowercase().replace('\\', "/");
+    let mut hits: Vec<String> = Vec::new();
+    let walk = ignore::WalkBuilder::new(root).hidden(true).max_depth(Some(12)).build();
+    for entry in walk.flatten().take(20_000) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else { continue };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if q.is_empty() || rel.to_lowercase().contains(&q) {
+            hits.push(rel);
+        }
+    }
+    hits.sort_by_key(|p| (p.len(), p.clone()));
+    hits.truncate(max);
+    hits
+}
+
 /// The folder of the open chat's project (the start folder without one).
 fn chat_root(gs: &GuiState, st: &server::AppState) -> std::path::PathBuf {
     gs.current_project()
@@ -1538,6 +1687,10 @@ pub async fn run(
     // The folder the app started in is a project; plain new chats go there.
     gs.default_project = state.db.upsert_project(&state.workspace).ok().map(|p| p.id);
     gs.editors = find_editors().into_iter().map(|(n, _)| n.to_string()).collect();
+    gs.commands = GUI_COMMANDS.iter().map(|(n, a, h)| (format!("{n}{}{a}", if a.is_empty() { "" } else { " " }), h.to_string())).collect();
+    for doc in crate::skills::load_commands(&state.workspace) {
+        gs.commands.push((doc.name.clone(), doc.description.clone()));
+    }
     // Agents write bash; without Git Bash they get cmd.exe and stumble.
     if crate::tools::shell_kind() == crate::permissions::Shell::Cmd {
         gs.push(
@@ -1816,6 +1969,9 @@ pub async fn run(
                 }
                 while let Ok(msg) = ui_rx.try_recv() {
                     match msg {
+                        UiMsg::Ipc(IpcMsg::Send(text)) if gui_command(&mut gs, &st, &rt, &text) => {
+                            changed = true;
+                        }
                         UiMsg::Ipc(IpcMsg::Send(text)) => {
                             gs.question = None; // answered (or passed over)
                             gs.input = text;
@@ -1981,6 +2137,11 @@ pub async fn run(
                                 Err(e) => format!("Settings not saved: {e:#}"),
                             };
                             gs.push(EntryKind::System, text);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::FindFiles(query)) => {
+                            let items = find_project_files(&chat_root(&gs, &st), &query, 12);
+                            gs.file_matches = (query, items);
                             changed = true;
                         }
                         UiMsg::Ipc(IpcMsg::LoadChanges) => {
@@ -3180,6 +3341,36 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), png);
         let _ = std::fs::remove_file(path);
         assert!(save_screenshot(b"not a png at all, sorry").is_err());
+    }
+
+    /// Built-in commands run in the app; anything else goes to the agent;
+    /// `@` finds project files.
+    #[tokio::test]
+    async fn desktop_commands_run_here_and_others_go_to_the_agent() {
+        let dir = std::env::temp_dir().join(format!("habi-cmds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src").join("app.js"), "x").unwrap();
+        std::fs::write(dir.join("readme.md"), "x").unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:9/v1".into();
+        let st = server::build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("c", None).unwrap();
+        let mut gs = GuiState { session: Some(s.id.clone()), ..Default::default() };
+        let rt = tokio::runtime::Handle::current();
+        assert!(gui_command(&mut gs, &st, &rt, "/help"));
+        assert!(gs.entries.last().unwrap().1.contains("/export [path]"));
+        assert!(gui_command(&mut gs, &st, &rt, "/init"));
+        assert!(dir.join("AGENTS.md").is_file(), "/init wrote the starter file");
+        assert!(gui_command(&mut gs, &st, &rt, "/plan"));
+        assert_eq!(st.mode_for(&s.id), crate::agents::AgentMode::Plan);
+        assert!(gui_command(&mut gs, &st, &rt, "/clear"));
+        assert_eq!(gs.entries.len(), 1, "only the 'cleared' note is left");
+        assert!(!gui_command(&mut gs, &st, &rt, "/deploy staging"), "a project command goes to the core");
+        assert!(!gui_command(&mut gs, &st, &rt, "fix the bug"));
+        assert_eq!(find_project_files(&dir, "APP", 5), vec!["src/app.js".to_string()]);
+        assert_eq!(find_project_files(&dir, "", 1).len(), 1, "capped");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The payload is the whole frontend contract: a missing key here means a

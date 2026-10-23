@@ -1082,6 +1082,23 @@
   #attach-btn:hover { color: var(--text); background: var(--surface-2); }
   #comp.dropping { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 
+  /* ---- / and @ autocomplete ---- */
+  #ac-menu {
+    margin: 0 0 6px;
+    border: 1px solid var(--line-strong);
+    background: var(--panel);
+    border-radius: var(--radius);
+    padding: 4px;
+    max-height: 260px;
+    overflow-y: auto;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  }
+  #ac-menu[hidden] { display: none; }
+  .ac-item { display: flex; gap: 10px; align-items: baseline; padding: 5px 8px; border-radius: var(--radius-s); cursor: pointer; font-size: 12.5px; }
+  .ac-item.on, .ac-item:hover { background: var(--accent-soft); }
+  .ac-item .k { font-family: var(--mono); color: var(--text); white-space: nowrap; }
+  .ac-item .h { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   /* ---- ask_user: a question with answers to click ---- */
   #ask-box {
     margin: 0 0 8px;
@@ -1712,6 +1729,7 @@
 
       <!-- Floating Composer Dock -->
       <div id="compwrap">
+        <div id="ac-menu" role="listbox" hidden></div>
         <div id="ask-box" hidden>
           <div id="ask-text"></div>
           <div id="ask-options"></div>
@@ -2845,6 +2863,74 @@
     overlayHooks.close();
   }
 
+  // ---- Autocomplete: "/" commands at the start, "@" project files ----
+  var acCommands = [];
+  var acFiles = { query: null, items: [] };
+  var ac = { kind: null, items: [], pick: 0, start: 0, end: 0 };
+  var acTimer = null;
+  function acContext(ta) {
+    var pos = ta.selectionStart, before = ta.value.slice(0, pos);
+    var slash = /^\/(\S*)$/.exec(before);
+    if (slash) return { kind: "cmd", query: slash[1], start: 0, end: pos };
+    var at = /(^|\s)@([^\s@]*)$/.exec(before);
+    if (at) return { kind: "file", query: at[2], start: pos - at[2].length - 1, end: pos };
+    return null;
+  }
+  function acRender() {
+    var menu = document.getElementById("ac-menu");
+    if (!menu) return;
+    menu.hidden = !ac.kind || !ac.items.length;
+    menu.textContent = "";
+    ac.items.forEach(function (it, i) {
+      var row = document.createElement("div");
+      row.className = "ac-item" + (i === ac.pick ? " on" : "");
+      row.setAttribute("role", "option");
+      var k = document.createElement("span");
+      k.className = "k";
+      k.textContent = ac.kind === "cmd" ? "/" + it[0] : "@" + it[0];
+      var h = document.createElement("span");
+      h.className = "h";
+      h.textContent = it[1] || "";
+      row.appendChild(k);
+      row.appendChild(h);
+      row.addEventListener("mousedown", function (ev) { ev.preventDefault(); ac.pick = i; acChoose(); });
+      menu.appendChild(row);
+    });
+  }
+  function acClose() { ac.kind = null; ac.items = []; acRender(); }
+  function acUpdate() {
+    var ta = document.getElementById("input");
+    var c = ta && acContext(ta);
+    if (!c) return acClose();
+    ac.kind = c.kind; ac.start = c.start; ac.end = c.end;
+    if (c.kind === "cmd") {
+      var q = c.query.toLowerCase();
+      ac.items = acCommands.filter(function (x) { return x[0].toLowerCase().indexOf(q) === 0; })
+        .concat(acCommands.filter(function (x) { return x[0].toLowerCase().indexOf(q) > 0; })).slice(0, 10);
+    } else {
+      if (acFiles.query === c.query) {
+        ac.items = acFiles.items.map(function (p) { return [p, ""]; });
+      } else {
+        clearTimeout(acTimer);
+        acTimer = setTimeout(function () { postToRust({ type: "find_files", query: c.query }); }, 120);
+      }
+    }
+    if (ac.pick >= ac.items.length) ac.pick = 0;
+    acRender();
+  }
+  function acChoose() {
+    var ta = document.getElementById("input");
+    var it = ac.items[ac.pick];
+    if (!ta || !it) return acClose();
+    var word = ac.kind === "cmd" ? "/" + it[0].split(" ")[0] + " " : "@" + it[0] + " ";
+    ta.value = ta.value.slice(0, ac.start) + word + ta.value.slice(ac.end);
+    var caret = ac.start + word.length;
+    ta.setSelectionRange(caret, caret);
+    acClose();
+    ta.dispatchEvent(new Event("input"));
+    ta.focus();
+  }
+
   // ---- Changes view: diff per file, click a line to comment ----
   var chgData = { files: [] };
   var chgPick = 0;
@@ -3209,6 +3295,13 @@
     // screen keeps the queue until its own chat is back and idle.
     if (queuedMsg && !busyNow && queuedMsg.session === currentSession) sendQueued();
     if (wasBusy !== busyNow) renderQueue();
+    // Autocomplete data: commands, and the files for the last "@" query.
+    acCommands = d.commands || acCommands;
+    var fm = d.file_matches;
+    if (fm && fm.query !== acFiles.query && fm.items) {
+      acFiles = { query: fm.query, items: fm.items };
+      if (ac.kind === "file") acUpdate();
+    }
     // New attachments: their markers go into the message box once each.
     var att = d.attach || {};
     if (att.seq && att.seq !== lastAttachSeq) {
@@ -3648,6 +3741,28 @@
         renderQueue();
         refreshSend();
       });
+    }
+    // Autocomplete keys win over send/history while the menu is open
+    // (capture: runs before the composer's other key handlers).
+    if (input) {
+      input.addEventListener("input", acUpdate);
+      input.addEventListener("click", acUpdate);
+      input.addEventListener("blur", function () { setTimeout(acClose, 150); });
+      input.addEventListener("keydown", function (ev) {
+        if (!ac.kind || !ac.items.length) return;
+        if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+          ac.pick = (ac.pick + (ev.key === "ArrowDown" ? 1 : ac.items.length - 1)) % ac.items.length;
+          acRender();
+        } else if ((ev.key === "Enter" && !ev.shiftKey) || ev.key === "Tab") {
+          acChoose();
+        } else if (ev.key === "Escape") {
+          acClose();
+        } else {
+          return;
+        }
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+      }, true);
     }
     // ---- Attachments: button, paste, drag and drop ----
     var attachBtn = document.getElementById("attach-btn");

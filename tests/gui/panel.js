@@ -596,6 +596,32 @@
   click("export-btn");
   ok("Export asks for the chat as Markdown", count("export") === 1);
 
+  // --- / and @ autocomplete ---
+  var acta = document.getElementById("input");
+  var acPage = payload(basePage);
+  acPage.commands = [["help", "List these commands"], ["export [path]", "Save this chat"], ["undo", "Put the files back"]];
+  window.render(acPage);
+  acta.value = "/ex";
+  acta.setSelectionRange(3, 3);
+  acta.dispatchEvent(new Event("input"));
+  var menu = document.getElementById("ac-menu");
+  ok("typing / suggests matching commands", !menu.hidden && menu.textContent.indexOf("/export [path]") >= 0 &&
+    menu.querySelectorAll(".ac-item").length === 1, menu.textContent);
+  sent = [];
+  acta.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  ok("Enter picks the command instead of sending", acta.value === "/export " && count("send") === 0 && menu.hidden, JSON.stringify(acta.value));
+  acta.value = "look at @app";
+  acta.setSelectionRange(12, 12);
+  acta.dispatchEvent(new Event("input"));
+  acPage.file_matches = { query: "app", items: ["src/app.js", "tests/app.test.js"] };
+  window.render(acPage);
+  ok("typing @ lists matching project files", !menu.hidden && menu.querySelectorAll(".ac-item").length === 2, menu.textContent);
+  acta.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+  acta.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }));
+  ok("arrow + Tab inserts the file", acta.value === "look at @tests/app.test.js ", JSON.stringify(acta.value));
+  acta.value = "";
+  acta.dispatchEvent(new Event("input"));
+
   // --- Changes view with line comments ---
   sent = [];
   click("changes-btn");
