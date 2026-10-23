@@ -68,6 +68,8 @@ pub struct GuiState {
     pub perm_mode: PermissionMode,
     /// A4: spawned agents, oldest first (the open chat's are shown).
     pub agents: Vec<AgentCard>,
+    /// Code editors found on this machine (for "Open in editor").
+    pub editors: Vec<String>,
     /// New (B-37): the entries as the page last received them, and for which
     /// chat, so a paint only sends what changed. `RefCell` because painting
     /// only has `&GuiState`.
@@ -161,6 +163,7 @@ impl Default for GuiState {
             usage: HashMap::new(),
             perm_mode: PermissionMode::Default,
             agents: Vec::new(),
+            editors: Vec::new(),
             sent: std::cell::RefCell::new(Vec::new()),
             sent_session: std::cell::RefCell::new(None),
         }
@@ -703,6 +706,7 @@ impl GuiState {
             "api": self.api.map(|(ok, ms)| serde_json::json!([ok, ms])),
             "sessions": sessions,
             "agents": agents,
+            "editors": self.editors,
             "projects": projects,
             "current_project": self.current_project(),
             "entries": entries,
@@ -810,6 +814,8 @@ pub enum IpcMsg {
     Stop,
     /// A4: stop one spawned agent.
     AgentStop(String),
+    /// Open the chat's project folder in a code editor (by name, or the first found).
+    OpenInEditor(Option<String>),
     /// Projects sidebar: a new chat inside project `id`.
     NewInProject(String),
     /// Add a project: this folder, or (no path) ask with a folder picker.
@@ -884,6 +890,7 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "page_error" => Some(IpcMsg::PageError(v.get("msg")?.as_str()?.to_string())),
         "stop" => Some(IpcMsg::Stop),
         "agent_stop" => Some(IpcMsg::AgentStop(v.get("id")?.as_str()?.to_string())),
+        "open_in_editor" => Some(IpcMsg::OpenInEditor(v.get("editor").and_then(|e| e.as_str()).map(str::to_string))),
         "new_in_project" => Some(IpcMsg::NewInProject(v.get("project")?.as_str()?.to_string())),
         "add_project" => Some(IpcMsg::AddProject(
             v.get("path").and_then(|p| p.as_str()).map(str::to_string).filter(|p| !p.trim().is_empty()),
@@ -1132,6 +1139,78 @@ fn pick_folder(_window: &tao::window::Window) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Closing stops every run: ask first while one is going.
+#[cfg(windows)]
+fn confirm_close(window: &tao::window::Window, gs: &GuiState) -> bool {
+    use tao::platform::windows::WindowExtWindows;
+    use windows::core::w;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDYES, MB_ICONWARNING, MB_YESNO};
+    if !gs.busy && gs.running.is_empty() {
+        return true;
+    }
+    // SAFETY: a modal message box owned by our own window, on the UI thread.
+    let answer = unsafe {
+        MessageBoxW(
+            Some(HWND(window.hwnd() as _)),
+            w!("An agent is still working. Close anyway? Its run will stop."),
+            w!("Habi"),
+            MB_YESNO | MB_ICONWARNING,
+        )
+    };
+    answer == IDYES
+}
+
+#[cfg(not(windows))]
+fn confirm_close(_window: &tao::window::Window, _gs: &GuiState) -> bool {
+    true
+}
+
+/// Code editors that can open a folder, found on this machine: (name, program).
+fn find_editors() -> Vec<(&'static str, std::path::PathBuf)> {
+    let mut found = Vec::new();
+    let candidates: &[(&str, &[&str])] = &[
+        ("VS Code", &["code.cmd", "code"]),
+        ("Cursor", &["cursor.cmd", "cursor"]),
+        ("Zed", &["zed.exe", "zed"]),
+    ];
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for (name, files) in candidates {
+        let hit = std::env::split_paths(&path).find_map(|dir| files.iter().map(|f| dir.join(f)).find(|p| p.is_file()));
+        if let Some(p) = hit {
+            found.push((*name, p));
+        }
+    }
+    found
+}
+
+/// Open `folder` in the editor called `name` (or the first one found).
+fn open_in_editor(name: Option<&str>, folder: &std::path::Path) -> Result<&'static str, String> {
+    let editors = find_editors();
+    let (label, program) = editors
+        .iter()
+        .find(|(n, _)| name.is_none_or(|want| want == *n))
+        .or(editors.first())
+        .ok_or("no VS Code, Cursor or Zed found on PATH")?;
+    let mut cmd = if program.extension().is_some_and(|e| e == "cmd") {
+        // A .cmd launcher runs through cmd.exe.
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg(program).arg(folder);
+        c
+    } else {
+        let mut c = std::process::Command::new(program);
+        c.arg(folder);
+        c
+    };
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash
+    }
+    cmd.spawn().map(|_| *label).map_err(|e| format!("could not start {label}: {e}"))
+}
+
 /// Refresh the sidebar chat list from the database.
 fn refresh_sessions(gs: &mut GuiState, st: &server::AppState) {
     if let Ok(rows) = st.db.list_session_rows() {
@@ -1284,6 +1363,7 @@ pub async fn run(
     gs.session = Some(session.id.clone());
     // The folder the app started in is a project; plain new chats go there.
     gs.default_project = state.db.upsert_project(&state.workspace).ok().map(|p| p.id);
+    gs.editors = find_editors().into_iter().map(|(n, _)| n.to_string()).collect();
     gs.approval_timeout_secs = state.cfg.permissions.approval_timeout_secs;
     gs.perm_mode = state.perm_mode();
     refresh_sessions(&mut gs, &state);
@@ -1525,6 +1605,11 @@ pub async fn run(
         match event {
             Event::UserEvent(AppEvent::Wake) | Event::MainEventsCleared => {
                 while let Ok(ev) = evt_rx.try_recv() {
+                    // Approval needed while the user looks elsewhere: flash
+                    // the taskbar button (it does not steal focus).
+                    if matches!(ev, ServerEvent::ApprovalNeeded { .. }) && !window.is_focused() {
+                        window.request_user_attention(Some(tao::window::UserAttentionType::Critical));
+                    }
                     gs.on_event(ev);
                     changed = true;
                 }
@@ -1650,7 +1735,11 @@ pub async fn run(
                             let maxed = window.is_maximized();
                             window.set_maximized(!maxed);
                         }
-                        UiMsg::Ipc(IpcMsg::Close) => *control_flow = ControlFlow::Exit,
+                        UiMsg::Ipc(IpcMsg::Close) => {
+                            if confirm_close(&window, &gs) {
+                                *control_flow = ControlFlow::Exit;
+                            }
+                        }
                         UiMsg::Ipc(IpcMsg::Stop) => {
                             // F-06: the same abort as the HTTP route.
                             if let Some(sid) = gs.session.clone() {
@@ -1663,6 +1752,18 @@ pub async fn run(
                                 });
                                 changed = true;
                             }
+                        }
+                        UiMsg::Ipc(IpcMsg::OpenInEditor(editor)) => {
+                            let root = gs
+                                .current_project()
+                                .and_then(|id| gs.projects.iter().find(|p| p.id == id).map(|p| std::path::PathBuf::from(&p.root)))
+                                .unwrap_or_else(|| st.workspace.clone());
+                            let text = match open_in_editor(editor.as_deref(), &root) {
+                                Ok(name) => format!("Opened {} in {name}.", root.display()),
+                                Err(e) => format!("Open in editor: {e}"),
+                            };
+                            gs.push(EntryKind::System, text);
+                            changed = true;
                         }
                         UiMsg::Ipc(IpcMsg::AgentStop(id)) => {
                             crate::subagent::stop(&id);
@@ -1867,7 +1968,9 @@ pub async fn run(
             }
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 eprintln!("[gui] close requested");
-                *control_flow = ControlFlow::Exit;
+                if confirm_close(&window, &gs) {
+                    *control_flow = ControlFlow::Exit;
+                }
             }
             // tao/winit signal a dead message loop this way; without it a
             // closed window can leave the process running invisibly.

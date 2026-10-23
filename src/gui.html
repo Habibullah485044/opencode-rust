@@ -945,6 +945,34 @@
   .chip-d { font-size: 12px; color: var(--text-muted); line-height: 1.4; }
 
   /* ---- Composer ---- */
+  /* ---- message queued while a run is going ---- */
+  #queue-chip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 8px;
+    padding: 6px 8px 6px 12px;
+    border: 1px dashed var(--accent-line);
+    background: var(--accent-soft);
+    border-radius: var(--radius);
+    font-size: 12.5px;
+    color: var(--text-soft);
+  }
+  #queue-chip[hidden] { display: none; }
+  .queue-label { color: var(--accent-strong); font-weight: 600; white-space: nowrap; }
+  #queue-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+  #queue-cancel {
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: var(--radius-s);
+  }
+  #queue-cancel:hover { color: var(--text); background: var(--surface-2); }
+
   /* ---- A4: spawned agents for this chat ---- */
   #agents {
     max-width: 820px;
@@ -1465,6 +1493,7 @@
           <div id="cstatus">
             <span>Ready</span>
           </div>
+          <button class="header-btn" id="open-editor-btn" hidden title="Open this project's folder in your code editor">Open in editor</button>
           <button class="header-btn" id="toggle-browser-btn" title="Toggle embedded preview browser">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
             Preview
@@ -1517,6 +1546,11 @@
 
       <!-- Floating Composer Dock -->
       <div id="compwrap">
+        <div id="queue-chip" hidden>
+          <span class="queue-label">Queued — sends when this run ends:</span>
+          <span id="queue-text"></span>
+          <button type="button" id="queue-cancel" title="Remove the queued message" aria-label="Remove the queued message">×</button>
+        </div>
         <div id="comp">
           <textarea id="input" rows="1" placeholder="Message Habi or ask a question…" autocomplete="off" spellcheck="false"></textarea>
           <div class="comp-bottom-row">
@@ -1619,6 +1653,39 @@
   var devServerUrl = "";
   // F-06: true while the chat on screen has a run going (from the payload).
   var busyNow = false;
+
+  // ---- Prompt history (Up/Down) and the queue for messages typed while busy ----
+  var historyPos = -1, historyDraft = "";
+  var queuedMsg = null; // { text, session }
+  var currentSession = "";
+  function loadHistory() {
+    try { return JSON.parse(localStorage.getItem("habi.history") || "[]"); } catch (e) { return []; }
+  }
+  function rememberPrompt(text) {
+    var list = loadHistory().filter(function (t) { return t !== text; });
+    list.push(text);
+    try { localStorage.setItem("habi.history", JSON.stringify(list.slice(-50))); } catch (e) {}
+    historyPos = -1;
+  }
+  function renderQueue() {
+    var box = document.getElementById("queue-chip");
+    if (!box) return;
+    box.hidden = !queuedMsg;
+    if (queuedMsg) document.getElementById("queue-text").textContent = queuedMsg.text;
+  }
+  function queueMessage(text) {
+    queuedMsg = { text: text, session: currentSession };
+    var input = document.getElementById("input");
+    if (input) { input.value = ""; input.dispatchEvent(new Event("input")); }
+    renderQueue();
+  }
+  function sendQueued() {
+    if (!queuedMsg) return;
+    postToRust({ type: "send", text: queuedMsg.text });
+    rememberPrompt(queuedMsg.text);
+    queuedMsg = null;
+    renderQueue();
+  }
   var panelOpen = false;
   var lastRectSig = "";
   var rectQueued = false;
@@ -2700,7 +2767,22 @@
     }
 
     // ---- F-06: while a run is going the send button becomes Stop ----
+    var wasBusy = busyNow;
     busyNow = !!d.busy;
+    currentSession = d.session || "";
+    // The run ended: send what was queued for this chat. Another chat on
+    // screen keeps the queue until its own chat is back and idle.
+    if (queuedMsg && !busyNow && queuedMsg.session === currentSession) sendQueued();
+    if (wasBusy !== busyNow) renderQueue();
+    var edBtn = document.getElementById("open-editor-btn");
+    if (edBtn) {
+      var eds = d.editors || [];
+      edBtn.hidden = !eds.length;
+      if (eds.length) {
+        edBtn.textContent = "Open in " + eds[0];
+        edBtn.setAttribute("data-editor", eds[0]);
+      }
+    }
     var sendBtn = document.getElementById("send");
     if (sendBtn) {
       sendBtn.classList.toggle("stop", busyNow);
@@ -2952,12 +3034,42 @@
     function submitMessage() {
       if (!input) return;
       var v = input.value.trim();
-      if (!v) return;
+      if (!v) {
+        // Ctrl+Enter on an empty composer sends what is queued, now.
+        if (queuedMsg) sendQueued();
+        return;
+      }
       postToRust({ type: "send", text: input.value });
+      rememberPrompt(input.value);
       input.value = "";
       refreshSend();
       input.focus();
     }
+
+    // Up/Down in the composer walk through what was sent before (when the
+    // cursor is at the start, so normal line moves still work).
+    input && input.addEventListener("keydown", function (ev) {
+      if (ev.isComposing || (ev.key !== "ArrowUp" && ev.key !== "ArrowDown")) return;
+      if (ev.shiftKey || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+      var atStart = input.selectionStart === 0 && input.selectionEnd === 0;
+      var walking = historyPos >= 0;
+      if (!(atStart || walking || !input.value)) return;
+      var list = loadHistory();
+      if (!list.length) return;
+      if (ev.key === "ArrowUp") {
+        if (historyPos < 0) historyDraft = input.value;
+        historyPos = Math.min(historyPos + 1, list.length - 1);
+      } else {
+        if (historyPos < 0) return;
+        historyPos -= 1;
+      }
+      ev.preventDefault();
+      input.value = historyPos < 0 ? historyDraft : list[list.length - 1 - historyPos];
+      input.setSelectionRange(0, 0);
+      refreshSend();
+      autoGrow();
+    });
+    input && input.addEventListener("input", function () { historyPos = -1; });
 
     // F-06: stop the run of the chat on screen.
     function stopRun() {
@@ -2989,7 +3101,9 @@
         if (ev.key !== "Enter" || ev.shiftKey) return; // Shift+Enter = new line
         ev.preventDefault();
         if (busyNow && !(ev.ctrlKey || ev.metaKey)) {
-          flashBusyHint();
+          // Busy: the message waits and goes when the run ends.
+          if (input.value.trim()) queueMessage(input.value);
+          else flashBusyHint();
           return;
         }
         // Not busy: send. Busy + Ctrl+Enter: send anyway; the core stops
@@ -3049,6 +3163,22 @@
           renderSidebar();
           sideSearch.blur();
         }
+      });
+    }
+    var queueCancel = document.getElementById("queue-cancel");
+    if (queueCancel) {
+      queueCancel.addEventListener("click", function () {
+        // Put the text back so nothing typed is lost.
+        if (queuedMsg && input && !input.value) input.value = queuedMsg.text;
+        queuedMsg = null;
+        renderQueue();
+        refreshSend();
+      });
+    }
+    var editorBtn = document.getElementById("open-editor-btn");
+    if (editorBtn) {
+      editorBtn.addEventListener("click", function () {
+        postToRust({ type: "open_in_editor", editor: editorBtn.getAttribute("data-editor") });
       });
     }
     var agHead = document.getElementById("ag-head");

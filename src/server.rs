@@ -1469,6 +1469,7 @@ impl AppState {
         let skills_list = skills::load_skills(&workspace);
         let agents_md = skills::load_agents_md(&workspace);
         let baked = skills::load_baked(&self.skill_base);
+        let lessons = load_lessons(self, &workspace);
         agents::compose_system(PromptInputs {
             workspace: &workspace,
             mode,
@@ -1477,6 +1478,7 @@ impl AppState {
             skills: &skills_list,
             ponytail: self.ponytail_level(session_id),
             baked: &baked,
+            lessons: lessons.as_deref(),
         })
     }
 
@@ -1632,7 +1634,7 @@ impl AppState {
             specs.extend(crate::browser::specs());
         }
         if let Ok(mcp) = self.mcp.try_lock() {
-            specs.extend(mcp.specs());
+            specs.extend(mcp_specs_for_prompt(mcp.specs()));
         }
         let roles = agents::load_subagents(&self.workspace_for(session_id));
         specs.push(crate::subagent::spawn_spec(&roles));
@@ -1889,7 +1891,7 @@ pub async fn run_loop(
     if st.browser.lock().map(|g| g.is_some()).unwrap_or(false) {
         specs.extend(crate::browser::specs());
     }
-    specs.extend(st.mcp.lock().await.specs());
+    specs.extend(mcp_specs_for_prompt(st.mcp.lock().await.specs()));
     if opts.can_spawn {
         let roles = agents::load_subagents(&st.workspace_for(session_id));
         specs.push(crate::subagent::spawn_spec(&roles));
@@ -2079,6 +2081,15 @@ pub async fn run_loop(
         // in a row is answered with an error and never runs (no approval
         // prompt either). Every requested call counts, spawns included.
         let calls = apply_loop_guard(st, opts, session_id, &mut loop_guard, calls)?;
+        // `mcp_call` runs as the MCP tool it names: permissions, role and
+        // mode rules and the activity view all see the real tool.
+        let calls: Vec<_> = calls
+            .into_iter()
+            .map(|(id, name, input)| match crate::mcp::unwrap_call(&name, &input) {
+                Some((inner, args)) => (id, inner, args),
+                None => (id, name, input),
+            })
+            .collect();
         // Execute each tool call: role gate → permission gate → route.
         // `spawn` calls run concurrently with each other — the agents panel
         // shows the parallel work — everything else keeps its call order.
@@ -2520,6 +2531,7 @@ async fn check_after_run(
         return;
     }
     let max_rounds = st.cfg.agent.verify_max_rounds;
+    let first_report = best.report.clone();
     let mut undone = false;
     for round in 1..=max_rounds {
         if abort.load(Ordering::SeqCst) {
@@ -2545,6 +2557,9 @@ async fn check_after_run(
         };
         if now.problems == 0 {
             note(format!("{VERIFY_PREFIX} {} passed after {round} fix round(s)", gate.label()));
+            // A failure the checks proved fixed is worth remembering here.
+            let fix = last_assistant_text(st, session_id).unwrap_or_default();
+            record_lesson(st, &ws, &first_report, &fix);
             return;
         }
         if now.problems < best.problems {
@@ -2564,6 +2579,82 @@ async fn check_after_run(
         "{VERIFY_PREFIX} {} still failing after {max_rounds} fix round(s) — over to you",
         best.summary
     ));
+}
+
+/// Most lessons kept per project (each is sent with every request).
+const MAX_LESSONS: usize = 8;
+
+/// Where a project's lessons live: in the app's state folder, not in the
+/// project, one file per project folder.
+fn lessons_path(st: &AppState, ws: &std::path::Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ws.canonicalize().unwrap_or_else(|_| ws.to_path_buf()).hash(&mut h);
+    st.state_dir.join("lessons").join(format!("{:016x}.md", h.finish()))
+}
+
+/// The project's lessons for the prompt, or `None`.
+pub fn load_lessons(st: &AppState, ws: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(lessons_path(st, ws)).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Remember a problem the checks found and a later round fixed (the idea of
+/// harness2's evidence-backed lessons, with the checks as the evidence).
+/// One line each; newest last; a repeat of the same problem replaces the
+/// older line.
+fn record_lesson(st: &AppState, ws: &std::path::Path, report: &str, fix: &str) {
+    let problem = report
+        .lines()
+        .map(str::trim)
+        .find(|l| l.chars().next().is_some_and(|c| c.is_ascii_digit()) && l.contains(". "))
+        .map(|l| l.split_once(". ").map_or(l, |(_, rest)| rest))
+        .or_else(|| report.lines().map(str::trim).find(|l| !l.is_empty()))
+        .unwrap_or("")
+        .to_string();
+    if problem.is_empty() {
+        return;
+    }
+    let short = |s: &str, n: usize| {
+        let one: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one.chars().count() > n {
+            one.chars().take(n).collect::<String>() + "…"
+        } else {
+            one
+        }
+    };
+    let key = short(&problem, 90);
+    let fix = short(fix, 200);
+    let line = if fix.is_empty() {
+        format!("- {} (fixed)", short(&problem, 180))
+    } else {
+        format!("- {} → fixed by: {fix}", short(&problem, 180))
+    };
+    let path = lessons_path(st, ws);
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("- ") && !l.contains(&key))
+        .map(String::from)
+        .collect();
+    lines.push(line);
+    let skip = lines.len().saturating_sub(MAX_LESSONS);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, lines[skip..].join("\n") + "\n");
+}
+
+/// The last thing the assistant said in a session (its fix summary).
+fn last_assistant_text(st: &AppState, session_id: &str) -> Option<String> {
+    let msgs = st.db.messages(session_id).ok()?;
+    msgs.iter().rev().filter(|m| m.role == "assistant").find_map(|m| {
+        m.parts.iter().rev().find_map(|p| match p {
+            Part::Text { text } if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        })
+    })
 }
 
 /// What the post-run check runs.
@@ -2907,6 +2998,14 @@ async fn execute_routed(
             Err(e) => (format!("error: {e:#}"), false),
         };
     }
+    if name == "mcp_search" {
+        let query = input.get("query").and_then(Value::as_str).unwrap_or("");
+        let specs = st.mcp.lock().await.specs();
+        return (crate::mcp::search(&specs, query, 6), true);
+    }
+    if name == "mcp_call" {
+        return ("error: mcp_call needs the `name` of an MCP tool (mcp__<server>__<tool>) from mcp_search".into(), false);
+    }
     if crate::subagent::is_agent_tool(name) {
         return crate::subagent::agent_tool(st, session_id, input, abort).await;
     }
@@ -3010,6 +3109,16 @@ fn tool_detail_for(st: &Shared, opts: &LoopOpts, tool: &str, input: &Value) -> S
 }
 
 /// Flatten a tool's input to a human-readable detail string for rules + display.
+/// MCP tools as the model sees them: one by one when there are few, as
+/// `mcp_search` + `mcp_call` when there are many (see `mcp::INLINE_MAX`).
+fn mcp_specs_for_prompt(specs: Vec<crate::provider::ToolSpec>) -> Vec<crate::provider::ToolSpec> {
+    if specs.len() > crate::mcp::INLINE_MAX {
+        crate::mcp::lazy_specs(specs.len())
+    } else {
+        specs
+    }
+}
+
 fn tool_detail(st: &Shared, tool: &str, input: &Value) -> String {
     match tool {
         "bash" => input.get("command").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -3017,7 +3126,10 @@ fn tool_detail(st: &Shared, tool: &str, input: &Value) -> String {
             let p = input.get("path").and_then(Value::as_str).unwrap_or("");
             normalize_path_detail(&st.workspace, p)
         }
-        "webfetch" => input.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+        "webfetch" => match input.get("query").and_then(Value::as_str).filter(|q| !q.trim().is_empty()) {
+            Some(q) => format!("search: {q}"),
+            None => input.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+        },
         "list" => normalize_path_detail(
             &st.workspace,
             input.get("path").and_then(Value::as_str).unwrap_or("."),
@@ -5748,6 +5860,15 @@ data: [DONE]
         }
         assert!(notes.iter().any(|n| n.contains("round 1 did not help (1 → 3 problem(s)); put back 1 file")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("passed after 2 fix round(s)")), "{notes:?}");
+        // The fixed failure became a lesson that later prompts carry.
+        let lessons = load_lessons(&st, &dir).expect("a lesson was saved");
+        assert!(lessons.starts_with("- ") && lessons.contains("failed (exit 1)") && lessons.contains("fixed by: done"), "{lessons}");
+        assert!(st.composed_system(&s.id).contains("## Lessons from earlier runs in this project"));
+        record_lesson(&st, &dir, "1. `x` failed (exit 1)", "again");
+        assert_eq!(load_lessons(&st, &dir).unwrap().lines().count(), 2, "a new problem adds a line");
+        record_lesson(&st, &dir, "1. `x` failed (exit 1)", "third");
+        assert_eq!(load_lessons(&st, &dir).unwrap().lines().count(), 2, "the same problem replaces its line");
+        let _ = std::fs::remove_file(lessons_path(&st, &dir));
         assert_eq!(std::fs::read_to_string(dir.join("errors.txt")).unwrap(), "error a\n", "the worse round was undone");
         let msgs = st.db.messages(&s.id).unwrap();
         assert!(msgs.iter().any(|m| m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.contains("its file changes were undone")))));

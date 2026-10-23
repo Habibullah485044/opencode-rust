@@ -502,6 +502,113 @@ impl McpRoute {
     }
 }
 
+/// More MCP tools than this are not listed one by one (every spec is sent
+/// with every request): the model gets `mcp_search` to find a tool and
+/// `mcp_call` to run it.
+pub const INLINE_MAX: usize = 12;
+
+/// The two tools that stand in for many MCP tools.
+pub fn lazy_specs(count: usize) -> Vec<ToolSpec> {
+    let spec = |name: &str, description: String, parameters: Value| ToolSpec {
+        kind: "function".into(),
+        function: ToolFnSpec { name: name.into(), description, parameters },
+    };
+    vec![
+        spec(
+            "mcp_search",
+            format!("Find tools among the {count} connected MCP tools; returns names and arguments for mcp_call."),
+            json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
+        ),
+        spec(
+            "mcp_call",
+            "Run an MCP tool found with mcp_search.".to_string(),
+            json!({"type": "object", "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}}, "required": ["name"]}),
+        ),
+    ]
+}
+
+/// `mcp_call {name, arguments}` → the MCP call it stands for. Only MCP
+/// names unwrap, so `mcp_call` cannot reach other tools.
+pub fn unwrap_call(name: &str, input: &Value) -> Option<(String, Value)> {
+    if name != "mcp_call" {
+        return None;
+    }
+    let inner = input.get("name").and_then(Value::as_str)?.trim();
+    parse_fn_name(inner)?;
+    let args = input.get("arguments").cloned().filter(Value::is_object).unwrap_or_else(|| json!({}));
+    Some((inner.to_string(), args))
+}
+
+/// Best matches for `query` among `specs`: name and arguments of each, for
+/// `mcp_call`. Name hits count more than description hits.
+pub fn search(specs: &[ToolSpec], query: &str, limit: usize) -> String {
+    let words: Vec<String> = query.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(String::from).collect();
+    let mut ranked: Vec<(usize, &ToolSpec)> = specs
+        .iter()
+        .map(|s| {
+            let name = s.function.name.to_lowercase();
+            let desc = s.function.description.to_lowercase();
+            let score = words.iter().map(|w| 3 * usize::from(name.contains(w.as_str())) + usize::from(desc.contains(w.as_str()))).sum();
+            (score, s)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.function.name.cmp(&b.1.function.name)));
+    if ranked.is_empty() {
+        let names: Vec<&str> = specs.iter().take(40).map(|s| s.function.name.as_str()).collect();
+        return format!("no MCP tool matches \"{query}\". Available: {}", names.join(", "));
+    }
+    let mut out = String::new();
+    for (_, s) in ranked.into_iter().take(limit) {
+        let desc: String = s.function.description.chars().take(200).collect();
+        let props = s.function.parameters.get("properties").and_then(Value::as_object);
+        let required: Vec<&str> = s
+            .function
+            .parameters
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let args: Vec<String> = props
+            .map(|p| {
+                p.iter()
+                    .map(|(k, v)| {
+                        let ty = v.get("type").and_then(Value::as_str).unwrap_or("any");
+                        let mark = if required.contains(&k.as_str()) { "" } else { "?" };
+                        format!("{k}{mark}: {ty}")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push_str(&format!("{} — {desc}\n  arguments: {{{}}}\n", s.function.name, args.join(", ")));
+    }
+    out.push_str("Run one with mcp_call {\"name\": <name>, \"arguments\": {...}}.");
+    out
+}
+
+#[cfg(test)]
+mod lazy_tests {
+    use super::*;
+
+    #[test]
+    fn search_ranks_by_name_and_mcp_call_only_unwraps_mcp_names() {
+        let t = |name: &str, desc: &str| McpTool {
+            name: name.into(),
+            description: desc.into(),
+            input_schema: json!({"type": "object", "properties": {"repo": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["repo"]}),
+        };
+        let specs = vec![spec_for("gh", &t("list_issues", "List issues")), spec_for("gh", &t("create_pr", "Open a pull request for issues"))];
+        let out = search(&specs, "issues", 5);
+        assert!(out.find("list_issues").unwrap() < out.find("create_pr").unwrap(), "{out}");
+        assert!(out.contains("arguments: {limit?: integer, repo: string}"), "{out}");
+        assert!(search(&specs, "weather", 5).starts_with("no MCP tool matches"));
+        let call = json!({"name": "mcp__gh__list_issues", "arguments": {"repo": "a/b"}});
+        assert_eq!(unwrap_call("mcp_call", &call), Some(("mcp__gh__list_issues".into(), json!({"repo": "a/b"}))));
+        assert_eq!(unwrap_call("mcp_call", &json!({"name": "bash", "arguments": {}})), None, "not an MCP tool");
+        assert_eq!(lazy_specs(30).len(), 2);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

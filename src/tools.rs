@@ -50,8 +50,8 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "webfetch",
-            "Fetch a URL and return its text content (html stripped).",
-            json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}),
+            "Fetch a URL and return its text (html stripped), or search the web with `query` instead.",
+            json!({"type":"object","properties":{"url":{"type":"string"},"query":{"type":"string"}}}),
         ),
         spec(
             "list",
@@ -128,6 +128,12 @@ pub async fn execute(
             args.get("case_insensitive").and_then(Value::as_bool).unwrap_or(false),
         ),
         "webfetch" => {
+            if let Some(q) = args.get("query").and_then(Value::as_str).filter(|q| !q.trim().is_empty()) {
+                return tokio::select! {
+                    r = web_search(q.trim()) => r,
+                    _ = wait_for_abort(abort) => Err(anyhow!("aborted while searching")),
+                };
+            }
             let url = arg_str(args, "url")?;
             // New (B-06): stop waiting for a slow page when the run is aborted.
             tokio::select! {
@@ -799,7 +805,8 @@ async fn webfetch(url: &str) -> Result<String> {
 
 /// S-06: GET `url` from addresses that pass `allowed` only. Checks every
 /// hop, pins each request to the checked addresses, caps the body.
-async fn fetch_checked(url: &str, allowed: fn(std::net::IpAddr) -> bool) -> Result<String> {
+/// Returns the body and whether it was cut.
+async fn fetch_body(url: &str, allowed: fn(std::net::IpAddr) -> bool) -> Result<(Vec<u8>, bool)> {
     let mut current = reqwest::Url::parse(url).with_context(|| format!("invalid url `{url}`"))?;
     for _ in 0..=WEBFETCH_MAX_REDIRECTS {
         if !matches!(current.scheme(), "http" | "https") {
@@ -866,15 +873,82 @@ async fn fetch_checked(url: &str, allowed: fn(std::net::IpAddr) -> bool) -> Resu
             }
             body.extend_from_slice(&chunk);
         }
-        let mut text = truncate(&html_to_text(&String::from_utf8_lossy(&body)), 20_000);
-        if cut {
-            text.push_str(&format!(
-                "\n… [page is larger than {WEBFETCH_MAX_BYTES} bytes; only the start was read]"
-            ));
-        }
-        return Ok(text);
+        return Ok((body, cut));
     }
     bail!("too many redirects (more than {WEBFETCH_MAX_REDIRECTS}) starting at {url}")
+}
+
+/// S-06 fetch as page text (html stripped, capped).
+async fn fetch_checked(url: &str, allowed: fn(std::net::IpAddr) -> bool) -> Result<String> {
+    let (body, cut) = fetch_body(url, allowed).await?;
+    let mut text = truncate(&html_to_text(&String::from_utf8_lossy(&body)), 20_000);
+    if cut {
+        text.push_str(&format!(
+            "\n… [page is larger than {WEBFETCH_MAX_BYTES} bytes; only the start was read]"
+        ));
+    }
+    Ok(text)
+}
+
+/// Web search without an API key: DuckDuckGo's HTML results page, read
+/// through the same checked fetch as webfetch. Up to 8 results.
+async fn web_search(query: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/")?;
+    url.query_pairs_mut().append_pair("q", query);
+    let (body, _) = fetch_body(url.as_str(), is_public_ip).await?;
+    let results = parse_search_results(&String::from_utf8_lossy(&body), 8);
+    if results.is_empty() {
+        return Ok(format!("no results for \"{query}\""));
+    }
+    Ok(results
+        .iter()
+        .enumerate()
+        .map(|(i, (title, link, snippet))| format!("{}. {title}\n   {link}\n   {snippet}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// (title, url, snippet) from a DuckDuckGo HTML results page.
+fn parse_search_results(html: &str, max: usize) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for block in html.split("class=\"result__a\"").skip(1) {
+        if out.len() >= max {
+            break;
+        }
+        let href = block.split("href=\"").nth(1).and_then(|s| s.split('"').next()).unwrap_or("");
+        let href = href.replace("&amp;", "&");
+        // Result links go through a redirect: the target is in `uddg`.
+        let link = reqwest::Url::parse(&format!("https:{}", href.trim_start_matches("https:")))
+            .ok()
+            .and_then(|u| u.query_pairs().find(|(k, _)| k == "uddg").map(|(_, v)| v.into_owned()))
+            .unwrap_or(href);
+        let title = block.split_once('>').and_then(|(_, s)| s.split("</a>").next()).unwrap_or("");
+        let snippet = block
+            .split("class=\"result__snippet\"")
+            .nth(1)
+            .and_then(|s| s.split_once('>'))
+            .and_then(|(_, s)| s.split("</a>").next())
+            .unwrap_or("");
+        // Inline tags (<b> around the matched words) go without a space.
+        let clean = |s: &str| {
+            let mut plain = String::new();
+            let mut in_tag = false;
+            for c in s.chars() {
+                match c {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    _ if !in_tag => plain.push(c),
+                    _ => {}
+                }
+            }
+            html_to_text(&plain).split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let (title, snippet) = (clean(title), clean(snippet));
+        if !title.is_empty() && link.starts_with("http") && !out.iter().any(|(_, l, _)| *l == link) {
+            out.push((title, link, snippet.chars().take(240).collect()));
+        }
+    }
+    out
 }
 
 /// Very small HTML→text: drop script/style, collapse tags to spaces, unescape basics.
@@ -1232,7 +1306,14 @@ mod s06_fetch_tests {
     }
 
     #[tokio::test]
-    async fn webfetch_refuses_local_hosts() {
+    async fn webfetch_refuses_local_hosts_and_parses_search_results() {
+        let page = r#"<div class="result"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.rs%2Ftokio&amp;rut=x">Tokio <b>docs</b></a>
+<a class="result__snippet" href="x">An async runtime for <b>Rust</b>.</a></div>
+<div class="result"><a class="result__a" href="https://example.com/b">Second</a></div>"#;
+        let r = parse_search_results(page, 8);
+        assert_eq!(r[0], ("Tokio docs".into(), "https://docs.rs/tokio".into(), "An async runtime for Rust.".into()));
+        assert_eq!(r[1].1, "https://example.com/b");
+        assert_eq!(parse_search_results(page, 1).len(), 1);
         for url in ["http://127.0.0.1:9/", "http://localhost:9/", "http://[::1]:9/", "http://10.0.0.1/"] {
             let err = webfetch(url).await.unwrap_err().to_string();
             assert!(err.contains("refused"), "{url}: {err}");

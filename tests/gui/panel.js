@@ -505,6 +505,44 @@
   window.render(payload(basePage));
   ok("Stop turns back into send", !document.getElementById("send").classList.contains("stop"));
 
+  // --- Queue while busy, prompt history, open in editor ---
+  var qta = document.getElementById("input");
+  var busyPage = payload(basePage);
+  busyPage.busy = true;
+  window.render(busyPage);
+  sent = [];
+  qta.value = "next step please";
+  key(qta, "Enter");
+  ok("Enter while busy queues instead of sending", count("send") === 0 && !document.getElementById("queue-chip").hidden &&
+    document.getElementById("queue-text").textContent === "next step please");
+  window.render(busyPage);
+  ok("the queue waits while the run goes on", count("send") === 0);
+  window.render(payload(basePage));
+  ok("the queued message is sent when the run ends", (last("send") || {}).text === "next step please" &&
+    document.getElementById("queue-chip").hidden, JSON.stringify(sent));
+  window.render(busyPage);
+  qta.value = "changed my mind";
+  key(qta, "Enter");
+  click("queue-cancel");
+  ok("removing the queued message puts its text back", qta.value === "changed my mind" && document.getElementById("queue-chip").hidden);
+  window.render(payload(basePage));
+  ok("a removed message is not sent", count("send") === 1, JSON.stringify(sent));
+  qta.value = "";
+  key(qta, "ArrowUp");
+  ok("Up in an empty composer recalls the last prompt", qta.value === "next step please", qta.value);
+  key(qta, "ArrowDown");
+  ok("Down goes back to what was being typed", qta.value === "", qta.value);
+  var edPage = payload(basePage);
+  edPage.editors = ["VS Code", "Zed"];
+  window.render(edPage);
+  var edBtn = document.getElementById("open-editor-btn");
+  ok("an installed editor shows its button", !edBtn.hidden && edBtn.textContent === "Open in VS Code");
+  sent = [];
+  click("open-editor-btn");
+  ok("the button asks to open the project in that editor", (last("open_in_editor") || {}).editor === "VS Code", JSON.stringify(sent));
+  window.render(payload(basePage));
+  ok("no editor, no button", edBtn.hidden);
+
   // --- A4: agents panel ---
   try { localStorage.removeItem("habi.agents.collapsed"); } catch (e) { /* ignore */ }
   var agentsEl = document.getElementById("agents");

@@ -224,16 +224,55 @@ pub fn skill_index(skills: &[Doc]) -> String {
         .join("\n")
 }
 
-/// Project instructions: `AGENTS.md` at the workspace root (M2: single file).
+/// Most characters of project instructions put into the prompt (they are
+/// sent with every request).
+const MAX_INSTRUCTION_CHARS: usize = 8_000;
+
+/// Project instructions. `AGENTS.md` at the workspace root when it exists;
+/// otherwise the files other agents read: `CLAUDE.md`, `GEMINI.md`,
+/// `.github/copilot-instructions.md`, `.cursorrules` and
+/// `.cursor/rules/*.md|mdc` (frontmatter dropped), each under its name.
+/// Capped at `MAX_INSTRUCTION_CHARS`.
 pub fn load_agents_md(workspace: &Path) -> Option<String> {
-    let p = workspace.join("AGENTS.md");
-    let text = std::fs::read_to_string(&p).ok()?;
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
+    let read = |p: &Path| std::fs::read_to_string(p).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let text = match read(&workspace.join("AGENTS.md")) {
+        Some(t) => t,
+        None => {
+            let mut files: Vec<(String, std::path::PathBuf)> = ["CLAUDE.md", "GEMINI.md", ".github/copilot-instructions.md", ".cursorrules"]
+                .iter()
+                .map(|n| (n.to_string(), workspace.join(n)))
+                .collect();
+            if let Ok(entries) = std::fs::read_dir(workspace.join(".cursor").join("rules")) {
+                let mut rules: Vec<_> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "md" || x == "mdc"))
+                    .collect();
+                rules.sort();
+                for p in rules {
+                    let name = format!(".cursor/rules/{}", p.file_name().unwrap_or_default().to_string_lossy());
+                    files.push((name, p));
+                }
+            }
+            let parts: Vec<String> = files
+                .iter()
+                .filter_map(|(name, p)| {
+                    let t = read(p)?;
+                    let body = split_frontmatter(&t).map(|(_, b)| b.trim().to_string()).unwrap_or(t);
+                    (!body.is_empty()).then(|| format!("From {name}:\n{body}"))
+                })
+                .collect();
+            if parts.is_empty() {
+                return None;
+            }
+            parts.join("\n\n")
+        }
+    };
+    if text.chars().count() > MAX_INSTRUCTION_CHARS {
+        let cut: String = text.chars().take(MAX_INSTRUCTION_CHARS).collect();
+        return Some(format!("{cut}\n[… project instructions cut at {MAX_INSTRUCTION_CHARS} characters]"));
     }
+    Some(text)
 }
 
 /// M6: the starter `AGENTS.md` that `/init` writes when the repo has none.
@@ -564,6 +603,23 @@ mod tests {
         // Empty file → None too.
         std::fs::write(ws.join("AGENTS.md"), "\n  \n").unwrap();
         assert_eq!(load_agents_md(&ws), None);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Without AGENTS.md, the instruction files other agents use are read.
+    #[test]
+    fn other_agents_instruction_files_are_read() {
+        let ws = tmp("claude-md");
+        std::fs::write(ws.join("CLAUDE.md"), "Use pnpm.\n").unwrap();
+        std::fs::create_dir_all(ws.join(".cursor").join("rules")).unwrap();
+        std::fs::write(ws.join(".cursor/rules/style.mdc"), "---\ndescription: style\nglobs: *.ts\n---\nNo default exports.\n").unwrap();
+        let text = load_agents_md(&ws).unwrap();
+        assert!(text.contains("From CLAUDE.md:\nUse pnpm."), "{text}");
+        assert!(text.contains("From .cursor/rules/style.mdc:\nNo default exports.") && !text.contains("globs"), "{text}");
+        std::fs::write(ws.join("AGENTS.md"), "Agents file wins.").unwrap();
+        assert_eq!(load_agents_md(&ws).as_deref(), Some("Agents file wins."));
+        std::fs::write(ws.join("AGENTS.md"), "x".repeat(MAX_INSTRUCTION_CHARS + 50)).unwrap();
+        assert!(load_agents_md(&ws).unwrap().ends_with("cut at 8000 characters]"));
         let _ = std::fs::remove_dir_all(&ws);
     }
 

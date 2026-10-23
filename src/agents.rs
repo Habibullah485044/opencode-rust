@@ -316,6 +316,9 @@ pub struct PromptInputs<'a> {
     /// Installed skills that passed vetting — embedded in full ("baked in"),
     /// same idea as the vendored ponytail rules.
     pub baked: &'a [skills::Doc],
+    /// Lessons from checks that failed and were fixed in this project
+    /// (see `server::record_lesson`).
+    pub lessons: Option<&'a str>,
 }
 
 /// Vendored Ponytail rules — "lazy senior dev" discipline: the smallest
@@ -436,6 +439,13 @@ pub fn compose_system(p: PromptInputs<'_>) -> String {
         out.push_str(&format!("\n\n## Skill: {} — always active\n\n", s.name));
         out.push_str(s.body.trim());
     }
+    if let Some(lessons) = p.lessons.filter(|l| !l.trim().is_empty()) {
+        out.push_str(
+            "\n\n## Lessons from earlier runs in this project\n\n\
+             Problems the checks found before, and what fixed them. Do not repeat them.\n",
+        );
+        out.push_str(lessons.trim());
+    }
     if let Some(extra) = Some(p.mode.instructions()).filter(|s| !s.is_empty()) {
         out.push_str("\n\n## Mode\n\n");
         out.push_str(extra);
@@ -459,6 +469,7 @@ mod tests {
                 skills: &[],
                 ponytail: level,
                 baked: &[],
+                lessons: None,
             })
         };
         assert!(!text(PonytailLevel::Off).contains("lazy senior developer"), "off drops the rules");
@@ -493,6 +504,7 @@ mod tests {
             skills: &skills,
             ponytail: PonytailLevel::Full,
             baked: &[],
+            lessons: None,
         });
         assert!(text.contains("lazy senior developer"), "the rules are still active");
         let index = crate::skills::skill_index(&skills);
@@ -566,6 +578,7 @@ mod tests {
             skills: &skills,
             ponytail: PonytailLevel::Off,
             baked: &[],
+            lessons: None,
         });
         assert!(text.contains("opencode-rust"), "default base");
         assert!(text.contains("Project instructions (AGENTS.md)"));
@@ -587,6 +600,7 @@ mod tests {
             skills: &[],
             ponytail: PonytailLevel::Full,
             baked: &[],
+            lessons: None,
         });
         assert!(
             text.contains("lazy senior developer"),
@@ -621,6 +635,7 @@ mod tests {
             }],
             ponytail: PonytailLevel::Full,
             baked: &[],
+            lessons: None,
         });
         assert!(
             !text.contains(".openclaw"),
@@ -643,6 +658,7 @@ mod tests {
             skills: &[],
             ponytail: PonytailLevel::Off,
             baked: &[],
+            lessons: None,
         });
         assert!(text.contains("no tool calls"), "explicit no-tools rule");
         assert!(text.to_lowercase().contains("greets you"), "greeting named");
@@ -664,6 +680,7 @@ mod tests {
             skills: &[],
             ponytail: PonytailLevel::Off,
             baked: &baked,
+            lessons: None,
         });
         assert!(
             text.contains("## Skill: deploy — always active"),
