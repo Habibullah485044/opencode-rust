@@ -858,6 +858,8 @@ pub enum IpcMsg {
     SaveSettings { base_url: String, model: String, api_key: Option<String>, effort: String },
     /// Settings page: ask the provider which models it has.
     ListModels,
+    /// Write the open chat as Markdown into its project.
+    Export,
     /// Open the chat's project folder in a code editor (by name, or the first found).
     OpenInEditor(Option<String>),
     /// Projects sidebar: a new chat inside project `id`.
@@ -941,6 +943,7 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
             effort: v.get("reasoning_effort").and_then(|e| e.as_str()).unwrap_or("").to_string(),
         }),
         "list_models" => Some(IpcMsg::ListModels),
+        "export" => Some(IpcMsg::Export),
         "open_in_editor" => Some(IpcMsg::OpenInEditor(v.get("editor").and_then(|e| e.as_str()).map(str::to_string))),
         "new_in_project" => Some(IpcMsg::NewInProject(v.get("project")?.as_str()?.to_string())),
         "add_project" => Some(IpcMsg::AddProject(
@@ -1444,6 +1447,15 @@ pub async fn run(
     // The folder the app started in is a project; plain new chats go there.
     gs.default_project = state.db.upsert_project(&state.workspace).ok().map(|p| p.id);
     gs.editors = find_editors().into_iter().map(|(n, _)| n.to_string()).collect();
+    // Agents write bash; without Git Bash they get cmd.exe and stumble.
+    if crate::tools::shell_kind() == crate::permissions::Shell::Cmd {
+        gs.push(
+            EntryKind::System,
+            "Git for Windows is not installed, so agents run commands in cmd.exe and often get them \
+             wrong. Install it (then restart Habi): winget install --id Git.Git -e --source winget"
+                .to_string(),
+        );
+    }
     {
         let p = &state.cfg.provider;
         let placeholder = p.base_url == crate::config::SETUP_PLACEHOLDER_URL;
@@ -1882,6 +1894,16 @@ pub async fn run(
                             };
                             gs.push(EntryKind::System, text);
                             changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::Export) => {
+                            if let Some(sid) = gs.session.clone() {
+                                let text = match st.export_transcript(&sid, None) {
+                                    Ok(path) => format!("Chat exported to {}", path.display()),
+                                    Err(e) => format!("Export failed: {e:#}"),
+                                };
+                                gs.push(EntryKind::System, text);
+                                changed = true;
+                            }
                         }
                         UiMsg::Ipc(IpcMsg::ListModels) => {
                             let st2 = st.clone();

@@ -570,6 +570,32 @@
   document.getElementById("set-form").dispatchEvent(new Event("submit", { cancelable: true }));
   ok("an empty key field keeps the saved key", !("api_key" in (last("save_settings") || {})), JSON.stringify(sent));
 
+  // --- Theme, drafts, export ---
+  click("settings-btn");
+  document.getElementById("set-theme").value = "light";
+  document.getElementById("set-form").dispatchEvent(new Event("submit", { cancelable: true }));
+  ok("the light theme applies", document.documentElement.getAttribute("data-theme") === "light");
+  click("settings-btn");
+  document.getElementById("set-theme").value = "dark";
+  document.getElementById("set-form").dispatchEvent(new Event("submit", { cancelable: true }));
+  ok("dark removes it again", !document.documentElement.hasAttribute("data-theme"));
+  var dta = document.getElementById("input");
+  var chatA = payload(basePage); chatA.session = "chat-a";
+  var chatB = payload(basePage); chatB.session = "chat-b";
+  window.render(chatA);
+  dta.value = "half-typed idea";
+  dta.dispatchEvent(new Event("input"));
+  window.render(chatB);
+  ok("another chat starts with its own (empty) box", dta.value === "", dta.value);
+  window.render(chatA);
+  ok("coming back brings the draft back", dta.value === "half-typed idea", dta.value);
+  dta.value = "";
+  dta.dispatchEvent(new Event("input"));
+  window.render(payload(basePage));
+  sent = [];
+  click("export-btn");
+  ok("Export asks for the chat as Markdown", count("export") === 1);
+
   // --- ask_user: question with answer buttons ---
   var askPage = payload(basePage);
   askPage.question = { text: "Which color theme?", options: ["Warm brown", "Dark roast"] };

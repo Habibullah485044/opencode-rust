@@ -48,6 +48,34 @@
     --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
+  /* Light palette: Settings → Appearance, or "System" when Windows is light. */
+  :root[data-theme="light"] {
+    --bg: #f6f6f8;
+    --panel: #ffffff;
+    --surface: #ffffff;
+    --surface-2: #eeeff3;
+    --surface-3: #e3e4ea;
+    --code-bg: #f1f2f5;
+    --line: rgba(15, 18, 30, 0.09);
+    --line-strong: rgba(15, 18, 30, 0.16);
+    --text: #17181c;
+    --text-soft: #3a3c45;
+    --text-muted: #62646f;
+    --text-dim: #8b8d98;
+    --accent: #4a5fd6;
+    --accent-strong: #3a4fc4;
+    --accent-soft: rgba(74, 95, 214, 0.10);
+    --accent-line: rgba(74, 95, 214, 0.35);
+    --on-accent: #ffffff;
+    --ok: #1f8f52;
+    --ok-soft: rgba(31, 143, 82, 0.10);
+    --bad: #c9393c;
+    --bad-soft: rgba(201, 57, 60, 0.08);
+    --warn: #a86b08;
+    --warn-soft: rgba(168, 107, 8, 0.10);
+    --think: #6b55c7;
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
   html, body {
@@ -1572,6 +1600,7 @@
           <div id="cstatus">
             <span>Ready</span>
           </div>
+          <button class="header-btn" id="export-btn" title="Save this chat as a Markdown file in the project">Export</button>
           <button class="header-btn" id="open-editor-btn" hidden title="Open this project's folder in your code editor">Open in editor</button>
           <button class="header-btn" id="toggle-browser-btn" title="Toggle embedded preview browser">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
@@ -1737,6 +1766,12 @@
         <option value="low">Low — cheapest, fastest</option>
         <option value="medium">Medium</option>
         <option value="high">High — slowest, most output tokens</option>
+      </select>
+      <label for="set-theme">Appearance</label>
+      <select id="set-theme">
+        <option value="system">Same as Windows</option>
+        <option value="dark">Dark</option>
+        <option value="light">Light</option>
       </select>
       <p class="set-path" id="set-path"></p>
       <div class="set-actions">
@@ -2730,6 +2765,34 @@
     overlayHooks.close();
   }
 
+  // ---- Appearance: dark, light, or follow Windows ----
+  function savedTheme() {
+    try { return localStorage.getItem("habi.theme") || "system"; } catch (e) { return "system"; }
+  }
+  function applyTheme(choice) {
+    var light = choice === "light" ||
+      (choice === "system" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+    if (light) document.documentElement.setAttribute("data-theme", "light");
+    else document.documentElement.removeAttribute("data-theme");
+  }
+  applyTheme(savedTheme());
+  if (window.matchMedia) {
+    var themeQuery = window.matchMedia("(prefers-color-scheme: light)");
+    var onThemeChange = function () { if (savedTheme() === "system") applyTheme("system"); };
+    if (themeQuery.addEventListener) themeQuery.addEventListener("change", onThemeChange);
+  }
+
+  // ---- Unsent text per chat (drafts) ----
+  function loadDrafts() {
+    try { return JSON.parse(localStorage.getItem("habi.drafts") || "{}"); } catch (e) { return {}; }
+  }
+  function saveDraft(session, text) {
+    if (!session) return;
+    var all = loadDrafts();
+    if (text) all[session] = text; else delete all[session];
+    try { localStorage.setItem("habi.drafts", JSON.stringify(all)); } catch (e) {}
+  }
+
   // ---- Settings: provider, model, key, thinking effort ----
   var settingsData = {};
   var setupShown = false;
@@ -2743,6 +2806,7 @@
     key.value = "";
     key.placeholder = s.has_key ? "A key is saved — leave empty to keep it" : "Paste a key (kept encrypted for your Windows user)";
     document.getElementById("set-effort").value = s.reasoning_effort || "";
+    document.getElementById("set-theme").value = savedTheme();
     document.getElementById("set-path").textContent = s.config_path ? "Saved to " + s.config_path : "";
     document.getElementById("set-setup").hidden = !s.needs_setup;
     box.hidden = false;
@@ -2937,7 +3001,18 @@
     // ---- F-06: while a run is going the send button becomes Stop ----
     var wasBusy = busyNow;
     busyNow = !!d.busy;
-    currentSession = d.session || "";
+    // Switching chats: keep what was typed in the old one, bring back the new one's.
+    var nextSession = d.session || "";
+    if (nextSession !== currentSession) {
+      var box = document.getElementById("input");
+      if (box) saveDraft(currentSession, box.value);
+      currentSession = nextSession;
+      if (box) {
+        box.value = loadDrafts()[nextSession] || "";
+        box.dispatchEvent(new Event("input"));
+      }
+    }
+    currentSession = nextSession;
     // The run ended: send what was queued for this chat. Another chat on
     // screen keeps the queue until its own chat is back and idle.
     if (queuedMsg && !busyNow && queuedMsg.session === currentSession) sendQueued();
@@ -3236,6 +3311,7 @@
       postToRust({ type: "send", text: input.value });
       rememberPrompt(input.value);
       input.value = "";
+      saveDraft(currentSession, "");
       refreshSend();
       input.focus();
     }
@@ -3263,7 +3339,7 @@
       refreshSend();
       autoGrow();
     });
-    input && input.addEventListener("input", function () { historyPos = -1; });
+    input && input.addEventListener("input", function () { historyPos = -1; saveDraft(currentSession, input.value); });
 
     // F-06: stop the run of the chat on screen.
     function stopRun() {
@@ -3369,6 +3445,8 @@
         refreshSend();
       });
     }
+    var exportBtn = document.getElementById("export-btn");
+    if (exportBtn) exportBtn.addEventListener("click", function () { postToRust({ type: "export" }); });
     var editorBtn = document.getElementById("open-editor-btn");
     if (editorBtn) {
       editorBtn.addEventListener("click", function () {
@@ -3407,6 +3485,9 @@
           reasoning_effort: document.getElementById("set-effort").value
         };
         if (key) msg.api_key = key; // empty: keep the saved key
+        var theme = document.getElementById("set-theme").value;
+        try { localStorage.setItem("habi.theme", theme); } catch (e) {}
+        applyTheme(theme);
         postToRust(msg);
         document.getElementById("set-key").value = "";
         closeSettings();
