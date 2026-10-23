@@ -1137,6 +1137,21 @@
   }
   .next-opt:hover { border-color: var(--accent-line); color: var(--text); background: var(--accent-soft); }
 
+  /* ---- Deep mode: the next message is tried several times ---- */
+  #deep-btn {
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 11.5px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    cursor: pointer;
+    flex: none;
+  }
+  #deep-btn:hover { color: var(--text); background: var(--surface-2); }
+  #deep-btn.on { color: var(--accent-strong); background: var(--accent-soft); border-color: var(--accent-line); }
+
   /* ---- git branch chip and its menu ---- */
   #git-wrap { position: relative; flex: none; }
   #git-wrap[hidden] { display: none; }
@@ -1828,6 +1843,8 @@
                 <button type="button" class="git-item" data-git="pr">Push and open a pull request</button>
               </div>
             </div>
+            <button type="button" id="deep-btn" aria-pressed="false"
+                    title="Deep: send the next message as several attempts in separate copies of the project; the app checks each one and keeps the best (uses more tokens)">Deep</button>
             <div class="mode-switch" id="mode-switch" role="radiogroup" aria-label="Permission mode">
               <button type="button" class="mode-btn on" data-mode="default" role="radio" aria-checked="true"
                       title="Default: safe reads run, anything that writes or runs a command asks first">Default</button>
@@ -2032,6 +2049,13 @@
     commit: "Commit all the changes in this project with a short, clear commit message (look at git diff first). Do not push.",
     pr: "Push the current branch and open a pull request for it with gh: a clear title and a short description of what changed and how it was tested. If gh is missing or not signed in, tell me the exact command to run instead."
   };
+  function setDeep(on) {
+    var b = document.getElementById("deep-btn");
+    if (!b) return;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    b.textContent = on ? "Deep: on" : "Deep";
+  }
   function sendQueued() {
     if (!queuedMsg) return;
     postToRust({ type: "send", text: queuedMsg.text });
@@ -3270,8 +3294,11 @@
       time.textContent = agentTime(a);
       var acts = document.createElement("span");
       acts.className = "ag-acts";
-      acts.appendChild(agentButton("Open", "Open this agent's transcript", "", { type: "load", id: a.id }));
-      if (agentRunning(a)) {
+      // Deep-mode attempts keep no transcript of their own and stop with the
+      // chat's Stop button, so their cards have no buttons.
+      var deepAttempt = String(a.id).indexOf("deep-") === 0;
+      if (!deepAttempt) acts.appendChild(agentButton("Open", "Open this agent's transcript", "", { type: "load", id: a.id }));
+      if (agentRunning(a) && !deepAttempt) {
         acts.appendChild(agentButton("Stop", "Stop this agent", "stop", { type: "agent_stop", id: a.id }));
       }
       var detail = document.createElement("span");
@@ -3734,7 +3761,14 @@
         if (queuedMsg) sendQueued();
         return;
       }
-      postToRust({ type: "send", text: input.value });
+      var text = input.value;
+      // Deep is for one message: it costs several runs.
+      var deepBtn = document.getElementById("deep-btn");
+      if (deepBtn && deepBtn.classList.contains("on") && v.charAt(0) !== "/") {
+        text = "/deep " + v;
+        setDeep(false);
+      }
+      postToRust({ type: "send", text: text });
       rememberPrompt(input.value);
       input.value = "";
       saveDraft(currentSession, "");
@@ -4116,6 +4150,10 @@
         if (btn && btn.getAttribute("data-copy")) copyCode(btn.getAttribute("data-copy"), btn);
       });
     }
+
+    // Deep toggle
+    var deepToggle = document.getElementById("deep-btn");
+    if (deepToggle) deepToggle.addEventListener("click", function () { setDeep(!deepToggle.classList.contains("on")); });
 
     // Git chip menu
     var gitChip = document.getElementById("git-chip");

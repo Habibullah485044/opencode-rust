@@ -28,8 +28,10 @@ pub enum Command {
     Review,
     /// Laziness Meter report: lines added/deleted/reuse hints this session.
     Debt,
-    /// Run the same task in isolated git worktrees and compare results.
-    Parallel(String),
+    /// Deep mode: try the task in isolated git worktrees, check each attempt
+    /// and keep the best. `attempts: None` = `agent.deep_attempts`.
+    /// `/parallel <task>` is `/deep 2 <task>`.
+    Deep { attempts: Option<usize>, task: String },
     /// Assign a mission: `kind` preselected or `None` (open the picker).
     /// The goal is expanded into a well-worded briefing before the run.
     Mission { kind: Option<crate::mission::MissionKind>, goal: String },
@@ -89,6 +91,7 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "clear", args: "", help: "Clear the transcript view (history kept)" },
         Builtin { name: "compact", args: "", help: "Summarize old history, keep the recent tail" },
         Builtin { name: "debt", args: "", help: "Laziness Meter: lines added/deleted/reuse hints" },
+        Builtin { name: "deep", args: "[n] <task>", help: "Try the task n times (default 3), keep the best checked one" },
         Builtin { name: "diff", args: "[id|n]", help: "Diff against the parent or another session" },
         Builtin { name: "edit", args: "<file> <what>", help: "Inline edit: one completion, diff preview" },
         Builtin { name: "export", args: "[path]", help: "Write the transcript to markdown" },
@@ -98,7 +101,7 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "mission", args: "[kind] <goal>", help: "Run a briefing (Explore/Commit/Merge PR/Custom)" },
         Builtin { name: "model", args: "[id]", help: "Show the active model, or switch to <id>" },
         Builtin { name: "new", args: "", help: "Start a fresh session" },
-        Builtin { name: "parallel", args: "<task>", help: "Run one task in two isolated worktrees" },
+        Builtin { name: "parallel", args: "<task>", help: "Same as /deep 2 <task>" },
         Builtin { name: "plan", args: "", help: "Read-only plan mode (no writes)" },
         Builtin { name: "ponytail", args: "[level]", help: "Ponytail rules: show or set lite / full / ultra / off" },
         Builtin { name: "quit", args: "", help: "Exit" },
@@ -188,7 +191,20 @@ pub fn classify(input: &str) -> Option<Command> {
         "skills" if arg.is_empty() => Some(Command::Skills),
         "review" if arg.is_empty() => Some(Command::Review),
         "debt" if arg.is_empty() => Some(Command::Debt),
-        "parallel" if !arg.is_empty() => Some(Command::Parallel(arg.to_string())),
+        "parallel" if !arg.is_empty() => Some(Command::Deep { attempts: Some(2), task: arg.to_string() }),
+        "deep" if !arg.is_empty() => {
+            // `/deep 4 <task>` sets the number of attempts; `/deep <task>` uses the config.
+            let mut it = arg.splitn(2, char::is_whitespace);
+            let first = it.next().unwrap_or("");
+            let rest = it.next().unwrap_or("").trim();
+            match first.parse::<usize>() {
+                Ok(n) if (1..=5).contains(&n) && !rest.is_empty() => {
+                    Some(Command::Deep { attempts: Some(n), task: rest.to_string() })
+                }
+                Ok(_) => None,
+                Err(_) => Some(Command::Deep { attempts: None, task: arg.to_string() }),
+            }
+        }
         "mission" if !arg.is_empty() => {
             // `/mission <kind> <goal>` runs with the kind preselected;
             // `/mission <goal>` opens the mission picker with the goal filled.
@@ -255,7 +271,7 @@ mod tests {
         assert_eq!(classify("/debt"), Some(Command::Debt));
         assert_eq!(
             classify("/parallel add a date picker"),
-            Some(Command::Parallel("add a date picker".into()))
+            Some(Command::Deep { attempts: Some(2), task: "add a date picker".into() })
         );
         assert_eq!(
             classify("/mission explore the auth flow"),
@@ -341,6 +357,17 @@ mod tests {
         assert_eq!(classify("/edit only-a-path.md"), None, "needs an instruction");
         assert_eq!(classify("/review now"), None, "no stray args");
         assert_eq!(classify("/parallel"), None, "task required");
+        assert_eq!(classify("/deep"), None, "task required");
+        assert_eq!(classify("/deep 3"), None, "a number alone is no task");
+        assert_eq!(classify("/deep 9 x"), None, "at most 5 attempts");
+        assert_eq!(
+            classify("/deep 4 fix the parser"),
+            Some(Command::Deep { attempts: Some(4), task: "fix the parser".into() })
+        );
+        assert_eq!(
+            classify("/deep fix the parser"),
+            Some(Command::Deep { attempts: None, task: "fix the parser".into() })
+        );
         assert_eq!(classify("/mission"), None, "goal required");
         assert_eq!(classify("/mission custom"), None, "kind without goal");
         assert_eq!(classify("/mission explore"), None, "kind without goal");

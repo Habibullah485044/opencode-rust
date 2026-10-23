@@ -128,25 +128,62 @@ impl Worktree {
         }
     }
 
-    fn save_patch(&self, patch_dir: &Path) -> Result<String> {
+    /// `git diff --cached <args> <base>`, limited to the workspace folder.
+    fn diff_from_base(&self, args: &[&str]) -> Result<String> {
+        let mut all = vec!["diff", "--cached"];
+        all.extend_from_slice(args);
+        all.push(self.base.as_str());
+        if !self.prefix.is_empty() {
+            // Only changes inside the workspace folder count.
+            all.extend(["--", self.prefix.as_str()]);
+        }
+        git(&self.dir, &all)
+    }
+
+    /// What changed so far: the changed files (full paths in the worktree)
+    /// and the number of lines added plus removed.
+    pub fn changes(&self) -> Result<(Vec<PathBuf>, usize)> {
+        git(&self.dir, &["add", "-A"])?;
+        let mut files = Vec::new();
+        let mut lines = 0;
+        for row in self.diff_from_base(&["--numstat", "--no-renames"])?.lines() {
+            let mut cols = row.splitn(3, '\t');
+            let (Some(add), Some(del), Some(path)) = (cols.next(), cols.next(), cols.next()) else {
+                continue;
+            };
+            // Binary files show "-": count them as one line.
+            lines += add.parse::<usize>().unwrap_or(1) + del.parse::<usize>().unwrap_or(0);
+            files.push(self.dir.join(path));
+        }
+        Ok((files, lines))
+    }
+
+    /// Write the changes as a patch file in `patch_dir`. `None` = no changes.
+    pub fn write_patch(&self, patch_dir: &Path) -> Result<Option<PathBuf>> {
         git(&self.dir, &["add", "-A"])?;
         let patch_dir = std::path::absolute(patch_dir)?;
         std::fs::create_dir_all(&patch_dir)?;
         let patch = patch_dir.join(format!("{}.patch", self.name));
         let output = format!("--output={}", patch.display());
-        let mut diff = vec!["diff", "--cached", "--binary", output.as_str(), self.base.as_str()];
-        let mut stat = vec!["diff", "--cached", "--stat", "--stat-count=20", self.base.as_str()];
-        if !self.prefix.is_empty() {
-            // Only changes inside the workspace folder come back.
-            diff.extend(["--", self.prefix.as_str()]);
-            stat.extend(["--", self.prefix.as_str()]);
-        }
-        git(&self.dir, &diff)?;
+        self.diff_from_base(&["--binary", output.as_str()])?;
         if std::fs::metadata(&patch).map(|m| m.len()).unwrap_or(0) == 0 {
             let _ = std::fs::remove_file(&patch);
-            return Ok("[isolated worktree] no file changes.".to_string());
+            return Ok(None);
         }
-        let stat = git(&self.dir, &stat)?;
+        Ok(Some(patch))
+    }
+
+    /// Apply a patch from `write_patch` to the real repository's files.
+    pub fn apply_to_repo(&self, patch: &Path) -> Result<()> {
+        let p = patch.to_string_lossy().to_string();
+        git(&self.root, &["apply", "--whitespace=nowarn", &p]).map(|_| ())
+    }
+
+    fn save_patch(&self, patch_dir: &Path) -> Result<String> {
+        let Some(patch) = self.write_patch(patch_dir)? else {
+            return Ok("[isolated worktree] no file changes.".to_string());
+        };
+        let stat = self.diff_from_base(&["--stat", "--stat-count=20"])?;
         let (p, r) = (patch.display(), self.root.display());
         Ok(format!(
             "[isolated worktree] changes saved as a patch, NOT applied to the workspace yet.\n\

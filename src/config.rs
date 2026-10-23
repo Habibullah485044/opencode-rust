@@ -312,6 +312,9 @@ pub struct AgentCfg {
     /// Most subagents one chat runs at the same time; more spawns wait in
     /// line for a free place.
     pub max_subagents: usize,
+    /// Deep mode (`/deep`): how many attempts at one task, each in its own
+    /// git worktree; the best checked one is kept. At most 5.
+    pub deep_attempts: usize,
     /// F-08: command that checks the work after a run that changed files,
     /// for example "cargo test". Unset (the default) = no check.
     pub verify_command: Option<String>,
@@ -342,6 +345,7 @@ impl Default for AgentCfg {
             ponytail: true,
             isolate_workers: false,
             max_subagents: 4,
+            deep_attempts: 3,
             verify_command: None,
             auto_verify: true,
             check_pages: true,

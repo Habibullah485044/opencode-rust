@@ -298,7 +298,8 @@ COMMANDS (in TUI, most also headless — type / for the palette, F1 for the refe
   /diff [id|n]     Diff this session against its parent or another one
   /undo /redo      Restore the workspace to a pre-run git snapshot
   /review /debt    Senior-dev review of the diff / line-debt report
-  /parallel <task> Run one task in two isolated worktrees
+  /deep [n] <task> Try the task n times (default 3), keep the best checked one
+  /parallel <task> Same as /deep 2 <task>
   /turbo [prompt]  Full access, no approvals, keeps working
   /skills          List loaded skills
   /skill install   Vet, install and bake in a skill
@@ -569,8 +570,8 @@ async fn headless_run(
                 }
                 return Ok(());
             }
-            Cmd::Parallel(task) => {
-                state.kick_parallel(session.id.clone(), task).await;
+            Cmd::Deep { attempts, task } => {
+                state.kick_deep(session.id.clone(), task, attempts).await;
                 team_spawned = true;
             }
             Cmd::Mission { kind, goal } => {
@@ -1152,8 +1153,8 @@ async fn tui_run(
                             text,
                         });
                     }
-                    tui::InputAction::Parallel(task) => {
-                        st.kick_parallel(sid.clone(), task).await;
+                    tui::InputAction::Deep { attempts, task } => {
+                        st.kick_deep(sid.clone(), task, attempts).await;
                     }
                     tui::InputAction::Approve { id, always } => {
                         let _ = st.decide(&id, true, always);

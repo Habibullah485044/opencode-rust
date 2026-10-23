@@ -95,7 +95,7 @@
         assert!(!app.busy, "debt is local");
         type_line(&mut app, "/parallel add a date picker");
         assert!(
-            matches!(app.on_key(key(KeyCode::Enter)), Some(InputAction::Parallel(ref t)) if t == "add a date picker")
+            matches!(app.on_key(key(KeyCode::Enter)), Some(InputAction::Deep { attempts: Some(2), ref task }) if task == "add a date picker")
         );
         assert!(app.busy, "parallel is an agent run");
         // A senior-dev note lands as a system line.

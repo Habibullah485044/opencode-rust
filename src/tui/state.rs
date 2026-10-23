@@ -561,7 +561,7 @@ impl App {
                         Some(Command::Team(_))
                             | Some(Command::Compact)
                             | Some(Command::Review)
-                            | Some(Command::Parallel(_))
+                            | Some(Command::Deep { .. })
                             | Some(Command::Edit { .. })
                             | Some(Command::SkillInstall(_))
                     )
@@ -599,8 +599,8 @@ impl App {
                     Some(Command::Skills) => (Some(InputAction::Skills), false),
                     Some(Command::Review) => (Some(InputAction::Review), true),
                     Some(Command::Debt) => (Some(InputAction::Debt), false),
-                    Some(Command::Parallel(task)) => {
-                        (Some(InputAction::Parallel(task)), true)
+                    Some(Command::Deep { attempts, task }) => {
+                        (Some(InputAction::Deep { attempts, task }), true)
                     }
                     Some(Command::Edit { path, instruction }) => {
                         (Some(InputAction::Edit { path, instruction }), true)
@@ -1228,8 +1228,8 @@ pub enum InputAction {
     Review,
     /// Laziness Meter report (local, instant).
     Debt,
-    /// Parallel worktree run of one task.
-    Parallel(String),
+    /// Deep mode: several checked attempts at one task, best one kept.
+    Deep { attempts: Option<usize>, task: String },
     SetMode(AgentMode),
     Compact,
     Undo,

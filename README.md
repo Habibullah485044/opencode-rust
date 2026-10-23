@@ -97,7 +97,8 @@ Inside the terminal UI, type `/` for the command palette or press F1:
 | `/init` | Create a starter `AGENTS.md` |
 | `/mission [kind] <goal>` | Run a briefing (Explore / Commit / Merge PR / Custom) |
 | `/model [id]` | Show or switch the model |
-| `/parallel <task>` | Run one task in two isolated git worktrees |
+| `/deep [n] <task>` | Deep mode: try the task n times (default 3, at most 5), each in its own git worktree; every attempt is checked (tests/build, page check) and the best one is applied (`/undo` takes it back). The Deep button in the desktop app does the same for one message |
+| `/parallel <task>` | Same as `/deep 2 <task>` |
 | `/review` | Senior-dev review of the uncommitted changes |
 | `/skill install <path\|url>`, `/skills` | Install / list skills |
 | `/team <goal>` | Plan → parallel workers → review → summary |

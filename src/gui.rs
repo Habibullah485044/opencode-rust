@@ -1335,6 +1335,7 @@ pub const GUI_COMMANDS: &[(&str, &str, &str)] = &[
     ("usage", "", "Tokens used, and how much came from the cache"),
     ("compact", "", "Summarize old messages to make room"),
     ("review", "", "Review the uncommitted changes"),
+    ("deep", "[n] <task>", "Try the task n times (default 3) in separate copies, keep the best checked one"),
     ("undo", "", "Put the files back as they were before the last run"),
     ("redo", "", "Re-apply what /undo put back"),
     ("init", "", "Write a starter AGENTS.md for this project"),
@@ -1407,6 +1408,19 @@ fn gui_command(gs: &mut GuiState, st: &Arc<server::AppState>, rt: &tokio::runtim
             rt.spawn(async move { st2.kick_review(sid2).await });
             gs.busy = true;
         }
+        "deep" => match crate::commands::classify(line) {
+            Some(crate::commands::Command::Deep { attempts, task }) => {
+                if gs.title() == NEW_CHAT {
+                    let _ = st.db.set_session_title(&sid, &clip(&task, 40));
+                    refresh_sessions(gs, st);
+                }
+                let st2 = st.clone();
+                let sid2 = sid.clone();
+                rt.spawn(async move { st2.kick_deep(sid2, task, attempts).await });
+                gs.busy = true;
+            }
+            _ => say(gs, "Usage: /deep [n] <task>, with n from 1 to 5 (default 3).".into()),
+        },
         "undo" | "redo" => {
             let res = if name == "undo" {
                 crate::gitsnap::undo(&root, &st.state_dir)

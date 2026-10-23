@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex, RwLock};
 
+mod deep;
+
 /// How much autonomy the agent has — set by the client (GUI composer toggle,
 /// `/turbo` in the TUI/CLI) and read by every permission check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1223,58 +1225,30 @@ impl AppState {
         });
     }
 
-    /// `/parallel <task>` — run the same task in two isolated git worktrees
-    /// and report what each produced, so you can pick the better result.
-    pub async fn kick_parallel(self: &Shared, session_id: String, task: String) {
-        let flag = {
-            let mut busy = self.busy.write().await;
-            if let Some(old) = busy.remove(&session_id) {
-                old.store(true, Ordering::SeqCst);
+    /// `/deep [n] <task>` (and `/parallel <task>`, which is `/deep 2`): try
+    /// the task in several git worktrees, check each attempt and apply the
+    /// best one (`deep::run_deep`). `None` = `agent.deep_attempts`.
+    pub async fn kick_deep(self: &Shared, session_id: String, task: String, attempts: Option<usize>) {
+        let n = attempts.unwrap_or(self.cfg.agent.deep_attempts);
+        self.kick_task(session_id, move |st, sid, flag| async move {
+            let res = deep::run_deep(&st, &sid, &task, n, &flag).await;
+            if st.is_superseded(&sid, &flag).await {
+                return;
             }
-            let flag = Arc::new(AtomicBool::new(false));
-            busy.insert(session_id.clone(), flag.clone());
-            flag
-        };
-        let st2 = self.clone();
-        tokio::spawn(async move {
-            let res = run_parallel(&st2, &task, &flag).await;
-            let superseded = {
-                let busy = st2.busy.read().await;
-                busy.get(&session_id)
-                    .map(|f| !Arc::ptr_eq(f, &flag))
-                    .unwrap_or(false)
-            };
-            if !superseded {
-                match res {
-                    Ok(summary) => {
-                        let _ = st2.events.send(ServerEvent::AssistantDelta {
-                            session_id: session_id.clone(),
-                            text: summary,
-                        });
-                        let _ = st2.events.send(ServerEvent::RunFinished {
-                            session_id: session_id.clone(),
-                            ok: true,
-                            message: None,
-                        });
+            let (ok, message) = match res {
+                Ok(text) => {
+                    if !text.is_empty() {
+                        let _ = st.db.add_message(&sid, "assistant", &[Part::Text { text: text.clone() }]);
+                        let _ = st.events.send(ServerEvent::AssistantDelta { session_id: sid.clone(), text });
                     }
-                    Err(e) => {
-                        let _ = st2.events.send(ServerEvent::RunFinished {
-                            session_id: session_id.clone(),
-                            ok: false,
-                            message: Some(format!("parallel failed: {e}")),
-                        });
-                    }
+                    (true, None)
                 }
-            }
-            let mut busy = st2.busy.write().await;
-            if busy
-                .get(&session_id)
-                .map(|f| Arc::ptr_eq(f, &flag))
-                .unwrap_or(false)
-            {
-                busy.remove(&session_id);
-            }
-        });
+                Err(e) if flag.load(Ordering::SeqCst) => (false, Some(format!("deep mode stopped: {e}"))),
+                Err(e) => (false, Some(format!("deep mode failed: {e:#}"))),
+            };
+            let _ = st.events.send(ServerEvent::RunFinished { session_id: sid, ok, message });
+        })
+        .await;
     }
 
     /// Start an agent run for `user_content`, first aborting any run already
@@ -2546,20 +2520,7 @@ async fn check_after_run(
         let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
     };
     let ws = st.workspace_for(session_id);
-    let configured = st.cfg.agent.verify_command.as_deref().map(str::trim).filter(|c| !c.is_empty());
-    let mut cmd = match configured {
-        Some(c) => Some(c.to_string()),
-        None if st.cfg.agent.auto_verify => detect_verify_command(&ws),
-        None => None,
-    };
-    // Deny rules still apply. There is no "ask" prompt: the user set this
-    // command, or it is the project's own check.
-    if let Some(c) = cmd.as_deref() {
-        if st.engine.evaluate("bash", c, |_, _| false).action == Action::Deny {
-            note(format!("{VERIFY_PREFIX} skipped: a deny rule blocks `{c}`"));
-            cmd = None;
-        }
-    }
+    let cmd = verify_command_for(st, &ws, &note);
     let pages = |since| changed_web_pages(&ws, since, bash_used, st.cfg.agent.check_pages);
     let mut gate = Gate { cmd, pages: pages(since), expect: crate::pagecheck::expected_texts(request) };
     if gate.cmd.is_none() && gate.pages.is_empty() {
@@ -2622,6 +2583,23 @@ async fn check_after_run(
         "{VERIFY_PREFIX} {} still failing after {max_rounds} fix round(s) — over to you",
         best.summary
     ));
+}
+
+/// The check command for `ws`: the configured one, else (with
+/// `agent.auto_verify`) the project's own. Deny rules still apply. There is
+/// no "ask" prompt: the user set this command, or it is the project's check.
+fn verify_command_for(st: &AppState, ws: &std::path::Path, note: &impl Fn(String)) -> Option<String> {
+    let configured = st.cfg.agent.verify_command.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let cmd = match configured {
+        Some(c) => Some(c.to_string()),
+        None if st.cfg.agent.auto_verify => detect_verify_command(ws),
+        None => None,
+    }?;
+    if st.engine.evaluate("bash", &cmd, |_, _| false).action == Action::Deny {
+        note(format!("{VERIFY_PREFIX} skipped: a deny rule blocks `{cmd}`"));
+        return None;
+    }
+    Some(cmd)
 }
 
 /// Most lessons kept per project (each is sent with every request).
@@ -2913,95 +2891,6 @@ fn tail_chars(s: &str, max: usize) -> &str {
     }
     let start = s.char_indices().nth(count - max).map(|(i, _)| i).unwrap_or(0);
     &s[start..]
-}
-
-/// Run `task` twice, in two isolated git worktrees, and summarize the results.
-/// New (B-25): both workers run at the same time, use the model the session
-/// uses now, and follow the session's permission mode. Workers have no
-/// screen for an approval prompt, so an `ask` is refused at once instead of
-/// waiting out the approval timeout.
-async fn run_parallel(st: &Shared, task: &str, abort: &Arc<AtomicBool>) -> Result<String> {
-    // Requires a git repo to branch from.
-    crate::gitsnap::git(&st.workspace, &["rev-parse", "HEAD"])
-        .map_err(|e| anyhow::anyhow!("parallel runs need a git repository: {e}"))?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let root = st.state_dir.join("parallel").join(format!("t{stamp}"));
-    std::fs::create_dir_all(&root)?;
-    // New (B-25): worker settings: no nested reviews, the model the session
-    // uses now (`/model` may have switched it), and no approval waits —
-    // nobody can answer a worker's prompt, so an `ask` is refused at once.
-    let mut cfg = st.cfg.clone();
-    cfg.agent.auto_review = false;
-    cfg.provider.model = st.current_model().await;
-    cfg.permissions.approval_timeout_secs = 0;
-    let mode = st.perm_mode();
-    // Create the worktrees one after the other (git locks the repository).
-    let mut workers = Vec::new();
-    for n in 1..=2u8 {
-        if abort.load(Ordering::SeqCst) {
-            break;
-        }
-        let wt = root.join(format!("w{n}"));
-        let branch = format!("ocrs/parallel-{stamp}-w{n}");
-        let wt_str = wt.to_string_lossy().to_string();
-        crate::gitsnap::git(&st.workspace, &["worktree", "add", "-b", &branch, &wt_str])
-            .map_err(|e| anyhow::anyhow!("git worktree add failed: {e}"))?;
-        workers.push((n, wt, branch));
-    }
-    // New (B-25): run the workers at the same time, each in the session's
-    // permission mode (turbo stays turbo).
-    let answers = futures::future::join_all(workers.iter().map(|(n, wt, _)| {
-        let cfg = cfg.clone();
-        async move {
-            let worker = build_state_ephemeral(cfg, wt.clone()).await;
-            let _ = worker.set_perm_mode(mode);
-            match worker.db.create_session(&format!("parallel-w{n}"), None) {
-                Ok(s) => agent_inner(&worker, &s.id, task, abort)
-                    .await
-                    .unwrap_or_else(|e| format!("error: {e}")),
-                Err(e) => format!("error: worker session: {e}"),
-            }
-        }
-    }))
-    .await;
-    let mut rows: Vec<String> = Vec::new();
-    for ((n, wt, branch), answer) in workers.iter().zip(answers) {
-        let stat = crate::gitsnap::git(&wt, &["diff", "--shortstat", "HEAD"])
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let changed = crate::gitsnap::git(&wt, &["status", "--porcelain"])
-            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-            .unwrap_or(0);
-        let first = answer.lines().take(3).collect::<Vec<_>>().join(" ");
-        rows.push(format!(
-            "[w{n}] {changed} file(s) changed · {}\n     branch {branch}\n     dir {}\n     {first}",
-            if stat.is_empty() {
-                "no diff".to_string()
-            } else {
-                stat
-            },
-            wt.display()
-        ));
-    }
-    let mut out = format!(
-        "parallel results (2 worktrees) — inspect, then merge the winner:\n{}",
-        rows.join("\n")
-    );
-    // New (B-25): how to clean up, and why a tool may have been refused.
-    out.push_str(
-        "\nremove a worktree you do not keep: git worktree remove <dir> && git branch -D <branch>",
-    );
-    if mode != PermissionMode::Turbo {
-        out.push_str(
-            "\nnote: workers cannot show approval prompts, so tools that need approval are \
-             refused there; switch on /turbo first or allow those tools in the config",
-        );
-    }
-    Ok(out)
 }
 
 /// Route a permitted tool call: MCP server, subagent spawn, or local tool.
@@ -4418,29 +4307,53 @@ data: [DONE]
         assert!(noted, "a note tells the user");
     }
 
-    /// B-25: /parallel workers use the model the session switched to.
+    /// Deep mode: three attempts at once, each in its own worktree; only the
+    /// "simplest" attempt writes a file the check accepts. That attempt is
+    /// applied to the project, the others are dropped, every request uses
+    /// the model the chat switched to, and no worktree is left behind.
     #[tokio::test]
-    async fn parallel_workers_use_the_current_model() {
+    async fn deep_mode_keeps_the_attempt_that_passes_the_check() {
         use axum::{routing::post, Router};
-        let dir = std::env::temp_dir().join(format!("ocrs-b25-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ocrs-deep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| crate::gitsnap::git(&dir, args).unwrap();
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
+        git(&["config", "core.autocrlf", "false"]);
         std::fs::write(dir.join("hello.txt"), "hi\n").unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", "init"]);
 
+        let models = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = models.clone();
         let app = Router::new().route(
             "/v1/chat/completions",
-            post(|body: axum::extract::Json<Value>| async move {
-                let model = body["model"].as_str().unwrap_or("?").to_string();
-                let payload = format!(
-                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"model={model}\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
-                );
-                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+            post(move |body: axum::extract::Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(body["model"].as_str().unwrap_or("?").to_string());
+                    let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                    let last_role = msgs.last().and_then(|m| m["role"].as_str()).unwrap_or("");
+                    let task = msgs
+                        .iter()
+                        .find(|m| m["role"] == "user")
+                        .and_then(|m| m["content"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let payload = if last_role != "tool" {
+                        let word = if task.contains("simplest") { "good" } else { "bad" };
+                        let args = serde_json::json!({ "path": "out.txt", "content": format!("{word}\n") }).to_string();
+                        let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                            {"index":0,"id":"w1","function":{"name":"write","arguments":args}}
+                        ]},"finish_reason":null}]});
+                        format!("data: {chunk}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
+                    } else {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"wrote out.txt\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string()
+                    };
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -4451,12 +4364,37 @@ data: [DONE]
         let mut cfg = crate::config::Config::default();
         cfg.provider.base_url = format!("http://{addr}/v1");
         cfg.provider.model = "first".into();
+        cfg.agent.verify_command = Some("grep -q good out.txt".into());
         let st = build_state_ephemeral(cfg, dir.clone()).await;
         st.set_model("switched").await;
+        let s = st.db.create_session("deep", None).unwrap();
 
-        let out = run_parallel(&st, "say OK", &Arc::new(AtomicBool::new(false))).await.unwrap();
-        assert_eq!(out.matches("model=switched").count(), 2, "{out}");
-        assert!(out.contains("git worktree remove"), "{out}");
+        let out = deep::run_deep(&st, &s.id, "write out.txt", 3, &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert!(out.contains("attempt 2") && out.contains("← kept"), "{out}");
+        assert!(out.contains("Applied attempt 2"), "{out}");
+        assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap(), "good\n");
+        let models = models.lock().unwrap().clone();
+        assert_eq!(models.len(), 6, "two requests per attempt: {models:?}");
+        assert!(models.iter().all(|m| m == "switched"), "{models:?}");
+        let worktrees = git(&["worktree", "list"]);
+        assert_eq!(worktrees.lines().count(), 1, "attempt worktrees removed: {worktrees}");
+        assert!(git(&["branch", "--list", "ocrs/*"]).trim().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deep mode without git says why instead of running.
+    #[tokio::test]
+    async fn deep_mode_needs_git() {
+        let dir = std::env::temp_dir().join(format!("ocrs-deep-nogit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = build_state_ephemeral(crate::config::Config::default(), dir.clone()).await;
+        let s = st.db.create_session("deep", None).unwrap();
+        let err = deep::run_deep(&st, &s.id, "x", 2, &Arc::new(AtomicBool::new(false))).await.unwrap_err();
+        assert!(format!("{err:#}").contains("needs a git repository"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// B-24: the automatic review prompt neither counts nor breaks the streak.
@@ -5150,7 +5088,8 @@ data: [DONE]
         assert!(report.contains("1 reuse hint"), "{report}");
     }
 
-    /// /parallel: two isolated git worktrees, both summarized.
+    /// `/parallel` (Deep mode with 2 attempts): attempts that change no
+    /// file are both listed and nothing is applied.
     #[tokio::test]
     async fn parallel_runs_in_isolated_worktrees() {
         let dir = std::env::temp_dir().join(format!("ocrs-par-{}", std::process::id()));
@@ -5170,11 +5109,12 @@ data: [DONE]
         cfg.provider.model = "stub".into();
         let st = build_state_ephemeral(cfg, dir.clone()).await;
 
-        let out = run_parallel(&st, "say OK", &Arc::new(AtomicBool::new(false)))
+        let s = st.db.create_session("par", None).unwrap();
+        let out = deep::run_deep(&st, &s.id, "say OK", 2, &Arc::new(AtomicBool::new(false)))
             .await
             .unwrap();
-        assert!(out.contains("parallel results (2 worktrees)"), "{out}");
-        assert!(out.contains("[w1]") && out.contains("[w2]"), "both rows present: {out}");
+        assert!(out.contains("attempt 1") && out.contains("attempt 2"), "both rows present: {out}");
+        assert!(out.contains("nothing was applied"), "{out}");
     }
 
     /// Ponytail review runs read-only against the mock and reports in full.

@@ -757,6 +757,35 @@
   ok("no git hides the chip", document.getElementById("git-wrap").hidden);
   ok("six starter templates", document.querySelectorAll("#empty .chip").length === 6);
 
+  // Deep attempts show as agent cards without Open/Stop.
+  var deepAgents = Object.assign(payload(basePage), { agents: [
+    { id: "deep-1-1", name: "attempt 1", task: "t", state: "working", detail: "write out.txt", secs: 3 }
+  ] });
+  window.render(deepAgents);
+  var deepCard = document.querySelector('.ag-card[data-id="deep-1-1"]');
+  ok("a deep attempt card has no buttons", !!deepCard && deepCard.querySelectorAll(".ag-btn").length === 0);
+  window.render(payload(basePage));
+
+  // Deep toggle: the next message goes out as /deep, once.
+  var dta = document.getElementById("input");
+  click("deep-btn");
+  ok("Deep turns on", document.getElementById("deep-btn").classList.contains("on"));
+  sent = [];
+  dta.value = "add a dark mode";
+  key(dta, "Enter");
+  ok("a message with Deep on is sent as /deep", (last("send") || {}).text === "/deep add a dark mode", JSON.stringify(sent));
+  ok("Deep is for one message", !document.getElementById("deep-btn").classList.contains("on"));
+  sent = [];
+  dta.value = "plain again";
+  key(dta, "Enter");
+  ok("the next message is plain", (last("send") || {}).text === "plain again", JSON.stringify(sent));
+  click("deep-btn");
+  sent = [];
+  dta.value = "/review";
+  key(dta, "Enter");
+  ok("a command is not wrapped in /deep", (last("send") || {}).text === "/review", JSON.stringify(sent));
+  click("deep-btn");
+
   } catch (e) {
     ok("harness ran to completion", false, "threw: " + (e && e.message));
   }

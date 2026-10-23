@@ -81,6 +81,9 @@ reuse_gate = true
 # isolate_workers = false
 # Most subagents one chat runs at once; extra spawns wait their turn.
 # max_subagents = 4
+# Deep mode (/deep <task>): attempts at one task, each in its own git
+# worktree; every attempt is checked and the best one is applied (max 5).
+# deep_attempts = 3
 
 # F-08: check the work after every run that changed files (unset = off).
 # On failure the agent gets the output and up to verify_max_rounds tries to fix it.
