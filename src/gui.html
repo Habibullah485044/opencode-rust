@@ -477,6 +477,58 @@
     animation: fadeIn 0.12s ease-out;
   }
   #history[hidden] { display: none; }
+  #settings {
+    position: fixed;
+    inset: 0;
+    z-index: 150;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: rgba(5, 6, 8, 0.72);
+    animation: fadeIn 0.12s ease-out;
+  }
+  #settings[hidden] { display: none; }
+  .set-card { width: min(520px, 100%); }
+  .set-note { color: var(--warn); font-size: 12px; }
+  .set-body { display: grid; gap: 6px; padding: 14px 16px 16px; }
+  .set-body label { font-size: 12px; font-weight: 600; color: var(--text-soft); margin-top: 8px; }
+  .set-body input, .set-body select {
+    font: inherit;
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: var(--radius-s);
+    border: 1px solid var(--line-strong);
+    background: var(--surface);
+    color: var(--text);
+    width: 100%;
+  }
+  .set-body input:focus, .set-body select:focus { outline: none; border-color: var(--accent-line); }
+  .set-row { display: flex; gap: 6px; }
+  .set-presets { display: flex; flex-wrap: wrap; gap: 6px; }
+  .set-presets button, .set-row button {
+    border: 1px solid var(--line-strong);
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 12px;
+    border-radius: var(--radius-s);
+    padding: 4px 10px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .set-presets button:hover, .set-row button:hover { color: var(--text); background: var(--surface-2); }
+  .set-path { font-size: 11.5px; color: var(--text-dim); margin: 8px 0 0; word-break: break-all; }
+  .set-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+  #set-save {
+    border: 0;
+    background: var(--accent);
+    color: var(--on-accent);
+    font: inherit;
+    font-weight: 600;
+    border-radius: var(--radius-s);
+    padding: 7px 18px;
+    cursor: pointer;
+  }
   .hist-card {
     width: min(640px, 100%);
     height: min(640px, 100%);
@@ -1493,6 +1545,10 @@
       <div id="sesslist"></div>
 
       <div id="foot">
+        <button class="side-link" id="settings-btn" title="Model provider, model, API key (Ctrl+,)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+          Settings
+        </button>
         <button class="side-link" id="history-btn" title="Every chat, including archived ones">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
           History
@@ -1646,6 +1702,47 @@
       <button class="hist-close" id="hist-close" title="Close (Esc)">&times;</button>
     </div>
     <div id="hist-list"></div>
+  </div>
+</div>
+
+<!-- Settings: provider, model, API key, thinking effort. -->
+<div id="settings" hidden>
+  <div class="hist-card set-card" role="dialog" aria-modal="true" aria-label="Settings">
+    <div class="hist-head">
+      <b>Settings</b>
+      <span class="set-note" id="set-setup" hidden>Choose a model provider to start.</span>
+      <span style="flex:1"></span>
+      <button class="hist-close" id="set-close" title="Close (Esc)">&times;</button>
+    </div>
+    <form id="set-form" class="set-body" novalidate>
+      <label for="set-url">Provider address</label>
+      <div class="set-presets">
+        <button type="button" data-url="https://openrouter.ai/api/v1">OpenRouter</button>
+        <button type="button" data-url="https://api.openai.com/v1">OpenAI</button>
+        <button type="button" data-url="https://api.groq.com/openai/v1">Groq</button>
+        <button type="button" data-url="http://127.0.0.1:11434/v1">Ollama (local)</button>
+      </div>
+      <input id="set-url" type="text" spellcheck="false" autocomplete="off" placeholder="https://openrouter.ai/api/v1" />
+      <label for="set-model">Model</label>
+      <div class="set-row">
+        <input id="set-model" type="text" list="set-models" spellcheck="false" autocomplete="off" placeholder="e.g. qwen/qwen3-coder:free" />
+        <button type="button" id="set-load-models" title="Ask the provider which models it has">Load models</button>
+      </div>
+      <datalist id="set-models"></datalist>
+      <label for="set-key">API key</label>
+      <input id="set-key" type="password" autocomplete="off" placeholder="Paste a key (kept encrypted for your Windows user)" />
+      <label for="set-effort">Thinking effort</label>
+      <select id="set-effort">
+        <option value="">Model default</option>
+        <option value="low">Low — cheapest, fastest</option>
+        <option value="medium">Medium</option>
+        <option value="high">High — slowest, most output tokens</option>
+      </select>
+      <p class="set-path" id="set-path"></p>
+      <div class="set-actions">
+        <button type="submit" id="set-save">Save</button>
+      </div>
+    </form>
   </div>
 </div>
 
@@ -2633,6 +2730,49 @@
     overlayHooks.close();
   }
 
+  // ---- Settings: provider, model, key, thinking effort ----
+  var settingsData = {};
+  var setupShown = false;
+  function openSettings() {
+    var box = document.getElementById("settings");
+    if (!box) return;
+    var s = settingsData || {};
+    document.getElementById("set-url").value = s.base_url || "";
+    document.getElementById("set-model").value = s.model || "";
+    var key = document.getElementById("set-key");
+    key.value = "";
+    key.placeholder = s.has_key ? "A key is saved — leave empty to keep it" : "Paste a key (kept encrypted for your Windows user)";
+    document.getElementById("set-effort").value = s.reasoning_effort || "";
+    document.getElementById("set-path").textContent = s.config_path ? "Saved to " + s.config_path : "";
+    document.getElementById("set-setup").hidden = !s.needs_setup;
+    box.hidden = false;
+    overlayHooks.open();
+    (s.base_url ? document.getElementById("set-model") : document.getElementById("set-url")).focus();
+  }
+  function closeSettings() {
+    var box = document.getElementById("settings");
+    if (!box || box.hidden) return;
+    box.hidden = true;
+    overlayHooks.close();
+  }
+  function renderSettings(s) {
+    settingsData = s || {};
+    var list = document.getElementById("set-models");
+    if (list) {
+      var models = settingsData.models || [];
+      if (list.getAttribute("data-n") !== String(models.length)) {
+        list.textContent = "";
+        models.forEach(function (m) { var o = document.createElement("option"); o.value = m; list.appendChild(o); });
+        list.setAttribute("data-n", String(models.length));
+      }
+    }
+    // No provider yet: open once by itself.
+    if (settingsData.needs_setup && !setupShown) {
+      setupShown = true;
+      openSettings();
+    }
+  }
+
   // Called by Rust: window.render(d)
   // ---- A4: agents panel ----
   var agentsData = [];
@@ -2733,6 +2873,7 @@
     agentsData = d.agents || [];
     agentsAt = Date.now();
     renderAgents();
+    renderSettings(d.settings);
 
     // Window and header title
     var title = d.title || "New chat";
@@ -3244,6 +3385,36 @@
         }
       });
     }
+    var settingsBtn = document.getElementById("settings-btn");
+    if (settingsBtn) settingsBtn.addEventListener("click", openSettings);
+    var setClose = document.getElementById("set-close");
+    if (setClose) setClose.addEventListener("click", closeSettings);
+    var setBox = document.getElementById("settings");
+    if (setBox) {
+      setBox.addEventListener("click", function (ev) { if (ev.target === setBox) closeSettings(); });
+      setBox.addEventListener("keydown", function (ev) { if (ev.key === "Escape") { ev.preventDefault(); closeSettings(); } });
+      [].forEach.call(setBox.querySelectorAll(".set-presets button"), function (b) {
+        b.addEventListener("click", function () { document.getElementById("set-url").value = b.getAttribute("data-url"); });
+      });
+      document.getElementById("set-load-models").addEventListener("click", function () { postToRust({ type: "list_models" }); });
+      document.getElementById("set-form").addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        var key = document.getElementById("set-key").value.trim();
+        var msg = {
+          type: "save_settings",
+          base_url: document.getElementById("set-url").value.trim(),
+          model: document.getElementById("set-model").value.trim(),
+          reasoning_effort: document.getElementById("set-effort").value
+        };
+        if (key) msg.api_key = key; // empty: keep the saved key
+        postToRust(msg);
+        document.getElementById("set-key").value = "";
+        closeSettings();
+      });
+    }
+    document.addEventListener("keydown", function (ev) {
+      if ((ev.ctrlKey || ev.metaKey) && ev.key === ",") { ev.preventDefault(); openSettings(); }
+    });
     var historyBtn = document.getElementById("history-btn");
     if (historyBtn) historyBtn.addEventListener("click", openHistory);
     var histClose = document.getElementById("hist-close");

@@ -75,6 +75,23 @@
 
     ok("no frame leaks the raw document", JSON.stringify(snap).length < 8000,
       JSON.stringify(snap).length);
+
+    // press / scroll / console / evaluate
+    var keys = [];
+    document.getElementById("i1").addEventListener("keydown", function (e) { keys.push(e.key); });
+    var snap2 = window.__habi.snapshot();
+    var field = snap2.nodes.filter(function (n) { return n.role === "text"; })[0];
+    var subs = 0;
+    var formEl = document.getElementById("i1").form;
+    formEl.addEventListener("submit", function (e) { e.preventDefault(); subs++; });
+    var pr = window.__habi.press("Enter", field.ref);
+    ok("press sends the key to the element", keys.indexOf("Enter") >= 0 && pr.pressed === "Enter", JSON.stringify(pr));
+    ok("Enter in a form field submits it", subs === 1, subs);
+    var sc = window.__habi.scroll("bottom");
+    ok("scroll reports the position", typeof sc.scrollY === "number" && sc.pageHeight > 0, JSON.stringify(sc));
+    console.warn("careful", { n: 1 });
+    ok("console output is kept", /warn: careful \{"n":1\}/.test(window.__habi.logs()), window.__habi.logs());
+    ok("evaluate returns JSON", window.__habi.evaluate("({a: 1 + 1})") === '{"a":2}');
   } catch (e) {
     ok("harness ran to completion", false, "threw: " + (e && e.message));
   }

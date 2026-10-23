@@ -543,6 +543,33 @@
   window.render(payload(basePage));
   ok("no editor, no button", edBtn.hidden);
 
+  // --- Settings page ---
+  var setPage = payload(basePage);
+  setPage.settings = { base_url: "", model: "", reasoning_effort: "", has_key: false, needs_setup: true,
+    models: ["qwen/qwen3-coder:free", "deepseek/deepseek-chat"], config_path: "C:/x/config.toml" };
+  window.render(setPage);
+  var setBox = document.getElementById("settings");
+  ok("no provider: Settings opens by itself", !setBox.hidden && !document.getElementById("set-setup").hidden);
+  ok("listed models fill the model suggestions", document.querySelectorAll("#set-models option").length === 2);
+  setBox.querySelector(".set-presets button").click();
+  document.getElementById("set-model").value = "qwen/qwen3-coder:free";
+  document.getElementById("set-key").value = "sk-or-123";
+  document.getElementById("set-effort").value = "low";
+  sent = [];
+  document.getElementById("set-form").dispatchEvent(new Event("submit", { cancelable: true }));
+  var saved = last("save_settings") || {};
+  ok("Save sends the provider, model, key and effort", saved.base_url === "https://openrouter.ai/api/v1" &&
+    saved.model === "qwen/qwen3-coder:free" && saved.api_key === "sk-or-123" && saved.reasoning_effort === "low", JSON.stringify(saved));
+  ok("the key field is cleared and the page closes", document.getElementById("set-key").value === "" && setBox.hidden);
+  setPage.settings.needs_setup = false;
+  setPage.settings.has_key = true;
+  window.render(setPage);
+  ok("it opens by itself only once", setBox.hidden);
+  click("settings-btn");
+  sent = [];
+  document.getElementById("set-form").dispatchEvent(new Event("submit", { cancelable: true }));
+  ok("an empty key field keeps the saved key", !("api_key" in (last("save_settings") || {})), JSON.stringify(sent));
+
   // --- ask_user: question with answer buttons ---
   var askPage = payload(basePage);
   askPage.question = { text: "Which color theme?", options: ["Warm brown", "Dark roast"] };

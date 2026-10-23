@@ -205,10 +205,10 @@ impl Default for PermissionsCfg {
         }
         // Goal B: reading the page and waiting are safe; clicking and typing
         // can submit forms, so they go through the approval modal (D1).
-        for t in ["browser_navigate", "browser_snapshot", "browser_wait", "browser_screenshot"] {
+        for t in ["browser_navigate", "browser_snapshot", "browser_wait", "browser_screenshot", "browser_scroll", "browser_console"] {
             defaults.insert(t.to_string(), "allow".to_string());
         }
-        for t in ["browser_click", "browser_type"] {
+        for t in ["browser_click", "browser_type", "browser_press", "browser_eval"] {
             defaults.insert(t.to_string(), "ask".to_string());
         }
         // Starting and managing subagents is safe by itself: each child still
@@ -383,6 +383,13 @@ impl Config {
         if let Ok(m) = std::env::var("OPENCODE_RUST_MODEL") {
             if !m.is_empty() { cfg.provider.model = m; }
         }
+        // The key saved from the desktop app's Settings (encrypted), when
+        // neither the file nor the environment has one.
+        if cfg.provider.api_key.is_empty() {
+            if let Some(k) = crate::settings::load_api_key() {
+                cfg.provider.api_key = k;
+            }
+        }
         cfg.permissions
             .validate()
             .with_context(|| format!("checking [permissions] in {}", path.display()))?;
@@ -431,6 +438,10 @@ pub fn unknown_config_keys(text: &str, cfg: &Config) -> Vec<String> {
     walk(&toml::Value::Table(user), &known, "", &mut out);
     out
 }
+
+/// Stand-in provider address while the desktop app has no provider yet:
+/// the app starts and opens Settings instead of failing (nothing listens).
+pub const SETUP_PLACEHOLDER_URL: &str = "http://127.0.0.1:9/v1";
 
 pub fn default_config_path() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")

@@ -18,6 +18,7 @@ pub mod permissions;
 pub mod preview;
 pub mod provider;
 pub mod server;
+pub mod settings;
 pub mod sessions;
 pub mod skills;
 pub mod subagent;

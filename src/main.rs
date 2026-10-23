@@ -139,6 +139,12 @@ fn run() -> Result<()> {
         }
     };
 
+    // The desktop app without a provider opens its Settings page instead of
+    // failing: started from a shortcut there is nobody to read an error.
+    if gui && cfg.effective_base_url().is_err() {
+        cfg.provider.base_url = opencode_rust::config::SETUP_PLACEHOLDER_URL.to_string();
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

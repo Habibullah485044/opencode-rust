@@ -115,6 +115,26 @@ pub fn specs() -> Vec<ToolSpec> {
             }),
         ),
         spec(
+            "browser_press",
+            "Press a key (Enter, Escape, Tab, ArrowDown, a …) on the element with ref, or the focused one.",
+            json!({"type":"object","properties":{"key":{"type":"string"},"ref":{"type":"string"}},"required":["key"]}),
+        ),
+        spec(
+            "browser_scroll",
+            "Scroll the page: direction down/up/top/bottom, or bring the element with ref into view.",
+            json!({"type":"object","properties":{"direction":{"type":"string"},"ref":{"type":"string"}}}),
+        ),
+        spec(
+            "browser_console",
+            "The page's recent console messages, uncaught errors and failed loads.",
+            json!({"type":"object","properties":{}}),
+        ),
+        spec(
+            "browser_eval",
+            "Run a JavaScript expression in the page and return its value (JSON).",
+            json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}),
+        ),
+        spec(
             "browser_screenshot",
             "Save a PNG of what the preview panel shows right now and return its file path \
              and size (Windows desktop app only). You cannot see the image; use it to hand \
@@ -177,6 +197,33 @@ pub async fn execute(
                 .await
         }
         "browser_screenshot" => handle.call("screenshot", json!({})).await,
+        "browser_press" => {
+            let key = input.get("key").and_then(Value::as_str).unwrap_or("").trim();
+            if key.is_empty() {
+                return Some(Err("browser_press needs a `key` (Enter, Escape, Tab, ArrowDown, a …)".into()));
+            }
+            let r = input.get("ref").and_then(Value::as_str);
+            if r.is_some_and(|r| !valid_ref(r)) {
+                return Some(Err("`ref` must be like `e12` — take a fresh snapshot".into()));
+            }
+            handle.call("press", json!({ "key": key, "ref": r })).await
+        }
+        "browser_scroll" => {
+            let dir = input.get("direction").and_then(Value::as_str).unwrap_or("down");
+            let r = input.get("ref").and_then(Value::as_str);
+            if r.is_some_and(|r| !valid_ref(r)) {
+                return Some(Err("`ref` must be like `e12` — take a fresh snapshot".into()));
+            }
+            handle.call("scroll", json!({ "direction": dir, "ref": r })).await
+        }
+        "browser_console" => handle.call("logs", json!({})).await,
+        "browser_eval" => {
+            let code = input.get("code").and_then(Value::as_str).unwrap_or("");
+            if code.trim().is_empty() {
+                return Some(Err("browser_eval needs `code`".into()));
+            }
+            handle.call("evaluate", json!({ "code": code })).await
+        }
         _ => return None,
     };
     Some(res)
@@ -224,7 +271,61 @@ pub const RUNTIME_JS: &str = r#"(function () {
     if (t === 'input') return el.type || 'text';
     return t;
   }
+  // Console output and uncaught errors, for browser_console (newest last).
+  var logs = [];
+  function keep(level, args) {
+    try {
+      var text = [].map.call(args, function (a) {
+        if (a instanceof Error) return a.message;
+        if (typeof a === 'object') { try { return JSON.stringify(a); } catch (e) { return String(a); } }
+        return String(a);
+      }).join(' ');
+      logs.push(level + ': ' + text.slice(0, 300));
+      if (logs.length > 200) logs.shift();
+    } catch (e) {}
+  }
+  ['log', 'info', 'warn', 'error'].forEach(function (level) {
+    var orig = console[level];
+    console[level] = function () { keep(level, arguments); return orig && orig.apply(console, arguments); };
+  });
+  if (window.addEventListener) {
+    window.addEventListener('error', function (e) {
+      if (e.target && e.target !== window && (e.target.src || e.target.href)) keep('failed to load', [e.target.src || e.target.href]);
+      else keep('uncaught', [e.message || 'error']);
+    }, true);
+    window.addEventListener('unhandledrejection', function (e) { keep('unhandled rejection', [e.reason]); });
+  }
+  function byRef(ref) {
+    var el = document.querySelector('[data-habi-ref="' + ref + '"]');
+    if (!el) throw new Error('no element with ref ' + ref + ' — take a fresh snapshot');
+    return el;
+  }
   window.__habi = {
+    press: function (key, ref) {
+      var el = ref ? byRef(ref) : (document.activeElement || document.body);
+      if (ref && el.focus) el.focus();
+      var opts = { key: key, bubbles: true, cancelable: true };
+      var go = el.dispatchEvent(new KeyboardEvent('keydown', opts));
+      el.dispatchEvent(new KeyboardEvent('keyup', opts));
+      // Enter in a form field submits, as a real key press would.
+      if (go && key === 'Enter' && el.form && el.tagName !== 'TEXTAREA' && el.form.requestSubmit) el.form.requestSubmit();
+      return { pressed: key, on: el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') };
+    },
+    scroll: function (direction, ref) {
+      if (ref) byRef(ref).scrollIntoView({ block: 'center' });
+      else if (direction === 'top') window.scrollTo(0, 0);
+      else if (direction === 'bottom') window.scrollTo(0, document.documentElement.scrollHeight);
+      else window.scrollBy(0, (direction === 'up' ? -0.8 : 0.8) * innerHeight);
+      return { scrollY: Math.round(scrollY), pageHeight: document.documentElement.scrollHeight, viewHeight: innerHeight };
+    },
+    logs: function () {
+      return logs.length ? logs.slice(-50).join('\n') : '(no console output)';
+    },
+    evaluate: function (code) {
+      var r = (0, eval)(code);
+      if (r === undefined) return 'undefined';
+      try { return JSON.stringify(r).slice(0, 4000); } catch (e) { return String(r).slice(0, 4000); }
+    },
     snapshot: function () {
       // Refs from an older snapshot must not survive: clear them first, so
       // every ref names exactly one element of THIS snapshot.
@@ -316,6 +417,18 @@ fn js_string(input: &Value, key: &str) -> Option<String> {
 pub fn eval_wrapper(method: &str, input: &Value, id: u64) -> Option<String> {
     let call = match method {
         "snapshot" => "__habi.snapshot()".to_string(),
+        "press" => format!(
+            "__habi.press({}, {})",
+            js_string(input, "key")?,
+            js_string(input, "ref").unwrap_or_else(|| "null".into())
+        ),
+        "scroll" => format!(
+            "__habi.scroll({}, {})",
+            js_string(input, "direction").unwrap_or_else(|| "\"down\"".into()),
+            js_string(input, "ref").unwrap_or_else(|| "null".into())
+        ),
+        "logs" => "__habi.logs()".to_string(),
+        "evaluate" => format!("__habi.evaluate({})", js_string(input, "code")?),
         "click" => format!("__habi.click({})", js_string(input, "ref")?),
         "type" => format!(
             "__habi.type({}, {}, {})",

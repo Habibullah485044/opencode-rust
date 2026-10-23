@@ -72,11 +72,27 @@ pub struct GuiState {
     pub editors: Vec<String>,
     /// The open chat's `ask_user` question and its answer buttons.
     pub question: Option<(String, Vec<String>)>,
+    /// What the Settings page shows.
+    pub settings: GuiSettings,
     /// New (B-37): the entries as the page last received them, and for which
     /// chat, so a paint only sends what changed. `RefCell` because painting
     /// only has `&GuiState`.
     sent: std::cell::RefCell<Vec<(EntryKind, String)>>,
     sent_session: std::cell::RefCell<Option<String>>,
+}
+
+/// The Settings page: provider fields (never the key itself).
+#[derive(Debug, Clone, Default)]
+pub struct GuiSettings {
+    pub base_url: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub has_key: bool,
+    /// No provider yet: the page opens by itself.
+    pub needs_setup: bool,
+    /// Models the provider lists (after "Load models").
+    pub models: Vec<String>,
+    pub config_path: String,
 }
 
 /// A4: one spawned agent in the agents panel.
@@ -167,6 +183,7 @@ impl Default for GuiState {
             agents: Vec::new(),
             editors: Vec::new(),
             question: None,
+            settings: GuiSettings::default(),
             sent: std::cell::RefCell::new(Vec::new()),
             sent_session: std::cell::RefCell::new(None),
         }
@@ -399,6 +416,9 @@ impl GuiState {
         if let ServerEvent::Usage { session_id, session, .. } = &ev {
             self.usage.insert(session_id.clone(), *session);
             return;
+        }
+        if let ServerEvent::ModelInfo { available, .. } = &ev {
+            self.settings.models = available.clone();
         }
         if let ServerEvent::Question { session_id, question, options } = ev {
             if self.is_current(&session_id) {
@@ -718,6 +738,15 @@ impl GuiState {
             "agents": agents,
             "editors": self.editors,
             "question": self.question.as_ref().map(|(q, o)| serde_json::json!({ "text": q, "options": o })),
+            "settings": {
+                "base_url": self.settings.base_url,
+                "model": self.settings.model,
+                "reasoning_effort": self.settings.reasoning_effort,
+                "has_key": self.settings.has_key,
+                "needs_setup": self.settings.needs_setup,
+                "models": self.settings.models,
+                "config_path": self.settings.config_path,
+            },
             "projects": projects,
             "current_project": self.current_project(),
             "entries": entries,
@@ -825,6 +854,10 @@ pub enum IpcMsg {
     Stop,
     /// A4: stop one spawned agent.
     AgentStop(String),
+    /// Settings page: save the provider; `api_key` None keeps the saved one.
+    SaveSettings { base_url: String, model: String, api_key: Option<String>, effort: String },
+    /// Settings page: ask the provider which models it has.
+    ListModels,
     /// Open the chat's project folder in a code editor (by name, or the first found).
     OpenInEditor(Option<String>),
     /// Projects sidebar: a new chat inside project `id`.
@@ -901,6 +934,13 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "page_error" => Some(IpcMsg::PageError(v.get("msg")?.as_str()?.to_string())),
         "stop" => Some(IpcMsg::Stop),
         "agent_stop" => Some(IpcMsg::AgentStop(v.get("id")?.as_str()?.to_string())),
+        "save_settings" => Some(IpcMsg::SaveSettings {
+            base_url: v.get("base_url")?.as_str()?.trim().to_string(),
+            model: v.get("model")?.as_str()?.trim().to_string(),
+            api_key: v.get("api_key").and_then(|k| k.as_str()).map(str::to_string),
+            effort: v.get("reasoning_effort").and_then(|e| e.as_str()).unwrap_or("").to_string(),
+        }),
+        "list_models" => Some(IpcMsg::ListModels),
         "open_in_editor" => Some(IpcMsg::OpenInEditor(v.get("editor").and_then(|e| e.as_str()).map(str::to_string))),
         "new_in_project" => Some(IpcMsg::NewInProject(v.get("project")?.as_str()?.to_string())),
         "add_project" => Some(IpcMsg::AddProject(
@@ -1150,6 +1190,35 @@ fn pick_folder(_window: &tao::window::Window) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Save the Settings page and build the client it describes. Returns the
+/// config path, the new client and whether a key is set.
+fn save_settings(
+    st: &server::AppState,
+    base_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+    effort: &str,
+) -> Result<(std::path::PathBuf, crate::provider::Client, bool)> {
+    if base_url.trim().is_empty() || model.trim().is_empty() {
+        anyhow::bail!("the provider address and the model are both needed");
+    }
+    let path = crate::settings::save_provider(base_url, model, effort)?;
+    if let Some(k) = api_key.filter(|k| !k.trim().is_empty()) {
+        crate::settings::save_api_key(k)?;
+    }
+    let mut p = st.cfg.provider.clone();
+    p.base_url = base_url.trim().to_string();
+    p.model = model.trim().to_string();
+    p.reasoning_effort = (!effort.trim().is_empty()).then(|| effort.trim().to_string());
+    p.api_key = api_key
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .or_else(crate::settings::load_api_key)
+        .unwrap_or_else(|| st.cfg.provider.api_key.clone());
+    let client = crate::provider::Client::from_cfg(p.base_url.trim_end_matches('/'), &p)?;
+    Ok((path, client, !p.api_key.is_empty()))
+}
+
 /// Closing stops every run: ask first while one is going.
 #[cfg(windows)]
 fn confirm_close(window: &tao::window::Window, gs: &GuiState) -> bool {
@@ -1375,6 +1444,19 @@ pub async fn run(
     // The folder the app started in is a project; plain new chats go there.
     gs.default_project = state.db.upsert_project(&state.workspace).ok().map(|p| p.id);
     gs.editors = find_editors().into_iter().map(|(n, _)| n.to_string()).collect();
+    {
+        let p = &state.cfg.provider;
+        let placeholder = p.base_url == crate::config::SETUP_PLACEHOLDER_URL;
+        gs.settings = GuiSettings {
+            base_url: if placeholder { String::new() } else { p.base_url.clone() },
+            model: p.model.clone(),
+            reasoning_effort: p.reasoning_effort.clone().unwrap_or_default(),
+            has_key: !p.api_key.is_empty(),
+            needs_setup: placeholder || p.model.trim().is_empty(),
+            models: Vec::new(),
+            config_path: crate::config::default_config_path().display().to_string(),
+        };
+    }
     gs.approval_timeout_secs = state.cfg.permissions.approval_timeout_secs;
     gs.perm_mode = state.perm_mode();
     refresh_sessions(&mut gs, &state);
@@ -1777,6 +1859,37 @@ pub async fn run(
                             };
                             gs.push(EntryKind::System, text);
                             changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::SaveSettings { base_url, model, api_key, effort }) => {
+                            let text = match save_settings(&st, &base_url, &model, api_key.as_deref(), &effort) {
+                                Ok((path, client, has_key)) => {
+                                    let st2 = st.clone();
+                                    rt.spawn(async move {
+                                        *st2.client.lock().await = client;
+                                    });
+                                    gs.settings.base_url = base_url;
+                                    gs.settings.model = model;
+                                    gs.settings.reasoning_effort = effort;
+                                    gs.settings.has_key = has_key;
+                                    gs.settings.needs_setup = false;
+                                    format!(
+                                        "Settings saved to {}. The new model is used from the next message; \
+                                         a few options (small model, limits) apply after a restart.",
+                                        path.display()
+                                    )
+                                }
+                                Err(e) => format!("Settings not saved: {e:#}"),
+                            };
+                            gs.push(EntryKind::System, text);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::ListModels) => {
+                            let st2 = st.clone();
+                            rt.spawn(async move {
+                                let client = st2.client.lock().await.clone();
+                                let available = client.list_models().await.unwrap_or_default();
+                                let _ = st2.events.send(ServerEvent::ModelInfo { current: client.model.clone(), available });
+                            });
                         }
                         UiMsg::Ipc(IpcMsg::AgentStop(id)) => {
                             crate::subagent::stop(&id);
