@@ -80,6 +80,9 @@ impl PermissionMode {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
     AssistantDelta { session_id: String, text: String },
+    /// Token counts of one provider reply (`last`) and the session's running
+    /// totals (`session`); `cached` is the part read from the prompt cache.
+    Usage { session_id: String, last: crate::provider::Usage, session: crate::db::UsageTotals },
     /// M5: streamed chain-of-thought (`reasoning_content`).
     ReasoningDelta { session_id: String, text: String },
     ToolStarted { session_id: String, call_id: String, tool: String, detail: String },
@@ -778,6 +781,7 @@ pub async fn one_shot(
         }
         match ev? {
             StreamEvent::Text(t) => text.push_str(&t),
+            StreamEvent::Usage(u) => st.record_usage("", &u),
             StreamEvent::Done { finish_reason } => {
                 // B-03: half an answer must not be used as a whole one.
                 if finish_reason.as_deref() == Some("length") {
@@ -1351,6 +1355,24 @@ pub struct LoopOpts {
 }
 
 impl AppState {
+    /// Save one reply's token counts (`/usage`) and tell the UIs. Model calls
+    /// outside a chat (planning, edits, summaries) use session "".
+    pub fn record_usage(&self, session_id: &str, u: &crate::provider::Usage) {
+        if let Err(e) = self.db.add_usage(session_id, u) {
+            core_log(&format!("[core] saving token usage failed: {e}"));
+            return;
+        }
+        if session_id.is_empty() {
+            return;
+        }
+        let session = self.db.usage_totals(Some(session_id), None).unwrap_or_default();
+        let _ = self.events.send(ServerEvent::Usage {
+            session_id: session_id.to_string(),
+            last: *u,
+            session,
+        });
+    }
+
     /// Base + AGENTS.md + skills index + subagent index + mode instructions.
     pub fn composed_system(&self, session_id: &str) -> String {
         let mode = self.mode_for(session_id);
@@ -1509,6 +1531,52 @@ impl AppState {
     }
 
     /// M6: `/todos` — the session's todo list as a transcript block.
+    /// `/usage`: tokens for this chat, the last 7 days and all time, and how
+    /// much of the input was read from the provider's prompt cache (billed
+    /// at a fraction of the normal input price).
+    pub fn usage_report(&self, session_id: &str) -> String {
+        let rows = [
+            ("This chat", self.db.usage_totals(Some(session_id), None)),
+            ("Last 7 days", self.db.usage_totals(None, Some(7))),
+            ("All time", self.db.usage_totals(None, None)),
+        ];
+        let mut out = String::from("Token usage (cached = read from the provider's prompt cache)\n");
+        out.push_str(&format!(
+            "  {:<12} {:>8} {:>9} {:>17} {:>9}\n",
+            "", "requests", "input", "cached", "output"
+        ));
+        let mut week = crate::db::UsageTotals::default();
+        for (label, t) in rows {
+            let t = t.unwrap_or_default();
+            if label == "Last 7 days" {
+                week = t;
+            }
+            out.push_str(&format!(
+                "  {:<12} {:>8} {:>9} {:>17} {:>9}\n",
+                label,
+                t.requests,
+                short_count(t.input),
+                format!("{} ({}%)", short_count(t.cached), percent(t.cached, t.input)),
+                short_count(t.output),
+            ));
+        }
+        if week.requests == 0 {
+            out.push_str("No model calls recorded yet.");
+        } else if week.cached == 0 && week.requests >= 3 {
+            out.push_str(
+                "No cache reads reported. Either the provider does not cache prompts, does not \
+                 report it, or (Anthropic models) needs `prompt_cache = \"on\"` under [provider].",
+            );
+        } else {
+            out.push_str(&format!(
+                "Cached input is billed at a fraction of the normal price (Anthropic about 10%, \
+                 OpenAI and DeepSeek 10-50%). Output ({} tokens this week) is never cached.",
+                short_count(week.output)
+            ));
+        }
+        out
+    }
+
     pub fn todos_report(&self, session_id: &str) -> String {
         let items = self.todo_store.list_all(session_id);
         if items.is_empty() {
@@ -1773,6 +1841,7 @@ pub async fn run_loop(
                         });
                     }
                 }
+                StreamEvent::Usage(u) => st.record_usage(session_id, &u),
                 StreamEvent::Done { finish_reason: fr } => {
                     finish_reason = fr.clone();
                     break;
@@ -3072,6 +3141,69 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// Prompt caching works only when each request starts with the previous
+    /// request unchanged. Over a tool call and a second prompt, check that,
+    /// that usage is asked for and saved, and that `/usage` shows the share.
+    #[tokio::test]
+    async fn requests_keep_a_stable_prefix_and_usage_is_recorded() {
+        use axum::{routing::post, Router};
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let seen2 = seen.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::extract::Json(body): axum::extract::Json<Value>| {
+                let seen = seen2.clone();
+                async move {
+                    let n = {
+                        let mut s = seen.lock().unwrap();
+                        s.push(body);
+                        s.len() as u64
+                    };
+                    // Request 1 calls a tool; the others answer with text.
+                    let first = if n == 1 {
+                        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"todo","arguments":"{\"op\":\"list\"}"}}]},"finish_reason":"tool_calls"}]}"#.to_string()
+                    } else {
+                        r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#.to_string()
+                    };
+                    let usage = json!({"choices": [], "usage": {
+                        "prompt_tokens": 1000 * n, "completion_tokens": 5,
+                        "prompt_tokens_details": {"cached_tokens": 1000 * (n - 1)}}});
+                    let payload = format!("data: {first}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let dir = std::env::temp_dir().join(format!("ocrs-cache-prefix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        st.set_perm_mode(PermissionMode::Turbo);
+        let s = st.db.create_session("cache", None).unwrap();
+        run_agent(&st, &s.id, "first", Arc::new(AtomicBool::new(false))).await;
+        run_agent(&st, &s.id, "second", Arc::new(AtomicBool::new(false))).await;
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3, "tool call, its follow-up, the second prompt");
+        for (i, w) in bodies.windows(2).enumerate() {
+            let (a, b) = (w[0]["messages"].as_array().unwrap(), w[1]["messages"].as_array().unwrap());
+            assert_eq!(&b[..a.len()], &a[..], "request {} must start with request {} unchanged", i + 2, i + 1);
+            assert_eq!(w[0]["tools"], w[1]["tools"], "the tool list never changes");
+        }
+        assert_eq!(bodies[0]["stream_options"]["include_usage"], true);
+        assert!(!bodies[0].to_string().contains("cache_control"), "no markers for a non-Claude model");
+        let t = st.db.usage_totals(Some(&s.id), None).unwrap();
+        assert_eq!((t.requests, t.input, t.cached, t.output), (3, 6000, 3000, 15));
+        assert!(st.usage_report(&s.id).contains("3.0K (50%)"), "{}", st.usage_report(&s.id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// F-12: a server with the token "t" and a client for it.
     async fn f12_server() -> (Shared, String, reqwest::Client) {
@@ -5266,4 +5398,18 @@ mod b29_tests {
         );
         assert_eq!(slow.await.unwrap().unwrap(), "slow");
     }
+}
+
+/// 1234 → "1.2K", 3_400_000 → "3.4M" (for `/usage`).
+fn short_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}K", n as f64 / 1e3),
+        _ => format!("{:.1}M", n as f64 / 1e6),
+    }
+}
+
+/// `part` as a whole percent of `whole` (0 when `whole` is 0).
+fn percent(part: u64, whole: u64) -> u64 {
+    if whole == 0 { 0 } else { part * 100 / whole }
 }

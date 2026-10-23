@@ -631,6 +631,7 @@ impl App {
                     }
                     Some(Command::Sessions) => (Some(InputAction::ListSessions), false),
                     Some(Command::Todos) => (Some(InputAction::Todos), false),
+                    Some(Command::Usage) => (Some(InputAction::Usage), false),
                     Some(Command::New) => (Some(InputAction::NewSession), false),
                     Some(Command::Init) => (Some(InputAction::Init), false),
                     Some(Command::Model(m)) => (Some(InputAction::Model(m)), false),
@@ -1008,6 +1009,8 @@ impl App {
     /// Apply a server event to the transcript.
     pub fn on_event(&mut self, ev: ServerEvent) {
         match ev {
+            // Counts are read on demand with /usage; the TUI shows nothing live.
+            ServerEvent::Usage { .. } => {}
             ServerEvent::AssistantDelta { text, .. } => {
                 // Team panel listens on the same stream the transcript shows.
                 // B-34: only a real team start opens the panel, not any text
@@ -1221,6 +1224,8 @@ pub enum InputAction {
     Export(Option<String>),
     /// M6: show this session's todo list.
     Todos,
+    /// Token usage and prompt-cache savings.
+    Usage,
     /// M6: start a fresh session.
     NewSession,
     /// M6: create a starter AGENTS.md when the repo has none.

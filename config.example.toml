@@ -41,6 +41,21 @@ request_timeout_secs = 600
 # connection error), waiting 1s, 2s, 4s... between tries. 0 = no retries.
 max_retries = 3
 
+# Prompt caching. Every request repeats the system prompt, the tool list and
+# the chat so far; providers can keep that start in a cache and bill it at a
+# fraction of the input price (Anthropic ~10%, OpenAI/DeepSeek 10-50%).
+# OpenAI, DeepSeek, Gemini, Ollama and llama.cpp do this on their own.
+# Anthropic models need markers saying where to cache:
+#   "auto" (default): markers for api = "anthropic" and for Claude models
+#                     behind an OpenAI-style router such as OpenRouter
+#   "on":  markers on every request     "off": never
+# See how much was cached with /usage (TUI/headless) or in the GUI sidebar.
+# prompt_cache = "auto"
+
+# Ask OpenAI-style servers for token counts at the end of each reply, so
+# /usage can show cache hits. Set false if a server rejects the request.
+# stream_usage = true
+
 [agent]
 max_steps = 40
 # Context window of your model in tokens; at ~80% the agent compacts older

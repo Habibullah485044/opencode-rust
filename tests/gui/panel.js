@@ -343,6 +343,15 @@
   window.render(steps);
   ok("an open step stops spinning when the run ends",
     document.querySelectorAll("#log .tool-card")[2].classList.contains("idle"));
+  var withUsage = payload(basePage0());
+  withUsage.usage = { requests: 4, input: 1200000, cached: 900000, cache_write: 0, output: 3400 };
+  window.render(withUsage);
+  var usageEl = document.getElementById("usage-line");
+  ok("the sidebar shows the chat's cache share",
+    !usageEl.hidden && /Cache 75%/.test(usageEl.textContent) && /1\.2M in/.test(usageEl.textContent),
+    usageEl.textContent);
+  window.render(payload(basePage0()));
+  ok("no usage line before the first reply", usageEl.hidden);
   var replay = payload(basePage0());
   replay.entries = [{ k: "w", t: "⏺ bash(ls)" }, { k: "w", t: "  ✓ Cargo.toml\nsrc" }];
   window.render(replay);

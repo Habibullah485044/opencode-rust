@@ -124,6 +124,29 @@ pub struct ProviderCfg {
     /// Extra tries for a failed provider request (connection error,
     /// HTTP 429/500/502/503/504/529). 0 = no retries.
     pub max_retries: u32,
+    /// Prompt caching markers: "auto" (default), "on" or "off". Most
+    /// providers (OpenAI, DeepSeek, Gemini, Ollama, llama.cpp) reuse a
+    /// repeated prompt start on their own; Anthropic models need markers
+    /// that say where to cache. "auto" sends them for `api = "anthropic"`
+    /// and for Claude models behind an OpenAI-style router (OpenRouter).
+    pub prompt_cache: PromptCache,
+    /// Ask OpenAI-style servers for token counts at the end of each reply
+    /// (`stream_options.include_usage`), so `/usage` can show cache hits.
+    /// Turn off for a server that rejects the field.
+    pub stream_usage: bool,
+}
+
+/// `provider.prompt_cache`: when to send prompt-caching markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptCache {
+    /// Markers for Anthropic's API and Claude models on routers.
+    #[default]
+    Auto,
+    /// Markers on every request (for a router or proxy that supports them).
+    On,
+    /// No markers. Providers that cache on their own still do.
+    Off,
 }
 
 impl Default for ProviderCfg {
@@ -137,6 +160,8 @@ impl Default for ProviderCfg {
             small_model: None,
             request_timeout_secs: 600,
             max_retries: 3,
+            prompt_cache: PromptCache::Auto,
+            stream_usage: true,
         }
     }
 }

@@ -45,6 +45,8 @@ pub enum Command {
     Clear,
     /// M6: show this session's todo list.
     Todos,
+    /// Token usage and how much the prompt cache saved.
+    Usage,
     /// M6: show the active model (None) or switch to it (Some).
     Model(Option<String>),
     /// M6: write the transcript to markdown (default path when None).
@@ -110,6 +112,7 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "todos", args: "", help: "Show this session's todo list" },
         Builtin { name: "turbo", args: "[prompt]", help: "Full access, no approvals, keeps working" },
         Builtin { name: "undo", args: "", help: "Restore the workspace to the last snapshot" },
+        Builtin { name: "usage", args: "", help: "Token usage and prompt-cache savings" },
     ]
 }
 
@@ -157,6 +160,7 @@ pub fn classify(input: &str) -> Option<Command> {
         "new" if arg.is_empty() => Some(Command::New),
         "clear" if arg.is_empty() => Some(Command::Clear),
         "todos" if arg.is_empty() => Some(Command::Todos),
+        "usage" if arg.is_empty() => Some(Command::Usage),
         "init" if arg.is_empty() => Some(Command::Init),
         "model" | "models" => Some(Command::Model(if arg.is_empty() {
             None
@@ -309,6 +313,7 @@ mod tests {
         assert_eq!(classify("/new"), Some(Command::New));
         assert_eq!(classify("/clear"), Some(Command::Clear));
         assert_eq!(classify("/todos"), Some(Command::Todos));
+        assert_eq!(classify("/usage"), Some(Command::Usage));
         assert_eq!(classify("/init"), Some(Command::Init));
         assert_eq!(classify("/model"), Some(Command::Model(None)), "bare /model lists");
         assert_eq!(classify("/models"), Some(Command::Model(None)));

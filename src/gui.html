@@ -269,6 +269,16 @@
   .api.down { color: var(--bad); }
   .api.down .dot { background: var(--bad); }
   .ver-badge { display: none; }
+  .usage-line {
+    font-size: 11.5px;
+    color: var(--text-dim);
+    padding: 0 8px 2px 23px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .usage-line b { font-weight: 600; color: var(--ok); }
 
   /* ---- Chat column ---- */
   #chat {
@@ -1090,6 +1100,8 @@
           <span class="dot"></span>
           <span id="apitxt">connecting…</span>
         </div>
+        <div class="usage-line" id="usage-line" hidden
+             title="Tokens this chat sent and received. Cached input was read from the provider's prompt cache and is billed at a fraction of the normal price."></div>
       </div>
     </aside>
 
@@ -1272,6 +1284,14 @@
     var kb = document.createElement("kbd");
     kb.textContent = "Shift+A";
     b.appendChild(kb);
+  }
+
+  // 1234 → "1.2K", 3400000 → "3.4M".
+  function shortCount(n) {
+    n = Number(n) || 0;
+    if (n < 1000) return String(n);
+    if (n < 1e6) return (n / 1e3).toFixed(1) + "K";
+    return (n / 1e6).toFixed(1) + "M";
   }
 
   // Escape HTML to prevent injection
@@ -1719,6 +1739,20 @@
       } else {
         api.className = "api down";
         apitxt.textContent = "API Offline";
+      }
+    }
+
+    // Token usage of this chat: how much input came from the prompt cache.
+    var usageLine = document.getElementById("usage-line");
+    if (usageLine) {
+      var u = d.usage;
+      if (u && u.input > 0) {
+        var pct = Math.floor((u.cached * 100) / u.input);
+        usageLine.innerHTML = "Cache <b>" + pct + "%</b> · " + shortCount(u.input) +
+          " in · " + shortCount(u.output) + " out";
+        usageLine.hidden = false;
+      } else {
+        usageLine.hidden = true;
       }
     }
 

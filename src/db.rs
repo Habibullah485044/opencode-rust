@@ -74,6 +74,29 @@ const APPROVALS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS approvals (
     UNIQUE (workspace, tool, pattern)
 );";
 
+/// Provider token counts, one row per session per UTC day (`/usage`).
+/// `session_id` is "" for model calls outside a chat (planning, edits).
+const USAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS usage (
+    session_id TEXT NOT NULL,
+    day INTEGER NOT NULL,
+    requests INTEGER NOT NULL DEFAULT 0,
+    input INTEGER NOT NULL DEFAULT 0,
+    cached INTEGER NOT NULL DEFAULT 0,
+    cache_write INTEGER NOT NULL DEFAULT 0,
+    output INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, day)
+);";
+
+/// Summed token counts (`/usage`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageTotals {
+    pub requests: u64,
+    pub input: u64,
+    pub cached: u64,
+    pub cache_write: u64,
+    pub output: u64,
+}
+
 /// Bring the approvals table to the S-07 layout. A table from an older
 /// build has no `workspace` column: it is renamed to `approvals_unscoped`
 /// and never read again, so approvals saved before this change no longer
@@ -139,6 +162,7 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);",
         )?;
         migrate_approvals(&conn)?;
+        conn.execute_batch(USAGE_SCHEMA)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -164,6 +188,7 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);",
         )?;
         migrate_approvals(&conn)?;
+        conn.execute_batch(USAGE_SCHEMA)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -207,6 +232,43 @@ impl Db {
             params![id, title, now_ms()],
         )?;
         Ok(())
+    }
+
+    /// Add one reply's token counts to today's row for `session_id`.
+    pub fn add_usage(&self, session_id: &str, u: &crate::provider::Usage) -> Result<()> {
+        let day = now_ms() / 86_400_000;
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO usage (session_id, day, requests, input, cached, cache_write, output)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6)
+             ON CONFLICT (session_id, day) DO UPDATE SET
+               requests = requests + 1, input = input + ?3, cached = cached + ?4,
+               cache_write = cache_write + ?5, output = output + ?6",
+            params![session_id, day, u.input as i64, u.cached as i64, u.cache_write as i64, u.output as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Summed usage. `session`: one session or all; `days`: only the last
+    /// N UTC days (today included) or all time.
+    pub fn usage_totals(&self, session: Option<&str>, days: Option<i64>) -> Result<UsageTotals> {
+        let from = days.map(|d| now_ms() / 86_400_000 - (d - 1)).unwrap_or(i64::MIN);
+        let conn = self.conn.lock().unwrap();
+        let t = conn.query_row(
+            "SELECT COALESCE(SUM(requests),0), COALESCE(SUM(input),0), COALESCE(SUM(cached),0),
+                    COALESCE(SUM(cache_write),0), COALESCE(SUM(output),0)
+             FROM usage WHERE day >= ?1 AND (?2 IS NULL OR session_id = ?2)",
+            params![from, session],
+            |r| {
+                Ok(UsageTotals {
+                    requests: r.get::<_, i64>(0)? as u64,
+                    input: r.get::<_, i64>(1)? as u64,
+                    cached: r.get::<_, i64>(2)? as u64,
+                    cache_write: r.get::<_, i64>(3)? as u64,
+                    output: r.get::<_, i64>(4)? as u64,
+                })
+            },
+        )?;
+        Ok(t)
     }
 
     /// New (F-12): delete a session and its messages in one transaction.

@@ -262,6 +262,7 @@ COMMANDS (in TUI, most also headless — type / for the palette, F1 for the refe
   /model [id]      Show the active model, or switch to <id>
   /export [--force] [path]  Transcript to markdown, inside the workspace
   /todos           Show this session's todo list
+  /usage           Token usage and prompt-cache savings
   /init            Create a starter AGENTS.md
   /team <goal>     Team mode: plan → parallel workers → synthesis
   /plan /build     Read-only plan mode vs normal build mode
@@ -472,6 +473,10 @@ async fn headless_run(
             }
             Cmd::Todos => {
                 println!("{}", state.todos_report(&session.id));
+                return Ok(());
+            }
+            Cmd::Usage => {
+                println!("{}", state.usage_report(&session.id));
                 return Ok(());
             }
             Cmd::Clear | Cmd::New => {
@@ -1095,6 +1100,13 @@ async fn tui_run(
                     }
                     tui::InputAction::Todos => {
                         let text = format!("{}\n", st.todos_report(&sid));
+                        let _ = st.events.send(server::ServerEvent::AssistantDelta {
+                            session_id: sid.clone(),
+                            text,
+                        });
+                    }
+                    tui::InputAction::Usage => {
+                        let text = format!("{}\n", st.usage_report(&sid));
                         let _ = st.events.send(server::ServerEvent::AssistantDelta {
                             session_id: sid.clone(),
                             text,

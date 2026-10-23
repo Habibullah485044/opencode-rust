@@ -451,8 +451,12 @@ impl Registry {
         }
     }
 
+    /// Sorted by name: `conns` is a HashMap, and the tool list is part of the
+    /// prompt start that providers cache, so its order must never change.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.conns.values().flat_map(|c| c.specs()).collect()
+        let mut specs: Vec<ToolSpec> = self.conns.values().flat_map(|c| c.specs()).collect();
+        specs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        specs
     }
 
     /// Find the server behind a model-facing MCP name and return a handle

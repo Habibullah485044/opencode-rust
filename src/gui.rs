@@ -55,6 +55,9 @@ pub struct GuiState {
     pub approval: Option<PendingApproval>,
     /// `[permissions] approval_timeout_secs` — drives the modal countdown.
     pub approval_timeout_secs: u64,
+    /// Token totals per chat (from `ServerEvent::Usage`, or the database
+    /// when a chat is opened); the sidebar shows the open chat's cache rate.
+    pub usage: HashMap<String, crate::db::UsageTotals>,
     /// Autonomy mode shown by the composer selector. The core owns the real
     /// value; this mirrors it for the page.
     pub perm_mode: PermissionMode,
@@ -101,6 +104,7 @@ impl Default for GuiState {
             dev_server: None,
             approval: None,
             approval_timeout_secs: 300,
+            usage: HashMap::new(),
             perm_mode: PermissionMode::Default,
             sent: std::cell::RefCell::new(Vec::new()),
             sent_session: std::cell::RefCell::new(None),
@@ -320,6 +324,11 @@ impl GuiState {
     /// on screen goes to its live copy in `background` (or is dropped), so it
     /// never lands in the open chat.
     pub fn on_event(&mut self, ev: ServerEvent) {
+        // Token counts belong to their chat, open or not.
+        if let ServerEvent::Usage { session_id, session, .. } = &ev {
+            self.usage.insert(session_id.clone(), *session);
+            return;
+        }
         // A chat was created or switched by another client: refresh the
         // sidebar, but never take over the chat the user is looking at.
         if matches!(ev, ServerEvent::SessionCreated { .. } | ServerEvent::SessionLoaded { .. }) {
@@ -559,6 +568,7 @@ impl GuiState {
             "entries_len": self.entries.len(),
             "browser": self.browser.payload(),
             "dev_server": self.dev_server,
+            "usage": self.session.as_ref().and_then(|s| self.usage.get(s)),
             "approval": self.approval.as_ref().map(|a| serde_json::json!({
                 "id": a.id,
                 "tool": a.tool,
@@ -911,6 +921,9 @@ fn load_session(gs: &mut GuiState, st: &server::AppState, id: &str) {
     };
     gs.leave_current_chat();
     gs.session = Some(id.to_string());
+    if let Ok(t) = st.db.usage_totals(Some(id), None) {
+        gs.usage.insert(id.to_string(), t);
+    }
     gs.entries = entries;
     gs.busy = gs.running.contains(id);
 }

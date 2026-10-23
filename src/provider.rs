@@ -30,6 +30,39 @@ pub struct Client {
     max_retries: u32,
     /// Wait before the first retry; doubles each time. Tests make it tiny.
     retry_base: std::time::Duration,
+    /// When to send prompt-caching markers (`provider.prompt_cache`).
+    prompt_cache: crate::config::PromptCache,
+    /// Ask OpenAI-style servers for usage at the end (`provider.stream_usage`).
+    stream_usage: bool,
+}
+
+/// Token counts of one reply, normalised across providers. `input` is the
+/// whole prompt (cached part included); `cached` of it was read from the
+/// provider's prompt cache (cheap), `cache_write` was newly stored there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input: u64,
+    pub cached: u64,
+    pub cache_write: u64,
+    pub output: u64,
+}
+
+impl Usage {
+    /// Read an OpenAI-style `usage` object (OpenAI, OpenRouter, DeepSeek,
+    /// vLLM, Ollama). `None` when it carries no counts.
+    pub fn from_openai(u: &Value) -> Option<Self> {
+        let n = |v: &Value| v.as_u64().unwrap_or(0);
+        let input = n(&u["prompt_tokens"]);
+        let output = n(&u["completion_tokens"]);
+        if input == 0 && output == 0 {
+            return None;
+        }
+        let details = &u["prompt_tokens_details"];
+        // DeepSeek reports `prompt_cache_hit_tokens` instead of the details.
+        let cached = n(&details["cached_tokens"]).max(n(&u["prompt_cache_hit_tokens"]));
+        let cache_write = n(&details["cache_write_tokens"]);
+        Some(Self { input, cached, cache_write, output })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,12 +113,17 @@ pub enum StreamEvent {
     Reasoning(String),
     ToolCallDelta { index: usize, id: Option<String>, name: Option<String>, args_delta: String },
     Done { finish_reason: Option<String> },
+    /// Token counts for this reply. Always sent before `Done`, which is
+    /// where every reader stops.
+    Usage(Usage),
 }
 
 #[derive(Deserialize)]
 struct SseChunk {
     #[serde(default)] // B-21: usage-only chunks have no `choices`
     choices: Vec<SseChoice>,
+    #[serde(default)]
+    usage: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +186,8 @@ impl Client {
             stall,
             max_retries: 0,
             retry_base: std::time::Duration::from_secs(1),
+            prompt_cache: crate::config::PromptCache::Auto,
+            stream_usage: true,
         })
     }
 
@@ -157,6 +197,8 @@ impl Client {
         c.max_retries = p.max_retries;
         c.api = p.api;
         c.max_tokens = p.max_tokens;
+        c.prompt_cache = p.prompt_cache;
+        c.stream_usage = p.stream_usage;
         Ok(c)
     }
 
@@ -231,6 +273,12 @@ impl Client {
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)?;
         }
+        if self.stream_usage {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
+        if self.cache_markers(model) {
+            add_openai_cache_markers(&mut body);
+        }
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self
             .send_with_retry(&url, || {
@@ -245,6 +293,21 @@ impl Client {
     let byte_stream = resp.bytes_stream();
     let event_stream = Box::pin(sse_event_stream(byte_stream, self.stall));
     Ok(event_stream)
+    }
+
+    /// Send prompt-caching markers for this model? (`provider.prompt_cache`)
+    /// "auto": always for Anthropic's API; on OpenAI-style routers only for
+    /// Claude models (others cache a repeated prompt start on their own).
+    fn cache_markers(&self, model: &str) -> bool {
+        use crate::config::PromptCache;
+        match self.prompt_cache {
+            PromptCache::On => true,
+            PromptCache::Off => false,
+            PromptCache::Auto => {
+                let m = model.to_ascii_lowercase();
+                self.api == ProviderApi::Anthropic || m.contains("claude") || m.contains("anthropic/")
+            }
+        }
     }
 
     /// Switch the active model in place (used by `/model <id>`). The client is
@@ -298,20 +361,53 @@ impl Client {
 /// Convert the raw SSE byte stream into StreamEvents, handling partial lines.
 /// A single `data:` line can yield several events (e.g. a tool_call delta *and*
 /// a finish_reason), so we buffer parsed events in a queue and emit one per poll.
+/// Mark where an OpenAI-style request may be cached (`cache_control`, the
+/// form OpenRouter passes on to Anthropic): the system prompt, the last user
+/// message (where this turn started) and the newest message. Each later
+/// request repeats all of that unchanged, so it is read from the cache
+/// instead of being paid in full. Anthropic allows 4 markers; this uses 3.
+fn add_openai_cache_markers(body: &mut Value) {
+    let Some(msgs) = body["messages"].as_array_mut() else { return };
+    let mut marks: Vec<usize> = Vec::new();
+    if let Some(i) = msgs.iter().position(|m| m["role"] == "system") {
+        marks.push(i);
+    }
+    if let Some(i) = msgs.iter().rposition(|m| m["role"] == "user") {
+        marks.push(i);
+    }
+    if !msgs.is_empty() {
+        marks.push(msgs.len() - 1);
+    }
+    marks.sort_unstable();
+    marks.dedup();
+    for i in marks {
+        let m = &mut msgs[i];
+        // Only plain text can carry the marker; empty text is rejected.
+        let Some(text) = m["content"].as_str().filter(|t| !t.trim().is_empty()) else { continue };
+        let text = text.to_string();
+        m["content"] = json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
+    }
+}
+
+/// How long to wait for the usage chunk after a finish_reason when the
+/// server sends no `[DONE]`.
+const USAGE_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
 fn sse_event_stream(
     byte_stream: impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
     stall: std::time::Duration,
 ) -> impl futures::Stream<Item = Result<StreamEvent>> + Send + 'static {
     // Pin the inner stream so `next()` works inside the unfold closure.
     let byte_stream = Box::pin(byte_stream);
-    // State: (source stream, line buffer, pending parsed events, terminal [DONE] seen).
+    // State: (source stream, line buffer, pending parsed events, the `Done`
+    // held back while the usage chunk may still come, terminal seen).
     futures::stream::unfold(
-        (byte_stream, Vec::<u8>::new(), std::collections::VecDeque::new(), false),
-        move |(mut src, mut buf, mut pending, mut done)| async move {
+        (byte_stream, Vec::<u8>::new(), std::collections::VecDeque::new(), None::<StreamEvent>, false),
+        move |(mut src, mut buf, mut pending, mut held, mut done)| async move {
             loop {
                 // 1) Emit any already-parsed event first.
                 if let Some(ev) = pending.pop_front() {
-                    return Some((Ok(ev), (src, buf, pending, done)));
+                    return Some((Ok(ev), (src, buf, pending, held, done)));
                 }
                 // 2) If we saw terminal [DONE] and drained pending, stop.
                 if done {
@@ -323,13 +419,22 @@ fn sse_event_stream(
                     let line = String::from_utf8_lossy(&line).trim().to_string();
                     // B-21: an `error` frame fails the stream loudly.
                     if let Some(msg) = sse_error_message(&line) {
-                        return Some((Err(anyhow!("provider error: {msg}")), (src, buf, pending, true)));
+                        return Some((Err(anyhow!("provider error: {msg}")), (src, buf, pending, held, true)));
                     }
                     if let Some((events, line_done)) = parse_sse_line(&line) {
-                        // B-21: `[DONE]` or a finish_reason ends the reply.
-                        let finished = events.iter().any(|e| matches!(e, StreamEvent::Done { .. }));
-                        pending.extend(events);
-                        if line_done || finished {
+                        // B-21: `[DONE]` or a finish_reason ends the reply. A
+                        // finish_reason is held back until `[DONE]` (or a short
+                        // quiet spell): the usage chunk comes after it.
+                        for ev in events {
+                            match ev {
+                                StreamEvent::Done { .. } if held.is_none() => held = Some(ev),
+                                StreamEvent::Usage(_) => pending.push_back(ev),
+                                _ if held.is_some() => {} // nothing else after the finish
+                                _ => pending.push_back(ev),
+                            }
+                        }
+                        if line_done {
+                            pending.extend(held.take());
                             done = true;
                         }
                     }
@@ -338,19 +443,35 @@ fn sse_event_stream(
                 // 4) Need more bytes from the transport. Bound the wait: a
                 //    silent stream means a dead provider/tunnel — surface an
                 //    error instead of hanging the agent loop forever.
-                match tokio::time::timeout(stall, src.next()).await {
+                // After a finish_reason, wait only briefly for the usage chunk.
+                let wait = if held.is_some() { USAGE_GRACE } else { stall };
+                match tokio::time::timeout(wait, src.next()).await {
+                    Err(_) if held.is_some() => {
+                        pending.extend(held.take());
+                        done = true;
+                    }
                     Err(_) => {
                         return Some((
                             Err(anyhow!(
                                 "provider stream stalled: no data for {}s",
                                 stall.as_secs()
                             )),
-                            (src, buf, pending, true),
+                            (src, buf, pending, held, true),
                         ));
                     }
                     Ok(Some(Ok(bytes))) => buf.extend_from_slice(&bytes),
                     Ok(Some(Err(e))) => {
-                        return Some((Err(anyhow!("stream error: {e}")), (src, buf, pending, true)));
+                        return Some((Err(anyhow!("stream error: {e}")), (src, buf, pending, held, true)));
+                    }
+                    Ok(None) if held.is_some() => {
+                        // Closed after a finish_reason: the reply is complete.
+                        let rest = String::from_utf8_lossy(&buf).trim().to_string();
+                        buf.clear();
+                        if let Some((events, _)) = parse_sse_line(&rest) {
+                            pending.extend(events.into_iter().filter(|e| matches!(e, StreamEvent::Usage(_))));
+                        }
+                        pending.extend(held.take());
+                        done = true;
                     }
                     Ok(None) => {
                         // B-21: closed before `[DONE]` and before any finish_reason.
@@ -369,7 +490,7 @@ fn sse_event_stream(
                                 "provider stream ended early: the connection closed before \
                                  the reply was finished"
                             )),
-                            (src, buf, pending, true),
+                            (src, buf, pending, held, true),
                         ));
                     }
                 }
@@ -442,6 +563,12 @@ fn parse_sse_line(line: &str) -> Option<(Vec<StreamEvent>, bool)> {
             // Emitted AFTER any deltas on this same line so nothing is lost.
             events.push(StreamEvent::Done { finish_reason: Some(fr.clone()) });
         }
+    }
+    // Usage comes in its own chunk after the finish_reason (or on the same
+    // line); it always goes before `Done`, where readers stop.
+    if let Some(u) = chunk.usage.as_ref().and_then(Usage::from_openai) {
+        let at = events.iter().position(|e| matches!(e, StreamEvent::Done { .. })).unwrap_or(events.len());
+        events.insert(at, StreamEvent::Usage(u));
     }
     Some((events, false))
 }
@@ -931,5 +1058,112 @@ mod f01_tests {
         let err = fast_client(&base, 3).stream("stub", &[], &[]).await.err().expect("fails");
         assert!(err.to_string().contains("120s"), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "a 2-minute Retry-After is not waited out");
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    async fn events(chunks: Vec<&str>) -> Vec<StreamEvent> {
+        let src = futures::stream::iter(
+            chunks.into_iter().map(|c| Ok::<_, reqwest::Error>(bytes::Bytes::from(c.to_string()))).collect::<Vec<_>>(),
+        );
+        let mut s = Box::pin(sse_event_stream(src, std::time::Duration::from_secs(5)));
+        let mut out = Vec::new();
+        while let Some(ev) = s.next().await {
+            out.push(ev.unwrap());
+        }
+        out
+    }
+
+    /// The usage chunk comes after the finish_reason; readers stop at `Done`,
+    /// so `Usage` must be sent before it.
+    #[tokio::test]
+    async fn usage_after_finish_reason_comes_before_done() {
+        let out = events(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":20,\
+             \"prompt_tokens_details\":{\"cached_tokens\":900}}}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        assert!(matches!(out[0], StreamEvent::Text(_)));
+        let want = Usage { input: 1000, cached: 900, cache_write: 0, output: 20 };
+        assert!(matches!(&out[1], StreamEvent::Usage(u) if *u == want), "{out:?}");
+        assert!(matches!(out[2], StreamEvent::Done { .. }));
+        assert_eq!(out.len(), 3);
+    }
+
+    /// A server that never sends usage or `[DONE]` still ends the reply.
+    #[tokio::test]
+    async fn finish_without_done_still_ends() {
+        let out = events(vec!["data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n"]).await;
+        assert!(matches!(out.last(), Some(StreamEvent::Done { .. })), "{out:?}");
+    }
+
+    /// The server keeps the connection open after the finish_reason and
+    /// never sends `[DONE]`: the reply still ends after a short grace.
+    #[tokio::test]
+    async fn open_connection_after_finish_ends_after_grace() {
+        let first = futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}
+
+",
+        ))]);
+        let src = first.chain(futures::stream::pending());
+        let mut s = Box::pin(sse_event_stream(src, std::time::Duration::from_secs(60)));
+        let t0 = std::time::Instant::now();
+        let mut last = None;
+        while let Some(ev) = s.next().await {
+            last = Some(ev.unwrap());
+        }
+        assert!(matches!(last, Some(StreamEvent::Done { .. })));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn usage_reads_openai_and_deepseek_shapes() {
+        let o = Usage::from_openai(&json!({"prompt_tokens": 50, "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 3}})).unwrap();
+        assert_eq!(o, Usage { input: 50, cached: 40, cache_write: 3, output: 5 });
+        let d = Usage::from_openai(&json!({"prompt_tokens": 50, "completion_tokens": 5,
+            "prompt_cache_hit_tokens": 30})).unwrap();
+        assert_eq!(d.cached, 30);
+        assert!(Usage::from_openai(&json!({})).is_none());
+    }
+
+    #[test]
+    fn openai_cache_markers_go_on_system_turn_start_and_newest() {
+        let mut body = json!({"messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "new question"},
+            {"role": "assistant", "content": null, "tool_calls": []},
+            {"role": "tool", "content": "file text", "tool_call_id": "c1"},
+        ]});
+        add_openai_cache_markers(&mut body);
+        let m = body["messages"].as_array().unwrap();
+        let marked = |i: usize| m[i]["content"][0]["cache_control"]["type"] == "ephemeral";
+        assert!(marked(0) && marked(3) && marked(5), "{body}");
+        assert_eq!(m[1]["content"], "old question", "older messages stay plain text");
+        assert_eq!(m[3]["content"][0]["text"], "new question");
+    }
+
+    #[test]
+    fn auto_markers_only_where_they_are_needed() {
+        let mut c = Client::new("http://x", "", "m", 10).unwrap();
+        assert!(!c.cache_markers("gpt-5"), "OpenAI caches on its own");
+        assert!(!c.cache_markers("deepseek-chat"));
+        assert!(c.cache_markers("anthropic/claude-sonnet-5-5"), "Claude behind a router");
+        c.prompt_cache = crate::config::PromptCache::Off;
+        assert!(!c.cache_markers("anthropic/claude-sonnet-5-5"));
+        c.prompt_cache = crate::config::PromptCache::On;
+        assert!(c.cache_markers("llama3"));
+        c.prompt_cache = crate::config::PromptCache::Auto;
+        c.api = ProviderApi::Anthropic;
+        assert!(c.cache_markers("anything"));
     }
 }

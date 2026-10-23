@@ -103,6 +103,49 @@ pub(super) fn request_body(
     body
 }
 
+/// Prompt caching (`cache_control`): mark the end of the tools, of the
+/// system prompt, of the message that started this turn and of the newest
+/// message. Each later request repeats all of that unchanged, so Anthropic
+/// reads it from its cache (about a tenth of the input price) instead of
+/// charging it in full. That is the 4 markers the API allows.
+pub(super) fn add_cache_markers(body: &mut Value) {
+    let mark = json!({ "type": "ephemeral" });
+    if let Some(last) = body["tools"].as_array_mut().and_then(|t| t.last_mut()) {
+        last["cache_control"] = mark.clone();
+    }
+    if let Some(sys) = body["system"].as_str().map(str::to_string) {
+        body["system"] = json!([{ "type": "text", "text": sys, "cache_control": mark.clone() }]);
+    }
+    let Some(msgs) = body["messages"].as_array_mut() else { return };
+    // The turn starts at the last user message that has text (not only
+    // tool results).
+    let has_text = |m: &Value| m["content"].as_array().is_some_and(|c| c.iter().any(|b| b["type"] == "text"));
+    let turn = msgs.iter().rposition(|m| m["role"] == "user" && has_text(m));
+    let mut targets: Vec<usize> = turn.into_iter().collect();
+    if !msgs.is_empty() && turn != Some(msgs.len() - 1) {
+        targets.push(msgs.len() - 1);
+    }
+    for i in targets {
+        // Thinking blocks cannot carry a marker; use the last other block.
+        let Some(blocks) = msgs[i]["content"].as_array_mut() else { continue };
+        if let Some(b) = blocks.iter_mut().rev().find(|b| !b["type"].as_str().unwrap_or("").ends_with("thinking")) {
+            b["cache_control"] = mark.clone();
+        }
+    }
+}
+
+/// The text of `system`, whether it is a string or (with caching) blocks.
+#[cfg(test)]
+pub(super) fn system_text(body: &Value) -> String {
+    match &body["system"] {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("
+
+"),
+        _ => String::new(),
+    }
+}
+
 /// One text block, or none for blank text (Anthropic rejects empty text).
 fn text_block(text: &str) -> Vec<Value> {
     if text.trim().is_empty() {
@@ -284,6 +327,8 @@ struct SseState {
     finished: bool,
     /// Where a finished tool-calling reply is saved.
     turns: TurnCache,
+    /// Token counts from `message_start`, completed by `message_delta`.
+    usage: super::Usage,
 }
 
 impl SseState {
@@ -353,11 +398,16 @@ impl SseState {
                     }
                 }
             }
+            "message_start" => self.read_usage(&v["message"]["usage"]),
             "message_delta" => {
+                self.read_usage(&v["usage"]);
                 if let Some(stop) = v["delta"]["stop_reason"].as_str() {
                     if !self.done_sent {
                         self.done_sent = true;
                         self.save_turn();
+                        if self.usage != super::Usage::default() {
+                            events.push(StreamEvent::Usage(self.usage));
+                        }
                         events.push(StreamEvent::Done { finish_reason: Some(finish_reason(stop)) });
                     }
                 }
@@ -367,6 +417,9 @@ impl SseState {
                 if !self.done_sent {
                     self.done_sent = true;
                     self.save_turn();
+                    if self.usage != super::Usage::default() {
+                        events.push(StreamEvent::Usage(self.usage));
+                    }
                     events.push(StreamEvent::Done { finish_reason: None });
                 }
             }
@@ -380,6 +433,27 @@ impl SseState {
             _ => {} // message_start, ping, event types added later
         }
         Ok(events)
+    }
+
+    /// Merge an Anthropic `usage` object. `input_tokens` excludes the cached
+    /// parts, so the prompt total is the sum of all three; `output_tokens`
+    /// is a running total.
+    fn read_usage(&mut self, u: &Value) {
+        let n = |k: &str| u[k].as_u64();
+        let read = n("cache_read_input_tokens");
+        let write = n("cache_creation_input_tokens");
+        if let Some(input) = n("input_tokens") {
+            self.usage.input = input + read.unwrap_or(0) + write.unwrap_or(0);
+        }
+        if let Some(r) = read {
+            self.usage.cached = r;
+        }
+        if let Some(w) = write {
+            self.usage.cache_write = w;
+        }
+        if let Some(o) = n("output_tokens") {
+            self.usage.output = o;
+        }
     }
 
     /// Keep this reply for the next request when it called tools and has
@@ -576,10 +650,13 @@ impl super::Client {
         messages: &[ChatMsg],
         tools: &[ToolSpec],
     ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent>>> {
-        let body = {
+        let mut body = {
             let turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
             request_body(model, self.max_tokens, messages, tools, &turns)
         };
+        if self.cache_markers(model) {
+            add_cache_markers(&mut body);
+        }
         let url = format!("{}/messages", self.base_url);
         let resp = self
             .send_with_retry(&url, || super::with_auth(self.http.post(&url), self.api, &self.api_key).json(&body))
@@ -636,7 +713,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
     async fn tool_round_trip_sends_thinking_back() {
         let messages = post(|h: HeaderMap, Json(body): Json<Value>| async move {
             let echoed = &body["messages"][1]["content"][0];
-            let sse = if !(auth_ok(&h) && body["system"] == "sys" && body["max_tokens"] == 321) {
+            let sse = if !(auth_ok(&h) && system_text(&body) == "sys" && body["max_tokens"] == 321) {
                 return (StatusCode::BAD_REQUEST, format!("unexpected: {body}")).into_response();
             } else if body["messages"].as_array().map_or(0, Vec::len) == 1 {
                 FIRST
@@ -687,5 +764,54 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
         let (text, _, finish) = collect(client.stream(&client.model, &history, &[]).await.unwrap()).await;
         assert_eq!((text.as_str(), finish.as_deref()), ("done", Some("stop")));
         assert_eq!(client.list_models().await.unwrap(), vec!["claude-sonnet-5-5"]);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn markers_on_tools_system_turn_start_and_newest_message() {
+        let mut body = json!({
+            "system": "sys",
+            "tools": [{"name": "a"}, {"name": "b"}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "old"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                {"role": "user", "content": [{"type": "text", "text": "fix it"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "hm", "signature": "s"},
+                    {"type": "tool_use", "id": "t1", "name": "read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "text"},
+                    {"type": "thinking", "thinking": "never here"}
+                ]}
+            ]
+        });
+        add_cache_markers(&mut body);
+        let eph = json!({"type": "ephemeral"});
+        assert_eq!(body["tools"][1]["cache_control"], eph);
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["system"][0]["cache_control"], eph);
+        assert_eq!(system_text(&body), "sys");
+        let m = &body["messages"];
+        assert_eq!(m[2]["content"][0]["cache_control"], eph, "turn start");
+        assert_eq!(m[4]["content"][0]["cache_control"], eph, "newest, not the thinking block");
+        assert!(m[4]["content"][1].get("cache_control").is_none());
+        assert!(m[0]["content"][0].get("cache_control").is_none());
+        let count = body.to_string().matches("cache_control").count();
+        assert!(count <= 4, "Anthropic allows 4 markers, got {count}");
+    }
+
+    #[test]
+    fn usage_adds_cached_parts_to_the_prompt_total() {
+        let mut st = SseState::default();
+        st.line(r#"data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":3000,"cache_creation_input_tokens":200,"output_tokens":1}}}"#).unwrap();
+        let ev = st.line(r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":55}}"#).unwrap();
+        let want = crate::provider::Usage { input: 3212, cached: 3000, cache_write: 200, output: 55 };
+        assert!(matches!(&ev[0], StreamEvent::Usage(u) if *u == want), "{ev:?}");
+        assert!(matches!(ev[1], StreamEvent::Done { .. }));
     }
 }
