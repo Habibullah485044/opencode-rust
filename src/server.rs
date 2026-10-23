@@ -926,15 +926,20 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
         None
     };
     let started = std::time::Instant::now();
+    // Coarse file times: a second of slack so this run's first writes count.
+    let started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
     let result = agent_inner(st, session_id, user_content, &abort).await;
     // Laziness Meter: did this run change the workspace at all? Successful
     // write/edit calls always count. New (P-02): bash counts only when the
     // git working tree really changed (or when there is no git to ask).
-    let touched = {
+    let (touched, bash_used) = {
         let after = snapshot_stats(st, session_id);
-        let bash_changed = after.bash_runs > before.bash_runs
+        let bash_used = after.bash_runs > before.bash_runs;
+        let bash_changed = bash_used
             && (tree_before.is_none() || st.workspace_fingerprint(session_id).await != tree_before);
-        after.writes > before.writes || after.edits > before.edits || bash_changed
+        // Files written by this run's subagents count too.
+        let by_agents = !crate::keepbest::written_since(&st.workspace_for(session_id), started_at).is_empty();
+        (after.writes > before.writes || after.edits > before.edits || bash_changed || by_agents, bash_used)
     };
     // The reply already streamed to clients as AssistantDelta — resending it
     // as `message` made the TUI print the whole answer a second time.
@@ -954,7 +959,7 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
         // F-08 verification loop: check the work before the review and
         // before the turn is declared done. Never after an abort.
         if ok && touched && !abort.load(Ordering::SeqCst) {
-            verify_after_run(st, session_id, &abort).await;
+            check_after_run(st, session_id, user_content, started_at, bash_used, &abort).await;
         }
         // Auto ponytail review: any run that changed files gets the
         // outside-the-diff senior-dev pass BEFORE the turn is declared done.
@@ -2463,70 +2468,271 @@ pub async fn run_review(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) 
 /// F-08: marks the user message that hands a failed check back to the agent.
 pub const VERIFY_PREFIX: &str = "[verify]";
 
-/// F-08 verification loop. After a top-level run that changed files, run
-/// `agent.verify_command` in the workspace. When it fails, hand the output
-/// back to the agent as a user message and run the agent again — at most
-/// `agent.verify_max_rounds` times. Each step shows up as a `Note`.
-async fn verify_after_run(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) {
-    let Some(cmd) = st.cfg.agent.verify_command.as_deref().map(str::trim) else {
-        return;
-    };
-    if cmd.is_empty() {
-        return;
-    }
+/// F-08 verification loop, now with page checks and keep-best rounds. After
+/// a top-level run that changed files:
+/// - run the project's check command (`agent.verify_command`, or one found
+///   in the project when `agent.auto_verify` is on), and
+/// - open every web page the run changed in a headless browser at phone and
+///   desktop width (`agent.check_pages`).
+///
+/// Problems go back to the agent as one `[verify]` message, at most
+/// `agent.verify_max_rounds` times. A round is kept only when it leaves
+/// fewer problems; otherwise the files it wrote are put back (the model
+/// cannot judge its own work without a signal, and later rounds often make
+/// things worse). Each step shows up as a `Note`.
+async fn check_after_run(
+    st: &Shared,
+    session_id: &str,
+    request: &str,
+    since: std::time::SystemTime,
+    bash_used: bool,
+    abort: &Arc<AtomicBool>,
+) {
     let note = |text: String| {
         let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
     };
-    // Deny rules still apply. There is no "ask" prompt: the user set this command.
-    if st.engine.evaluate("bash", cmd, |_, _| false).action == Action::Deny {
-        note(format!("{VERIFY_PREFIX} skipped: a deny rule blocks `{cmd}`"));
+    let ws = st.workspace_for(session_id);
+    let configured = st.cfg.agent.verify_command.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let mut cmd = match configured {
+        Some(c) => Some(c.to_string()),
+        None if st.cfg.agent.auto_verify => detect_verify_command(&ws),
+        None => None,
+    };
+    // Deny rules still apply. There is no "ask" prompt: the user set this
+    // command, or it is the project's own check.
+    if let Some(c) = cmd.as_deref() {
+        if st.engine.evaluate("bash", c, |_, _| false).action == Action::Deny {
+            note(format!("{VERIFY_PREFIX} skipped: a deny rule blocks `{c}`"));
+            cmd = None;
+        }
+    }
+    let pages = |since| changed_web_pages(&ws, since, bash_used, st.cfg.agent.check_pages);
+    let mut gate = Gate { cmd, pages: pages(since), expect: crate::pagecheck::expected_texts(request) };
+    if gate.cmd.is_none() && gate.pages.is_empty() {
         return;
     }
     let timeout = std::time::Duration::from_secs(st.cfg.agent.verify_timeout_secs.max(1));
+    let Some(mut best) = run_gate(st, &ws, &mut gate, timeout, &note, abort).await else {
+        return;
+    };
+    if best.problems == 0 {
+        note(format!("{VERIFY_PREFIX} {} passed", gate.label()));
+        return;
+    }
     let max_rounds = st.cfg.agent.verify_max_rounds;
-    let mut round = 0;
-    loop {
+    let mut undone = false;
+    for round in 1..=max_rounds {
         if abort.load(Ordering::SeqCst) {
             return;
         }
-        note(format!("{VERIFY_PREFIX} running `{cmd}`…"));
-        let result = run_verify_command(cmd, &st.workspace_for(session_id), timeout, abort).await;
-        if abort.load(Ordering::SeqCst) {
-            return;
+        note(format!("{VERIFY_PREFIX} {} failed — fix round {round} of {max_rounds}", best.summary));
+        let mut msg = format!("{VERIFY_PREFIX} {}\n", best.report);
+        if undone {
+            msg.push_str("Your last fix attempt did not reduce the problems, so its file changes were undone. Try a different fix.\n");
         }
-        let (code, output) = match result {
-            Ok(r) => r,
-            Err(e) => {
-                note(format!("{VERIFY_PREFIX} could not run `{cmd}`: {e:#}"));
-                return;
-            }
-        };
-        if code == Some(0) {
-            note(format!("{VERIFY_PREFIX} `{cmd}` passed"));
-            return;
-        }
-        let status = match code {
-            Some(c) => format!("exit {c}"),
-            None => "timed out or was killed".to_string(),
-        };
-        if round >= max_rounds {
-            note(format!(
-                "{VERIFY_PREFIX} `{cmd}` still fails ({status}) after {round} fix round(s) — over to you"
-            ));
-            return;
-        }
-        round += 1;
-        note(format!("{VERIFY_PREFIX} `{cmd}` failed ({status}) — fix round {round} of {max_rounds}"));
-        let msg = format!(
-            "{VERIFY_PREFIX} `{cmd}` failed ({status}). Output (last 4000 chars):\n```\n{}\n```\n\
-             Fix the failures, then stop.",
-            tail_chars(&output, 4000)
-        );
+        msg.push_str("Fix these problems, then stop.");
+        let journal = crate::keepbest::Journal::begin(&ws);
         if let Err(e) = agent_inner(st, session_id, &msg, abort).await {
             note(format!("{VERIFY_PREFIX} fix round failed: {e}"));
             return;
         }
+        if abort.load(Ordering::SeqCst) {
+            return;
+        }
+        gate.pages = pages(since);
+        let Some(now) = run_gate(st, &ws, &mut gate, timeout, &note, abort).await else {
+            return;
+        };
+        if now.problems == 0 {
+            note(format!("{VERIFY_PREFIX} {} passed after {round} fix round(s)", gate.label()));
+            return;
+        }
+        if now.problems < best.problems {
+            note(format!("{VERIFY_PREFIX} round {round} helped: {} → {} problem(s)", best.problems, now.problems));
+            best = now;
+            undone = false;
+        } else {
+            let n = journal.restore();
+            note(format!(
+                "{VERIFY_PREFIX} round {round} did not help ({} → {} problem(s)); put back {n} file(s) it changed",
+                best.problems, now.problems
+            ));
+            undone = true;
+        }
     }
+    note(format!(
+        "{VERIFY_PREFIX} {} still failing after {max_rounds} fix round(s) — over to you",
+        best.summary
+    ));
+}
+
+/// What the post-run check runs.
+struct Gate {
+    cmd: Option<String>,
+    /// Web pages, relative to the workspace.
+    pages: Vec<String>,
+    /// Texts the pages must show (quoted names from the request).
+    expect: Vec<String>,
+}
+
+impl Gate {
+    fn label(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(c) = &self.cmd {
+            parts.push(format!("`{c}`"));
+        }
+        if !self.pages.is_empty() {
+            parts.push(format!("page check of {}", self.pages.join(", ")));
+        }
+        parts.join(" and ")
+    }
+}
+
+/// One pass of the checks.
+struct GateResult {
+    /// Lower is better; 0 = everything passed.
+    problems: usize,
+    /// What the agent reads.
+    report: String,
+    /// One line for the notes.
+    summary: String,
+}
+
+/// Run the gate once. `None` = nothing could run. A check that cannot run
+/// here (no browser, a missing test runner) is dropped from `gate` with a
+/// note instead of being handed to the agent as its fault.
+async fn run_gate(
+    st: &Shared,
+    ws: &std::path::Path,
+    gate: &mut Gate,
+    timeout: std::time::Duration,
+    note: &impl Fn(String),
+    abort: &AtomicBool,
+) -> Option<GateResult> {
+    let mut problems = 0;
+    let mut report = String::new();
+    let mut summary = Vec::new();
+    let mut ran = false;
+    if let Some(cmd) = gate.cmd.clone() {
+        note(format!("{VERIFY_PREFIX} running `{cmd}`…"));
+        match run_verify_command(&cmd, ws, timeout, abort).await {
+            Err(e) => {
+                note(format!("{VERIFY_PREFIX} could not run `{cmd}`: {e:#}"));
+                gate.cmd = None;
+            }
+            Ok((code, out)) if code != Some(0) && command_unavailable(&out) => {
+                note(format!("{VERIFY_PREFIX} skipped `{cmd}`: it is not available here"));
+                gate.cmd = None;
+            }
+            Ok((Some(0), _)) => {
+                ran = true;
+                summary.push(format!("`{cmd}` passed"));
+            }
+            Ok((code, out)) => {
+                ran = true;
+                let status = match code {
+                    Some(c) => format!("exit {c}"),
+                    None => "timed out or was killed".to_string(),
+                };
+                problems += failure_count(&out);
+                summary.push(format!("`{cmd}` ({status})"));
+                report.push_str(&format!(
+                    "`{cmd}` failed ({status}). Output (last 4000 chars):\n```\n{}\n```\n",
+                    tail_chars(&out, 4000)
+                ));
+            }
+        }
+    }
+    if abort.load(Ordering::SeqCst) {
+        return None;
+    }
+    let mut shown = false;
+    for page in gate.pages.clone() {
+        let widths: Vec<String> = crate::pagecheck::DEFAULT_WIDTHS.iter().map(|w| format!("{w}px")).collect();
+        note(format!("{VERIFY_PREFIX} opening {page} in a browser at {}…", widths.join(" and ")));
+        match crate::pagecheck::check(ws, &page, crate::pagecheck::DEFAULT_WIDTHS, &gate.expect).await {
+            Ok(r) => {
+                ran = true;
+                if !shown {
+                    show_in_panel(st, &r.url);
+                    shown = true;
+                }
+                if r.score() > 0 {
+                    problems += r.score();
+                    summary.push(format!("{page}: {} problem(s)", r.score()));
+                    report.push_str(&r.render());
+                    report.push('\n');
+                } else {
+                    summary.push(format!("{page} looks right"));
+                }
+            }
+            Err(e) => {
+                note(format!("{VERIFY_PREFIX} page check of {page} skipped: {e:#}"));
+                gate.pages.retain(|p| *p != page);
+            }
+        }
+    }
+    ran.then(|| GateResult { problems, report: report.trim_end().to_string(), summary: summary.join(", ") })
+}
+
+/// Web pages this run changed: files the tools wrote, plus (when shell
+/// commands ran) web files modified since the run started.
+fn changed_web_pages(ws: &std::path::Path, since: std::time::SystemTime, bash_used: bool, enabled: bool) -> Vec<String> {
+    if !enabled {
+        return Vec::new();
+    }
+    let mut files = crate::keepbest::written_since(ws, since);
+    if bash_used {
+        files.extend(crate::pagecheck::recently_modified(ws, since));
+    }
+    crate::pagecheck::pages_for(ws, &files, 3)
+}
+
+/// The project's own check, for `agent.auto_verify`: quick ones that need
+/// no setup. `None` when the project has none.
+pub fn detect_verify_command(ws: &std::path::Path) -> Option<String> {
+    if ws.join("Cargo.toml").is_file() {
+        return Some("cargo check --quiet".into());
+    }
+    if ws.join("go.mod").is_file() {
+        return Some("go test ./...".into());
+    }
+    if let Ok(text) = std::fs::read_to_string(ws.join("package.json")) {
+        let test = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v["scripts"]["test"].as_str().map(str::to_string));
+        if test.is_some_and(|t| !t.contains("no test specified")) {
+            return Some("npm test --silent".into());
+        }
+    }
+    let is_test = |name: &str| {
+        name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py"))
+    };
+    let has_py_tests = [ws.to_path_buf(), ws.join("tests")].iter().any(|dir| {
+        std::fs::read_dir(dir)
+            .map(|it| it.flatten().any(|e| is_test(&e.file_name().to_string_lossy())))
+            .unwrap_or(false)
+    });
+    has_py_tests.then(|| "python -m pytest -q".into())
+}
+
+/// The check command itself is missing (not the project failing it).
+fn command_unavailable(out: &str) -> bool {
+    let head: String = out.chars().take(600).collect::<String>().to_ascii_lowercase();
+    ["command not found", "is not recognized as an internal or external command", "no module named pytest", "missing script: test"]
+        .iter()
+        .any(|m| head.contains(m))
+}
+
+/// How many failures a failing check's output shows (at least 1).
+fn failure_count(out: &str) -> usize {
+    out.lines()
+        .filter(|l| {
+            let l = l.to_ascii_lowercase();
+            l.contains("error") || l.contains("failed") || l.starts_with("fail")
+        })
+        .count()
+        .clamp(1, 99)
 }
 
 /// F-08: run the check in the workspace with a timeout. Returns the exit code
@@ -2749,6 +2955,10 @@ async fn execute_for(
     input: &Value,
     abort: &AtomicBool,
 ) -> (String, bool) {
+    if name == "check_page" {
+        let root = opts.workspace.clone().unwrap_or_else(|| st.workspace_for(session_id));
+        return check_page_tool(st, &root, input).await;
+    }
     if let Some(ws) = &opts.workspace {
         if WORKSPACE_TOOLS.contains(&name) {
             return match tools::execute(name, input, ws, abort).await {
@@ -2758,6 +2968,30 @@ async fn execute_for(
         }
     }
     execute_routed(st, session_id, name, input, abort).await
+}
+
+/// The `check_page` tool. In the desktop app the checked page also opens in
+/// the preview panel, so the user sees what the agent checked.
+async fn check_page_tool(st: &Shared, root: &std::path::Path, input: &Value) -> (String, bool) {
+    match crate::pagecheck::run_tool(root, input).await {
+        Ok((text, report)) => {
+            show_in_panel(st, &report.url);
+            (text, true)
+        }
+        Err(e) => (format!("error: {e:#}"), false),
+    }
+}
+
+/// Open `url` in the desktop app's preview panel, when it is open. Does not
+/// wait for the page to load.
+fn show_in_panel(st: &Shared, url: &str) {
+    let handle = st.browser.lock().ok().and_then(|g| g.clone());
+    if let Some(handle) = handle {
+        let url = url.to_string();
+        tokio::spawn(async move {
+            let _ = handle.call("navigate", serde_json::json!({ "url": url })).await;
+        });
+    }
 }
 
 /// F-05: like `tool_detail`, but paths are made relative to the run's own
@@ -5430,6 +5664,96 @@ data: [DONE]
         assert_eq!(turbo_streak(&st, &s.id), 1, "a verify hand-back neither counts nor resets");
     }
 
+    #[test]
+    fn the_project_check_is_found_without_configuration() {
+        let dir = std::env::temp_dir().join(format!("ocrs-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        assert_eq!(detect_verify_command(&dir), None);
+        std::fs::write(dir.join("tests").join("test_app.py"), "").unwrap();
+        assert_eq!(detect_verify_command(&dir).as_deref(), Some("python -m pytest -q"));
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#).unwrap();
+        assert_eq!(detect_verify_command(&dir).as_deref(), Some("python -m pytest -q"), "npm's placeholder is not a test");
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"vitest run"}}"#).unwrap();
+        assert_eq!(detect_verify_command(&dir).as_deref(), Some("npm test --silent"));
+        std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(detect_verify_command(&dir).as_deref(), Some("cargo check --quiet"));
+        assert!(command_unavailable("/usr/bin/python: No module named pytest"));
+        assert!(!command_unavailable("FAILED tests/test_app.py::test_x"));
+        assert_eq!(failure_count("ok\nerror: a\nFAILED b\n"), 2);
+        assert_eq!(failure_count(""), 1, "a failing check is at least one problem");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Keep-best: a fix round that leaves more problems is undone, and the
+    /// next round starts from the better state.
+    #[tokio::test]
+    async fn a_fix_round_that_makes_things_worse_is_undone() {
+        if crate::tools::shell_kind() != crate::permissions::Shell::Posix {
+            return; // the check below is a POSIX shell script
+        }
+        use axum::{routing::post, Router};
+        fn write_call(id: &str, path: &str, content: &str) -> String {
+            let args = serde_json::json!({"path": path, "content": content}).to_string();
+            let frame = serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": id, "function": {"name": "write", "arguments": args}
+            }]}, "finish_reason": null}]});
+            format!(
+                "data: {frame}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+            )
+        }
+        let dir = std::env::temp_dir().join(format!("ocrs-keepbest-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: axum::extract::Json<Value>| async move {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                let verifies = msgs
+                    .iter()
+                    .filter(|m| m["role"] == "user" && m["content"].as_str().unwrap_or("").starts_with("[verify]"))
+                    .count();
+                let payload = if msgs.last().is_some_and(|m| m["role"] == "tool") {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string()
+                } else {
+                    match verifies {
+                        0 => write_call("c0", "errors.txt", "error a\n"),
+                        1 => write_call("c1", "errors.txt", "error a\nerror b\nerror c\n"),
+                        _ => write_call("c2", "fixed.txt", "ok\n"),
+                    }
+                };
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.auto_review = false;
+        cfg.agent.verify_command = Some("test -f fixed.txt && exit 0; cat errors.txt; exit 1".into());
+        cfg.permissions.defaults.insert("write".into(), "allow".into());
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("kb", None).unwrap();
+        let mut rx = st.events.subscribe();
+        run_agent(&st, &s.id, "make it", Arc::new(AtomicBool::new(false))).await;
+        let mut notes = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::Note { text, .. } = ev {
+                notes.push(text);
+            }
+        }
+        assert!(notes.iter().any(|n| n.contains("round 1 did not help (1 → 3 problem(s)); put back 1 file")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("passed after 2 fix round(s)")), "{notes:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("errors.txt")).unwrap(), "error a\n", "the worse round was undone");
+        let msgs = st.db.messages(&s.id).unwrap();
+        assert!(msgs.iter().any(|m| m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.contains("its file changes were undone")))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// F-08 end to end: the run writes a file, the check fails, the agent gets
     /// the output as a `[verify]` message, fixes it, and the check passes.
     #[tokio::test]
@@ -5733,7 +6057,9 @@ mod prompt_budget_tests {
         let s = st.db.create_session("m", None).unwrap();
         let (system, tools, count) = st.request_overhead(&s.id);
         assert!(system <= 900, "system prompt ~{system} tokens");
-        assert!(tools <= 1150, "tool list ~{tools} tokens ({count} tools)");
+        // 1150 → 1200 for `check_page` (~70 tokens; `todo` was trimmed to pay
+        // for most of it): checking the rendered page is the cheapest fix.
+        assert!(tools <= 1200, "tool list ~{tools} tokens ({count} tools)");
         assert!(st.usage_report(&s.id).contains("Each request of this chat starts with about"));
         let _ = std::fs::remove_dir_all(&dir);
     }

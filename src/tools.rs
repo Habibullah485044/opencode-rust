@@ -60,8 +60,14 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "todo",
-            "Manage a per-session todo list: add, list, complete, or remove tasks. Use this to track work across a long session.",
-            json!({"type":"object","properties":{"op":{"type":"string","enum":["add","list","complete","remove"],"description":"Operation"},"content":{"type":"string","description":"Task content (required for add)"},"id":{"type":"string","description":"Todo id (required for complete/remove)"}},"required":["op"]}),
+            "Todo list of this chat, for tracking long work. add needs content; complete and remove need id.",
+            json!({"type":"object","properties":{"op":{"type":"string","enum":["add","list","complete","remove"]},"content":{"type":"string"},"id":{"type":"string"}},"required":["op"]}),
+        ),
+        spec(
+            "check_page",
+            "Open a page in a real browser at phone and desktop width; lists what is broken. \
+             Run after changing a page and fix all it reports. expect_text: names it must show.",
+            json!({"type":"object","properties":{"path":{"type":"string"},"expect_text":{"type":"array","items":{"type":"string"}}}}),
         ),
     ]
 }
@@ -521,6 +527,8 @@ fn write_file(workspace: &Path, path: &str, content: &str) -> Result<String> {
 /// a plain write when the rename is refused (Windows, file held open).
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // A keep-best fix round can put this file back if the round makes things worse.
+    crate::keepbest::before_write(path);
     let old_perms = std::fs::metadata(path).ok().map(|m| m.permissions());
     if old_perms.as_ref().map(|p| p.readonly()).unwrap_or(false) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the file is read-only"));

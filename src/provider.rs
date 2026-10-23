@@ -1158,9 +1158,9 @@ mod f01_tests {
             let _ = axum::serve(listener, app).await;
         });
         let mut c = fast_client(&format!("http://{addr}/v1"), 0);
-        c.stream("stub", &[], &[]).await.unwrap();
+        let _ = c.stream("stub", &[], &[]).await.unwrap();
         c.reasoning_effort = Some("low".into());
-        c.stream("stub", &[], &[]).await.unwrap();
+        let _ = c.stream("stub", &[], &[]).await.unwrap();
         let seen = seen.lock().unwrap();
         assert!(seen[0].get("reasoning").is_none(), "unset: nothing extra is sent");
         assert_eq!(seen[1]["reasoning"]["effort"], "low");

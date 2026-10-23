@@ -165,7 +165,7 @@ pub fn builtin_subagents() -> Vec<SubagentDef> {
              arguments, wrong exit codes or messages, temporary files left in the project. \
              Report each real problem with file:line and how to fix it, most serious first. \
              If it is good, say so in one line. Do not edit files.",
-            Some(&["read", "list", "glob", "grep", "bash"]),
+            Some(&["read", "list", "glob", "grep", "bash", "check_page"]),
             true,
         ),
     ]

@@ -8,9 +8,11 @@ pub mod gitsnap;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod inline_edit;
+pub mod keepbest;
 pub mod mcp;
 pub mod mcp_http;
 pub mod mission;
+pub mod pagecheck;
 pub mod permissions;
 #[cfg(feature = "gui")]
 pub mod preview;

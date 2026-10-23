@@ -197,7 +197,7 @@ impl Default for PermissionsCfg {
     fn default() -> Self {
         let mut defaults = HashMap::new();
         // Safe reads: allow. Anything that mutates the machine: ask.
-        for t in ["read", "list", "glob", "grep"] {
+        for t in ["read", "list", "glob", "grep", "check_page"] {
             defaults.insert(t.to_string(), "allow".to_string());
         }
         for t in ["bash", "write", "edit", "webfetch"] {
@@ -310,6 +310,12 @@ pub struct AgentCfg {
     /// F-08: command that checks the work after a run that changed files,
     /// for example "cargo test". Unset (the default) = no check.
     pub verify_command: Option<String>,
+    /// No `verify_command` set: find the project's check (Cargo.toml →
+    /// `cargo check`, package.json test script, pytest tests, go.mod).
+    pub auto_verify: bool,
+    /// After a run that changed a web page, open it in a headless browser
+    /// at phone and desktop width and hand the problems back to the agent.
+    pub check_pages: bool,
     /// F-08: how many fix rounds the agent gets when the check fails.
     pub verify_max_rounds: u32,
     /// F-08: seconds before a check that hangs is stopped.
@@ -332,6 +338,8 @@ impl Default for AgentCfg {
             isolate_workers: false,
             max_subagents: 4,
             verify_command: None,
+            auto_verify: true,
+            check_pages: true,
             verify_max_rounds: 2,
             verify_timeout_secs: 600,
             auto_review: true,
