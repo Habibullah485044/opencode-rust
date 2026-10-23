@@ -74,6 +74,9 @@ pub struct GuiState {
     pub question: Option<(String, Vec<String>)>,
     /// What the Settings page shows.
     pub settings: GuiSettings,
+    /// Attachments to put into the composer: (counter, markers). The page
+    /// inserts each batch once, by counter.
+    pub attach: (u64, Vec<String>),
     /// New (B-37): the entries as the page last received them, and for which
     /// chat, so a paint only sends what changed. `RefCell` because painting
     /// only has `&GuiState`.
@@ -184,6 +187,7 @@ impl Default for GuiState {
             editors: Vec::new(),
             question: None,
             settings: GuiSettings::default(),
+            attach: (0, Vec::new()),
             sent: std::cell::RefCell::new(Vec::new()),
             sent_session: std::cell::RefCell::new(None),
         }
@@ -737,6 +741,7 @@ impl GuiState {
             "sessions": sessions,
             "agents": agents,
             "editors": self.editors,
+            "attach": { "seq": self.attach.0, "items": self.attach.1 },
             "question": self.question.as_ref().map(|(q, o)| serde_json::json!({ "text": q, "options": o })),
             "settings": {
                 "base_url": self.settings.base_url,
@@ -860,6 +865,10 @@ pub enum IpcMsg {
     ListModels,
     /// Write the open chat as Markdown into its project.
     Export,
+    /// Attach files picked in a dialog.
+    PickFiles,
+    /// Attach a pasted or dropped file (`data` is base64).
+    SaveAttachment { name: String, data: String },
     /// Open the chat's project folder in a code editor (by name, or the first found).
     OpenInEditor(Option<String>),
     /// Projects sidebar: a new chat inside project `id`.
@@ -944,6 +953,11 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         }),
         "list_models" => Some(IpcMsg::ListModels),
         "export" => Some(IpcMsg::Export),
+        "pick_files" => Some(IpcMsg::PickFiles),
+        "save_attachment" => Some(IpcMsg::SaveAttachment {
+            name: v.get("name").and_then(|n| n.as_str()).unwrap_or("pasted.png").to_string(),
+            data: v.get("data")?.as_str()?.to_string(),
+        }),
         "open_in_editor" => Some(IpcMsg::OpenInEditor(v.get("editor").and_then(|e| e.as_str()).map(str::to_string))),
         "new_in_project" => Some(IpcMsg::NewInProject(v.get("project")?.as_str()?.to_string())),
         "add_project" => Some(IpcMsg::AddProject(
@@ -1220,6 +1234,58 @@ fn save_settings(
         .unwrap_or_else(|| st.cfg.provider.api_key.clone());
     let client = crate::provider::Client::from_cfg(p.base_url.trim_end_matches('/'), &p)?;
     Ok((path, client, !p.api_key.is_empty()))
+}
+
+/// The folder of the open chat's project (the start folder without one).
+fn chat_root(gs: &GuiState, st: &server::AppState) -> std::path::PathBuf {
+    gs.current_project()
+        .and_then(|id| gs.projects.iter().find(|p| p.id == id).map(|p| std::path::PathBuf::from(&p.root)))
+        .unwrap_or_else(|| st.workspace.clone())
+}
+
+/// Files picked in the Windows open dialog (several allowed).
+#[cfg(windows)]
+fn pick_files(window: &tao::window::Window) -> Vec<std::path::PathBuf> {
+    use tao::platform::windows::WindowExtWindows;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileOpenDialog, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, SIGDN_FILESYSPATH,
+    };
+    let mut out = Vec::new();
+    // SAFETY: plain COM calls on the UI thread; each returned string is
+    // copied and then freed with CoTaskMemFree as the API requires.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let Ok(dialog) = CoCreateInstance::<_, IFileOpenDialog>(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) else {
+            return out;
+        };
+        let Ok(options) = dialog.GetOptions() else { return out };
+        if dialog.SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM).is_err() {
+            return out;
+        }
+        if dialog.Show(Some(HWND(window.hwnd() as _))).is_err() {
+            return out; // cancelled
+        }
+        let Ok(items) = dialog.GetResults() else { return out };
+        let n = items.GetCount().unwrap_or(0);
+        for i in 0..n {
+            let Ok(item) = items.GetItemAt(i) else { continue };
+            let Ok(name) = item.GetDisplayName(SIGDN_FILESYSPATH) else { continue };
+            if let Ok(p) = name.to_string() {
+                out.push(std::path::PathBuf::from(p));
+            }
+            CoTaskMemFree(Some(name.0 as *const _));
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn pick_files(_window: &tao::window::Window) -> Vec<std::path::PathBuf> {
+    Vec::new()
 }
 
 /// Closing stops every run: ask first while one is going.
@@ -1861,10 +1927,7 @@ pub async fn run(
                             }
                         }
                         UiMsg::Ipc(IpcMsg::OpenInEditor(editor)) => {
-                            let root = gs
-                                .current_project()
-                                .and_then(|id| gs.projects.iter().find(|p| p.id == id).map(|p| std::path::PathBuf::from(&p.root)))
-                                .unwrap_or_else(|| st.workspace.clone());
+                            let root = chat_root(&gs, &st);
                             let text = match open_in_editor(editor.as_deref(), &root) {
                                 Ok(name) => format!("Opened {} in {name}.", root.display()),
                                 Err(e) => format!("Open in editor: {e}"),
@@ -1893,6 +1956,33 @@ pub async fn run(
                                 Err(e) => format!("Settings not saved: {e:#}"),
                             };
                             gs.push(EntryKind::System, text);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::PickFiles) => {
+                            let root = chat_root(&gs, &st);
+                            let mut markers = Vec::new();
+                            for file in pick_files(&window) {
+                                match crate::attachments::copy_in(&root, &file) {
+                                    Ok(p) => markers.push(crate::attachments::marker(&p)),
+                                    Err(e) => gs.push(EntryKind::System, format!("Not attached: {e:#}")),
+                                }
+                            }
+                            if !markers.is_empty() {
+                                gs.attach = (gs.attach.0 + 1, markers);
+                            }
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::SaveAttachment { name, data }) => {
+                            use base64::Engine;
+                            let root = chat_root(&gs, &st);
+                            let saved = base64::engine::general_purpose::STANDARD
+                                .decode(data.split_once(',').map_or(data.as_str(), |(_, b)| b))
+                                .map_err(anyhow::Error::from)
+                                .and_then(|bytes| crate::attachments::save_bytes(&root, &name, &bytes));
+                            match saved {
+                                Ok(p) => gs.attach = (gs.attach.0 + 1, vec![crate::attachments::marker(&p)]),
+                                Err(e) => gs.push(EntryKind::System, format!("Not attached: {e:#}")),
+                            }
                             changed = true;
                         }
                         UiMsg::Ipc(IpcMsg::Export) => {

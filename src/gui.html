@@ -1025,6 +1025,21 @@
   .chip-d { font-size: 12px; color: var(--text-muted); line-height: 1.4; }
 
   /* ---- Composer ---- */
+  #attach-btn {
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-s);
+    display: inline-grid;
+    place-items: center;
+    cursor: pointer;
+    flex: none;
+  }
+  #attach-btn:hover { color: var(--text); background: var(--surface-2); }
+  #comp.dropping { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
   /* ---- ask_user: a question with answers to click ---- */
   #ask-box {
     margin: 0 0 8px;
@@ -1666,6 +1681,9 @@
         <div id="comp">
           <textarea id="input" rows="1" placeholder="Message Habi or ask a question…" autocomplete="off" spellcheck="false"></textarea>
           <div class="comp-bottom-row">
+            <button type="button" id="attach-btn" title="Attach files (you can also paste or drop screenshots)" aria-label="Attach files">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21.4 11.1l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8l8.5-8.5a3.7 3.7 0 0 1 5.2 5.2l-8.5 8.5a1.8 1.8 0 0 1-2.6-2.6l7.8-7.8"/></svg>
+            </button>
             <div class="mode-switch" id="mode-switch" role="radiogroup" aria-label="Permission mode">
               <button type="button" class="mode-btn on" data-mode="default" role="radio" aria-checked="true"
                       title="Default: safe reads run, anything that writes or runs a command asks first">Default</button>
@@ -1817,6 +1835,7 @@
   var historyPos = -1, historyDraft = "";
   var queuedMsg = null; // { text, session }
   var currentSession = "";
+  var lastAttachSeq = 0;
   function loadHistory() {
     try { return JSON.parse(localStorage.getItem("habi.history") || "[]"); } catch (e) { return []; }
   }
@@ -3017,6 +3036,18 @@
     // screen keeps the queue until its own chat is back and idle.
     if (queuedMsg && !busyNow && queuedMsg.session === currentSession) sendQueued();
     if (wasBusy !== busyNow) renderQueue();
+    // New attachments: their markers go into the message box once each.
+    var att = d.attach || {};
+    if (att.seq && att.seq !== lastAttachSeq) {
+      lastAttachSeq = att.seq;
+      var ta = document.getElementById("input");
+      if (ta && (att.items || []).length) {
+        var add = att.items.join("\n");
+        ta.value = ta.value ? ta.value.replace(/\s*$/, "") + "\n" + add + "\n" : add + "\n";
+        ta.dispatchEvent(new Event("input"));
+        ta.focus();
+      }
+    }
     // ask_user: the question with one button per answer (typing still works).
     var askBox = document.getElementById("ask-box");
     if (askBox) {
@@ -3443,6 +3474,41 @@
         queuedMsg = null;
         renderQueue();
         refreshSend();
+      });
+    }
+    // ---- Attachments: button, paste, drag and drop ----
+    var attachBtn = document.getElementById("attach-btn");
+    if (attachBtn) attachBtn.addEventListener("click", function () { postToRust({ type: "pick_files" }); });
+    function sendFile(file) {
+      if (!file || file.size > 10 * 1024 * 1024) return;
+      var reader = new FileReader();
+      reader.onload = function () {
+        postToRust({ type: "save_attachment", name: file.name || "pasted.png", data: String(reader.result || "") });
+      };
+      reader.readAsDataURL(file);
+    }
+    if (input) {
+      input.addEventListener("paste", function (ev) {
+        var items = (ev.clipboardData && ev.clipboardData.items) || [];
+        var took = false;
+        for (var i = 0; i < items.length; i++) {
+          if (items[i].kind === "file") {
+            var f = items[i].getAsFile();
+            if (f) { sendFile(f); took = true; }
+          }
+        }
+        if (took) ev.preventDefault(); // a pasted screenshot, not text
+      });
+    }
+    var compBox = document.getElementById("comp");
+    if (compBox) {
+      compBox.addEventListener("dragover", function (ev) { ev.preventDefault(); compBox.classList.add("dropping"); });
+      compBox.addEventListener("dragleave", function () { compBox.classList.remove("dropping"); });
+      compBox.addEventListener("drop", function (ev) {
+        ev.preventDefault();
+        compBox.classList.remove("dropping");
+        var files = (ev.dataTransfer && ev.dataTransfer.files) || [];
+        for (var i = 0; i < files.length; i++) sendFile(files[i]);
       });
     }
     var exportBtn = document.getElementById("export-btn");

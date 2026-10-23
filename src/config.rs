@@ -133,6 +133,10 @@ pub struct ProviderCfg {
     /// "medium" or "high" (OpenAI-style servers; OpenRouter passes it on).
     /// Thinking is billed as output. Unset = the model's default.
     pub reasoning_effort: Option<String>,
+    /// Send the images attached to a message to the model: "auto" (when
+    /// the model name says it can see, e.g. -vl, gpt-4o, claude, gemini),
+    /// "on" or "off".
+    pub images: String,
     /// Prompt caching markers: "auto" (default), "on" or "off". Most
     /// providers (OpenAI, DeepSeek, Gemini, Ollama, llama.cpp) reuse a
     /// repeated prompt start on their own; Anthropic models need markers
@@ -171,6 +175,7 @@ impl Default for ProviderCfg {
             max_retries: 3,
             rate_limit_wait_secs: 300,
             reasoning_effort: None,
+            images: "auto".into(),
             prompt_cache: PromptCache::Auto,
             stream_usage: true,
         }

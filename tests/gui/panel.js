@@ -596,6 +596,21 @@
   click("export-btn");
   ok("Export asks for the chat as Markdown", count("export") === 1);
 
+  // --- Attachments ---
+  sent = [];
+  click("attach-btn");
+  ok("the attach button opens the file picker", count("pick_files") === 1);
+  var ata = document.getElementById("input");
+  ata.value = "what is wrong here?";
+  var attPage = payload(basePage);
+  attPage.attach = { seq: 7, items: ["[image: C:/p/.opencode/attachments/1-shot.png]"] };
+  window.render(attPage);
+  ok("an attachment's marker goes into the message", ata.value === "what is wrong here?\n[image: C:/p/.opencode/attachments/1-shot.png]\n", JSON.stringify(ata.value));
+  window.render(attPage);
+  ok("each attachment is inserted once", ata.value.split("[image:").length === 2);
+  ata.value = "";
+  ata.dispatchEvent(new Event("input"));
+
   // --- ask_user: question with answer buttons ---
   var askPage = payload(basePage);
   askPage.question = { text: "Which color theme?", options: ["Warm brown", "Dark roast"] };

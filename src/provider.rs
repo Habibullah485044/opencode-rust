@@ -41,6 +41,8 @@ pub struct Client {
     stream_usage: bool,
     /// `provider.reasoning_effort`, sent when set.
     reasoning_effort: Option<String>,
+    /// `provider.images`: auto / on / off.
+    images: String,
 }
 
 /// Token counts of one reply, normalised across providers. `input` is the
@@ -198,6 +200,7 @@ impl Client {
             prompt_cache: crate::config::PromptCache::Auto,
             stream_usage: true,
             reasoning_effort: None,
+            images: "auto".into(),
         })
     }
 
@@ -211,6 +214,7 @@ impl Client {
         c.prompt_cache = p.prompt_cache;
         c.stream_usage = p.stream_usage;
         c.reasoning_effort = p.reasoning_effort.clone().filter(|e| !e.trim().is_empty());
+        c.images = p.images.clone();
         Ok(c)
     }
 
@@ -321,6 +325,9 @@ impl Client {
             } else {
                 body["reasoning"] = json!({ "effort": effort });
             }
+        }
+        if crate::attachments::model_sees_images(&self.images, model) {
+            crate::attachments::attach_images(&mut body);
         }
         if self.cache_markers(model) {
             add_openai_cache_markers(&mut body);
