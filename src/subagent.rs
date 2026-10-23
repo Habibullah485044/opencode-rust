@@ -106,9 +106,11 @@ pub async fn spawn_subagent(
         .add_message(&session.id, "user", &[Part::Text { text: task.to_string() }])?;
 
     // Restricted system prompt: def.system as base + project instructions.
-    let agents_md = crate::skills::load_agents_md(&st.workspace);
+    // The child works in its parent chat's project folder.
+    let project_ws = st.workspace_for(&session.id);
+    let agents_md = crate::skills::load_agents_md(&project_ws);
     let system = agents::compose_system(agents::PromptInputs {
-        workspace: &st.workspace,
+        workspace: &project_ws,
         mode: crate::agents::AgentMode::Build,
         configured: Some(def.system),
         agents_md: agents_md.as_deref(),
@@ -134,7 +136,7 @@ pub async fn spawn_subagent(
     // F-05: with `agent.isolate_workers`, a `worker` runs in its own git
     // worktree and keeps to the built-in tools.
     let iso = (st.cfg.agent.isolate_workers && name == "worker")
-        .then(|| crate::worktree::Isolation::start(&st.workspace, &st.state_dir, "worker"));
+        .then(|| crate::worktree::Isolation::start(&project_ws, &st.state_dir, "worker"));
     let iso_ws = iso.as_ref().and_then(|i| i.workspace());
     let mut system = system;
     let mut allow = def.tools.map(|t| t.iter().map(|s| s.to_string()).collect());
@@ -148,7 +150,7 @@ pub async fn spawn_subagent(
         allow,
         can_spawn: false, // no recursive spawning
         agent: Some(agent.clone()),
-        workspace: iso_ws,
+        workspace: iso_ws.or_else(|| st.run_workspace(&session.id)),
     };
     let out = match run_loop(st, &session.id, &opts, abort).await {
         Ok(out) => out,

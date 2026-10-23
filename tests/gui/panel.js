@@ -359,6 +359,67 @@
     !!document.querySelector("#log .tool-res.has-out") &&
     document.querySelector("#log .tool-card").classList.contains("ok"));
 
+  // --- Projects sidebar ---
+  try { localStorage.removeItem("habi.sidebar"); } catch (e) { /* ignore */ }
+  function chatOf(id, project, extra) {
+    var c = { id: id, title: "Chat " + id, project: project, updated: 1000 - Number(id.slice(1)),
+      pinned: false, archived: false, empty: false, running: false, needs: false, active: false };
+    for (var k in (extra || {})) c[k] = extra[k];
+    return c;
+  }
+  var sb = payload(basePage0());
+  sb.projects = [{ id: "pa", name: "alpha", root: "C:/alpha" }, { id: "pb", name: "beta", root: "C:/beta" }];
+  sb.current_project = "pa";
+  sb.sessions = [
+    chatOf("c1", "pa", { active: true }), chatOf("c2", "pa"), chatOf("c3", "pa"), chatOf("c4", "pa"),
+    chatOf("c5", "pa"), chatOf("c6", "pa"), chatOf("c7", "pa"),
+    chatOf("c8", "pb", { pinned: true }), chatOf("c9", "pb", { running: true }),
+    chatOf("c10", "pb", { archived: true }), chatOf("c11", "pb", { empty: true }),
+    chatOf("c12", null)
+  ];
+  window.render(sb);
+  var side = document.getElementById("sesslist");
+  var secs = Array.prototype.map.call(side.querySelectorAll(".side-sec"), function (e) { return e.textContent; });
+  ok("sidebar sections in order", secs.join("|") === "Pinned|Active|Projects|Chats without a project", secs.join("|"));
+  function rowIds() {
+    return Array.prototype.map.call(side.querySelectorAll(".sess"), function (e) { return e.dataset.id; });
+  }
+  var ids = rowIds();
+  ok("archived and never-used chats are hidden", ids.indexOf("c10") < 0 && ids.indexOf("c11") < 0, ids.join(","));
+  ok("a pinned chat is listed once, under Pinned", ids.filter(function (i) { return i === "c8"; }).length === 1);
+  ok("a project shows its newest 5 chats", ids.indexOf("c6") < 0 && ids.indexOf("c5") >= 0, ids.join(","));
+  ok("the running chat shows a spinner", !!side.querySelector('.sess[data-id="c9"] .st.run'));
+  var moreBtn = side.querySelector(".show-more");
+  ok("Show more names how many are hidden", !!moreBtn && /Show 2 more/.test(moreBtn.textContent));
+  moreBtn.click();
+  ok("Show more lists the rest", rowIds().indexOf("c7") >= 0);
+  sent = [];
+  side.querySelector('.proj-head [data-act="new"]').click();
+  ok("+ on a project starts a chat there", (last("new_in_project") || {}).project === "pa", JSON.stringify(sent));
+  side.querySelector(".proj-head").click();
+  ok("a project header collapses its chats", side.querySelector(".proj-body").classList.contains("collapsed"));
+  side.querySelector(".proj-head").click();
+  sent = [];
+  side.querySelector('.sess[data-id="c2"]').click();
+  ok("clicking a chat opens it", (last("load") || {}).id === "c2");
+  side.querySelector('.sess[data-id="c2"] [data-act="pin"]').click();
+  ok("the pin button pins", (last("pin") || {}).on === true && last("pin").id === "c2");
+  var search = document.getElementById("side-search");
+  search.value = "c12";
+  search.dispatchEvent(new Event("input", { bubbles: true }));
+  ok("search filters every chat", rowIds().join(",") === "c12", rowIds().join(","));
+  search.value = "";
+  search.dispatchEvent(new Event("input", { bubbles: true }));
+  sent = [];
+  document.getElementById("history-btn").click();
+  var hist = document.getElementById("history");
+  ok("History opens and hides the native preview", !hist.hidden && count("panel_visible") <= 1);
+  ok("History lists archived chats too",
+    /Chat c10/.test(document.getElementById("hist-list").textContent) &&
+    !/Chat c11/.test(document.getElementById("hist-list").textContent));
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  ok("Escape closes History", hist.hidden);
+
   // --- Permission mode selector: default / manual / turbo ---
   var basePage = { url: "", title: "", can_back: false, can_forward: false, loading: false, error: null, visible: false };
   function withMode(mode) {

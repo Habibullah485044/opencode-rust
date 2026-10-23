@@ -269,6 +269,260 @@
   .api.down { color: var(--bad); }
   .api.down .dot { background: var(--bad); }
   .ver-badge { display: none; }
+
+  /* ---- Sidebar: search, sections, projects, rows ---- */
+  /* The list scrolls; rows keep their height instead of being squeezed. */
+  #sesslist > *, .proj-body > * { flex-shrink: 0; }
+  .side-search {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 10px 0 4px;
+    padding: 0 8px;
+    height: 30px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-dim);
+    cursor: text;
+  }
+  .side-search:focus-within { background: rgba(255, 255, 255, 0.07); color: var(--text-muted); }
+  .side-search svg { width: 14px; height: 14px; flex: none; }
+  .side-search input {
+    flex: 1;
+    min-width: 0;
+    background: none;
+    border: 0;
+    outline: 0;
+    font-size: 12.5px;
+    color: var(--text);
+  }
+  .side-search input::placeholder { color: var(--text-dim); }
+  .side-search kbd { font-family: var(--font); font-size: 10px; color: var(--text-dim); }
+
+  .side-sec {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-dim);
+    margin: 14px 10px 4px;
+    user-select: none;
+  }
+  .side-sec .sec-act {
+    margin-left: auto;
+    width: 20px;
+    height: 20px;
+    border: 0;
+    border-radius: 5px;
+    background: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+  }
+  .side-sec .sec-act:hover { background: var(--surface-2); color: var(--text); }
+  .side-sec .sec-act svg { width: 13px; height: 13px; }
+
+  .proj-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 6px 6px 8px;
+    border-radius: 8px;
+    color: var(--text-soft);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    user-select: none;
+  }
+  .proj-head:hover { background: rgba(255, 255, 255, 0.04); }
+  .proj-head .chev { width: 10px; height: 10px; flex: none; color: var(--text-dim); transition: transform 0.15s var(--ease); }
+  .proj-head.collapsed .chev { transform: rotate(-90deg); }
+  .proj-head .folder { width: 14px; height: 14px; flex: none; color: var(--text-muted); }
+  .proj-head .pname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .proj-head .pcount { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .proj-head .row-act { opacity: 0; }
+  .proj-head:hover .row-act, .proj-head:focus-within .row-act { opacity: 1; }
+  .proj-body { display: flex; flex-direction: column; gap: 1px; padding-left: 12px; }
+  .proj-body.collapsed { display: none; }
+  .proj-empty { font-size: 12px; color: var(--text-dim); padding: 4px 10px 6px 18px; }
+
+  .sess .st { flex: none; width: 14px; height: 14px; display: grid; place-items: center; }
+  .sess .st.run::before {
+    content: "";
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    border: 1.5px solid rgba(142, 162, 255, 0.25);
+    border-top-color: var(--accent);
+    animation: sp 0.8s linear infinite;
+  }
+  .sess .st.needs::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--warn); }
+  .sess .row-acts { display: none; gap: 1px; margin-left: 2px; flex: none; }
+  .sess:hover .row-acts, .sess:focus-within .row-acts, .sess.menu-open .row-acts { display: flex; }
+  .sess:hover .pin-mark { display: none; }
+  .pin-mark { width: 11px; height: 11px; flex: none; color: var(--text-dim); }
+  .row-act {
+    width: 22px;
+    height: 22px;
+    border: 0;
+    border-radius: 6px;
+    background: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    flex: none;
+  }
+  .row-act:hover { background: var(--surface-3); color: var(--text); }
+  .row-act svg { width: 13px; height: 13px; }
+  .sess .rename {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--accent-line);
+    border-radius: 5px;
+    padding: 1px 6px;
+    outline: none;
+  }
+  .show-more {
+    align-self: flex-start;
+    margin: 1px 0 4px 10px;
+    padding: 3px 6px;
+    border: 0;
+    border-radius: 6px;
+    background: none;
+    color: var(--text-dim);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .show-more:hover { color: var(--text-soft); background: rgba(255, 255, 255, 0.04); }
+  .side-none { font-size: 12.5px; color: var(--text-dim); padding: 10px; }
+  .tag {
+    flex: none;
+    font-size: 10.5px;
+    color: var(--text-dim);
+    background: var(--surface-2);
+    border-radius: 4px;
+    padding: 0 5px;
+  }
+
+  .side-link {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 8px;
+    margin-bottom: 4px;
+    border: 0;
+    border-radius: 8px;
+    background: none;
+    color: var(--text-muted);
+    font-size: 12.5px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .side-link:hover { background: rgba(255, 255, 255, 0.04); color: var(--text); }
+  .side-link svg { width: 14px; height: 14px; }
+
+  /* Menu for a chat or project (right-click or "…"). */
+  .ctxmenu {
+    position: fixed;
+    z-index: 260;
+    min-width: 190px;
+    max-width: 280px;
+    padding: 4px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: 10px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+    animation: fadeIn 0.08s ease-out;
+  }
+  .ctxmenu[hidden] { display: none; }
+  .ctxmenu button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 9px;
+    border: 0;
+    border-radius: 6px;
+    background: none;
+    color: var(--text-soft);
+    font-size: 12.5px;
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ctxmenu button:hover:not(:disabled) { background: var(--surface-3); color: var(--text); }
+  .ctxmenu button:disabled { color: var(--text-dim); cursor: default; }
+  .ctxmenu button.danger { color: var(--bad); }
+  .ctxmenu .menu-sep { height: 1px; margin: 4px 6px; background: var(--line); }
+  .ctxmenu .menu-label { padding: 5px 9px 3px; font-size: 11px; color: var(--text-dim); }
+
+  /* History: every chat, grouped by date. */
+  #history {
+    position: fixed;
+    inset: 0;
+    z-index: 150;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: rgba(5, 6, 8, 0.72);
+    animation: fadeIn 0.12s ease-out;
+  }
+  #history[hidden] { display: none; }
+  .hist-card {
+    width: min(640px, 100%);
+    height: min(640px, 100%);
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-l);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+    overflow: hidden;
+  }
+  .hist-head { display: flex; align-items: center; gap: 10px; padding: 12px 12px 10px 16px; border-bottom: 1px solid var(--line); }
+  .hist-head b { font-size: 14px; }
+  .hist-head input {
+    flex: 1;
+    min-width: 0;
+    height: 30px;
+    padding: 0 10px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 12.5px;
+    outline: none;
+  }
+  .hist-head input:focus { border-color: var(--accent-line); }
+  .hist-close { width: 28px; height: 28px; border: 0; border-radius: 7px; background: none; color: var(--text-muted); font-size: 17px; cursor: pointer; }
+  .hist-close:hover { background: var(--surface-2); color: var(--text); }
+  #hist-list { flex: 1; overflow-y: auto; padding: 6px 8px 12px; }
+  .hist-group { font-size: 11px; font-weight: 600; color: var(--text-dim); margin: 12px 8px 4px; }
+  .hist-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 8px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-soft);
+  }
+  .hist-row:hover { background: var(--surface-2); color: var(--text); }
+  .hist-row .htitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hist-row .hwhen { flex: none; font-size: 11.5px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .hist-row .row-act { opacity: 0; }
+  .hist-row:hover .row-act { opacity: 1; }
+  .hist-row .row-act.confirm { opacity: 1; color: var(--bad); width: auto; padding: 0 6px; font-size: 11.5px; }
   .usage-line {
     font-size: 11.5px;
     color: var(--text-dim);
@@ -1084,18 +1338,24 @@
   <div id="app">
     <!-- Left Sidebar -->
     <aside id="side">
-      <button class="newchat" id="new-chat-btn">
+      <button class="newchat" id="new-chat-btn" title="New chat in the current project">
         <svg viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
-        New Chat
+        New chat
       </button>
-      
-      <div class="seclabel">
-        <span>Conversations</span>
-      </div>
-      
+
+      <label class="side-search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="side-search" type="text" placeholder="Search chats" spellcheck="false" autocomplete="off" />
+        <kbd>Ctrl K</kbd>
+      </label>
+
       <div id="sesslist"></div>
-      
+
       <div id="foot">
+        <button class="side-link" id="history-btn" title="Every chat, including archived ones">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+          History
+        </button>
         <div class="api" id="api">
           <span class="dot"></span>
           <span id="apitxt">connecting…</span>
@@ -1213,6 +1473,21 @@
     </section>
   </div>
 </div>
+
+<!-- History: every top-level chat by date, archived ones included. -->
+<div id="history" hidden>
+  <div class="hist-card" role="dialog" aria-modal="true" aria-label="History">
+    <div class="hist-head">
+      <b>History</b>
+      <input id="hist-search" type="text" placeholder="Search all chats" spellcheck="false" autocomplete="off" />
+      <button class="hist-close" id="hist-close" title="Close (Esc)">&times;</button>
+    </div>
+    <div id="hist-list"></div>
+  </div>
+</div>
+
+<!-- Right-click / "…" menu for a chat or a project. -->
+<div class="ctxmenu" id="ctxmenu" hidden></div>
 
 <!-- D1: tool-approval modal. Not part of #app so it can sit above everything. -->
 <div id="approval" hidden>
@@ -1678,6 +1953,490 @@
     }
   }
 
+  // ---- Sidebar: projects and chats ----
+  // Order: Pinned → Active (running or waiting for you) → Projects (each
+  // with its newest chats, "Show more") → Chats without a project. Archived
+  // and never-used chats stay out of the lists (History has everything).
+  var sidebarData = null;
+  var sideQuery = "";
+  var historyOpen = false;
+  var renamingId = "";
+  var ROWS_PER_PROJECT = 5;
+  // Set by initApp: hide / restore the native preview while an overlay is up.
+  var overlayHooks = { open: function () {}, close: function () {} };
+
+  var ICONS = {
+    chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+    pin: '<path d="M12 17v5"/><path d="M9 3h6l-1 6 4 4H6l4-4z"/>',
+    more: '<circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
+    folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+    chev: '<path d="m6 9 6 6 6-6"/>',
+    trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
+    restore: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>'
+  };
+  function svg(paths, cls) {
+    return '<svg class="' + (cls || "") + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+      'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + paths + '</svg>';
+  }
+
+  // Collapsed projects and "show all" choices survive restarts (per viewer).
+  var sideState = { collapsed: {}, all: {} };
+  try {
+    var saved = JSON.parse(localStorage.getItem("habi.sidebar") || "null");
+    if (saved && typeof saved === "object") {
+      sideState.collapsed = saved.collapsed || {};
+      sideState.all = saved.all || {};
+    }
+  } catch (e) { /* storage unavailable: defaults */ }
+  function saveSideState() {
+    try { localStorage.setItem("habi.sidebar", JSON.stringify(sideState)); } catch (e) { /* ignore */ }
+  }
+
+  function chatRow(s) {
+    var row = document.createElement("div");
+    row.className = "sess" + (s.active ? " active" : "");
+    row.setAttribute("role", "button");
+    row.tabIndex = 0;
+    row.dataset.id = s.id;
+    var state = s.needs ? "needs" : s.running ? "run" : "";
+    var st = '<span class="st ' + state + '"' +
+      (s.needs ? ' title="Waiting for your approval"' : s.running ? ' title="Working…"' : "") + '>' +
+      (state ? "" : svg(ICONS.chat, "sess-icon")) + "</span>";
+    row.innerHTML = st;
+    if (renamingId === s.id) {
+      var inp = document.createElement("input");
+      inp.className = "rename";
+      inp.value = s.title || "New chat";
+      inp.addEventListener("keydown", function (ev) {
+        ev.stopPropagation();
+        if (ev.key === "Enter") {
+          var t = inp.value.trim();
+          renamingId = "";
+          if (t && t !== s.title) postToRust({ type: "rename", id: s.id, title: t });
+          renderSidebar();
+        } else if (ev.key === "Escape") {
+          renamingId = "";
+          renderSidebar();
+        }
+      });
+      inp.addEventListener("blur", function () {
+        if (renamingId !== s.id) return;
+        var t = inp.value.trim();
+        renamingId = "";
+        if (t && t !== s.title) postToRust({ type: "rename", id: s.id, title: t });
+        renderSidebar();
+      });
+      inp.addEventListener("click", function (ev) { ev.stopPropagation(); });
+      row.appendChild(inp);
+      return row; // renderSidebar focuses it once it is on the page
+    }
+    var title = document.createElement("span");
+    title.textContent = s.title || "New chat";
+    row.title = s.title || "New chat";
+    row.appendChild(title);
+    if (s.pinned) row.insertAdjacentHTML("beforeend", svg(ICONS.pin, "pin-mark"));
+    var acts = document.createElement("span");
+    acts.className = "row-acts";
+    acts.innerHTML =
+      '<button class="row-act" data-act="pin" title="' + (s.pinned ? "Unpin" : "Pin") + '">' + svg(ICONS.pin) + "</button>" +
+      '<button class="row-act" data-act="more" title="More">' + svg(ICONS.more) + "</button>";
+    row.appendChild(acts);
+    row.addEventListener("click", function (ev) {
+      var act = ev.target.closest && ev.target.closest("[data-act]");
+      if (act) {
+        ev.stopPropagation();
+        if (act.dataset.act === "pin") postToRust({ type: "pin", id: s.id, on: !s.pinned });
+        else openChatMenu(s, act.getBoundingClientRect());
+        return;
+      }
+      postToRust({ type: "load", id: s.id });
+    });
+    row.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" && ev.target === row) postToRust({ type: "load", id: s.id });
+      if (ev.key === "F2") { renamingId = s.id; renderSidebar(); }
+    });
+    row.addEventListener("contextmenu", function (ev) {
+      ev.preventDefault();
+      openChatMenu(s, { left: ev.clientX, bottom: ev.clientY, right: ev.clientX });
+    });
+    return row;
+  }
+
+  function section(list, label, action) {
+    var h = document.createElement("div");
+    h.className = "side-sec";
+    h.textContent = label;
+    if (action) {
+      var b = document.createElement("button");
+      b.className = "sec-act";
+      b.title = action.title;
+      b.innerHTML = svg(action.icon);
+      b.addEventListener("click", action.run);
+      h.appendChild(b);
+    }
+    list.appendChild(h);
+  }
+
+  // A group of chats with a "Show N more" toggle.
+  function chatGroup(parent, key, chats) {
+    var all = !!sideState.all[key];
+    var shown = all ? chats : chats.slice(0, ROWS_PER_PROJECT);
+    // The open chat is always visible, even past the limit.
+    var active = chats.filter(function (c) { return c.active; })[0];
+    if (active && shown.indexOf(active) < 0) shown = shown.concat([active]);
+    shown.forEach(function (c) { parent.appendChild(chatRow(c)); });
+    if (chats.length > ROWS_PER_PROJECT) {
+      var more = document.createElement("button");
+      more.className = "show-more";
+      more.textContent = all ? "Show less" : "Show " + (chats.length - ROWS_PER_PROJECT) + " more";
+      more.addEventListener("click", function () {
+        sideState.all[key] = !all;
+        saveSideState();
+        renderSidebar();
+      });
+      parent.appendChild(more);
+    }
+  }
+
+  function renderSidebar() {
+    var list = document.getElementById("sesslist");
+    var d = sidebarData;
+    if (!list || !d) return;
+    list.textContent = "";
+    var chats = d.sessions || [];
+    var projects = d.projects || [];
+    var known = {};
+    projects.forEach(function (p) { known[p.id] = p; });
+    // Never-used chats only show while they are the open one.
+    var listed = chats.filter(function (c) { return !c.archived && (!c.empty || c.active); });
+
+    if (sideQuery) {
+      var q = sideQuery.toLowerCase();
+      var hits = chats.filter(function (c) {
+        return !c.empty && (c.title || "").toLowerCase().indexOf(q) >= 0;
+      });
+      section(list, hits.length ? "Results" : "No chats match");
+      hits.slice(0, 50).forEach(function (c) { list.appendChild(chatRow(c)); });
+      return;
+    }
+
+    var pinned = listed.filter(function (c) { return c.pinned; });
+    if (pinned.length) {
+      section(list, "Pinned");
+      pinned.forEach(function (c) { list.appendChild(chatRow(c)); });
+    }
+    var activeNow = listed.filter(function (c) { return !c.pinned && (c.running || c.needs); });
+    if (activeNow.length) {
+      section(list, "Active");
+      activeNow.forEach(function (c) { list.appendChild(chatRow(c)); });
+    }
+    var rest = listed.filter(function (c) { return !c.pinned && !c.running && !c.needs; });
+
+    section(list, "Projects", {
+      title: "Add project (a folder)",
+      icon: ICONS.plus,
+      run: function () { addProject(); }
+    });
+    projects.forEach(function (p) {
+      var mine = rest.filter(function (c) { return c.project === p.id; });
+      var collapsed = !!sideState.collapsed[p.id];
+      var head = document.createElement("div");
+      head.className = "proj-head" + (collapsed ? " collapsed" : "") +
+        (p.id === d.current_project ? " current" : "");
+      head.title = p.root;
+      head.innerHTML = svg(ICONS.chev, "chev") + svg(ICONS.folder, "folder") +
+        '<span class="pname"></span><span class="pcount"></span>' +
+        '<button class="row-act" data-act="new" title="New chat in this project">' + svg(ICONS.plus) + "</button>" +
+        '<button class="row-act" data-act="more" title="More">' + svg(ICONS.more) + "</button>";
+      head.querySelector(".pname").textContent = p.name;
+      head.querySelector(".pcount").textContent = collapsed && mine.length ? String(mine.length) : "";
+      head.addEventListener("click", function (ev) {
+        var act = ev.target.closest && ev.target.closest("[data-act]");
+        if (act && act.dataset.act === "new") {
+          ev.stopPropagation();
+          postToRust({ type: "new_in_project", project: p.id });
+          return;
+        }
+        if (act) {
+          ev.stopPropagation();
+          openProjectMenu(p, act.getBoundingClientRect());
+          return;
+        }
+        sideState.collapsed[p.id] = !collapsed;
+        saveSideState();
+        renderSidebar();
+      });
+      head.addEventListener("contextmenu", function (ev) {
+        ev.preventDefault();
+        openProjectMenu(p, { left: ev.clientX, bottom: ev.clientY, right: ev.clientX });
+      });
+      list.appendChild(head);
+      var body = document.createElement("div");
+      body.className = "proj-body" + (collapsed ? " collapsed" : "");
+      if (!mine.length) {
+        var none = document.createElement("div");
+        none.className = "proj-empty";
+        none.textContent = "No chats yet";
+        body.appendChild(none);
+      } else {
+        chatGroup(body, p.id, mine);
+      }
+      list.appendChild(body);
+    });
+
+    var loose = rest.filter(function (c) { return !c.project || !known[c.project]; });
+    if (loose.length) {
+      section(list, "Chats without a project");
+      chatGroup(list, "__loose", loose);
+    }
+    if (!listed.length && !projects.length) {
+      var empty = document.createElement("div");
+      empty.className = "side-none";
+      empty.textContent = "No chats yet.";
+      list.appendChild(empty);
+    }
+    // A chat being renamed takes the keyboard right away.
+    var renameBox = list.querySelector(".rename");
+    if (renameBox && document.activeElement !== renameBox) {
+      renameBox.focus();
+      renameBox.select();
+    }
+  }
+
+  function addProject() {
+    // Windows shows a folder picker from Rust; elsewhere ask for a path.
+    if (/Windows/i.test(navigator.userAgent)) {
+      postToRust({ type: "add_project" });
+    } else {
+      var path = window.prompt("Folder for the new project:");
+      if (path && path.trim()) postToRust({ type: "add_project", path: path.trim() });
+    }
+  }
+
+  // ---- Menus ----
+  var menuEl = null;
+  function closeMenu() {
+    if (!menuEl) menuEl = document.getElementById("ctxmenu");
+    if (menuEl) menuEl.hidden = true;
+    var open = document.querySelector(".sess.menu-open");
+    if (open) open.classList.remove("menu-open");
+  }
+  function showMenu(items, at) {
+    menuEl = document.getElementById("ctxmenu");
+    if (!menuEl) return;
+    menuEl.textContent = "";
+    items.forEach(function (it) {
+      if (it === "-") {
+        var sep = document.createElement("div");
+        sep.className = "menu-sep";
+        menuEl.appendChild(sep);
+        return;
+      }
+      if (it.label && !it.run) {
+        var lab = document.createElement("div");
+        lab.className = "menu-label";
+        lab.textContent = it.label;
+        menuEl.appendChild(lab);
+        return;
+      }
+      var b = document.createElement("button");
+      b.textContent = it.text;
+      if (it.danger) b.className = "danger";
+      if (it.disabled) b.disabled = true;
+      b.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        closeMenu();
+        it.run();
+      });
+      menuEl.appendChild(b);
+    });
+    menuEl.hidden = false;
+    var w = menuEl.offsetWidth, h = menuEl.offsetHeight;
+    var x = Math.min(at.left, window.innerWidth - w - 8);
+    var y = at.bottom + 4;
+    if (y + h > window.innerHeight - 8) y = Math.max(8, window.innerHeight - h - 8);
+    menuEl.style.left = Math.max(8, x) + "px";
+    menuEl.style.top = y + "px";
+  }
+  function openChatMenu(s, at) {
+    var row = document.querySelector('.sess[data-id="' + s.id + '"]');
+    if (row) row.classList.add("menu-open");
+    // A hidden "…" button has no position: open the menu under the row.
+    if (row && !at.left && !at.bottom) at = row.getBoundingClientRect();
+    var d = sidebarData || {};
+    var items = [
+      { text: s.pinned ? "Unpin" : "Pin to top", run: function () { postToRust({ type: "pin", id: s.id, on: !s.pinned }); } },
+      { text: "Rename", run: function () { renamingId = s.id; renderSidebar(); } },
+      "-",
+      { label: "Move to project" }
+    ];
+    (d.projects || []).forEach(function (p) {
+      items.push({
+        text: (p.id === s.project ? "✓ " : "   ") + p.name,
+        disabled: p.id === s.project || s.running,
+        run: function () { postToRust({ type: "move", id: s.id, project: p.id }); }
+      });
+    });
+    items.push({
+      text: (s.project ? "   " : "✓ ") + "No project",
+      disabled: !s.project || s.running,
+      run: function () { postToRust({ type: "move", id: s.id, project: null }); }
+    });
+    items.push("-");
+    items.push({
+      text: s.running ? "Archive (after the run ends)" : "Archive",
+      disabled: s.running,
+      run: function () { postToRust({ type: "archive", id: s.id, on: true }); }
+    });
+    showMenu(items, at);
+  }
+  function openProjectMenu(p, at) {
+    var known = {};
+    ((sidebarData || {}).projects || []).forEach(function (x) { known[x.id] = true; });
+    var unfiled = ((sidebarData || {}).sessions || []).filter(function (c) {
+      return !c.empty && (!c.project || !known[c.project]);
+    }).length;
+    showMenu([
+      { text: "New chat here", run: function () { postToRust({ type: "new_in_project", project: p.id }); } },
+      {
+        text: unfiled ? "Move " + unfiled + " chat" + (unfiled === 1 ? "" : "s") + " without a project here"
+          : "No chats without a project",
+        disabled: !unfiled,
+        run: function () { postToRust({ type: "adopt_unfiled", project: p.id }); }
+      },
+      { label: p.root },
+      "-",
+      { text: "Remove from list", danger: true, run: function () { postToRust({ type: "remove_project", id: p.id }); } }
+    ], at);
+  }
+
+  // ---- History ----
+  var histQuery = "";
+  function dayLabel(ms) {
+    var startToday = new Date();
+    startToday.setHours(0, 0, 0, 0);
+    var t = startToday.getTime(), day = 86400000;
+    if (ms >= t) return "Today";
+    if (ms >= t - day) return "Yesterday";
+    if (ms >= t - 7 * day) return "Previous 7 days";
+    if (ms >= t - 30 * day) return "Previous 30 days";
+    return "Older";
+  }
+  function whenText(ms) {
+    var dt = new Date(ms);
+    var now = new Date();
+    if (dt.toDateString() === now.toDateString()) {
+      return dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+    return dt.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
+  function renderHistory() {
+    var listEl = document.getElementById("hist-list");
+    var d = sidebarData;
+    if (!listEl || !d) return;
+    listEl.textContent = "";
+    var names = {};
+    (d.projects || []).forEach(function (p) { names[p.id] = p.name; });
+    var q = histQuery.toLowerCase();
+    var chats = (d.sessions || []).filter(function (c) {
+      return !c.empty && (!q || (c.title || "").toLowerCase().indexOf(q) >= 0);
+    });
+    // Newest first, so each date group appears once.
+    chats.sort(function (a, b) { return (b.updated || 0) - (a.updated || 0); });
+    if (!chats.length) {
+      var none = document.createElement("div");
+      none.className = "side-none";
+      none.textContent = q ? "No chats match." : "No chats yet.";
+      listEl.appendChild(none);
+      return;
+    }
+    var group = "";
+    chats.forEach(function (c) {
+      var g = dayLabel(c.updated || 0);
+      if (g !== group) {
+        group = g;
+        var gh = document.createElement("div");
+        gh.className = "hist-group";
+        gh.textContent = g;
+        listEl.appendChild(gh);
+      }
+      var row = document.createElement("div");
+      row.className = "hist-row";
+      var title = document.createElement("span");
+      title.className = "htitle";
+      title.textContent = c.title || "New chat";
+      row.appendChild(title);
+      if (c.project && names[c.project]) {
+        var tag = document.createElement("span");
+        tag.className = "tag";
+        tag.textContent = names[c.project];
+        row.appendChild(tag);
+      }
+      if (c.archived) {
+        var at = document.createElement("span");
+        at.className = "tag";
+        at.textContent = "archived";
+        row.appendChild(at);
+        var rs = document.createElement("button");
+        rs.className = "row-act";
+        rs.title = "Restore to the sidebar";
+        rs.innerHTML = svg(ICONS.restore);
+        rs.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          postToRust({ type: "archive", id: c.id, on: false });
+        });
+        row.appendChild(rs);
+      }
+      var del = document.createElement("button");
+      del.className = "row-act";
+      del.title = "Delete for good";
+      del.innerHTML = svg(ICONS.trash);
+      del.disabled = !!c.running;
+      del.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        // Two clicks: delete cannot be undone.
+        if (!del.classList.contains("confirm")) {
+          del.classList.add("confirm");
+          del.textContent = "Delete?";
+          setTimeout(function () {
+            if (del.isConnected) { del.classList.remove("confirm"); del.innerHTML = svg(ICONS.trash); }
+          }, 3000);
+          return;
+        }
+        postToRust({ type: "delete", id: c.id });
+      });
+      row.appendChild(del);
+      var when = document.createElement("span");
+      when.className = "hwhen";
+      when.textContent = whenText(c.updated || 0);
+      row.appendChild(when);
+      row.addEventListener("click", function () {
+        if (c.archived) postToRust({ type: "archive", id: c.id, on: false });
+        postToRust({ type: "load", id: c.id });
+        closeHistory();
+      });
+      listEl.appendChild(row);
+    });
+  }
+  function openHistory() {
+    var h = document.getElementById("history");
+    if (!h) return;
+    historyOpen = true;
+    h.hidden = false;
+    overlayHooks.open();
+    renderHistory();
+    var s = document.getElementById("hist-search");
+    if (s) { s.value = histQuery; s.focus(); }
+  }
+  function closeHistory() {
+    var h = document.getElementById("history");
+    if (!h || h.hidden) return;
+    historyOpen = false;
+    h.hidden = true;
+    overlayHooks.close();
+  }
+
   // Called by Rust: window.render(d)
   window.render = function (d) {
     if (!d) return;
@@ -1690,41 +2449,10 @@
     if (tbtitle) tbtitle.textContent = title;
     document.title = "Habi Studio — " + title;
 
-    // Sidebar sessions list
-    var list = document.getElementById("sesslist");
-    if (list) {
-      list.textContent = "";
-      if (d.sessions && d.sessions.length) {
-        for (var i = 0; i < d.sessions.length; i++) {
-          var s = d.sessions[i];
-          var btn = document.createElement("button");
-          btn.className = "sess" + (s.active ? " active" : "");
-          btn.title = s.title || "New chat";
-
-          var iconSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-          iconSvg.setAttribute("class", "sess-icon");
-          iconSvg.setAttribute("viewBox", "0 0 24 24");
-          iconSvg.setAttribute("fill", "none");
-          iconSvg.setAttribute("stroke", "currentColor");
-          iconSvg.setAttribute("stroke-width", "2");
-          iconSvg.innerHTML = '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>';
-
-          var span = document.createElement("span");
-          span.textContent = s.title || "New chat";
-
-          btn.appendChild(iconSvg);
-          btn.appendChild(span);
-
-          (function (id) {
-            btn.addEventListener("click", function () {
-              postToRust({ type: "load", id: id });
-            });
-          })(s.id);
-
-          list.appendChild(btn);
-        }
-      }
-    }
+    // Sidebar: pinned, active, projects, chats (see renderSidebar).
+    sidebarData = d;
+    renderSidebar();
+    if (historyOpen) renderHistory();
 
     // API connectivity pill
     var api = document.getElementById("api");
@@ -2098,6 +2826,65 @@
         postToRust({ type: "new" });
       });
     }
+
+    // ---- Sidebar search, History and menus ----
+    // The native preview is drawn above the page, so it hides while
+    // History is open and comes back afterwards if the panel is open.
+    overlayHooks.open = function () { sendVisible(false); };
+    overlayHooks.close = function () {
+      if (browserPanel && !browserPanel.classList.contains("collapsed")) {
+        sendRect();
+        sendVisible(true);
+      }
+    };
+    var sideSearch = document.getElementById("side-search");
+    if (sideSearch) {
+      sideSearch.addEventListener("input", function () {
+        sideQuery = sideSearch.value.trim();
+        renderSidebar();
+      });
+      sideSearch.addEventListener("keydown", function (ev) {
+        if (ev.key === "Escape") {
+          sideSearch.value = "";
+          sideQuery = "";
+          renderSidebar();
+          sideSearch.blur();
+        }
+      });
+    }
+    var historyBtn = document.getElementById("history-btn");
+    if (historyBtn) historyBtn.addEventListener("click", openHistory);
+    var histClose = document.getElementById("hist-close");
+    if (histClose) histClose.addEventListener("click", closeHistory);
+    var histEl = document.getElementById("history");
+    if (histEl) {
+      histEl.addEventListener("click", function (ev) {
+        if (ev.target === histEl) closeHistory(); // click on the dim backdrop
+      });
+    }
+    var histSearch = document.getElementById("hist-search");
+    if (histSearch) {
+      histSearch.addEventListener("input", function () {
+        histQuery = histSearch.value.trim();
+        renderHistory();
+      });
+    }
+    document.addEventListener("click", function (ev) {
+      var menu = document.getElementById("ctxmenu");
+      if (menu && !menu.hidden && !menu.contains(ev.target)) closeMenu();
+    });
+    window.addEventListener("blur", closeMenu);
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") {
+        closeMenu();
+        closeHistory();
+      }
+      if ((ev.ctrlKey || ev.metaKey) && (ev.key === "k" || ev.key === "K") && sideSearch) {
+        ev.preventDefault();
+        sideSearch.focus();
+        sideSearch.select();
+      }
+    });
 
     if (ctaDevServer) {
       ctaDevServer.addEventListener("click", function () {

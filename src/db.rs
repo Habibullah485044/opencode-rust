@@ -32,10 +32,91 @@ pub struct Session {
     pub parent_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The project (folder) this chat works in; `None` = an older chat made
+    /// before projects existed (it runs in the folder the app started in).
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Shown at the top of the sidebar.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Hidden from the sidebar; still in History.
+    #[serde(default)]
+    pub archived: bool,
+}
+
+/// A project: a folder whose chats run their tools, git snapshots and
+/// project instructions (AGENTS.md, skills) inside it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    /// The folder, as given (shown to the user and used as the working dir).
+    pub root: String,
+    pub created_at: i64,
+}
+
+/// One sidebar row: a chat and whether anything was ever said in it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRow {
+    #[serde(flatten)]
+    pub session: Session,
+    pub has_messages: bool,
 }
 
 pub struct Db {
     conn: Mutex<Connection>,
+    /// The project new top-level chats are filed under (the folder the app
+    /// started in). Child chats (subagents, forks) take their parent's.
+    default_project: Mutex<Option<String>>,
+}
+
+/// Columns of `sessions` in the order `session_from_row` reads them.
+const SESSION_COLS: &str = "id,title,parent_id,created_at,updated_at,project_id,pinned,archived";
+
+fn session_from_row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        parent_id: r.get(2)?,
+        created_at: r.get(3)?,
+        updated_at: r.get(4)?,
+        project_id: r.get(5)?,
+        pinned: r.get::<_, i64>(6)? != 0,
+        archived: r.get::<_, i64>(7)? != 0,
+    })
+}
+
+fn project_from_row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
+    Ok(Project { id: r.get(0)?, name: r.get(1)?, root: r.get(2)?, created_at: r.get(3)? })
+}
+
+/// Projects table, and the project/pin/archive columns on `sessions`
+/// (added in place to databases from older builds).
+fn migrate_projects(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            root TEXT NOT NULL,
+            root_key TEXT NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL
+        );",
+    )?;
+    let cols: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        names.collect::<std::result::Result<_, _>>()?
+    };
+    for (col, def) in [
+        ("project_id", "TEXT"),
+        ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+        ("archived", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !cols.iter().any(|c| c == col) {
+            conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {col} {def};"))?;
+        }
+    }
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -163,7 +244,8 @@ impl Db {
         )?;
         migrate_approvals(&conn)?;
         conn.execute_batch(USAGE_SCHEMA)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        migrate_projects(&conn)?;
+        Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -189,40 +271,160 @@ impl Db {
         )?;
         migrate_approvals(&conn)?;
         conn.execute_batch(USAGE_SCHEMA)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        migrate_projects(&conn)?;
+        Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
     }
 
+    /// A new chat. A child chat (subagent) joins its parent's project; a
+    /// top-level chat joins the default project (see `set_default_project`).
     pub fn create_session(&self, title: &str, parent_id: Option<&str>) -> Result<Session> {
-        let id = new_id("ses");
+        let project = match parent_id {
+            Some(p) => self.get_session(p)?.and_then(|s| s.project_id),
+            None => self.default_project.lock().unwrap().clone(),
+        };
+        self.create_session_in(title, parent_id, project.as_deref())
+    }
+
+    /// A new chat in a given project (`None` = no project).
+    pub fn create_session_in(
+        &self,
+        title: &str,
+        parent_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Session> {
         let now = now_ms();
         let s = Session {
-            id: id.clone(),
+            id: new_id("ses"),
             title: title.to_string(),
             parent_id: parent_id.map(str::to_string),
             created_at: now,
             updated_at: now,
+            project_id: project_id.map(str::to_string),
+            pinned: false,
+            archived: false,
         };
         self.conn.lock().unwrap().execute(
-            "INSERT INTO sessions (id, title, parent_id, created_at, updated_at) VALUES (?1,?2,?3,?4,?5)",
-            params![s.id, s.title, s.parent_id, s.created_at, s.updated_at],
+            "INSERT INTO sessions (id, title, parent_id, created_at, updated_at, project_id)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![s.id, s.title, s.parent_id, s.created_at, s.updated_at, s.project_id],
         )?;
         Ok(s)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id,title,parent_id,created_at,updated_at FROM sessions ORDER BY updated_at DESC")?;
+        let mut stmt = conn.prepare(&format!("SELECT {SESSION_COLS} FROM sessions ORDER BY updated_at DESC"))?;
+        let rows = stmt.query_map([], session_from_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Every chat with whether it has any message (empty chats are hidden
+    /// in the sidebar), newest first.
+    pub fn list_session_rows(&self) -> Result<Vec<SessionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let cols: Vec<String> = SESSION_COLS.split(',').map(|c| format!("s.{c}")).collect();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {}, EXISTS(SELECT 1 FROM messages m WHERE m.session_id = s.id)
+             FROM sessions s ORDER BY s.updated_at DESC",
+            cols.join(",")
+        ))?;
         let rows = stmt.query_map([], |r| {
-            Ok(Session {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                parent_id: r.get(2)?,
-                created_at: r.get(3)?,
-                updated_at: r.get(4)?,
-            })
+            Ok(SessionRow { session: session_from_row(r)?, has_messages: r.get::<_, i64>(8)? != 0 })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// File new top-level chats under this project from now on.
+    pub fn set_default_project(&self, project_id: Option<&str>) {
+        *self.default_project.lock().unwrap() = project_id.map(str::to_string);
+    }
+
+    /// The project for folder `root` (matched by its canonical path),
+    /// created and named after the folder when it is new.
+    pub fn upsert_project(&self, root: &Path) -> Result<Project> {
+        let key = workspace_key(root);
+        let conn = self.conn.lock().unwrap();
+        let found = conn
+            .query_row(
+                "SELECT id,name,root,created_at FROM projects WHERE root_key=?1",
+                params![key],
+                project_from_row,
+            )
+            .optional()?;
+        if let Some(p) = found {
+            return Ok(p);
+        }
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| root.display().to_string());
+        let p = Project { id: new_id("prj"), name, root: root.display().to_string(), created_at: now_ms() };
+        conn.execute(
+            "INSERT INTO projects (id, name, root, root_key, created_at) VALUES (?1,?2,?3,?4,?5)",
+            params![p.id, p.name, p.root, key, p.created_at],
+        )?;
+        Ok(p)
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<Project>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id,name,root,created_at FROM projects ORDER BY lower(name)")?;
+        let rows = stmt.query_map([], project_from_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn get_project(&self, id: &str) -> Result<Option<Project>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT id,name,root,created_at FROM projects WHERE id=?1", params![id], project_from_row)
+            .optional()?)
+    }
+
+    /// Take a project off the list. Its chats stay, without a project.
+    pub fn remove_project(&self, id: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE sessions SET project_id=NULL WHERE project_id=?1", params![id])?;
+        tx.execute("DELETE FROM projects WHERE id=?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_session_project(&self, id: &str, project_id: Option<&str>) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE sessions SET project_id=?2 WHERE id=?1", params![id, project_id])?;
+        Ok(())
+    }
+
+    /// File every top-level chat that has no project under `project_id`
+    /// (chats made before projects existed). Returns how many moved.
+    pub fn adopt_unfiled_sessions(&self, project_id: &str) -> Result<usize> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE sessions SET project_id=?1 WHERE project_id IS NULL AND parent_id IS NULL",
+            params![project_id],
+        )?)
+    }
+
+    pub fn set_session_pinned(&self, id: &str, pinned: bool) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE sessions SET pinned=?2 WHERE id=?1", params![id, pinned as i64])?;
+        Ok(())
+    }
+
+    /// Archiving also unpins: an archived chat lives only in History.
+    pub fn set_session_archived(&self, id: &str, archived: bool) -> Result<()> {
+        let sql = if archived {
+            "UPDATE sessions SET archived=1, pinned=0 WHERE id=?1"
+        } else {
+            "UPDATE sessions SET archived=0 WHERE id=?1"
+        };
+        self.conn.lock().unwrap().execute(sql, params![id])?;
+        Ok(())
     }
 
     /// Rename a session (the GUI titles chats after their first message).
@@ -285,19 +487,7 @@ impl Db {
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let conn = self.conn.lock().unwrap();
         let s = conn
-            .query_row(
-                "SELECT id,title,parent_id,created_at,updated_at FROM sessions WHERE id=?1",
-                params![id],
-                |r| {
-                    Ok(Session {
-                        id: r.get(0)?,
-                        title: r.get(1)?,
-                        parent_id: r.get(2)?,
-                        created_at: r.get(3)?,
-                        updated_at: r.get(4)?,
-                    })
-                },
-            )
+            .query_row(&format!("SELECT {SESSION_COLS} FROM sessions WHERE id=?1"), params![id], session_from_row)
             .optional()?;
         Ok(s)
     }
@@ -350,13 +540,17 @@ impl Db {
             parent_id: Some(parent.id.clone()),
             created_at: now,
             updated_at: now,
+            project_id: parent.project_id.clone(),
+            pinned: false,
+            archived: false,
         };
         // One transaction: a failed fork leaves no half-copied session.
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO sessions (id, title, parent_id, created_at, updated_at) VALUES (?1,?2,?3,?4,?5)",
-            params![new.id, new.title, new.parent_id, new.created_at, new.updated_at],
+            "INSERT INTO sessions (id, title, parent_id, created_at, updated_at, project_id)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![new.id, new.title, new.parent_id, new.created_at, new.updated_at, new.project_id],
         )?;
         {
             let mut ins = tx.prepare(
@@ -467,6 +661,66 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Projects: one row per folder, new chats go to the default project,
+    /// children follow their parent, and pin/archive/move/remove work.
+    #[test]
+    fn projects_and_chat_organization() {
+        let db = Db::open_in_memory().unwrap();
+        let dir = std::env::temp_dir();
+        let p = db.upsert_project(&dir).unwrap();
+        assert_eq!(db.upsert_project(&dir).unwrap(), p, "the same folder is one project");
+        assert!(db.create_session("loose", None).unwrap().project_id.is_none(), "no default yet");
+        db.set_default_project(Some(&p.id));
+        let top = db.create_session("top", None).unwrap();
+        assert_eq!(top.project_id.as_deref(), Some(p.id.as_str()));
+        let child = db.create_session("sub:worker", Some(&top.id)).unwrap();
+        assert_eq!(child.project_id, top.project_id, "a subagent works in its parent's project");
+
+        db.add_message(&top.id, "user", &[Part::Text { text: "hi".into() }]).unwrap();
+        let rows = db.list_session_rows().unwrap();
+        let row = |id: &str| rows.iter().find(|r| r.session.id == id).unwrap().clone();
+        assert!(row(&top.id).has_messages && !row(&child.id).has_messages);
+
+        db.set_session_pinned(&top.id, true).unwrap();
+        assert!(db.get_session(&top.id).unwrap().unwrap().pinned);
+        db.set_session_archived(&top.id, true).unwrap();
+        let s = db.get_session(&top.id).unwrap().unwrap();
+        assert!(s.archived && !s.pinned, "archiving also unpins");
+        db.set_session_project(&top.id, None).unwrap();
+        assert!(db.get_session(&top.id).unwrap().unwrap().project_id.is_none());
+
+        let loose = db.create_session_in("loose 2", None, None).unwrap();
+        assert!(db.adopt_unfiled_sessions(&p.id).unwrap() >= 2, "both unfiled top-level chats move");
+        assert_eq!(db.get_session(&loose.id).unwrap().unwrap().project_id.as_deref(), Some(p.id.as_str()));
+
+        db.remove_project(&p.id).unwrap();
+        assert!(db.list_projects().unwrap().is_empty());
+        assert!(db.get_session(&child.id).unwrap().unwrap().project_id.is_none(), "chats stay, unfiled");
+    }
+
+    /// A database from before projects gets the new columns in place and
+    /// keeps its chats.
+    #[test]
+    fn old_database_gets_project_columns() {
+        let path = std::env::temp_dir().join(format!("ocrs-old-db-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, parent_id TEXT,
+                   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 INSERT INTO sessions VALUES ('ses_old', 'old chat', NULL, 1, 2);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let s = db.get_session("ses_old").unwrap().unwrap();
+        assert_eq!(s.title, "old chat");
+        assert!(s.project_id.is_none() && !s.pinned && !s.archived);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn session_roundtrip() {

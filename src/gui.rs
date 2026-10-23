@@ -33,8 +33,13 @@ pub struct GuiState {
     pub busy: bool,
     pub session: Option<String>,
     pub api: Option<(bool, u64)>,
-    /// Sidebar chats, newest-first: (id, title). Mirrors `db.list_sessions()`.
-    pub sessions: Vec<(String, String)>,
+    /// Sidebar chats, newest first (top-level chats only: subagent and
+    /// team-worker chats are internal).
+    pub sessions: Vec<ChatItem>,
+    /// Projects (folders) for the sidebar, by name.
+    pub projects: Vec<crate::db::Project>,
+    /// Where a plain "New chat" goes when the open chat has no project.
+    pub default_project: Option<String>,
     /// New (B-12): chats that have a run in flight right now.
     pub running: std::collections::HashSet<String>,
     /// New (B-12): live transcripts of running chats that are not on screen,
@@ -68,6 +73,26 @@ pub struct GuiState {
     sent_session: std::cell::RefCell<Option<String>>,
 }
 
+/// One chat in the sidebar.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChatItem {
+    pub id: String,
+    pub title: String,
+    pub project_id: Option<String>,
+    pub pinned: bool,
+    pub archived: bool,
+    /// Nothing was said yet: hidden from the lists (except when open).
+    pub empty: bool,
+    pub updated_at: i64,
+}
+
+impl ChatItem {
+    /// A plain, non-empty chat (tests and simple callers).
+    pub fn new(id: &str, title: &str) -> Self {
+        Self { id: id.into(), title: title.into(), ..Default::default() }
+    }
+}
+
 /// One `ask` decision the engine is blocked on. The core holds the actual
 /// oneshot; this is only what the window needs to draw and answer it.
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +121,8 @@ impl Default for GuiState {
             session: None,
             api: None,
             sessions: Vec::new(),
+            projects: Vec::new(),
+            default_project: None,
             running: std::collections::HashSet::new(),
             background: HashMap::new(),
             approval_queue: std::collections::VecDeque::new(),
@@ -249,8 +276,8 @@ impl GuiState {
     pub fn session_title(&self, id: &str) -> &str {
         self.sessions
             .iter()
-            .find(|(sid, _)| sid == id)
-            .map(|(_, t)| t.as_str())
+            .find(|c| c.id == id)
+            .map(|c| c.title.as_str())
             .unwrap_or(NEW_CHAT)
     }
 
@@ -264,6 +291,16 @@ impl GuiState {
         self.browser.covered = self.approval.is_some();
     }
 
+    /// Project of the open chat, else the default project ("New chat" goes
+    /// there).
+    pub fn current_project(&self) -> Option<String> {
+        self.session
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|c| &c.id == id))
+            .and_then(|c| c.project_id.clone())
+            .or_else(|| self.default_project.clone())
+    }
+
     /// Title of the active session (chat header + window title).
     pub fn title(&self) -> &str {
         self.session
@@ -271,8 +308,8 @@ impl GuiState {
             .and_then(|id| {
                 self.sessions
                     .iter()
-                    .find(|(sid, _)| sid == id)
-                    .map(|(_, t)| t.as_str())
+                    .find(|c| &c.id == id)
+                    .map(|c| c.title.as_str())
             })
             .unwrap_or(NEW_CHAT)
     }
@@ -545,16 +582,35 @@ impl GuiState {
             .skip(from)
             .map(|(k, t)| serde_json::json!({ "k": kind_class(k).to_string(), "t": t }))
             .collect();
+        // Chats blocked on an approval: shown as "needs you" in the sidebar.
+        let waiting: std::collections::HashSet<&str> = self
+            .approval
+            .iter()
+            .chain(self.approval_queue.iter())
+            .map(|a| a.session_id.as_str())
+            .collect();
         let sessions: Vec<serde_json::Value> = self
             .sessions
             .iter()
-            .map(|(id, title)| {
+            .map(|c| {
                 serde_json::json!({
-                    "id": id,
-                    "title": title,
-                    "active": self.session.as_deref() == Some(id.as_str()),
+                    "id": c.id,
+                    "title": c.title,
+                    "active": self.session.as_deref() == Some(c.id.as_str()),
+                    "project": c.project_id,
+                    "pinned": c.pinned,
+                    "archived": c.archived,
+                    "empty": c.empty,
+                    "updated": c.updated_at,
+                    "running": self.running.contains(&c.id),
+                    "needs": waiting.contains(c.id.as_str()),
                 })
             })
+            .collect();
+        let projects: Vec<serde_json::Value> = self
+            .projects
+            .iter()
+            .map(|p| serde_json::json!({ "id": p.id, "name": p.name, "root": p.root }))
             .collect();
         serde_json::json!({
             "session": self.session.clone().unwrap_or_default(),
@@ -563,6 +619,8 @@ impl GuiState {
             "perm_mode": self.perm_mode.as_str(),
             "api": self.api.map(|(ok, ms)| serde_json::json!([ok, ms])),
             "sessions": sessions,
+            "projects": projects,
+            "current_project": self.current_project(),
             "entries": entries,
             "entries_from": from,
             "entries_len": self.entries.len(),
@@ -666,6 +724,21 @@ pub enum IpcMsg {
     PageError(String),
     /// New (F-06): the Stop button — abort the run of the chat on screen.
     Stop,
+    /// Projects sidebar: a new chat inside project `id`.
+    NewInProject(String),
+    /// Add a project: this folder, or (no path) ask with a folder picker.
+    AddProject(Option<String>),
+    /// Take a project off the list (its chats stay, without a project).
+    RemoveProject(String),
+    Pin { id: String, on: bool },
+    Archive { id: String, on: bool },
+    Rename { id: String, title: String },
+    /// Move a chat to a project (`None` = no project).
+    MoveChat { id: String, project: Option<String> },
+    /// Delete a chat for good (from History).
+    DeleteChat(String),
+    /// File every chat without a project under project `id`.
+    AdoptUnfiled(String),
 }
 
 /// Callbacks from the preview child webview itself (not from the page).
@@ -724,6 +797,24 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "mode" => Some(IpcMsg::Mode(PermissionMode::parse(v.get("mode")?.as_str()?)?)),
         "page_error" => Some(IpcMsg::PageError(v.get("msg")?.as_str()?.to_string())),
         "stop" => Some(IpcMsg::Stop),
+        "new_in_project" => Some(IpcMsg::NewInProject(v.get("project")?.as_str()?.to_string())),
+        "add_project" => Some(IpcMsg::AddProject(
+            v.get("path").and_then(|p| p.as_str()).map(str::to_string).filter(|p| !p.trim().is_empty()),
+        )),
+        "remove_project" => Some(IpcMsg::RemoveProject(v.get("id")?.as_str()?.to_string())),
+        "pin" => Some(IpcMsg::Pin { id: v.get("id")?.as_str()?.to_string(), on: v.get("on")?.as_bool()? }),
+        "archive" => Some(IpcMsg::Archive { id: v.get("id")?.as_str()?.to_string(), on: v.get("on")?.as_bool()? }),
+        "rename" => {
+            let id = v.get("id")?.as_str()?.to_string();
+            let title = v.get("title")?.as_str()?.trim().to_string();
+            (!title.is_empty()).then_some(IpcMsg::Rename { id, title })
+        }
+        "move" => Some(IpcMsg::MoveChat {
+            id: v.get("id")?.as_str()?.to_string(),
+            project: v.get("project").and_then(|p| p.as_str()).map(str::to_string),
+        }),
+        "delete" => Some(IpcMsg::DeleteChat(v.get("id")?.as_str()?.to_string())),
+        "adopt_unfiled" => Some(IpcMsg::AdoptUnfiled(v.get("project")?.as_str()?.to_string())),
         _ => None,
     }
 }
@@ -897,10 +988,82 @@ fn newest_empty_session(st: &server::AppState) -> Option<crate::db::Session> {
     empty.then_some(newest)
 }
 
+/// Open a fresh chat in `project` (or reuse the open chat when it is
+/// already an empty one in that project — B-42).
+fn open_new_chat(gs: &mut GuiState, st: &server::AppState, project: Option<String>) {
+    let reuse = gs.entries.is_empty()
+        && !gs.busy
+        && gs.session.as_ref().is_some_and(|id| {
+            gs.sessions.iter().find(|c| &c.id == id).map(|c| c.project_id.clone()) == Some(project.clone())
+        });
+    if reuse {
+        return;
+    }
+    match st.db.create_session_in(NEW_CHAT, None, project.as_deref()) {
+        Ok(s) => {
+            // B-12: a running chat keeps its live transcript.
+            gs.leave_current_chat();
+            gs.session = Some(s.id);
+            gs.entries.clear();
+            gs.busy = false;
+            refresh_sessions(gs, st);
+        }
+        Err(e) => gs.push(EntryKind::Error, format!("new chat failed: {e}")),
+    }
+}
+
+/// Ask for a folder with the system's folder picker (Windows). Elsewhere
+/// the page asks for a path and sends it with `add_project`.
+#[cfg(windows)]
+fn pick_folder(window: &tao::window::Window) -> Option<std::path::PathBuf> {
+    use tao::platform::windows::WindowExtWindows;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+    };
+    // SAFETY: plain COM calls on the UI thread; the returned string is
+    // copied and then freed with CoTaskMemFree as the API requires.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        dialog.Show(Some(HWND(window.hwnd() as _))).ok()?; // Err = cancelled
+        let item = dialog.GetResult().ok()?;
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        path.map(std::path::PathBuf::from)
+    }
+}
+
+#[cfg(not(windows))]
+fn pick_folder(_window: &tao::window::Window) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Refresh the sidebar chat list from the database.
 fn refresh_sessions(gs: &mut GuiState, st: &server::AppState) {
-    if let Ok(list) = st.db.list_sessions() {
-        gs.sessions = list.into_iter().map(|s| (s.id, s.title)).collect();
+    if let Ok(rows) = st.db.list_session_rows() {
+        gs.sessions = rows
+            .into_iter()
+            .filter(|r| r.session.parent_id.is_none())
+            .map(|r| ChatItem {
+                id: r.session.id,
+                title: r.session.title,
+                project_id: r.session.project_id,
+                pinned: r.session.pinned,
+                archived: r.session.archived,
+                empty: !r.has_messages,
+                updated_at: r.session.updated_at,
+            })
+            .collect();
+    }
+    if let Ok(projects) = st.db.list_projects() {
+        gs.projects = projects;
     }
 }
 
@@ -1032,6 +1195,8 @@ pub async fn run(
     };
     let mut gs = GuiState::new();
     gs.session = Some(session.id.clone());
+    // The folder the app started in is a project; plain new chats go there.
+    gs.default_project = state.db.upsert_project(&state.workspace).ok().map(|p| p.id);
     gs.approval_timeout_secs = state.cfg.permissions.approval_timeout_secs;
     gs.perm_mode = state.perm_mode();
     refresh_sessions(&mut gs, &state);
@@ -1295,23 +1460,89 @@ pub async fn run(
                                 changed = true;
                             }
                         }
-                        // B-42: already on an empty chat — nothing to create.
-                        UiMsg::Ipc(IpcMsg::NewSession) if gs.entries.is_empty() && !gs.busy => {}
-                        UiMsg::Ipc(IpcMsg::NewSession) => match st.db.create_session(NEW_CHAT, None) {
-                            Ok(s) => {
-                                // B-12: a running chat keeps its live transcript.
-                                gs.leave_current_chat();
-                                gs.session = Some(s.id);
-                                gs.entries.clear();
-                                gs.busy = false;
-                                refresh_sessions(&mut gs, &st);
+                        // "New chat" opens a chat in the open chat's project.
+                        UiMsg::Ipc(IpcMsg::NewSession) => {
+                            let project = gs.current_project();
+                            open_new_chat(&mut gs, &st, project);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::NewInProject(project)) => {
+                            open_new_chat(&mut gs, &st, Some(project));
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::AddProject(path)) => {
+                            let folder = match path {
+                                Some(p) => Some(std::path::PathBuf::from(p)),
+                                None => pick_folder(&window),
+                            };
+                            if let Some(folder) = folder {
+                                if folder.is_dir() {
+                                    match st.db.upsert_project(&folder) {
+                                        Ok(p) => open_new_chat(&mut gs, &st, Some(p.id)),
+                                        Err(e) => gs.push(EntryKind::Error, format!("add project failed: {e}")),
+                                    }
+                                } else {
+                                    gs.push(EntryKind::Error, format!("not a folder: {}", folder.display()));
+                                }
                                 changed = true;
                             }
-                            Err(e) => {
-                                gs.push(EntryKind::Error, format!("new session failed: {e}"));
-                                changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::RemoveProject(id)) => {
+                            if let Err(e) = st.db.remove_project(&id) {
+                                gs.push(EntryKind::Error, format!("remove project failed: {e}"));
                             }
-                        },
+                            refresh_sessions(&mut gs, &st);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::Pin { id, on }) => {
+                            let _ = st.db.set_session_pinned(&id, on);
+                            refresh_sessions(&mut gs, &st);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::Archive { id, on }) => {
+                            // A chat with a run going stays until the run ends.
+                            if !(on && gs.running.contains(&id)) {
+                                let _ = st.db.set_session_archived(&id, on);
+                                if on && gs.is_current(&id) {
+                                    let project = gs.current_project();
+                                    open_new_chat(&mut gs, &st, project);
+                                }
+                            }
+                            refresh_sessions(&mut gs, &st);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::Rename { id, title }) => {
+                            let _ = st.db.set_session_title(&id, &title);
+                            refresh_sessions(&mut gs, &st);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::MoveChat { id, project }) => {
+                            if !gs.running.contains(&id) {
+                                let _ = st.db.set_session_project(&id, project.as_deref());
+                            }
+                            refresh_sessions(&mut gs, &st);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::AdoptUnfiled(project)) => {
+                            if let Err(e) = st.db.adopt_unfiled_sessions(&project) {
+                                gs.push(EntryKind::Error, format!("move chats failed: {e}"));
+                            }
+                            refresh_sessions(&mut gs, &st);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::DeleteChat(id)) => {
+                            if !gs.running.contains(&id) {
+                                if let Err(e) = st.db.delete_session(&id) {
+                                    gs.push(EntryKind::Error, format!("delete failed: {e}"));
+                                } else if gs.is_current(&id) {
+                                    gs.session = None;
+                                    let project = gs.default_project.clone();
+                                    open_new_chat(&mut gs, &st, project);
+                                }
+                            }
+                            refresh_sessions(&mut gs, &st);
+                            changed = true;
+                        }
                         UiMsg::Ipc(IpcMsg::Load(id)) => {
                             if gs.session.as_deref() != Some(id.as_str()) {
                                 load_session(&mut gs, &st, &id);
@@ -2104,6 +2335,34 @@ mod tests {
         assert_eq!(parse_ipc(r#"{"type":"send","text":" hi "}"#), Some(IpcMsg::Send("hi".into())));
         assert_eq!(parse_ipc(r#"{"type":"send","text":"   "}"#), None, "blank sends are dropped");
         assert_eq!(parse_ipc(r#"{"type":"new"}"#), Some(IpcMsg::NewSession));
+        // Projects sidebar.
+        assert_eq!(
+            parse_ipc(r#"{"type":"new_in_project","project":"prj_1"}"#),
+            Some(IpcMsg::NewInProject("prj_1".into()))
+        );
+        assert_eq!(parse_ipc(r#"{"type":"add_project"}"#), Some(IpcMsg::AddProject(None)));
+        assert_eq!(
+            parse_ipc(r#"{"type":"add_project","path":"C:/code/app"}"#),
+            Some(IpcMsg::AddProject(Some("C:/code/app".into())))
+        );
+        assert_eq!(
+            parse_ipc(r#"{"type":"pin","id":"s","on":true}"#),
+            Some(IpcMsg::Pin { id: "s".into(), on: true })
+        );
+        assert_eq!(
+            parse_ipc(r#"{"type":"rename","id":"s","title":" New name "}"#),
+            Some(IpcMsg::Rename { id: "s".into(), title: "New name".into() })
+        );
+        assert_eq!(parse_ipc(r#"{"type":"rename","id":"s","title":"  "}"#), None, "no blank titles");
+        assert_eq!(
+            parse_ipc(r#"{"type":"move","id":"s","project":null}"#),
+            Some(IpcMsg::MoveChat { id: "s".into(), project: None })
+        );
+        assert_eq!(parse_ipc(r#"{"type":"delete","id":"s"}"#), Some(IpcMsg::DeleteChat("s".into())));
+        assert_eq!(
+            parse_ipc(r#"{"type":"adopt_unfiled","project":"p"}"#),
+            Some(IpcMsg::AdoptUnfiled("p".into()))
+        );
         assert_eq!(parse_ipc(r#"{"type":"load","id":"ses_9"}"#), Some(IpcMsg::Load("ses_9".into())));
         assert_eq!(parse_ipc(r#"{"type":"load"}"#), None, "load without id is malformed");
         assert_eq!(parse_ipc(r#"{"type":"ready"}"#), Some(IpcMsg::Ready));
@@ -2173,10 +2432,7 @@ mod tests {
     #[test]
     fn payload_carries_sessions_and_active_title() {
         let mut g = GuiState::new();
-        g.sessions = vec![
-            ("ses_2".into(), "Second".into()),
-            ("ses_1".into(), "First".into()),
-        ];
+        g.sessions = vec![ChatItem::new("ses_2", "Second"), ChatItem::new("ses_1", "First")];
         g.session = Some("ses_1".into());
         let v: serde_json::Value = serde_json::from_str(&g.payload()).unwrap();
         assert_eq!(v["title"], "First", "header shows the active chat's title");

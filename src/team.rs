@@ -253,13 +253,15 @@ async fn run_worker_agent(
     abort: &AtomicBool,
 ) -> Result<String> {
     st.db.add_message(session_id, "user", &[Part::Text { text: prompt.to_string() }])?;
+    // The worker works in its parent chat's project folder.
+    let project_ws = st.workspace_for(session_id);
     let mut system = format!(
         "You are a focused worker agent in team mode. Complete only your subtask.\n\n\
          Workspace: {}.\nNobody can answer questions during this run: make reasonable \
          decisions yourself and finish. Report a 1-2 sentence summary when finished.",
-        st.workspace.display()
+        project_ws.display()
     );
-    if let Some(md) = crate::skills::load_agents_md(&st.workspace) {
+    if let Some(md) = crate::skills::load_agents_md(&project_ws) {
         system.push_str("\n\n## Project instructions (AGENTS.md)\n\n");
         system.push_str(md.trim());
     }
@@ -277,7 +279,7 @@ async fn run_worker_agent(
         .cfg
         .agent
         .isolate_workers
-        .then(|| crate::worktree::Isolation::start(&st.workspace, &st.state_dir, "team"));
+        .then(|| crate::worktree::Isolation::start(&project_ws, &st.state_dir, "team"));
     let iso_ws = iso.as_ref().and_then(|i| i.workspace());
     if let Some(ws) = &iso_ws {
         system.push_str(&crate::worktree::isolation_prompt(ws));
@@ -289,7 +291,7 @@ async fn run_worker_agent(
         // F-05: an isolated worker keeps to the built-in tools.
         allow: iso_ws.as_ref().map(|_| crate::worktree::local_tool_names()),
         can_spawn: false,
-        workspace: iso_ws,
+        workspace: iso_ws.or_else(|| st.run_workspace(session_id)),
     };
     let out = crate::server::run_loop(st, session_id, &opts, abort).await?;
     // F-05: report what the worktree produced, or why there was none. The

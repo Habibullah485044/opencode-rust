@@ -250,6 +250,9 @@ impl AppState {
 pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
     let state_dir = crate::config::default_state_dir();
     let db = Db::open(&state_dir.join("opencode.db"))?;
+    // Projects: the folder the app starts in is one; new chats go there.
+    let start = db.upsert_project(&workspace)?;
+    db.set_default_project(Some(&start.id));
     let todo_store = TodoStore::open(&state_dir.join("opencode.db"))?;
     let engine = Engine::new(&cfg.permissions);
     let client = Client::from_cfg(&cfg.effective_base_url()?, &cfg.provider)?;
@@ -306,7 +309,13 @@ pub async fn build_state_ephemeral_skills(
         approvals: Mutex::new(HashMap::new()),
         busy: RwLock::new(HashMap::new()),
         stats: Mutex::new(HashMap::new()),
-        db: Db::open_in_memory().expect("in-memory db"),
+        db: {
+            let db = Db::open_in_memory().expect("in-memory db");
+            if let Ok(p) = db.upsert_project(&workspace) {
+                db.set_default_project(Some(&p.id));
+            }
+            db
+        },
         cfg,
         workspace,
         // New (B-25): unit tests must not write snapshots or worktrees into
@@ -340,7 +349,11 @@ impl AppState {
         };
         let Some(entry) = entry else { return false };
         if allow && always {
-            let ws = crate::db::workspace_key(&self.workspace);
+            let folder = match &entry.request {
+                ServerEvent::ApprovalNeeded { session_id, .. } => self.workspace_for(session_id),
+                _ => self.workspace.clone(),
+            };
+            let ws = crate::db::workspace_key(&folder);
             let _ = self.db.add_approval(&ws, &entry.tool, &entry.detail, "session");
         }
         let reason = if allow && always { "always" } else { "user" };
@@ -892,7 +905,7 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
     // Safety net before anything mutates the workspace. Failure is not
     // fatal — snapshotting is a convenience, the run must still work.
     // New (B-48): git runs off the async threads; errors go to core.log.
-    let (ws, sd) = (st.workspace.clone(), st.state_dir.clone());
+    let (ws, sd) = (st.workspace_for(session_id), st.state_dir.clone());
     let snap = tokio::task::spawn_blocking(move || {
         crate::gitsnap::record_before_run(&ws, &sd, "pre-run")
     })
@@ -904,7 +917,7 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
     // New (P-02): fingerprint the git working tree first, so a run that only
     // ran read-only commands (ls, cargo test, git log) gets no review.
     let tree_before = if st.cfg.agent.auto_review {
-        st.workspace_fingerprint().await
+        st.workspace_fingerprint(session_id).await
     } else {
         None
     };
@@ -915,7 +928,7 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
     let touched = {
         let after = snapshot_stats(st, session_id);
         let bash_changed = after.bash_runs > before.bash_runs
-            && (tree_before.is_none() || st.workspace_fingerprint().await != tree_before);
+            && (tree_before.is_none() || st.workspace_fingerprint(session_id).await != tree_before);
         after.writes > before.writes || after.edits > before.edits || bash_changed
     };
     // The reply already streamed to clients as AssistantDelta — resending it
@@ -1092,8 +1105,8 @@ impl AppState {
     /// New (P-02): a fingerprint of the git working tree (status plus diff),
     /// or None when the workspace is not a git repository. Git runs off the
     /// async threads.
-    pub(crate) async fn workspace_fingerprint(&self) -> Option<u64> {
-        let ws = self.workspace.clone();
+    pub(crate) async fn workspace_fingerprint(&self, session_id: &str) -> Option<u64> {
+        let ws = self.workspace_for(session_id);
         tokio::task::spawn_blocking(move || {
             use std::hash::{Hash, Hasher};
             let status = crate::gitsnap::git(&ws, &["status", "--porcelain=v1", "-uall"]).ok()?;
@@ -1305,7 +1318,7 @@ async fn agent_inner(
     st.db.add_message(session_id, "user", &[Part::Text { text: user_content.to_string() }])?;
     // M2: expand slash-command templates (`.opencode/commands/*.md`);
     // the raw input stays visible to the user, the expansion is a system note.
-    if let Some((rendered, doc)) = skills::resolve_command(&st.workspace, user_content) {
+    if let Some((rendered, doc)) = skills::resolve_command(&st.workspace_for(session_id), user_content) {
         st.db.add_message(
             session_id,
             "system",
@@ -1320,7 +1333,7 @@ async fn agent_inner(
         emit_activity: true,
         allow: None,
         can_spawn: true,
-        workspace: None,
+        workspace: st.run_workspace(session_id),
         agent: None,
     };
     run_loop(st, session_id, &opts, abort).await
@@ -1355,6 +1368,27 @@ pub struct LoopOpts {
 }
 
 impl AppState {
+    /// The folder chat `session_id` works in: its project's folder, or the
+    /// folder the app started in (no project, or the folder is gone).
+    pub fn workspace_for(&self, session_id: &str) -> PathBuf {
+        self.db
+            .get_session(session_id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.project_id)
+            .and_then(|p| self.db.get_project(&p).ok().flatten())
+            .map(|p| PathBuf::from(p.root))
+            .filter(|root| root.is_dir())
+            .unwrap_or_else(|| self.workspace.clone())
+    }
+
+    /// The folder a run of chat `session_id` overrides the start folder
+    /// with (`LoopOpts::workspace`), or `None` when it is the start folder.
+    pub fn run_workspace(&self, session_id: &str) -> Option<PathBuf> {
+        let ws = self.workspace_for(session_id);
+        (ws != self.workspace).then_some(ws)
+    }
+
     /// Save one reply's token counts (`/usage`) and tell the UIs. Model calls
     /// outside a chat (planning, edits, summaries) use session "".
     pub fn record_usage(&self, session_id: &str, u: &crate::provider::Usage) {
@@ -1376,11 +1410,13 @@ impl AppState {
     /// Base + AGENTS.md + skills index + subagent index + mode instructions.
     pub fn composed_system(&self, session_id: &str) -> String {
         let mode = self.mode_for(session_id);
-        let skills_list = skills::load_skills(&self.workspace);
-        let agents_md = skills::load_agents_md(&self.workspace);
+        // The chat's own project: its AGENTS.md and skills.
+        let workspace = self.workspace_for(session_id);
+        let skills_list = skills::load_skills(&workspace);
+        let agents_md = skills::load_agents_md(&workspace);
         let baked = skills::load_baked(&self.skill_base);
         agents::compose_system(PromptInputs {
-            workspace: &self.workspace,
+            workspace: &workspace,
             mode,
             configured: self.cfg.agent.system_prompt.as_deref(),
             agents_md: agents_md.as_deref(),
@@ -1481,7 +1517,7 @@ impl AppState {
         } else {
             raw.to_string()
         };
-        let path = Self::export_path(&self.workspace, &name)?;
+        let path = Self::export_path(&self.workspace_for(session_id), &name)?;
         if path.exists() && !force {
             let existing = std::fs::read_to_string(&path).unwrap_or_default();
             if !existing.starts_with(Self::EXPORT_MARKER) {
@@ -2034,7 +2070,7 @@ fn finish_tool_call(
         }
     }
     if ok && st.cfg.agent.reuse_gate {
-        if let Some(hint) = reuse_gate(&st.workspace, name, input) {
+        if let Some(hint) = reuse_gate(opts.workspace.as_deref().unwrap_or(&st.workspace), name, input) {
             output.push_str(&format!("\n[{hint}]"));
             bump_hints(st, session_id);
             let _ = st.events.send(ServerEvent::Note {
@@ -2279,14 +2315,14 @@ pub async fn run_review(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) 
     let system = format!(
         "{}\n\nWorkspace: {}. Read-only tools only (read/glob/grep); report in full.",
         crate::agents::ponytail_review_rules(),
-        st.workspace.display()
+        st.workspace_for(session_id).display()
     );
     let opts = LoopOpts {
         system,
         emit_activity: false,
         allow: Some(vec!["read".to_string(), "glob".to_string(), "grep".to_string()]),
         can_spawn: false,
-        workspace: None,
+        workspace: st.run_workspace(session_id),
         agent: None,
     };
     run_loop(st, session_id, &opts, abort).await
@@ -2322,7 +2358,7 @@ async fn verify_after_run(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>
             return;
         }
         note(format!("{VERIFY_PREFIX} running `{cmd}`…"));
-        let result = run_verify_command(cmd, &st.workspace, timeout, abort).await;
+        let result = run_verify_command(cmd, &st.workspace_for(session_id), timeout, abort).await;
         if abort.load(Ordering::SeqCst) {
             return;
         }
@@ -2608,6 +2644,9 @@ fn tool_detail_for(st: &Shared, opts: &LoopOpts, tool: &str, input: &Value) -> S
             let p = input.get("path").and_then(Value::as_str).unwrap_or("");
             normalize_path_detail(ws, p)
         }
+        (Some(ws), "list") => {
+            normalize_path_detail(ws, input.get("path").and_then(Value::as_str).unwrap_or("."))
+        }
         _ => tool_detail(st, tool, input),
     }
 }
@@ -2702,8 +2741,8 @@ async fn check_permission_preview(
     preview: &str,
     abort: &AtomicBool,
 ) -> bool {
-    // "Always allow" answers belong to this workspace only (S-07).
-    let ws_key = crate::db::workspace_key(&st.workspace);
+    // "Always allow" answers belong to this chat's workspace only (S-07).
+    let ws_key = crate::db::workspace_key(&st.workspace_for(session_id));
     let remembered = |t: &str, d: &str| st.db.has_approval(&ws_key, t, d).unwrap_or(false);
     let decision = st.engine.evaluate(tool, detail, remembered);
     // Hard `deny` rules are policy, not prompts: they survive every mode.
@@ -3141,6 +3180,67 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// Projects: a chat filed under another folder works there: its tools
+    /// write into that folder and its AGENTS.md reaches the prompt.
+    #[tokio::test]
+    async fn a_chat_runs_in_its_projects_folder() {
+        use axum::{routing::post, Router};
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let seen2 = seen.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::extract::Json(body): axum::extract::Json<Value>| {
+                let seen = seen2.clone();
+                async move {
+                    let n = {
+                        let mut s = seen.lock().unwrap();
+                        s.push(body);
+                        s.len()
+                    };
+                    let first = if n == 1 {
+                        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"w1","function":{"name":"write","arguments":"{\"path\":\"made.txt\",\"content\":\"hi\\n\"}"}}]},"finish_reason":"tool_calls"}]}"#
+                    } else {
+                        r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#
+                    };
+                    let payload = format!("data: {first}\n\ndata: [DONE]\n\n");
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base = std::env::temp_dir().join(format!("ocrs-projects-{}", std::process::id()));
+        let (start, other) = (base.join("start"), base.join("other"));
+        std::fs::create_dir_all(&start).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("AGENTS.md"), "OTHER-PROJECT-RULES\n").unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        cfg.agent.auto_review = false;
+        let st = build_state_ephemeral(cfg, start.clone()).await;
+        st.set_perm_mode(PermissionMode::Turbo);
+        let project = st.db.upsert_project(&other).unwrap();
+        let s = st.db.create_session_in("in other", None, Some(&project.id)).unwrap();
+        assert_eq!(st.workspace_for(&s.id), other);
+
+        run_agent(&st, &s.id, "make a file", Arc::new(AtomicBool::new(false))).await;
+
+        assert_eq!(std::fs::read_to_string(other.join("made.txt")).unwrap_or_default(), "hi\n");
+        assert!(!start.join("made.txt").exists(), "nothing lands in the start folder");
+        let bodies = seen.lock().unwrap().clone();
+        let system = bodies[0]["messages"][0]["content"].as_str().unwrap_or("");
+        assert!(system.contains("OTHER-PROJECT-RULES"), "the project's AGENTS.md is in the prompt");
+        // A chat whose project folder is gone falls back to the start folder.
+        let gone = st.db.upsert_project(&base.join("missing")).unwrap();
+        let g = st.db.create_session_in("gone", None, Some(&gone.id)).unwrap();
+        assert_eq!(st.workspace_for(&g.id), start);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// Prompt caching works only when each request starts with the previous
     /// request unchanged. Over a tool call and a second prompt, check that,
