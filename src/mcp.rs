@@ -813,8 +813,12 @@ mod b19_startup_tests {
         let _ = silent.await;
     }
 
-    /// Two servers that each take 1.5 s to answer `initialize` start in
-    /// about 1.5 s together, not 3 s. Each lists `echo` twice; one is dropped.
+    /// Two servers that each take 1.5 s to answer `initialize` are started
+    /// together: the second gets its `initialize` before the first has
+    /// answered (one after another, it would come >= 1.5 s later). Comparing
+    /// those two moments, not the total time, keeps the test steady on a
+    /// busy machine where node itself starts slowly.
+    /// Each lists `echo` twice; one is dropped.
     #[tokio::test]
     async fn servers_start_at_the_same_time() {
         let node = ["node", "nodejs"].iter().find(|c| {
@@ -826,11 +830,13 @@ mod b19_startup_tests {
         };
         let script = r#"
 const delay = Number(process.argv[2] || 0);
+const stamp = process.argv[3];
 const rl = require('readline').createInterface({ input: process.stdin });
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 rl.on('line', (line) => {
   let m; try { m = JSON.parse(line); } catch { return; }
   if (m.id === undefined) return;
+  if (m.method === 'initialize' && stamp) require('fs').writeFileSync(stamp, String(Date.now()));
   if (m.method === 'initialize') setTimeout(() => send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'slow',version:'0'}}}), delay);
   else if (m.method === 'tools/list') send({jsonrpc:'2.0',id:m.id,result:{tools:[{name:'echo',inputSchema:{type:'object'}},{name:'echo',inputSchema:{type:'object'}}]}});
   else send({jsonrpc:'2.0',id:m.id,result:{content:[{type:'text',text:'ok'}]}});
@@ -843,17 +849,23 @@ rl.on('line', (line) => {
         let cfg = |name: &str| McpServerCfg {
             name: name.into(),
             command: node.to_string(),
-            args: vec![path.to_string_lossy().into_owned(), "1500".into()],
+            args: vec![
+                path.to_string_lossy().into_owned(),
+                "1500".into(),
+                dir.join(format!("{name}.stamp")).to_string_lossy().into_owned(),
+            ],
             ..Default::default() // keeps compiling when McpServerCfg gets more fields (F-03)
         };
         let mut reg = Registry::default();
-        let started = std::time::Instant::now();
         reg.start_all(&[cfg("a"), cfg("b")]).await;
-        let took = started.elapsed();
         let mut names = reg.connected();
         names.sort();
         assert_eq!(names, vec!["a", "b"]);
-        assert!(took < Duration::from_millis(2700), "servers started one after another: {took:?}");
+        let stamp = |n: &str| -> i64 {
+            std::fs::read_to_string(dir.join(format!("{n}.stamp"))).unwrap().trim().parse().unwrap()
+        };
+        let gap = (stamp("a") - stamp("b")).abs();
+        assert!(gap < 1500, "the second server waited for the first: initialize {gap} ms apart");
         assert_eq!(reg.specs().len(), 2, "the duplicate `echo` is dropped on each server");
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
