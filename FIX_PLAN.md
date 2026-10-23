@@ -28,13 +28,13 @@ written so a coding AI can follow it one task at a time.
 
 ## Progress status
 
-*Updated 23 Oct 2026, checked against the code in `opencode-rust/` (git `1549b9b`).*
+*Updated 23 Oct 2026, checked against the code in `opencode-rust/` (git `835c517`).*
 
 **92 of 92 tasks done (100%).** Each finished task has its own commit; its code
 changes and new tests are in the code.
 
 - **Build:** `cargo build` gives 0 warnings (Windows), with and without the `gui` feature.
-- **Tests:** `cargo test` gives **397 passed, 0 failed** on Windows (390 library + 7 binary); 348 with `--no-default-features`. `tests/gui/run.sh` (Edge) gives 0 FAIL (105 + 16 assertions). `cargo build --release` is clean.
+- **Tests:** `cargo test` gives **398 passed, 0 failed** on Windows (391 library + 7 binary), three full runs in a row; 349 with `--no-default-features`. `tests/gui/run.sh` (Edge) gives 0 FAIL (105 + 16 assertions). `cargo build --release` is clean.
 - **Next task:** none, every task is done
 - **Beyond the plan:** the desktop GUI (`src/gui.html`) was redesigned: calmer theme, one-line
   tool steps with ✓/✗, real Markdown paragraphs, solid approval backdrop. Ids and the IPC
@@ -52,10 +52,9 @@ changes and new tests are in the code.
   checks out with CRLF). B-41's help/edit-preview scrolling also stops at the end (as B-14
   does for the transcript). F-11's `build_state` step was done by hand because P-05 had
   changed its "Find" lines. H-04 also ticked items that F-04, F-09 and F-13 built.
-- **Gaps seen, not fixed:** `/ponytail <unknown level>` goes to the model as chat (P-05);
-  `preview <url> --exit-after-ms N` never closes when the page fails to load (also before
-  B-46); the timing test `servers_start_at_the_same_time` (B-19) sometimes fails under full
-  load (2.84 s against a 2.7 s limit) and passes on reruns.
+- **Gaps found during the plan, now fixed:** headless `/ponytail <unknown level>` (and other
+  bad builtin arguments) now prints usage; `preview --exit-after-ms` closes reliably; the MCP
+  startup test no longer depends on machine load. See `PLAN_PROGRESS.md`.
 
 | Phase | Done | Status |
 |---|---|---|
