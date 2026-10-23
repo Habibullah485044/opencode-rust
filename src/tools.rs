@@ -25,7 +25,7 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "read",
-            "Read a text file. Returns numbered lines. offset = first line number to show (1-based, as printed); limit = how many lines (default 500). For directories, use list instead.",
+            "Read a file as numbered lines. offset: first line (1-based); limit: how many (default 500).",
             json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}),
         ),
         spec(
@@ -35,17 +35,17 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "edit",
-            "Replace old_str with new_str in a file. old_str must be non-empty, copied exactly from the file, and match exactly once unless replace_all.",
-            json!({"type":"object","properties":{"path":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_str","new_str"]}),
+            "Replace old_str with new_str in a file (copy old_str from the file; it must match once unless replace_all). edits: several {old_str,new_str} at once.",
+            json!({"type":"object","properties":{"path":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"},"replace_all":{"type":"boolean"},"edits":{"type":"array","items":{"type":"object"}}},"required":["path"]}),
         ),
         spec(
             "glob",
-            "Find files by glob pattern (respects .gitignore). Pattern like **/*.rs",
+            "Find files by glob, e.g. **/*.rs (respects .gitignore).",
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}),
         ),
         spec(
             "grep",
-            "Regex search file contents (respects .gitignore). Returns path:line matches.",
+            "Regex search in files (respects .gitignore); returns path:line matches.",
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"case_insensitive":{"type":"boolean"}},"required":["pattern"]}),
         ),
         spec(
@@ -62,6 +62,11 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
             "todo",
             "Todo list of this chat, for tracking long work. add needs content; complete and remove need id.",
             json!({"type":"object","properties":{"op":{"type":"string","enum":["add","list","complete","remove"]},"content":{"type":"string"},"id":{"type":"string"}},"required":["op"]}),
+        ),
+        spec(
+            "ask_user",
+            "Ask the user one question with up to 6 answers to click; ends your turn.",
+            json!({"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"required":["question"]}),
         ),
         spec(
             "check_page",
@@ -109,13 +114,31 @@ pub async fn execute(
             args.get("limit").and_then(Value::as_i64).unwrap_or(500),
         ),
         "write" => write_file(workspace, arg_str(args, "path")?, arg_str(args, "content")?),
-        "edit" => edit_file(
-            workspace,
-            arg_str(args, "path")?,
-            arg_str(args, "old_str")?,
-            arg_str(args, "new_str")?,
-            args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
-        ),
+        "edit" => {
+            let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+            match args.get("edits").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+                Some(list) => {
+                    let edits: Vec<(String, String)> = list
+                        .iter()
+                        .map(|e| {
+                            let field = |k: &str| e.get(k).and_then(Value::as_str).map(str::to_string);
+                            Ok((
+                                field("old_str").ok_or_else(|| anyhow!("each edit needs old_str"))?,
+                                field("new_str").ok_or_else(|| anyhow!("each edit needs new_str"))?,
+                            ))
+                        })
+                        .collect::<Result<_>>()?;
+                    edit_many(workspace, arg_str(args, "path")?, &edits, replace_all)
+                }
+                None => edit_file(
+                    workspace,
+                    arg_str(args, "path")?,
+                    arg_str(args, "old_str")?,
+                    arg_str(args, "new_str")?,
+                    replace_all,
+                ),
+            }
+        }
         "glob" => glob_files(
             workspace,
             arg_str(args, "pattern")?,
@@ -571,29 +594,139 @@ fn edit_file(
              To create or fully rewrite a file, use the write tool."
         );
     }
+    edit_many(workspace, path, &[(old_str.to_string(), new_str.to_string())], replace_all)
+}
+
+/// Apply several edits to one file, in order, all or nothing.
+fn edit_many(workspace: &Path, path: &str, edits: &[(String, String)], replace_all: bool) -> Result<String> {
+    if edits.is_empty() {
+        bail!("no edits given");
+    }
+    if edits.iter().any(|(old, _)| old.is_empty()) {
+        bail!(
+            "old_str is empty: give the exact text to replace (copy it from the file). \
+             To create or fully rewrite a file, use the write tool."
+        );
+    }
     let abs = confine_path(workspace, path)?;
     let text = std::fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
-    let matches = text.matches(old_str).count();
-    if matches == 0 {
-        return Err(anyhow!("old_str not found in {path}"));
+    let mut new_text = text.clone();
+    let mut total = 0;
+    let mut loose = 0;
+    for (i, (old, new)) in edits.iter().enumerate() {
+        let which = if edits.len() > 1 { format!(" (edit {} of {})", i + 1, edits.len()) } else { String::new() };
+        let (next, n, fuzzy) = apply_edit(&new_text, old, new, replace_all).map_err(|e| anyhow!("{e} in {path}{which}"))?;
+        new_text = next;
+        total += n;
+        loose += usize::from(fuzzy);
     }
-    if matches > 1 && !replace_all {
-        return Err(anyhow!(
-            "old_str matches {matches} times in {path}; make it unique or set replace_all"
-        ));
-    }
-    let new_text = if replace_all {
-        text.replace(old_str, new_str)
-    } else {
-        text.replacen(old_str, new_str, 1)
-    };
     write_atomic(&abs, new_text.as_bytes()).with_context(|| format!("writing {}", abs.display()))?;
     let lines_before = text.matches('\n').count();
     let lines_after = new_text.matches('\n').count();
+    let note = if loose > 0 { " (matched ignoring indentation/line endings)" } else { "" };
     Ok(format!(
-        "edited {path}: replaced {matches} occurrence(s), line delta {:+}",
+        "edited {path}: replaced {total} occurrence(s), line delta {:+}{note}",
         lines_after as i64 - lines_before as i64
     ))
+}
+
+/// One replacement in `text`. Exact match first; then a match that ignores
+/// line endings and indentation (weak models often get those wrong), with
+/// `new` re-indented by the same amount. Returns the new text, how many
+/// places changed, and whether the loose match was used. On a miss the
+/// error shows the closest lines, so the next try can copy them.
+fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<(String, usize, bool)> {
+    // CRLF files: the model writes \n.
+    let crlf = text.contains("\r\n");
+    let (old, new) = if crlf && !old.contains("\r\n") {
+        (old.replace('\n', "\r\n"), new.replace('\n', "\r\n"))
+    } else {
+        (old.to_string(), new.to_string())
+    };
+    let matches = text.matches(old.as_str()).count();
+    if matches > 1 && !replace_all {
+        bail!("old_str matches {matches} times; make it unique (add a nearby line) or set replace_all");
+    }
+    if matches >= 1 {
+        let out = if replace_all { text.replace(old.as_str(), &new) } else { text.replacen(old.as_str(), &new, 1) };
+        return Ok((out, matches, false));
+    }
+    // Loose: compare trimmed lines.
+    let eol = if crlf { "\r\n" } else { "\n" };
+    let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let want: Vec<&str> = old.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let want: Vec<&str> = {
+        // Leading and trailing blank lines carry no information.
+        let start = want.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
+        let end = want.iter().rposition(|l| !l.trim().is_empty()).map_or(start, |e| e + 1);
+        want[start..end].to_vec()
+    };
+    if want.is_empty() {
+        bail!("old_str not found");
+    }
+    let hits: Vec<usize> = (0..=lines.len().saturating_sub(want.len()))
+        .filter(|&i| want.iter().enumerate().all(|(k, w)| lines[i + k].trim() == w.trim()))
+        .collect();
+    if hits.len() > 1 && !replace_all {
+        bail!("old_str matches {} places (ignoring indentation); make it unique or set replace_all", hits.len());
+    }
+    if hits.is_empty() {
+        return Err(anyhow!("old_str not found{}", closest_region(&lines, &want)));
+    }
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let first = want.iter().find(|l| !l.trim().is_empty()).copied().unwrap_or("");
+    let new_lines: Vec<&str> = new.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    // Replace from the last hit back, so earlier indexes stay valid.
+    for &i in hits.iter().rev() {
+        let file_first = lines[i..i + want.len()].iter().find(|l| !l.trim().is_empty()).copied().unwrap_or("");
+        let file_pad = &file_first[..indent(file_first)];
+        let delta = indent(file_first) as i64 - indent(first) as i64;
+        let fixed: Vec<String> = new_lines
+            .iter()
+            .map(|l| {
+                if l.trim().is_empty() {
+                    String::new()
+                } else if delta >= 0 {
+                    // Same indent character as the file uses.
+                    let unit = file_pad.chars().next().unwrap_or(' ');
+                    format!("{}{l}", unit.to_string().repeat(delta as usize))
+                } else {
+                    let cut = (-delta as usize).min(indent(l));
+                    l[cut..].to_string()
+                }
+            })
+            .collect();
+        out.splice(i..i + want.len(), fixed);
+    }
+    Ok((out.join(eol), hits.len(), true))
+}
+
+/// " — closest match at lines N-M: ..." for a failed edit, or "" when
+/// nothing is close.
+fn closest_region(lines: &[&str], want: &[&str]) -> String {
+    let first = want.iter().find(|l| !l.trim().is_empty()).map(|l| l.trim()).unwrap_or("");
+    let mut best: Option<(usize, usize)> = None; // (score, start)
+    for i in 0..lines.len() {
+        let score = want
+            .iter()
+            .enumerate()
+            .filter(|(k, w)| lines.get(i + k).is_some_and(|l| !w.trim().is_empty() && l.trim() == w.trim()))
+            .count()
+            + usize::from(!first.is_empty() && lines[i].contains(first));
+        if score > 0 && best.is_none_or(|(s, _)| score > s) {
+            best = Some((score, i));
+        }
+    }
+    let Some((_, start)) = best else { return String::new() };
+    let end = (start + want.len().max(1)).min(lines.len());
+    let shown: Vec<String> = lines[start..end].iter().take(12).enumerate().map(|(k, l)| format!("{:>5}\t{l}", start + k + 1)).collect();
+    format!(
+        ". Closest match at lines {}-{} (copy old_str from here):\n{}",
+        start + 1,
+        end,
+        shown.join("\n")
+    )
 }
 
 fn glob_files(workspace: &Path, pattern: &str, sub: Option<&str>) -> Result<String> {
@@ -1120,6 +1253,41 @@ mod tests {
         assert!(match_glob("src/*.rs", "src/lib.rs"));
         assert!(!match_glob("src/*.rs", "src/deep/lib.rs"));
         assert!(match_glob("src/**/*.rs", "src/deep/lib.rs"));
+    }
+
+    /// Weak models get indentation and line endings wrong: the edit still
+    /// lands, re-indented to fit, and a miss shows the closest lines.
+    #[test]
+    fn edits_forgive_indentation_and_line_endings() {
+        let file = "fn main() {\r\n    if ready {\r\n        go();\r\n    }\r\n}\r\n";
+        // Indented two levels too little, LF instead of CRLF.
+        let (out, n, loose) = apply_edit(file, "if ready {\n    go();\n}", "if ready {\n    go();\n    done();\n}", false).unwrap();
+        assert!(loose && n == 1);
+        assert_eq!(out, "fn main() {\r\n    if ready {\r\n        go();\r\n        done();\r\n    }\r\n}\r\n");
+        // Exact matches still win and say nothing about looseness.
+        let (out, _, loose) = apply_edit("a b c", "b", "x", false).unwrap();
+        assert!(!loose && out == "a x c");
+        // A miss names the closest region with line numbers.
+        let err = apply_edit("one\ntwo\nthree\n", "two\nfour", "x", false).unwrap_err().to_string();
+        assert!(err.contains("Closest match at lines 2-3") && err.contains("    2\ttwo"), "{err}");
+        // Ambiguous loose matches are refused.
+        assert!(apply_edit("  x\n y\n", "x\n", "z", false).is_ok());
+        assert!(apply_edit(" x\n  x\n", "x", "z", false).unwrap_err().to_string().contains("2 times"));
+    }
+
+    #[tokio::test]
+    async fn several_edits_apply_together_or_not_at_all() {
+        let dir = TempDir::new("multi-edit");
+        let ws = dir.path();
+        write_file(ws, "m.txt", "alpha\nbeta\ngamma\n").unwrap();
+        let args = json!({"path": "m.txt", "edits": [{"old_str": "alpha", "new_str": "A"}, {"old_str": "gamma", "new_str": "G"}]});
+        let out = execute("edit", &args, ws, &std::sync::atomic::AtomicBool::new(false)).await.unwrap();
+        assert!(out.contains("replaced 2"), "{out}");
+        assert_eq!(std::fs::read_to_string(ws.join("m.txt")).unwrap(), "A\nbeta\nG\n");
+        let bad = json!({"path": "m.txt", "edits": [{"old_str": "beta", "new_str": "B"}, {"old_str": "nope", "new_str": "x"}]});
+        let err = execute("edit", &bad, ws, &std::sync::atomic::AtomicBool::new(false)).await.unwrap_err().to_string();
+        assert!(err.contains("edit 2 of 2"), "{err}");
+        assert_eq!(std::fs::read_to_string(ws.join("m.txt")).unwrap(), "A\nbeta\nG\n", "nothing written when one edit fails");
     }
 
     #[tokio::test]

@@ -197,7 +197,7 @@ impl Default for PermissionsCfg {
     fn default() -> Self {
         let mut defaults = HashMap::new();
         // Safe reads: allow. Anything that mutates the machine: ask.
-        for t in ["read", "list", "glob", "grep", "check_page", "mcp_search"] {
+        for t in ["read", "list", "glob", "grep", "check_page", "mcp_search", "ask_user", "todo"] {
             defaults.insert(t.to_string(), "allow".to_string());
         }
         for t in ["bash", "write", "edit", "webfetch"] {

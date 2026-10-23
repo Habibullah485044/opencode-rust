@@ -70,6 +70,8 @@ pub struct GuiState {
     pub agents: Vec<AgentCard>,
     /// Code editors found on this machine (for "Open in editor").
     pub editors: Vec<String>,
+    /// The open chat's `ask_user` question and its answer buttons.
+    pub question: Option<(String, Vec<String>)>,
     /// New (B-37): the entries as the page last received them, and for which
     /// chat, so a paint only sends what changed. `RefCell` because painting
     /// only has `&GuiState`.
@@ -164,6 +166,7 @@ impl Default for GuiState {
             perm_mode: PermissionMode::Default,
             agents: Vec::new(),
             editors: Vec::new(),
+            question: None,
             sent: std::cell::RefCell::new(Vec::new()),
             sent_session: std::cell::RefCell::new(None),
         }
@@ -395,6 +398,13 @@ impl GuiState {
         // Token counts belong to their chat, open or not.
         if let ServerEvent::Usage { session_id, session, .. } = &ev {
             self.usage.insert(session_id.clone(), *session);
+            return;
+        }
+        if let ServerEvent::Question { session_id, question, options } = ev {
+            if self.is_current(&session_id) {
+                self.push(EntryKind::System, format!("? {question}"));
+                self.question = Some((question, options));
+            }
             return;
         }
         if let ServerEvent::AgentStatus { agent_id, parent_id, name, task, state, detail } = ev {
@@ -707,6 +717,7 @@ impl GuiState {
             "sessions": sessions,
             "agents": agents,
             "editors": self.editors,
+            "question": self.question.as_ref().map(|(q, o)| serde_json::json!({ "text": q, "options": o })),
             "projects": projects,
             "current_project": self.current_project(),
             "entries": entries,
@@ -1621,6 +1632,7 @@ pub async fn run(
                 while let Ok(msg) = ui_rx.try_recv() {
                     match msg {
                         UiMsg::Ipc(IpcMsg::Send(text)) => {
+                            gs.question = None; // answered (or passed over)
                             gs.input = text;
                             if let Some(content) = submit_and_name(&mut gs, &st) {
                                 eprintln!("[gui] run start: {}", clip(&content, 80));
@@ -1717,6 +1729,7 @@ pub async fn run(
                         }
                         UiMsg::Ipc(IpcMsg::Load(id)) => {
                             if gs.session.as_deref() != Some(id.as_str()) {
+                                gs.question = None;
                                 load_session(&mut gs, &st, &id);
                             }
                             changed = true;

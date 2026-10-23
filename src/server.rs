@@ -142,6 +142,9 @@ pub enum ServerEvent {
     ModelInfo { current: String, available: Vec<String> },
     /// M7: live status of a spawned subagent — one card in the agents panel.
     /// `state` is "working", "done" or "failed".
+    /// `ask_user`: a question for the user, with answers they can click.
+    /// The run ends; the answer arrives as the next user message.
+    Question { session_id: String, question: String, options: Vec<String> },
     AgentStatus {
         agent_id: String,
         /// The chat that spawned it.
@@ -1901,7 +1904,11 @@ pub async fn run_loop(
     // A subagent skips `todo`: the plan list belongs to the chat, and the
     // spec is sent with every request.
     if opts.agent.is_some() {
-        specs.retain(|s| s.function.name != "todo");
+        specs.retain(|s| s.function.name != "todo" && s.function.name != "ask_user");
+    }
+    // Turbo means "decide yourself": no questions.
+    if st.turbo() {
+        specs.retain(|s| s.function.name != "ask_user");
     }
     let specs: Vec<_> = match &opts.allow {
         Some(allow) => specs
@@ -2090,6 +2097,15 @@ pub async fn run_loop(
                 None => (id, name, input),
             })
             .collect();
+        // A step that only ticks off todos next to a final answer needs no
+        // further model call (Freebuff's bookkeeping tools): one request saved.
+        let bookkeeping_only = calls.iter().all(|(_, n, i)| {
+            n == "todo" && matches!(i.get("op").and_then(Value::as_str), Some("complete" | "remove" | "list"))
+        });
+        let asked = calls
+            .iter()
+            .find(|(_, n, _)| n == "ask_user")
+            .and_then(|(_, _, i)| i.get("question").and_then(Value::as_str).map(str::to_string));
         // Execute each tool call: role gate → permission gate → route.
         // `spawn` calls run concurrently with each other — the agents panel
         // shows the parallel work — everything else keeps its call order.
@@ -2144,6 +2160,17 @@ pub async fn run_loop(
             meta.into_iter().zip(futures::future::join_all(futs).await)
         {
             finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
+        }
+        // The user was asked: stop until they answer.
+        if let Some(question) = asked.filter(|_| opts.agent.is_none() && !st.turbo()) {
+            final_text = if text.trim().is_empty() { question } else { text };
+            finished = true;
+            break;
+        }
+        if bookkeeping_only && !text.trim().is_empty() {
+            final_text = text;
+            finished = true;
+            break;
         }
     }
     // New (B-26): the steps ran out while the model still wanted tools. Say
@@ -2274,12 +2301,13 @@ fn account_tool(st: &Shared, session_id: &str, name: &str, input: &Value) {
                 s.added += content.lines().count() as u64;
             }
             "edit" => {
-                // New (P-01): the edit tool's keys are old_str / new_str.
-                let old = input.get("old_str").and_then(Value::as_str).unwrap_or("");
-                let new = input.get("new_str").and_then(Value::as_str).unwrap_or("");
+                // New (P-01): the edit tool's keys are old_str / new_str
+                // (or an `edits` list of them).
                 s.edits += 1;
-                s.deleted += old.lines().count() as u64;
-                s.added += new.lines().count() as u64;
+                for (old, new) in edit_pairs(input) {
+                    s.deleted += old.lines().count() as u64;
+                    s.added += new.lines().count() as u64;
+                }
             }
             "bash" => s.bash_runs += 1,
             _ => {}
@@ -2998,6 +3026,19 @@ async fn execute_routed(
             Err(e) => (format!("error: {e:#}"), false),
         };
     }
+    if name == "ask_user" {
+        let question = input.get("question").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if question.is_empty() {
+            return ("error: ask_user needs a `question`".into(), false);
+        }
+        let options: Vec<String> = input
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).take(6).collect())
+            .unwrap_or_default();
+        let _ = st.events.send(ServerEvent::Question { session_id: session_id.to_string(), question, options });
+        return ("The question is on the user's screen. Stop now; their answer comes as the next message.".into(), true);
+    }
     if name == "mcp_search" {
         let query = input.get("query").and_then(Value::as_str).unwrap_or("");
         let specs = st.mcp.lock().await.specs();
@@ -3109,6 +3150,16 @@ fn tool_detail_for(st: &Shared, opts: &LoopOpts, tool: &str, input: &Value) -> S
 }
 
 /// Flatten a tool's input to a human-readable detail string for rules + display.
+/// The (old, new) pairs of an `edit` call: its `edits` list, or the single
+/// old_str / new_str.
+fn edit_pairs(input: &Value) -> Vec<(String, String)> {
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    match input.get("edits").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+        Some(list) => list.iter().map(|e| (s(e, "old_str"), s(e, "new_str"))).collect(),
+        None => vec![(s(input, "old_str"), s(input, "new_str"))],
+    }
+}
+
 /// MCP tools as the model sees them: one by one when there are few, as
 /// `mcp_search` + `mcp_call` when there are many (see `mcp::INLINE_MAX`).
 fn mcp_specs_for_prompt(specs: Vec<crate::provider::ToolSpec>) -> Vec<crate::provider::ToolSpec> {
@@ -3159,8 +3210,15 @@ pub fn approval_preview(tool: &str, input: &Value) -> String {
         "edit" => {
             let all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
             out.push_str(&format!("edit {}{}\n", field("path"), if all { " (every match)" } else { "" }));
-            push_prefixed(&mut out, "- ", field("old_str"), MAX_LINES / 2);
-            push_prefixed(&mut out, "+ ", field("new_str"), MAX_LINES / 2);
+            let pairs = edit_pairs(input);
+            let share = (MAX_LINES / 2 / pairs.len().max(1)).max(2);
+            for (i, (old, new)) in pairs.iter().enumerate() {
+                if pairs.len() > 1 {
+                    out.push_str(&format!("@@ change {} of {}\n", i + 1, pairs.len()));
+                }
+                push_prefixed(&mut out, "- ", old, share);
+                push_prefixed(&mut out, "+ ", new, share);
+            }
         }
         _ => return String::new(),
     }
@@ -4170,6 +4228,75 @@ mod tests {
         run_agent(&st, &s.id, "hi", Arc::new(AtomicBool::new(false))).await;
         assert!(!scratch_dir(&dir).exists(), "cleared after a failed run");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ask_user ends the turn (the answer comes as the next message), and a
+    /// step that only ticks off todos next to a final answer costs no extra
+    /// model call.
+    #[tokio::test]
+    async fn questions_and_bookkeeping_end_the_turn_without_more_calls() {
+        use axum::{routing::post, Router};
+        fn reply(text: &str, name: &str, args: Value) -> String {
+            let frame = serde_json::json!({"choices": [{"delta": {"content": text, "tool_calls": [{
+                "index": 0, "id": "c1", "function": {"name": name, "arguments": args.to_string()}
+            }]}, "finish_reason": null}]});
+            format!("data: {frame}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
+        }
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<Value>| {
+                h.fetch_add(1, Ordering::SeqCst);
+                let last = body["messages"].as_array().and_then(|m| m.last().cloned()).unwrap_or_default();
+                let wants_todo = last["content"].as_str().unwrap_or("").contains("wrap up");
+                async move {
+                    let payload = if wants_todo {
+                        reply("All done: the page is built.", "todo", serde_json::json!({"op": "list"}))
+                    } else {
+                        reply("", "ask_user", serde_json::json!({"question": "Warm or dark theme?", "options": ["Warm", "Dark"]}))
+                    };
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        let s = st.db.create_session("ask", None).unwrap();
+        let opts = LoopOpts {
+            model: None,
+            max_steps: None,
+            system: "s".into(),
+            emit_activity: true,
+            allow: None,
+            can_spawn: false,
+            workspace: None,
+            agent: None,
+        };
+        let mut rx = st.events.subscribe();
+        st.db.add_message(&s.id, "user", &[Part::Text { text: "build it".into() }]).unwrap();
+        let out = run_loop(&st, &s.id, &opts, &AtomicBool::new(false)).await.unwrap();
+        assert_eq!(out, "Warm or dark theme?");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "no call after the question");
+        let mut asked = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::Question { question, options, .. } = ev {
+                asked = Some((question, options));
+            }
+        }
+        assert_eq!(asked, Some(("Warm or dark theme?".to_string(), vec!["Warm".to_string(), "Dark".to_string()])));
+
+        st.db.add_message(&s.id, "user", &[Part::Text { text: "Warm, and wrap up".into() }]).unwrap();
+        let out = run_loop(&st, &s.id, &opts, &AtomicBool::new(false)).await.unwrap();
+        assert_eq!(out, "All done: the page is built.");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "the todo-only final step needed no extra call");
     }
 
     /// A reply that breaks off mid-stream is asked again; the run goes on.
@@ -6180,7 +6307,10 @@ mod prompt_budget_tests {
         assert!(system <= 900, "system prompt ~{system} tokens");
         // 1150 → 1200 for `check_page` (~70 tokens; `todo` was trimmed to pay
         // for most of it): checking the rendered page is the cheapest fix.
-        assert!(tools <= 1200, "tool list ~{tools} tokens ({count} tools)");
+        // 1200 → 1250 for `ask_user` and multi-edit (read/glob/grep were
+        // shortened to pay for half): a question with buttons saves a wrong
+        // guess, one edit call with several changes saves round trips.
+        assert!(tools <= 1250, "tool list ~{tools} tokens ({count} tools)");
         assert!(st.usage_report(&s.id).contains("Each request of this chat starts with about"));
         let _ = std::fs::remove_dir_all(&dir);
     }

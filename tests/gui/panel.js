@@ -543,6 +543,20 @@
   window.render(payload(basePage));
   ok("no editor, no button", edBtn.hidden);
 
+  // --- ask_user: question with answer buttons ---
+  var askPage = payload(basePage);
+  askPage.question = { text: "Which color theme?", options: ["Warm brown", "Dark roast"] };
+  window.render(askPage);
+  var askBox = document.getElementById("ask-box");
+  ok("a question shows with one button per answer", !askBox.hidden &&
+    document.getElementById("ask-text").textContent === "Which color theme?" &&
+    document.querySelectorAll("#ask-options .ask-opt").length === 2);
+  sent = [];
+  document.querySelectorAll("#ask-options .ask-opt")[1].click();
+  ok("clicking an answer sends it", (last("send") || {}).text === "Dark roast", JSON.stringify(sent));
+  window.render(payload(basePage));
+  ok("no question, no box", askBox.hidden);
+
   // --- A4: agents panel ---
   try { localStorage.removeItem("habi.agents.collapsed"); } catch (e) { /* ignore */ }
   var agentsEl = document.getElementById("agents");

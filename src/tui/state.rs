@@ -393,6 +393,8 @@ pub struct App {
     pub model: Option<String>,
     /// M7: spawned-subagent cards for the agents panel (live while they run).
     pub agents: Vec<AgentCard>,
+    /// Answers offered by the last `ask_user` question (typing its number picks one).
+    pub last_question_options: Vec<String>,
     /// Redraw counter — drives the busy spinner frame.
     pub tick: u64,
 }
@@ -435,6 +437,7 @@ impl App {
             sessions: None,
             model: None,
             agents: Vec::new(),
+            last_question_options: Vec::new(),
             tick: 0,
         }
     }
@@ -528,12 +531,23 @@ impl App {
                 None
             }
             KeyCode::Enter => {
-                let content = std::mem::take(&mut self.input);
+                let mut content = std::mem::take(&mut self.input);
                 self.cursor = 0;
                 self.palette = None;
                 if content.trim().is_empty() {
                     return None;
                 }
+                // A number answers the last question with that option.
+                let picked = content
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|i| self.last_question_options.get(i).cloned());
+                if let Some(answer) = picked {
+                    content = answer;
+                }
+                self.last_question_options.clear();
                 if classify(&content) == Some(Command::Quit) {
                     self.should_quit = true;
                     return None;
@@ -1148,6 +1162,18 @@ impl App {
                     }
                 }
                 self.push(EntryKind::System, text); // B-33: busy unchanged
+            }
+            ServerEvent::Question { question, options, .. } => {
+                // The TUI has no buttons: number the answers; typing one replies.
+                let mut text = format!("? {question}");
+                for (i, o) in options.iter().enumerate() {
+                    text.push_str(&format!("\n   {}. {o}", i + 1));
+                }
+                if !options.is_empty() {
+                    text.push_str("\n   (type an answer, or its number)");
+                }
+                self.last_question_options = options;
+                self.push(EntryKind::System, text);
             }
             ServerEvent::AgentStatus { agent_id, name, task, state, detail, .. } => {
                 let state = match state.as_str() {
