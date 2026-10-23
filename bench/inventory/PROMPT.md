@@ -21,5 +21,12 @@ python -I bench/inventory/score.py <the folder the tool worked in>
 ```
 
 It checks 12 behaviours against hidden cases (the tool never sees them), runs
-the tool's own tests, and prints a score out of 100. Also note for each run:
+the tool's own tests, and prints a score out of 100. It then prints three "extra
+quality" checks the prompt does not ask for (a corrupt data file is not
+overwritten, loose quantities like `+5` or `1_000` are refused, no scratch
+files are left behind). They are not part of the score.
+
+First results (2026-10-23, same model): Freebuff 100/100, extra 1/3;
+opencode-rust 72/100, extra 0/3 (the run ended on an OpenRouter rate limit
+after the Windows shell bug; both fixed since). Also note for each run:
 the time it took, and the tokens or credits it used (`/usage` in opencode-rust).

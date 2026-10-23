@@ -122,6 +122,42 @@ def main():
     print(f"tests written: {passed} passing  (+{bonus})")
     score += bonus
     print(f"\nSCORE {score}/100   behaviours {sum(ok for _, ok, _ in results)}/{len(results)}")
+    extra = extra_quality(sol)
+    print("\nExtra quality (not asked in the prompt; not part of the score):")
+    for name, ok, got in extra:
+        print(("  PASS " if ok else "  FAIL ") + name + ("" if ok else f"   got: {ascii(got)}"[:160]))
+    print(f"EXTRA {sum(ok for _, ok, _ in extra)}/{len(extra)}")
+
+
+# Root files a finished project may have besides the package and its tests.
+ALLOWED_ROOT = {"README.md", "README", "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
+                "conftest.py", "pytest.ini", "tox.ini", "LICENSE", ".gitignore"}
+
+
+def extra_quality(sol):
+    """What a careful senior developer does without being asked."""
+    out = []
+    cwd = tempfile.mkdtemp(prefix="inv-extra-")
+    junk = "{not json"
+    with open(os.path.join(cwd, "inventory.json"), "w", encoding="utf-8") as f:
+        f.write(junk)
+    run(sol, cwd, "add", "a", "1")
+    with open(os.path.join(cwd, "inventory.json"), encoding="utf-8") as f:
+        kept = f.read() == junk
+    out.append(("a corrupt inventory.json is not overwritten (no silent data loss)", kept, "file was replaced"))
+
+    loose = []
+    for q in ("+5", " 5", "1_000", "٣"):  # the last is an Arabic-Indic 3
+        (code, _, _), _ = case(sol, [["add", "a", q]])
+        loose.append((q, code))
+    out.append(("quantities with a sign, spaces, underscores or non-ASCII digits are refused",
+                all(c == 2 for _, c in loose), loose))
+
+    extra_files = [n for n in os.listdir(sol)
+                   if not n.startswith(".") and n not in ALLOWED_ROOT
+                   and n not in ("inventory", "tests") and n != "__pycache__"]
+    out.append(("no leftover scratch files or test data in the project", not extra_files, extra_files))
+    return out
 
 
 if __name__ == "__main__":

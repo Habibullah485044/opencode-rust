@@ -160,8 +160,11 @@ pub fn builtin_subagents() -> Vec<SubagentDef> {
             "Checks a change against the task, runs tests, reports problems. No edits.",
             "You are a review subagent. Check the work described in the task: read the changed \
              code, run the tests or the build when you can, and compare the result with what was \
-             asked. Report each real problem with file:line and how to fix it, most serious \
-             first. If it is good, say so in one line. Do not edit files.",
+             asked. Also try to break it: bad or corrupt input (including files it reads), \
+             a crash or failed write that loses data, too-loose parsing of numbers and \
+             arguments, wrong exit codes or messages, temporary files left in the project. \
+             Report each real problem with file:line and how to fix it, most serious first. \
+             If it is good, say so in one line. Do not edit files.",
             Some(&["read", "list", "glob", "grep", "bash"]),
             true,
         ),
