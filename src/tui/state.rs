@@ -639,20 +639,13 @@ impl App {
                     Some(Command::Quit) => unreachable!("handled above"),
                     None => {
                         // A builtin verb with missing/invalid args (bare
-                        // `/resume`, `/team`, …) is a usage mistake — say so
-                        // in the transcript instead of silently handing it
-                        // to the model as chat. Unknown verbs still go
-                        // through (user command templates, plain text).
-                        let verb = content
-                            .trim()
-                            .strip_prefix('/')
-                            .and_then(|r| r.split_whitespace().next());
-                        match verb.and_then(|v| builtins().into_iter().find(|b| b.name == v)) {
-                            Some(b) => {
-                                self.push(
-                                    EntryKind::Error,
-                                    format!("usage: {} — see /help for all commands", b.usage()),
-                                );
+                        // `/resume`, `/ponytail max`, …) is a usage mistake —
+                        // say so in the transcript instead of silently
+                        // handing it to the model as chat. Unknown verbs
+                        // still go through (user command templates, text).
+                        match crate::commands::usage_error(&content) {
+                            Some(msg) => {
+                                self.push(EntryKind::Error, msg);
                                 (None, false)
                             }
                             None => (Some(InputAction::Prompt(content)), true),

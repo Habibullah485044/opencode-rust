@@ -319,6 +319,12 @@ async fn headless_run(
 
     // Subscribe before starting so we see every event.
     let mut rx = state.events.subscribe();
+    // A builtin with missing or invalid arguments is a usage mistake, as in
+    // the TUI: say so instead of sending it to the model as chat.
+    if let Some(msg) = opencode_rust::commands::usage_error(&prompt) {
+        eprintln!("{msg}");
+        std::process::exit(2);
+    }
     // M2: builtin commands that make sense headless.
     let mut team_spawned = false;
     if let Some(cmd) = opencode_rust::commands::classify(&prompt) {
@@ -522,9 +528,16 @@ async fn headless_run(
                 println!("{}", state.debt_report(&session.id));
                 return Ok(());
             }
-            Cmd::Ponytail(_) => {
+            Cmd::Ponytail(level) => {
                 // P-05: a level lives in one session; set agent.ponytail for headless.
                 println!("[ponytail] level: {}", state.ponytail_level(&session.id).as_str());
+                if level.is_some() {
+                    println!(
+                        "[ponytail] not changed: a level lasts one session, and a headless run ends \
+                         here. Use the TUI, or turn the rules on/off with `ponytail` under [agent] \
+                         in the config."
+                    );
+                }
                 return Ok(());
             }
             Cmd::Parallel(task) => {

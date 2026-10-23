@@ -129,6 +129,19 @@ pub fn help_text() -> String {
     out
 }
 
+/// A builtin verb with missing or invalid arguments (bare `/resume`,
+/// `/ponytail max`, …) is a usage mistake: the message to show instead of
+/// handing the line to the model as chat. `None` for a valid builtin, plain
+/// text, or an unknown verb (user command templates go through).
+pub fn usage_error(input: &str) -> Option<String> {
+    if classify(input).is_some() {
+        return None;
+    }
+    let verb = input.trim().strip_prefix('/')?.split_whitespace().next()?;
+    let b = builtins().into_iter().find(|b| b.name == verb)?;
+    Some(format!("usage: {} — see /help for all commands", b.usage()))
+}
+
 /// Parse a builtin command from a typed line. `None` = not a builtin
 /// (prompt, user command template, or bare `/verb` we don't know).
 pub fn classify(input: &str) -> Option<Command> {
@@ -340,6 +353,16 @@ mod tests {
         assert_eq!(classify("/ponytail ultra"), Some(Command::Ponytail(Some(PonytailLevel::Ultra))));
         assert_eq!(classify("/ponytail OFF"), Some(Command::Ponytail(Some(PonytailLevel::Off))));
         assert_eq!(classify("/ponytail max"), None, "unknown level");
+    }
+
+    #[test]
+    fn bad_builtin_arguments_are_usage_errors() {
+        let e = usage_error("/ponytail max").expect("unknown level");
+        assert!(e.contains("/ponytail [level]"), "{e}");
+        assert!(usage_error("/resume").is_some(), "missing argument");
+        assert_eq!(usage_error("/ponytail ultra"), None, "valid builtin");
+        assert_eq!(usage_error("fix the bug"), None, "plain text");
+        assert_eq!(usage_error("/mytemplate x"), None, "unknown verbs go through");
     }
 
     #[test]
