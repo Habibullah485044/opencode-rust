@@ -17,11 +17,11 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         spec(
             "bash",
             &format!(
-                "Run a shell command in the workspace with {}. Prefer specialized tools \
-                 (read/write/edit/grep/glob) over raw commands.",
+                "Run a shell command with {}. Prefer the file tools. background:true \
+                 for servers (gives a job id); {{job}} reads its output, {{job, stop:true}} stops it.",
                 shell_label()
             ),
-            json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer"}},"required":["command"]}),
+            json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer"},"background":{"type":"boolean"},"job":{"type":"string"},"stop":{"type":"boolean"}}}),
         ),
         spec(
             "read",
@@ -50,7 +50,7 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "webfetch",
-            "Fetch a URL and return its text (html stripped), or search the web with `query` instead.",
+            "Fetch a URL as text, or search the web with `query`.",
             json!({"type":"object","properties":{"url":{"type":"string"},"query":{"type":"string"}}}),
         ),
         spec(
@@ -98,6 +98,17 @@ pub async fn execute(
         bail!("not run: the run was aborted");
     }
     match name {
+        "bash" if is_job_control(name, args) => {
+            let id = arg_str(args, "job")?;
+            if args.get("stop").and_then(Value::as_bool).unwrap_or(false) {
+                jobs::stop(id).await
+            } else {
+                jobs::output(id)
+            }
+        }
+        "bash" if args.get("background").and_then(Value::as_bool).unwrap_or(false) => {
+            jobs::start(arg_str(args, "command")?, workspace)
+        }
         "bash" => {
             let cmd = arg_str(args, "command")?;
             let timeout = args
@@ -238,7 +249,7 @@ pub fn shell_kind() -> crate::permissions::Shell {
 fn shell_label() -> &'static str {
     match shell_kind() {
         crate::permissions::Shell::Posix if cfg!(windows) => {
-            "bash (Git Bash on Windows: POSIX syntax and tools; drive C: is /c/)"
+            "bash (Git Bash: POSIX syntax and tools)"
         }
         crate::permissions::Shell::Posix => "sh",
         crate::permissions::Shell::Cmd => {
@@ -323,6 +334,123 @@ async fn bash(
 }
 
 /// New (B-06): read a child's pipe to the end (empty when there is none).
+/// `bash {job}` / `bash {job, stop}`: reading or stopping a background job
+/// the agent already started (and was allowed to start). Needs no approval.
+pub fn is_job_control(name: &str, args: &Value) -> bool {
+    name == "bash" && args.get("job").and_then(Value::as_str).is_some() && args.get("command").is_none()
+}
+
+/// Background commands (dev servers, watchers): `bash {command, background:
+/// true}` starts one and returns its id; `bash {job}` returns the output
+/// since the last read and whether it still runs; `bash {job, stop: true}`
+/// stops it and everything it started.
+mod jobs {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// Most output kept per job (older output is dropped).
+    const KEEP: usize = 1_000_000;
+
+    struct Job {
+        command: String,
+        pid: Option<u32>,
+        out: Arc<Mutex<Vec<u8>>>,
+        /// Bytes dropped from the front of `out` so far.
+        dropped: Arc<Mutex<usize>>,
+        read_to: usize,
+        exit: Arc<Mutex<Option<String>>>,
+    }
+
+    fn jobs() -> &'static Mutex<HashMap<String, Job>> {
+        static J: OnceLock<Mutex<HashMap<String, Job>>> = OnceLock::new();
+        J.get_or_init(Default::default)
+    }
+
+    pub fn start(command: &str, workspace: &Path) -> Result<String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut cmd = shell_command(command);
+        cmd.current_dir(workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        scrub_secrets(&mut cmd);
+        let mut child = cmd.spawn().with_context(|| format!("starting `{command}`"))?;
+        let id = format!("job{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(Mutex::new(0usize));
+        let exit = Arc::new(Mutex::new(None));
+        for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+                     child.stderr.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>)]
+            .into_iter()
+            .flatten()
+        {
+            let (out, dropped) = (out.clone(), dropped.clone());
+            tokio::spawn(async move {
+                let mut pipe = pipe;
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = tokio::io::AsyncReadExt::read(&mut pipe, &mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let mut o = out.lock().unwrap_or_else(|e| e.into_inner());
+                    o.extend_from_slice(&buf[..n]);
+                    if o.len() > KEEP {
+                        let cut = o.len() - KEEP;
+                        o.drain(..cut);
+                        *dropped.lock().unwrap_or_else(|e| e.into_inner()) += cut;
+                    }
+                }
+            });
+        }
+        let pid = child.id();
+        let exit_slot = exit.clone();
+        tokio::spawn(async move {
+            let status = child.wait().await;
+            *exit_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(match status {
+                Ok(s) => format!("exited with code {}", s.code().unwrap_or(-1)),
+                Err(e) => format!("failed: {e}"),
+            });
+        });
+        jobs().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id.clone(),
+            Job { command: command.to_string(), pid, out, dropped, read_to: 0, exit },
+        );
+        Ok(format!(
+            "started {id} in the background: `{command}`. Read its output with bash {{\"job\": \"{id}\"}}; \
+             stop it with bash {{\"job\": \"{id}\", \"stop\": true}}."
+        ))
+    }
+
+    pub fn output(id: &str) -> Result<String> {
+        let mut map = jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let job = map.get_mut(id).ok_or_else(|| anyhow!("no background job `{id}` (ids look like job1)"))?;
+        let o = job.out.lock().unwrap_or_else(|e| e.into_inner());
+        let dropped = *job.dropped.lock().unwrap_or_else(|e| e.into_inner());
+        let start = job.read_to.saturating_sub(dropped).min(o.len());
+        let new = String::from_utf8_lossy(&o[start..]).into_owned();
+        job.read_to = dropped + o.len();
+        drop(o);
+        let state = job.exit.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| "still running".into());
+        let body = if new.trim().is_empty() { "(no new output)".to_string() } else { truncate_middle(&new, 3_000, 9_000) };
+        Ok(format!("{id} `{}` — {state}\n{body}", job.command))
+    }
+
+    pub async fn stop(id: &str) -> Result<String> {
+        let pid = {
+            let map = jobs().lock().unwrap_or_else(|e| e.into_inner());
+            let job = map.get(id).ok_or_else(|| anyhow!("no background job `{id}`"))?;
+            if job.exit.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                return Ok(format!("{id} had already ended"));
+            }
+            job.pid
+        };
+        kill_tree(pid).await;
+        Ok(format!("stopped {id}"))
+    }
+}
+
 async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
     let mut buf = Vec::new();
     if let Some(p) = pipe.as_mut() {
@@ -1273,6 +1401,48 @@ mod tests {
         // Ambiguous loose matches are refused.
         assert!(apply_edit("  x\n y\n", "x\n", "z", false).is_ok());
         assert!(apply_edit(" x\n  x\n", "x", "z", false).unwrap_err().to_string().contains("2 times"));
+    }
+
+    /// A background job keeps running; its output is read in pieces, and
+    /// stop ends it.
+    #[tokio::test]
+    async fn background_jobs_start_report_and_stop() {
+        if shell_kind() != crate::permissions::Shell::Posix {
+            return;
+        }
+        let dir = TempDir::new("jobs");
+        let no = std::sync::atomic::AtomicBool::new(false);
+        let started = execute("bash", &json!({"command": "echo ONE$((0+1)); sleep 1; echo TWO$((1+1)); sleep 30", "background": true}), dir.path(), &no)
+            .await
+            .unwrap();
+        let id = started.split_whitespace().nth(1).unwrap().to_string();
+        assert!(id.starts_with("job"), "{started}");
+        assert!(is_job_control("bash", &json!({"job": id})));
+        assert!(!is_job_control("bash", &json!({"job": id, "command": "rm -rf x"})), "a command always needs approval");
+        // The shell may take a while to start: wait for each line.
+        async fn read_until(id: &str, ws: &Path, want: &str) -> String {
+            let no = std::sync::atomic::AtomicBool::new(false);
+            let mut all = String::new();
+            for _ in 0..100 {
+                let out = execute("bash", &json!({"job": id}), ws, &no).await.unwrap();
+                all.push_str(&out);
+                if all.contains(want) {
+                    return all;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            all
+        }
+        let out = read_until(&id, dir.path(), "ONE1").await;
+        assert!(out.contains("still running") && out.contains("ONE1") && !out.contains("TWO2"), "{out}");
+        let out = read_until(&id, dir.path(), "TWO2").await;
+        assert!(out.contains("TWO2") && !out.contains("ONE1"), "only new output: {out}");
+        let out = execute("bash", &json!({"job": id, "stop": true}), dir.path(), &no).await.unwrap();
+        assert!(out.contains("stopped"), "{out}");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let out = execute("bash", &json!({"job": id}), dir.path(), &no).await.unwrap();
+        assert!(out.contains("exited"), "{out}");
+        assert!(execute("bash", &json!({"job": "job999"}), dir.path(), &no).await.is_err());
     }
 
     #[tokio::test]

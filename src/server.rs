@@ -2122,6 +2122,8 @@ pub async fn run_loop(
                 Some("not run: the run was aborted".to_string())
             } else if !tool_allowed(mode, opts, &name) {
                 Some("tool blocked: not allowed in this mode/role".to_string())
+            } else if crate::tools::is_job_control(&name, &input) {
+                None // reading or stopping a job it was allowed to start
             } else if !check_permission_preview(
                 st,
                 session_id,
