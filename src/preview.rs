@@ -67,6 +67,16 @@ pub fn open_preview(url: &str, title: &str, exit_after: Option<std::time::Durati
 
     let started = std::time::Instant::now();
     let mut auto_logged = false;
+    // `ControlFlow::WaitUntil` alone did not wake the loop on Windows (the
+    // window stayed open forever, seen with a page that failed to load), so
+    // a timer thread sends the loop an event when the time is up.
+    if let Some(d) = exit_after {
+        let proxy = event_loop.create_proxy();
+        std::thread::spawn(move || {
+            std::thread::sleep(d);
+            let _ = proxy.send_event(());
+        });
+    }
     event_loop.run(move |event, _, control_flow| {
         let mut exit = false;
         match event {
