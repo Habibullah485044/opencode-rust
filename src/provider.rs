@@ -182,7 +182,9 @@ impl Client {
         let stall = std::time::Duration::from_secs(timeout_secs.clamp(5, 120));
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
-            .connect_timeout(std::time::Duration::from_secs(10))
+            // Split over the host's addresses: a dead one costs 3 s (two
+            // addresses) before the next is tried.
+            .connect_timeout(std::time::Duration::from_secs(6))
             .build()?;
         Ok(Self {
             http,

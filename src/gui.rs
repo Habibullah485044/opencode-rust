@@ -77,6 +77,8 @@ pub struct GuiState {
     /// Next-step buttons after a run: (label, what to send; `@changes`
     /// opens the Changes view).
     pub followups: Vec<(String, String)>,
+    /// The last status check, in words (tooltip of the API pill).
+    pub api_detail: String,
     /// The project's git branch and how many files changed, if git.
     pub git: Option<(String, usize)>,
     /// Read the git state again (after a run, a chat switch).
@@ -201,6 +203,7 @@ impl Default for GuiState {
             commands: Vec::new(),
             file_matches: (String::new(), Vec::new()),
             followups: Vec::new(),
+            api_detail: String::new(),
             git: None,
             git_stale: true,
             question: None,
@@ -602,7 +605,10 @@ impl GuiState {
                 }
             }
             // SessionCreated / SessionLoaded are handled in `on_event` (B-12).
-            ServerEvent::Heartbeat { ok, latency_ms } => self.api = Some((ok, latency_ms)),
+            ServerEvent::Heartbeat { ok, latency_ms, detail } => {
+                self.api = Some((ok, latency_ms));
+                self.api_detail = detail;
+            }
             ServerEvent::DevServer { url, .. } => self.dev_server = Some(url),
             ServerEvent::ApprovalNeeded { session_id, approval_id, tool, detail, .. } => {
                 // The run is blocked until this is answered (or times out).
@@ -790,6 +796,7 @@ impl GuiState {
             "busy": self.busy,
             "perm_mode": self.perm_mode.as_str(),
             "api": self.api.map(|(ok, ms)| serde_json::json!([ok, ms])),
+            "api_detail": self.api_detail,
             "sessions": sessions,
             "agents": agents,
             "editors": self.editors,

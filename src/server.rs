@@ -133,7 +133,13 @@ pub enum ServerEvent {
     EditApplied { session_id: String, path: String, line: usize },
     /// M5: periodic endpoint probe — keeps quick tunnels warm and drives the
     /// TUI's `api ok/DOWN` header indicator.
-    Heartbeat { ok: bool, latency_ms: u64 },
+    Heartbeat {
+        ok: bool,
+        latency_ms: u64,
+        /// What the check asked and got, e.g. "GET https://x/v1/models → 404".
+        #[serde(default)]
+        detail: String,
+    },
     /// Laziness Meter: a senior-dev note (reuse hint / overbuild flag / info).
     Note { session_id: String, text: String },
     /// Laziness Meter: live per-session line totals for the status bar.
@@ -449,13 +455,19 @@ impl AppState {
                 return;
             };
             let key = st.cfg.provider.api_key.clone();
+            // A connect timeout of its own: reqwest splits it over the
+            // host's addresses, so one dead address (seen with Cloudflare
+            // tunnels: one of two IPs never answers on some networks) costs
+            // 2 s and the next is tried, instead of using up the whole check.
             let http = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(8))
+                .connect_timeout(std::time::Duration::from_secs(4))
+                .timeout(std::time::Duration::from_secs(12))
                 .build()
             {
                 Ok(c) => c,
                 Err(_) => return,
             };
+            let mut last_ok = None;
             loop {
                 let t0 = std::time::Instant::now();
                 // Require 2xx: Cloudflare error pages (530/1030/1033) arrive
@@ -466,19 +478,43 @@ impl AppState {
                     st.cfg.provider.api,
                     &key,
                 );
-                let ok = req
-                    .send()
-                    .await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
-                let _ = st.events.send(ServerEvent::Heartbeat {
-                    ok,
-                    latency_ms: t0.elapsed().as_millis() as u64,
-                });
+                let (ok, got) = match req.send().await {
+                    Ok(r) => (r.status().is_success(), r.status().to_string()),
+                    Err(e) => (false, heartbeat_error(&e)),
+                };
+                let latency_ms = t0.elapsed().as_millis() as u64;
+                let detail = format!("GET {base}/models → {got} ({latency_ms} ms)");
+                // Say it once per change, so a failing check is never silent.
+                if last_ok != Some(ok) {
+                    let line = format!("[api] {} — {detail}", if ok { "online" } else { "offline" });
+                    eprintln!("{line}");
+                    core_log(&line);
+                    last_ok = Some(ok);
+                }
+                let _ = st.events.send(ServerEvent::Heartbeat { ok, latency_ms, detail });
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             }
         });
     }
+}
+
+/// A failed status check in plain words (the cause chain, not just the
+/// outermost "error sending request").
+fn heartbeat_error(e: &reqwest::Error) -> String {
+    let kind = if e.is_timeout() {
+        "timed out"
+    } else if e.is_connect() {
+        "could not connect"
+    } else {
+        "request failed"
+    };
+    let mut cause = String::new();
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        cause = s.to_string();
+        src = s.source();
+    }
+    if cause.is_empty() { kind.to_string() } else { format!("{kind}: {cause}") }
 }
 
 pub fn router(state: Shared) -> Router {

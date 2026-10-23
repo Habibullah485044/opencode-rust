@@ -186,9 +186,9 @@
     fn heartbeat_drives_api_status() {
         let mut app = App::new();
         assert!(app.api.is_none());
-        app.on_event(ServerEvent::Heartbeat { ok: true, latency_ms: 42 });
+        app.on_event(ServerEvent::Heartbeat { ok: true, latency_ms: 42, detail: String::new() });
         assert_eq!(app.api, Some((true, 42)));
-        app.on_event(ServerEvent::Heartbeat { ok: false, latency_ms: 8000 });
+        app.on_event(ServerEvent::Heartbeat { ok: false, latency_ms: 8000, detail: String::new() });
         assert_eq!(app.api, Some((false, 8000)));
     }
 

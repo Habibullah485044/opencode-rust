@@ -344,7 +344,7 @@ pub fn is_job_control(name: &str, args: &Value) -> bool {
 /// true}` starts one and returns its id; `bash {job}` returns the output
 /// since the last read and whether it still runs; `bash {job, stop: true}`
 /// stops it and everything it started.
-mod jobs {
+pub mod jobs {
     use super::*;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -354,6 +354,9 @@ mod jobs {
 
     struct Job {
         command: String,
+        /// Started from the desktop terminal panel (not by the agent).
+        by_user: bool,
+        cwd: PathBuf,
         pid: Option<u32>,
         out: Arc<Mutex<Vec<u8>>>,
         /// Bytes dropped from the front of `out` so far.
@@ -368,6 +371,16 @@ mod jobs {
     }
 
     pub fn start(command: &str, workspace: &Path) -> Result<String> {
+        let id = spawn(command, workspace, false)?;
+        Ok(format!(
+            "started {id} in the background: `{command}`. Read its output with bash {{\"job\": \"{id}\"}}; \
+             stop it with bash {{\"job\": \"{id}\", \"stop\": true}}."
+        ))
+    }
+
+    /// Start `command` in `workspace` and return its id. `by_user` marks a
+    /// command typed in the desktop terminal panel.
+    pub fn spawn(command: &str, workspace: &Path, by_user: bool) -> Result<String> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut cmd = shell_command(command);
         cmd.current_dir(workspace)
@@ -377,7 +390,8 @@ mod jobs {
             .kill_on_drop(true);
         scrub_secrets(&mut cmd);
         let mut child = cmd.spawn().with_context(|| format!("starting `{command}`"))?;
-        let id = format!("job{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = if by_user { format!("term{n}") } else { format!("job{n}") };
         let out = Arc::new(Mutex::new(Vec::new()));
         let dropped = Arc::new(Mutex::new(0usize));
         let exit = Arc::new(Mutex::new(None));
@@ -415,12 +429,71 @@ mod jobs {
         });
         jobs().lock().unwrap_or_else(|e| e.into_inner()).insert(
             id.clone(),
-            Job { command: command.to_string(), pid, out, dropped, read_to: 0, exit },
+            Job {
+                command: command.to_string(),
+                by_user,
+                cwd: workspace.to_path_buf(),
+                pid,
+                out,
+                dropped,
+                read_to: 0,
+                exit,
+            },
         );
-        Ok(format!(
-            "started {id} in the background: `{command}`. Read its output with bash {{\"job\": \"{id}\"}}; \
-             stop it with bash {{\"job\": \"{id}\", \"stop\": true}}."
-        ))
+        Ok(id)
+    }
+
+    /// One job as the terminal panel shows it.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct JobView {
+        pub id: String,
+        pub command: String,
+        pub by_user: bool,
+        pub cwd: PathBuf,
+        /// `None` while it runs, else how it ended.
+        pub exit: Option<String>,
+        /// The end of its output (lossy UTF-8, whole lines).
+        pub tail: String,
+        /// All output bytes so far (to tell when something new came in).
+        pub total: usize,
+    }
+
+    /// Every job, oldest first, with the last `max` bytes of its output.
+    /// The agent's read position (`output`) is not moved.
+    pub fn list(max: usize) -> Vec<JobView> {
+        let map = jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let mut v: Vec<JobView> = map
+            .iter()
+            .map(|(id, j)| {
+                let o = j.out.lock().unwrap_or_else(|e| e.into_inner());
+                let dropped = *j.dropped.lock().unwrap_or_else(|e| e.into_inner());
+                let mut start = o.len().saturating_sub(max);
+                // Start on a line, so the panel never shows half a line.
+                if start > 0 {
+                    if let Some(nl) = o[start..].iter().position(|&b| b == b'\n') {
+                        start += nl + 1;
+                    }
+                }
+                JobView {
+                    id: id.clone(),
+                    command: j.command.clone(),
+                    by_user: j.by_user,
+                    cwd: j.cwd.clone(),
+                    exit: j.exit.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                    tail: String::from_utf8_lossy(&o[start..]).into_owned(),
+                    total: dropped + o.len(),
+                }
+            })
+            .collect();
+        let num = |id: &str| id.trim_start_matches(|c: char| c.is_ascii_alphabetic()).parse::<u64>().unwrap_or(0);
+        v.sort_by_key(|j| num(&j.id));
+        v
+    }
+
+    /// Forget the ended commands the user typed (the terminal's Clear).
+    pub fn clear_user_jobs() {
+        let mut map = jobs().lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, j| !(j.by_user && j.exit.lock().unwrap_or_else(|e| e.into_inner()).is_some()));
     }
 
     pub fn output(id: &str) -> Result<String> {
@@ -1099,6 +1172,7 @@ async fn fetch_body(url: &str, allowed: fn(std::net::IpAddr) -> bool) -> Result<
         }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
             .user_agent("opencode-rust/0.1")
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(&host, &addrs)
