@@ -75,7 +75,9 @@ function run(){var o={w:innerWidth,overflow:document.documentElement.scrollWidth
  var btn=document.querySelector('header [aria-expanded]');
  o.btn=!!btn;o.btnControls=!!(btn&&btn.getAttribute('aria-controls'));
  var links=document.querySelectorAll('header nav a');
- o.linksBefore=links.length?vis(links[0]):false;
+ // A slide-in menu parks its links off-screen (transform): not visible.
+ var onscreen=function(el){var r=el.getBoundingClientRect();return r.right>1&&r.left<innerWidth-1;};
+ o.linksBefore=links.length?(vis(links[0])&&onscreen(links[0])):false;
  if(btn&&vis(btn)){btn.click();o.expOpen=btn.getAttribute('aria-expanded');
   o.linksOpen=links.length?vis(links[links.length-1]):false;
   btn.click();o.expClosed=btn.getAttribute('aria-expanded');}

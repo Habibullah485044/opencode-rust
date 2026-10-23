@@ -333,7 +333,7 @@ async fn serve_harness(
 
 /// Runs first: collect script errors and failed loads from the start.
 const EARLY: &str = "<script>window.__errs=[];window.__fails=[];\
-addEventListener('error',function(e){var t=e.target;if(t&&t!==window&&(t.src||t.href)){__fails.push(t.src||t.href)}\
+addEventListener('error',function(e){var t=e.target;if(t&&t!==window&&(t.src||t.href)){__fails.push(t)}\
 else{__errs.push(String(e.message||'error'))}},true);\
 addEventListener('unhandledrejection',function(e){__errs.push('unhandled promise rejection: '+e.reason)});\
 (function(){var ce=console.error;console.error=function(){try{__errs.push([].map.call(arguments,String).join(' '))}catch(x){}\
@@ -374,7 +374,13 @@ function run(){
  var svgs=document.querySelectorAll('svg');for(var s=0;s<svgs.length;s++){var sv=svgs[s];
   if(vis(sv)&&!sv.querySelector('path,circle,rect,line,polyline,polygon,ellipse,use,text,image')){P.push('an svg icon draws nothing: '+desc(sv));break;}}
  var imgs=document.images;for(var m=0;m<imgs.length;m++){if(imgs[m].complete&&imgs[m].naturalWidth===0&&vis(imgs[m]))P.push('an image does not load: '+(imgs[m].getAttribute('src')||desc(imgs[m])));}
- (window.__fails||[]).filter(function(u){return u.indexOf(location.origin)===0}).slice(0,5).forEach(function(u){P.push('a file failed to load: '+u.slice(location.origin.length))});
+ // Files of this page that did not load: the browser's own request log
+ // with HTTP status (error events miss stylesheet 404s, and a stylesheet
+ // whose @import of an outside font fails, blocked here, fires one wrongly).
+ var bad={};(performance.getEntriesByType('resource')||[]).forEach(function(r){
+  if(r.name.indexOf(location.origin)===0&&(r.responseStatus>=400||r.responseStatus===0))bad[r.name]=1;});
+ (window.__fails||[]).forEach(function(t){var u=t.src||t.href||'';if(u.indexOf(location.origin)===0&&!(t.tagName==='LINK'&&t.sheet))bad[u]=1;});
+ Object.keys(bad).slice(0,5).forEach(function(u){P.push('a file failed to load: '+decodeURI(u.slice(location.origin.length).replace(/^\/p\/[0-9a-f]+\//,'').split('?')[0]))});
  var E=(window.__errs||[]);if(E.length)P.push('script error'+(E.length>1?'s':'')+': '+E.slice(0,3).join(' | '));else OK.push('no script errors');
  if(W<768){
   if(!links.length&&!(btn&&vis(btn)))P.push('the navigation cannot be reached: its links are hidden and there is no visible menu button');
@@ -421,7 +427,14 @@ pub async fn check(root: &Path, page: &str, widths: &[u32], expect: &[String]) -
     let exe = find_browser().ok_or_else(|| {
         anyhow!("no Edge or Chrome found to check the page with (set OPENCODE_RUST_BROWSER to its path)")
     })?;
-    let rel = file.strip_prefix(root.canonicalize().unwrap_or_else(|_| root.to_path_buf())).map(|p| p.to_path_buf()).unwrap_or_else(|_| PathBuf::from(page));
+    // `confine_path` keeps the workspace spelled as given (no `\\?\`), so
+    // strip that form; an absolute `page` becomes relative here too.
+    let base = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let rel = file
+        .strip_prefix(&base)
+        .or_else(|_| file.strip_prefix(root.canonicalize().unwrap_or_else(|_| root.to_path_buf())))
+        .map(|p| p.to_path_buf())
+        .map_err(|_| anyhow!("{page} is outside the folder being checked"))?;
     let rel = url_path(&rel.to_string_lossy());
     let (p, token) = serve_root(root).await?;
     let widths: Vec<u32> = if widths.is_empty() { DEFAULT_WIDTHS.to_vec() } else { widths.to_vec() };
@@ -638,7 +651,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ocrs-pagecheck-site-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let bad = r##"<!doctype html><html><head><meta name="viewport" content="width=device-width"><link rel="stylesheet" href="s.css"></head>
+        let bad = r##"<!doctype html><html><head><meta name="viewport" content="width=device-width"><link rel="stylesheet" href="s.css"><link rel="stylesheet" href="missing.css"></head>
 <body><header><nav><ul><li><a href="#a">A</a></li><li><a href="#b">B</a></li><li><a href="#c">C</a></li></ul></nav>
 <button aria-expanded="false" aria-controls="n"><span class="icon"></span></button></header>
 <main><div class="wide">Lumen<span>Coffee</span> Roasters</div></main><script>nope()</script></body></html>"##;
@@ -653,8 +666,13 @@ mod tests {
         assert!(text.contains("solid block"), "{text}");
         assert!(text.contains("script error"), "{text}");
         assert!(text.contains("\"Lumen Coffee Roasters\""), "{text}");
+        assert!(text.contains("a file failed to load: missing.css"), "a real 404 is reported by name: {text}");
+        assert!(!text.contains("s.css"), "a stylesheet that loaded is not blamed: {text}");
 
-        let good = r##"<!doctype html><html><head><meta name="viewport" content="width=device-width"><style>
+        // A stylesheet that @imports a web font (outside hosts are blocked
+        // during the check) loaded fine and must not be reported.
+        std::fs::write(dir.join("g.css"), "@import url('https://fonts.googleapis.com/css2?family=Inter');\nbody{margin:0}").unwrap();
+        let good = r##"<!doctype html><html><head><meta name="viewport" content="width=device-width"><link rel="stylesheet" href="g.css"><style>
 nav ul{list-style:none;display:flex;gap:8px;margin:0;padding:0} button{display:none}
 @media (max-width:767px){nav{display:none} nav.open{display:block} button{display:block}}</style></head>
 <body><header><nav id="n"><ul><li><a href="#a">A</a></li><li><a href="#b">B</a></li><li><a href="#c">C</a></li></ul></nav>
@@ -662,7 +680,10 @@ nav ul{list-style:none;display:flex;gap:8px;margin:0;padding:0} button{display:n
 <script>var b=document.querySelector('button'),n=document.getElementById('n');b.onclick=function(){var o=b.getAttribute('aria-expanded')!=='true';
 b.setAttribute('aria-expanded',String(o));n.classList.toggle('open',o)}</script></body></html>"##;
         std::fs::write(dir.join("index.html"), good).unwrap();
-        let r = check(&dir, "index.html", &[375, 1440], &expect).await.unwrap();
+        // The agent may name the page by its full path.
+        let full = dir.join("index.html").to_string_lossy().to_string();
+        let r = check(&dir, &full, &[375, 1440], &expect).await.unwrap();
+        assert_eq!(r.page, "index.html");
         assert_eq!(r.score(), 0, "{}", r.render());
         assert!(r.render().contains("mobile menu opens and closes"), "{}", r.render());
         let _ = std::fs::remove_dir_all(&dir);
