@@ -1503,7 +1503,7 @@ impl AppState {
     /// the chat, so prompt additions based on it keep the cached prefix.
     pub fn first_request(&self, session_id: &str) -> Option<String> {
         let msgs = self.db.messages(session_id).ok()?;
-        msgs.iter().find(|m| m.role == "user").and_then(|m| {
+        msgs.iter().find(|m| m.role == "user" && !m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.starts_with("[app] ")))).and_then(|m| {
             m.parts.iter().find_map(|p| match p {
                 Part::Text { text } => Some(text.clone()),
                 _ => None,
@@ -1902,6 +1902,46 @@ fn apply_loop_guard(
     Ok(keep)
 }
 
+/// Most "do it now" nudges per run.
+const MAX_NUDGES: u32 = 2;
+/// Sent when a reply only announced work. Starts with a marker so it never
+/// counts as the user's words (`first_request`, transcripts).
+pub const NUDGE_TEXT: &str = "[app] You said what you will do but made no tool call, so nothing happened. \
+    Do it now with your tools. Reply without a tool call only when the whole task is done (then give a \
+    short summary of what you changed), or when you need the user to decide something (then ask).";
+
+/// Does a reply end by announcing work it did not do ("I'll build it now.",
+/// "Let me fix that:")? Looks at the last two sentences only, so a summary
+/// that mentions a plan earlier on does not count, and never fires on a
+/// question or on "let me know".
+pub fn announces_work(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.ends_with('?') || t.chars().count() > 1500 {
+        return false;
+    }
+    let lower = t.to_lowercase().replace('\u{2019}', "'");
+    if lower.contains("let me know") || lower.contains("would you like") || lower.contains("do you want") {
+        return false;
+    }
+    if lower.ends_with(':') {
+        return true;
+    }
+    let sentences: Vec<&str> = lower
+        .split(['.', '!', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    const STARTS: [&str; 14] = [
+        "i'll ", "i will ", "let me ", "let's ", "i'm going to ", "i am going to ", "now i'll ", "now i will ",
+        "next, i", "next i", "first, i", "now let me ", "now, let me ", "i'll now ",
+    ];
+    sentences.iter().rev().take(2).any(|s| {
+        // The sentence itself, or its last clause ("No, not yet. Let me…").
+        let clause = s.rsplit([',', ';', '—']).next().unwrap_or(s).trim();
+        STARTS.iter().any(|p| s.starts_with(p) || clause.starts_with(p))
+    })
+}
+
 /// The agent loop: load history, call model, execute tools, repeat until done.
 pub async fn run_loop(
     st: &Shared,
@@ -1912,6 +1952,8 @@ pub async fn run_loop(
     let mode = st.mode_for(session_id);
     // F-09: one loop guard per run (a spawned subagent has its own).
     let mut loop_guard = LoopGuard::default();
+    // Replies that only said what the model would do next (see `announces_work`).
+    let mut nudges = 0;
     // Spec list: base tools + MCP tools (+ spawn), then filter by mode/role.
     let mut specs = tools::tool_specs();
     // Browser tools only work while a GUI panel is attached. Advertising them
@@ -2105,6 +2147,18 @@ pub async fn run_loop(
         }
 
         if calls.is_empty() {
+            // "I'll build it now." and no tool call: weak models end their
+            // turn on a plan. Nothing happened, so ask once or twice for the
+            // work itself instead of reporting the plan as the answer.
+            if nudges < MAX_NUDGES && mode == AgentMode::Build && !truncated && announces_work(&text) {
+                nudges += 1;
+                let _ = st.events.send(ServerEvent::Note {
+                    session_id: session_id.to_string(),
+                    text: "the model said what it will do but did not do it — asking it to go ahead".into(),
+                });
+                st.db.add_message(session_id, "user", &[Part::Text { text: NUDGE_TEXT.to_string() }])?;
+                continue;
+            }
             final_text = text;
             finished = true;
             break;
@@ -4170,6 +4224,94 @@ mod tests {
         let s = st.db.create_session("s", None).unwrap();
         run_agent(&st, &s.id, "hi", Arc::new(AtomicBool::new(false))).await;
         assert!(!scratch_dir(&dir).exists(), "cleared after a failed run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn announced_work_is_spotted() {
+        for t in [
+            "I'll replace index.html with a complete, self-contained file meeting every requirement.",
+            "No, not yet. Let me build the complete single-file page now.",
+            "The existing site doesn't match. I\u{2019}ll build a single index.html, then verify it.",
+            "Here is the plan:",
+            "Next, I will add the cart drawer.",
+        ] {
+            assert!(announces_work(t), "should nudge: {t}");
+        }
+        for t in [
+            "Done. I built index.html with all nine sections and checked it at 375 and 1280 px.",
+            "I'll leave the colours to you. Let me know if you want a darker theme.",
+            "Should I use a warm or a dark theme?",
+            "",
+            "I added the card. Earlier I said I'll check the cart; it works now. Everything passes.",
+        ] {
+            assert!(!announces_work(t), "should not nudge: {t}");
+        }
+    }
+
+    /// A reply that only announces the work ("I'll build it now.") does not
+    /// end the run: the model is asked to go ahead, and does the work.
+    #[tokio::test]
+    async fn an_announced_plan_is_followed_by_the_work() {
+        use axum::{routing::post, Router};
+        let dir = std::env::temp_dir().join(format!("ocrs-nudge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<Value>| {
+                let n = h.fetch_add(1, Ordering::SeqCst);
+                let last = body["messages"].as_array().and_then(|m| m.last().cloned()).unwrap_or_default();
+                let nudged = last["content"].as_str().unwrap_or("").starts_with("[app] ");
+                async move {
+                    let text = |t: &str| {
+                        let frame = serde_json::json!({"choices":[{"delta":{"content":t},"finish_reason":"stop"}]});
+                        format!("data: {frame}\n\ndata: [DONE]\n\n")
+                    };
+                    let payload = match (n, nudged) {
+                        (0, _) => text("The folder is empty. I'll build index.html now."),
+                        (_, true) => {
+                            let args = serde_json::json!({"path": "index.html", "content": "<h1>Ember</h1>\n"}).to_string();
+                            let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                                {"index":0,"id":"w1","function":{"name":"write","arguments":args}}
+                            ]},"finish_reason":null}]});
+                            format!("data: {chunk}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
+                        }
+                        _ => text("Done: index.html is written."),
+                    };
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        cfg.permissions.defaults.insert("write".into(), "allow".into());
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("nudge", None).unwrap();
+        let opts = LoopOpts {
+            model: None,
+            max_steps: None,
+            system: "s".into(),
+            emit_activity: true,
+            allow: None,
+            can_spawn: false,
+            workspace: None,
+            agent: None,
+        };
+        st.db.add_message(&s.id, "user", &[Part::Text { text: "build the page".into() }]).unwrap();
+        let out = run_loop(&st, &s.id, &opts, &AtomicBool::new(false)).await.unwrap();
+        assert_eq!(out, "Done: index.html is written.");
+        assert_eq!(std::fs::read_to_string(dir.join("index.html")).unwrap(), "<h1>Ember</h1>\n");
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "announce, nudge → write, summary");
+        assert_eq!(st.first_request(&s.id).as_deref(), Some("build the page"), "the nudge is not the user's request");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
