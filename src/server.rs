@@ -2169,6 +2169,73 @@ pub fn announces_work(text: &str) -> bool {
     })
 }
 
+/// Our tool for a name another agent uses (`list_files`, `Bash`,
+/// `read_file`, `str_replace`…), with its arguments renamed to ours
+/// (`file_path` → `path`, `cmd` → `command`…). `None` = not a known alias.
+pub fn tool_alias(name: &str, input: &Value) -> Option<(&'static str, Value)> {
+    let n = name.to_ascii_lowercase().replace(['-', ' '], "_");
+    let real = match n.as_str() {
+        "list_files" | "list_dir" | "list_directory" | "ls" | "listdir" | "dir" => "list",
+        "bash" | "shell" | "run_terminal_command" | "run_command" | "execute_command" | "terminal" | "run_shell_command" | "exec" => "bash",
+        "read_file" | "read_files" | "view" | "open_file" | "cat" | "view_file" => "read",
+        "write_file" | "create_file" | "write_to_file" => "write",
+        "edit_file" | "str_replace" | "str_replace_editor" | "replace_in_file" | "apply_edit" | "multiedit" | "multi_edit" => "edit",
+        "find_files" | "file_search" | "search_files_by_name" => "glob",
+        "search" | "code_search" | "search_files" | "ripgrep" | "rg" | "grep_search" => "grep",
+        "web_fetch" | "fetch" | "read_url" | "fetch_url" | "web_search" => "webfetch",
+        "todowrite" | "write_todos" | "todo_write" => "todo",
+        // Same name in another case: `Read`, `Grep`, `Glob`, `Write`, `Edit`.
+        other if ["read", "grep", "glob", "write", "edit", "list"].contains(&other) => {
+            ["read", "grep", "glob", "write", "edit", "list"].into_iter().find(|t| *t == other)?
+        }
+        _ => return None,
+    };
+    let mut args = input.as_object().cloned().unwrap_or_default();
+    let rename = |args: &mut serde_json::Map<String, Value>, from: &str, to: &str| {
+        if !args.contains_key(to) {
+            if let Some(v) = args.remove(from) {
+                args.insert(to.to_string(), v);
+            }
+        }
+    };
+    for from in ["file_path", "filepath", "filename", "file", "target_file", "dir", "directory", "dir_path", "relative_workspace_path"] {
+        rename(&mut args, from, "path");
+    }
+    for from in ["cmd", "script", "shell_command"] {
+        rename(&mut args, from, "command");
+    }
+    rename(&mut args, "old_string", "old_str");
+    rename(&mut args, "new_string", "new_str");
+    rename(&mut args, "old_text", "old_str");
+    rename(&mut args, "new_text", "new_str");
+    rename(&mut args, "text", "content");
+    rename(&mut args, "query", if real == "grep" { "pattern" } else { "query" });
+    rename(&mut args, "regex", "pattern");
+    rename(&mut args, "url", "url");
+    // `list_files` with no path means the project folder.
+    if real == "list" && !args.contains_key("path") {
+        args.insert("path".into(), Value::String(".".into()));
+    }
+    // Extra keys other agents send (`description`, `timeout`) are left in;
+    // our tools ignore what they do not know.
+    Some((real, Value::Object(args)))
+}
+
+/// Does a reply claim the model cannot reach the user's files ("I can't see
+/// your local folder… paste the contents")? Only short replies count, so a
+/// real answer that mentions access in passing does not.
+pub fn denies_file_access(text: &str) -> bool {
+    let t = text.to_lowercase().replace('\u{2019}', "'");
+    if t.chars().count() > 2500 {
+        return false;
+    }
+    let cannot = ["can't see", "cannot see", "can't read", "cannot read", "can't access", "cannot access",
+        "don't have access", "do not have access", "unable to access", "unable to read", "no access to"];
+    let files = ["file", "folder", "director", "local", "computer", "system", "project", "repo"];
+    let ask = ["paste", "upload", "share", "provide", "send me"];
+    cannot.iter().any(|c| t.contains(c)) && files.iter().any(|f| t.contains(f)) && ask.iter().any(|a| t.contains(a))
+}
+
 /// The agent loop: load history, call model, execute tools, repeat until done.
 pub async fn run_loop(
     st: &Shared,
@@ -2421,11 +2488,39 @@ pub async fn run_loop(
                 st.db.add_message(session_id, "user", &[Part::Text { text: NUDGE_TEXT.to_string() }])?;
                 continue;
             }
+            // "I can't see your files, please paste them": the model forgot
+            // it has tools. Remind it once or twice, with the folder.
+            if nudges < MAX_NUDGES && !truncated && !specs.is_empty() && denies_file_access(&text) {
+                nudges += 1;
+                let _ = st.events.send(ServerEvent::Note {
+                    session_id: session_id.to_string(),
+                    text: "the model said it cannot see the files — reminding it that it has tools".into(),
+                });
+                let folder = opts.workspace.clone().unwrap_or_else(|| st.workspace_for(session_id));
+                let reminder = format!(
+                    "[app] You can see the files: you have tools (list, glob, grep, read) that work in the project \
+                     folder {}. Do not ask the user to paste or upload anything. Use the tools now to do what \
+                     was asked.",
+                    folder.display()
+                );
+                st.db.add_message(session_id, "user", &[Part::Text { text: reminder }])?;
+                continue;
+            }
             final_text = text;
             finished = true;
             break;
         }
 
+        // Models trained on other agents call tools by those agents' names
+        // (`list_files`, `Bash`, `read_file`…): run them as ours.
+        let known: std::collections::HashSet<&str> = specs.iter().map(|s| s.function.name.as_str()).collect();
+        let calls: Vec<_> = calls
+            .into_iter()
+            .map(|(id, name, input)| match tool_alias(&name, &input).filter(|_| !known.contains(name.as_str())) {
+                Some((real, args)) if known.contains(real) => (id, real.to_string(), args),
+                _ => (id, name, input),
+            })
+            .collect();
         // F-09 loop guard: an identical call repeated LOOP_GUARD_LIMIT times
         // in a row is answered with an error and never runs (no approval
         // prompt either). Every requested call counts, spawns included.
@@ -4556,6 +4651,29 @@ mod tests {
         let d = vec![m("system", "s2"), m("user", "hi")];
         assert_eq!(prefix_change(&sid, &d, &tools), "system prompt changed");
         assert_eq!(prefix_change(&sid, &d, &tools[..2]), "tool list changed");
+    }
+
+    #[test]
+    fn other_agents_tool_names_map_to_ours() {
+        let (t, a) = tool_alias("list_files", &json!({})).unwrap();
+        assert_eq!((t, a), ("list", json!({"path": "."})));
+        let (t, a) = tool_alias("Bash", &json!({"command": "ls -la", "description": "x"})).unwrap();
+        assert_eq!(t, "bash");
+        assert_eq!(a["command"], "ls -la");
+        let (t, a) = tool_alias("read_file", &json!({"file_path": "src/a.rs"})).unwrap();
+        assert_eq!((t, a), ("read", json!({"path": "src/a.rs"})));
+        let (t, a) = tool_alias("str_replace", &json!({"path": "a", "old_string": "x", "new_string": "y"})).unwrap();
+        assert_eq!((t, a), ("edit", json!({"path": "a", "old_str": "x", "new_str": "y"})));
+        assert_eq!(tool_alias("Read", &json!({"file_path": "a"})).unwrap().0, "read");
+        assert!(tool_alias("launch_rockets", &json!({})).is_none());
+    }
+
+    #[test]
+    fn a_model_that_forgets_its_tools_is_spotted() {
+        assert!(denies_file_access("I can\u{2019}t see or read your local folder unless you share its contents with me. Please paste the folder structure."));
+        assert!(denies_file_access("I don't have access to your file system. Could you upload the files?"));
+        assert!(!denies_file_access("I read the folder: it has 3 files, main.rs, lib.rs and Cargo.toml."));
+        assert!(!denies_file_access("I can't access the network from here, so I could not download the page."));
     }
 
     #[test]
