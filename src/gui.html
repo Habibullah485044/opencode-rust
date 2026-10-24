@@ -1149,7 +1149,19 @@
     cursor: pointer;
     flex: none;
   }
-  #deep-btn:hover { color: var(--text); background: var(--surface-2); }
+  #deep-btn:hover, #mission-btn:hover { color: var(--text); background: var(--surface-2); }
+  #mission-btn {
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 11.5px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    cursor: pointer;
+    flex: none;
+  }
+  #mission-btn.on { color: var(--warn); background: var(--warn-soft); border-color: rgba(231, 179, 90, 0.45); }
   #deep-btn.on { color: var(--accent-strong); background: var(--accent-soft); border-color: var(--accent-line); }
 
   /* ---- git branch chip and its menu ---- */
@@ -1920,6 +1932,8 @@
                 <button type="button" class="git-item" data-git="pr">Push and open a pull request</button>
               </div>
             </div>
+            <button type="button" id="mission-btn" class="mode-toggle" aria-pressed="false"
+                    title="Mission: the next message becomes a mission — planned into steps and worked on by itself until it is done, no approvals needed (Stop ends it, /mission resume carries on)">Mission</button>
             <button type="button" id="deep-btn" aria-pressed="false"
                     title="Deep: send the next message as several attempts in separate copies of the project; the app checks each one and keeps the best (uses more tokens)">Deep</button>
             <div class="mode-switch" id="mode-switch" role="radiogroup" aria-label="Permission mode">
@@ -2126,6 +2140,15 @@
     commit: "Commit all the changes in this project with a short, clear commit message (look at git diff first). Do not push.",
     pr: "Push the current branch and open a pull request for it with gh: a clear title and a short description of what changed and how it was tested. If gh is missing or not signed in, tell me the exact command to run instead."
   };
+  function setMission(on) {
+    var b = document.getElementById("mission-btn");
+    if (!b) return;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    b.textContent = on ? "Mission: on" : "Mission";
+    // One at a time: a mission is not also a Deep run.
+    if (on) setDeep(false);
+  }
   function setDeep(on) {
     var b = document.getElementById("deep-btn");
     if (!b) return;
@@ -3944,6 +3967,11 @@
         text = "/deep " + v;
         setDeep(false);
       }
+      var missionBtn = document.getElementById("mission-btn");
+      if (missionBtn && missionBtn.classList.contains("on") && v.charAt(0) !== "/") {
+        text = "/mission " + v;
+        setMission(false);
+      }
       postToRust({ type: "send", text: text });
       rememberPrompt(input.value);
       input.value = "";
@@ -4356,7 +4384,13 @@
 
     // Deep toggle
     var deepToggle = document.getElementById("deep-btn");
-    if (deepToggle) deepToggle.addEventListener("click", function () { setDeep(!deepToggle.classList.contains("on")); });
+    if (deepToggle) deepToggle.addEventListener("click", function () {
+      var on = !deepToggle.classList.contains("on");
+      setDeep(on);
+      if (on) setMission(false);
+    });
+    var missionToggle = document.getElementById("mission-btn");
+    if (missionToggle) missionToggle.addEventListener("click", function () { setMission(!missionToggle.classList.contains("on")); });
 
     // Git chip menu
     var gitChip = document.getElementById("git-chip");

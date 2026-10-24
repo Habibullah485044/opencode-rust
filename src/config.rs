@@ -318,6 +318,9 @@ pub struct AgentCfg {
     /// Project map in the system prompt: the project's files and their main
     /// parts, most relevant first, in about this many tokens. 0 = off.
     pub repo_map_tokens: usize,
+    /// Mission mode: most step runs one `/mission` makes before it pauses
+    /// (`/mission resume` carries on). 0 = no limit.
+    pub mission_max_steps: usize,
     /// F-08: command that checks the work after a run that changed files,
     /// for example "cargo test". Unset (the default) = no check.
     pub verify_command: Option<String>,
@@ -350,6 +353,7 @@ impl Default for AgentCfg {
             max_subagents: 4,
             deep_attempts: 3,
             repo_map_tokens: 1000,
+            mission_max_steps: 50,
             verify_command: None,
             auto_verify: true,
             check_pages: true,

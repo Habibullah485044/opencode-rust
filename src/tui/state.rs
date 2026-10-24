@@ -613,6 +613,10 @@ impl App {
                         })),
                         true,
                     ),
+                    Some(Command::MissionCtl(what)) => {
+                        let busy = what == "resume";
+                        (Some(InputAction::MissionCtl(what)), busy)
+                    }
                     Some(Command::Mission { kind: None, goal }) => {
                         // Open the dialog — Custom checked, High effort, like Freebuff.
                         self.mission_picker = Some(MissionPicker {
@@ -1220,6 +1224,8 @@ pub enum InputAction {
     Team(String),
     /// Run a mission: the core expands it into the well-worded brief.
     Mission(crate::mission::Mission),
+    /// `/mission status | stop | resume`.
+    MissionCtl(String),
     /// Turbo mode: toggle (None) or enable + run this prompt right away.
     Turbo(Option<String>),
     /// Install + vet + bake a skill from a local path or URL.

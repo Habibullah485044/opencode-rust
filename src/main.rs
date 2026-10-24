@@ -583,12 +583,29 @@ async fn headless_run(
                     goal,
                 };
                 if mission.kind.read_only() {
+                    // An explore mission reads and reports: one run in plan mode.
                     state.set_mode(&session.id, AgentMode::Plan);
+                    state.kick_run(session.id.clone(), mission.briefing()).await;
+                } else {
+                    // Mission mode: step by step, on its own, until done.
+                    state.kick_mission(session.id.clone(), Some(mission.goal_for_mission_mode())).await;
                 }
-                // New (B-06): kick_run registers the run in `busy`.
-                state.kick_run(session.id.clone(), mission.briefing()).await;
                 team_spawned = true;
             }
+            Cmd::MissionCtl(what) => match what.as_str() {
+                "resume" => {
+                    state.kick_mission(session.id.clone(), None).await;
+                    team_spawned = true;
+                }
+                "status" => {
+                    println!("{}", server::mission_report(&state, &session.id));
+                    return Ok(());
+                }
+                _ => {
+                    println!("a headless run has no mission running to stop");
+                    return Ok(());
+                }
+            },
             Cmd::Turbo { prompt } => {
                 let on = match &prompt {
                     Some(_) => {
@@ -841,10 +858,28 @@ async fn tui_run(
                                 text: "explore mission: plan mode (read-only) is on; /build switches back".into(),
                             });
                         }
-                        // The mission expands into the well-worded brief —
-                        // that brief is what the agent runs.
-                        st.kick_run(sid.clone(), mission.briefing()).await;
+                        if mission.kind.read_only() {
+                            // An explore mission reads and reports: one run.
+                            st.kick_run(sid.clone(), mission.briefing()).await;
+                        } else {
+                            // Mission mode: step by step until the goal is reached.
+                            st.kick_mission(sid.clone(), Some(mission.goal_for_mission_mode())).await;
+                        }
                     }
+                    tui::InputAction::MissionCtl(what) => match what.as_str() {
+                        "resume" => st.kick_mission(sid.clone(), None).await,
+                        "stop" => {
+                            let stopped = st.abort_run(&sid).await;
+                            let text = if stopped { "mission: stopping — /mission resume carries on" } else { "no mission is running" };
+                            let _ = st.events.send(server::ServerEvent::Note { session_id: sid.clone(), text: text.into() });
+                        }
+                        _ => {
+                            let _ = st.events.send(server::ServerEvent::Note {
+                                session_id: sid.clone(),
+                                text: server::mission_report(&st, &sid),
+                            });
+                        }
+                    },
                     tui::InputAction::Turbo(prompt) => {
                         // Core is the authority: toggle on bare /turbo, force
                         // ON when a prompt comes with it.

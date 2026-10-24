@@ -157,6 +157,49 @@ const APPROVALS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS approvals (
 
 /// Provider token counts, one row per session per UTC day (`/usage`).
 /// `session_id` is "" for model calls outside a chat (planning, edits).
+/// Missions: one per chat (a new one replaces the old), and its steps in
+/// order. A step's `result` is its receipt: what the worker said it did,
+/// the files it changed and what the checks said.
+const MISSION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS missions (
+    session_id TEXT PRIMARY KEY,
+    goal TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mission_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    pos REAL NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    result TEXT NOT NULL DEFAULT '',
+    child_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mission_steps ON mission_steps(session_id, pos);";
+
+/// A chat's mission.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mission {
+    pub goal: String,
+    /// planning, running, paused, done, stopped
+    pub status: String,
+    pub steps: Vec<MissionStep>,
+}
+
+/// One step of a mission.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissionStep {
+    pub id: i64,
+    pub title: String,
+    /// pending, working, done, failed
+    pub status: String,
+    pub attempts: i64,
+    pub result: String,
+    pub child_id: Option<String>,
+}
+
 const USAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS usage (
     session_id TEXT NOT NULL,
     day INTEGER NOT NULL,
@@ -244,6 +287,7 @@ impl Db {
         )?;
         migrate_approvals(&conn)?;
         conn.execute_batch(USAGE_SCHEMA)?;
+        conn.execute_batch(MISSION_SCHEMA)?;
         migrate_projects(&conn)?;
         Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
     }
@@ -271,6 +315,7 @@ impl Db {
         )?;
         migrate_approvals(&conn)?;
         conn.execute_batch(USAGE_SCHEMA)?;
+        conn.execute_batch(MISSION_SCHEMA)?;
         migrate_projects(&conn)?;
         Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
     }
@@ -432,6 +477,94 @@ impl Db {
         self.conn.lock().unwrap().execute(
             "UPDATE sessions SET title=?2, updated_at=?3 WHERE id=?1",
             params![id, title, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Start a mission in chat `session_id` with these steps (replaces any
+    /// earlier mission of the chat).
+    pub fn mission_start(&self, session_id: &str, goal: &str, steps: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = now_ms();
+        tx.execute("DELETE FROM mission_steps WHERE session_id=?1", params![session_id])?;
+        tx.execute(
+            "INSERT INTO missions (session_id, goal, status, created_at, updated_at) VALUES (?1, ?2, 'running', ?3, ?3)
+             ON CONFLICT (session_id) DO UPDATE SET goal=?2, status='running', created_at=?3, updated_at=?3",
+            params![session_id, goal, now],
+        )?;
+        for (i, t) in steps.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO mission_steps (session_id, pos, title, status) VALUES (?1, ?2, ?3, 'pending')",
+                params![session_id, i as f64 + 1.0, t],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The chat's mission with its steps in order, if it has one.
+    pub fn mission(&self, session_id: &str) -> Result<Option<Mission>> {
+        let conn = self.conn.lock().unwrap();
+        let head = conn
+            .query_row(
+                "SELECT goal, status FROM missions WHERE session_id=?1",
+                params![session_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((goal, status)) = head else { return Ok(None) };
+        let mut stmt = conn.prepare(
+            "SELECT id, title, status, attempts, result, child_id FROM mission_steps WHERE session_id=?1 ORDER BY pos, id",
+        )?;
+        let steps = stmt
+            .query_map(params![session_id], |r| {
+                Ok(MissionStep {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    status: r.get(2)?,
+                    attempts: r.get(3)?,
+                    result: r.get(4)?,
+                    child_id: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(Mission { goal, status, steps }))
+    }
+
+    pub fn mission_set_status(&self, session_id: &str, status: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE missions SET status=?2, updated_at=?3 WHERE session_id=?1",
+            params![session_id, status, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Save a step's state and receipt.
+    pub fn mission_step_update(&self, id: i64, status: &str, attempts: i64, result: &str, child_id: Option<&str>) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE mission_steps SET status=?2, attempts=?3, result=?4, child_id=COALESCE(?5, child_id) WHERE id=?1",
+            params![id, status, attempts, result, child_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a new pending step right after step `after`.
+    pub fn mission_step_insert_after(&self, session_id: &str, after: i64, title: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let pos: f64 = conn.query_row("SELECT pos FROM mission_steps WHERE id=?1", params![after], |r| r.get(0))?;
+        let next: Option<f64> = conn
+            .query_row(
+                "SELECT MIN(pos) FROM mission_steps WHERE session_id=?1 AND pos > ?2",
+                params![session_id, pos],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let new_pos = next.map_or(pos + 1.0, |n| (pos + n) / 2.0);
+        conn.execute(
+            "INSERT INTO mission_steps (session_id, pos, title, status) VALUES (?1, ?2, ?3, 'pending')",
+            params![session_id, new_pos, title],
         )?;
         Ok(())
     }
@@ -655,6 +788,37 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(n > 0)
+    }
+}
+
+#[cfg(test)]
+mod mission_tests {
+    use super::*;
+
+    #[test]
+    fn missions_keep_steps_in_order_and_take_inserted_steps() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("m", None).unwrap();
+        assert!(db.mission(&s.id).unwrap().is_none());
+        db.mission_start(&s.id, "ship it", &["one".into(), "two".into()]).unwrap();
+        let m = db.mission(&s.id).unwrap().unwrap();
+        assert_eq!((m.goal.as_str(), m.status.as_str()), ("ship it", "running"));
+        let first = m.steps[0].id;
+        db.mission_step_insert_after(&s.id, first, "one and a half").unwrap();
+        db.mission_step_update(first, "done", 1, "did one", Some("child1")).unwrap();
+        let m = db.mission(&s.id).unwrap().unwrap();
+        let titles: Vec<&str> = m.steps.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["one", "one and a half", "two"]);
+        assert_eq!((m.steps[0].status.as_str(), m.steps[0].result.as_str()), ("done", "did one"));
+        assert_eq!(m.steps[0].child_id.as_deref(), Some("child1"));
+        let last = m.steps[2].id;
+        db.mission_step_insert_after(&s.id, last, "four").unwrap();
+        assert_eq!(db.mission(&s.id).unwrap().unwrap().steps[3].title, "four");
+        db.mission_set_status(&s.id, "paused").unwrap();
+        assert_eq!(db.mission(&s.id).unwrap().unwrap().status, "paused");
+        // A new mission replaces the old one.
+        db.mission_start(&s.id, "again", &["x".into()]).unwrap();
+        assert_eq!(db.mission(&s.id).unwrap().unwrap().steps.len(), 1);
     }
 }
 

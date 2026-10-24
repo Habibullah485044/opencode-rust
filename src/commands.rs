@@ -35,6 +35,8 @@ pub enum Command {
     /// Assign a mission: `kind` preselected or `None` (open the picker).
     /// The goal is expanded into a well-worded briefing before the run.
     Mission { kind: Option<crate::mission::MissionKind>, goal: String },
+    /// `/mission status`, `/mission stop`, `/mission resume`.
+    MissionCtl(String),
     /// Turbo mode: toggle (no prompt) or enable + run `prompt` immediately.
     Turbo { prompt: Option<String> },
     /// Install a skill from a local path or URL: vet it, then bake it in.
@@ -98,7 +100,7 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "fork", args: "", help: "Branch this session into a child session" },
         Builtin { name: "help", args: "", help: "Show the command and key reference" },
         Builtin { name: "init", args: "", help: "Create a starter AGENTS.md when missing" },
-        Builtin { name: "mission", args: "[kind] <goal>", help: "Run a briefing (Explore/Commit/Merge PR/Custom)" },
+        Builtin { name: "mission", args: "[kind] <goal> | status | stop | resume", help: "Mission mode: work on the goal step by step, on its own, until it is done" },
         Builtin { name: "model", args: "[id]", help: "Show the active model, or switch to <id>" },
         Builtin { name: "new", args: "", help: "Start a fresh session" },
         Builtin { name: "parallel", args: "<task>", help: "Same as /deep 2 <task>" },
@@ -205,6 +207,7 @@ pub fn classify(input: &str) -> Option<Command> {
                 Err(_) => Some(Command::Deep { attempts: None, task: arg.to_string() }),
             }
         }
+        "mission" if matches!(arg, "status" | "stop" | "resume") => Some(Command::MissionCtl(arg.to_string())),
         "mission" if !arg.is_empty() => {
             // `/mission <kind> <goal>` runs with the kind preselected;
             // `/mission <goal>` opens the mission picker with the goal filled.
@@ -358,6 +361,13 @@ mod tests {
         assert_eq!(classify("/review now"), None, "no stray args");
         assert_eq!(classify("/parallel"), None, "task required");
         assert_eq!(classify("/deep"), None, "task required");
+        assert_eq!(classify("/mission resume"), Some(Command::MissionCtl("resume".into())));
+        assert_eq!(classify("/mission status"), Some(Command::MissionCtl("status".into())));
+        assert_eq!(
+            classify("/mission resume the old app"),
+            Some(Command::Mission { kind: None, goal: "resume the old app".into() }),
+            "only the bare word is a control"
+        );
         assert_eq!(classify("/deep 3"), None, "a number alone is no task");
         assert_eq!(classify("/deep 9 x"), None, "at most 5 attempts");
         assert_eq!(

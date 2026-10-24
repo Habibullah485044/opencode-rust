@@ -25,6 +25,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex, RwLock};
 
 mod deep;
+mod mission_run;
+pub use mission_run::mission_report;
 
 /// How much autonomy the agent has — set by the client (GUI composer toggle,
 /// `/turbo` in the TUI/CLI) and read by every permission check.
@@ -1296,6 +1298,28 @@ impl AppState {
                 busy.remove(&session_id);
             }
         });
+    }
+
+    /// `/mission <goal>` (or `/mission resume` with `goal: None`): work on
+    /// the goal step by step without the user until it is done
+    /// (`mission_run`). Stop ends it like any run; resume carries on.
+    pub async fn kick_mission(self: &Shared, session_id: String, goal: Option<String>) {
+        self.kick_task(session_id, move |st, sid, flag| async move {
+            let res = mission_run::run_mission(&st, &sid, goal.as_deref(), &flag).await;
+            if st.is_superseded(&sid, &flag).await {
+                return;
+            }
+            let (ok, message) = match res {
+                Ok(text) => {
+                    let _ = st.db.add_message(&sid, "assistant", &[Part::Text { text: text.clone() }]);
+                    let _ = st.events.send(ServerEvent::AssistantDelta { session_id: sid.clone(), text });
+                    (true, None)
+                }
+                Err(e) => (false, Some(format!("mission: {e:#}"))),
+            };
+            let _ = st.events.send(ServerEvent::RunFinished { session_id: sid, ok, message });
+        })
+        .await;
     }
 
     /// `/deep [n] <task>` (and `/parallel <task>`, which is `/deep 2`): try
@@ -2734,7 +2758,7 @@ async fn check_after_run(
     since: std::time::SystemTime,
     bash_used: bool,
     abort: &Arc<AtomicBool>,
-) {
+) -> Option<(bool, String)> {
     let note = |text: String| {
         let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
     };
@@ -2743,22 +2767,22 @@ async fn check_after_run(
     let pages = |since| changed_web_pages(&ws, since, bash_used, st.cfg.agent.check_pages);
     let mut gate = Gate { cmd, pages: pages(since), expect: crate::pagecheck::expected_texts(request) };
     if gate.cmd.is_none() && gate.pages.is_empty() {
-        return;
+        return None;
     }
     let timeout = std::time::Duration::from_secs(st.cfg.agent.verify_timeout_secs.max(1));
     let Some(mut best) = run_gate(st, &ws, &mut gate, timeout, &note, abort).await else {
-        return;
+        return None;
     };
     if best.problems == 0 {
         note(format!("{VERIFY_PREFIX} {} passed", gate.label()));
-        return;
+        return Some((true, best.summary));
     }
     let max_rounds = st.cfg.agent.verify_max_rounds;
     let first_report = best.report.clone();
     let mut undone = false;
     for round in 1..=max_rounds {
         if abort.load(Ordering::SeqCst) {
-            return;
+            return None;
         }
         note(format!("{VERIFY_PREFIX} {} failed — fix round {round} of {max_rounds}", best.summary));
         let mut msg = format!("{VERIFY_PREFIX} {}\n", best.report);
@@ -2769,21 +2793,21 @@ async fn check_after_run(
         let journal = crate::keepbest::Journal::begin(&ws);
         if let Err(e) = agent_inner(st, session_id, &msg, abort).await {
             note(format!("{VERIFY_PREFIX} fix round failed: {e}"));
-            return;
+            return Some((false, best.summary));
         }
         if abort.load(Ordering::SeqCst) {
-            return;
+            return None;
         }
         gate.pages = pages(since);
         let Some(now) = run_gate(st, &ws, &mut gate, timeout, &note, abort).await else {
-            return;
+            return None;
         };
         if now.problems == 0 {
             note(format!("{VERIFY_PREFIX} {} passed after {round} fix round(s)", gate.label()));
             // A failure the checks proved fixed is worth remembering here.
             let fix = last_assistant_text(st, session_id).unwrap_or_default();
             record_lesson(st, &ws, &first_report, &fix);
-            return;
+            return Some((true, format!("{} (after {round} fix round(s))", now.summary)));
         }
         if now.problems < best.problems {
             note(format!("{VERIFY_PREFIX} round {round} helped: {} → {} problem(s)", best.problems, now.problems));
@@ -2802,6 +2826,7 @@ async fn check_after_run(
         "{VERIFY_PREFIX} {} still failing after {max_rounds} fix round(s) — over to you",
         best.summary
     ));
+    Some((false, best.summary))
 }
 
 /// The check command for `ws`: the configured one, else (with

@@ -79,6 +79,15 @@ impl MissionKind {
     }
 }
 
+impl Mission {
+    /// The goal a mission-mode coordinator works from: the user's words for
+    /// a custom mission, the full brief for the other kinds (their playbook
+    /// is the point).
+    pub fn goal_for_mission_mode(&self) -> String {
+        if self.kind == MissionKind::Custom { self.goal.clone() } else { self.briefing() }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Effort {
     Low,

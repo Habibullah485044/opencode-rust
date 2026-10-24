@@ -681,13 +681,62 @@ impl ToolCallAccumulator {
                 let v = if args.trim().is_empty() {
                     json!({})
                 } else {
-                    serde_json::from_str(&args).unwrap_or_else(|_| json!({ "raw": args }))
+                    serde_json::from_str(&args)
+                        .ok()
+                        .or_else(|| repair_cut_args(&name, &args))
+                        .unwrap_or_else(|| json!({ "raw": args }))
                 };
                 let id = if id.is_empty() { crate::db::new_id("call") } else { id };
                 (id, name, v)
             })
             .collect()
     }
+}
+
+/// Some servers drop the last stream chunk, so args arrive as
+/// `{"question": "What next?` with the closing quote and braces missing.
+/// Close them, but only for tools where a lost tail is harmless: a cut
+/// `write` or `edit` must still fail rather than save half a file.
+fn repair_cut_args(name: &str, args: &str) -> Option<Value> {
+    const SAFE: [&str; 5] = ["ask_user", "read", "list", "glob", "grep"];
+    if !SAFE.contains(&name) {
+        return None;
+    }
+    let (mut in_str, mut escaped) = (false, false);
+    let mut open = Vec::new();
+    for c in args.chars() {
+        if in_str {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => open.push('}'),
+            '[' => open.push(']'),
+            '}' | ']' => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    if !in_str && open.is_empty() {
+        return None;
+    }
+    let mut fixed = args.to_string();
+    if escaped {
+        fixed.pop();
+    }
+    if in_str {
+        fixed.push('"');
+    }
+    let trimmed = fixed.trim_end().strip_suffix(',').unwrap_or(fixed.trim_end()).to_string();
+    let closed: String = trimmed.chars().chain(open.iter().rev().copied()).collect();
+    serde_json::from_str::<Value>(&closed).ok().filter(Value::is_object)
 }
 
 /// When the app may send its next request (B: shared rate-limit wait).
@@ -1033,6 +1082,30 @@ mod b21_calls_tests {
         assert_eq!(calls.len(), 2);
         assert!(!calls[0].0.is_empty() && calls[0].0 != calls[1].0, "{calls:?}");
         assert_eq!(calls[0].2, json!({}));
+    }
+
+    #[test]
+    fn cut_args_are_closed_for_safe_tools_only() {
+        let cut = "{\"options\": [\"Fix a bug\", \"Write tests\"], \"question\": \"What next?";
+        let call = |name: &str| {
+            let mut acc = ToolCallAccumulator::default();
+            acc.push(&StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("a".into()),
+                name: Some(name.into()),
+                args_delta: cut.into(),
+            });
+            acc.finish().remove(0).2
+        };
+        let asked = call("ask_user");
+        assert_eq!(asked["question"], "What next?");
+        assert_eq!(asked["options"][1], "Write tests");
+        // A cut write keeps the raw marker, so it errors instead of saving half a file.
+        assert!(call("write").get("raw").is_some());
+        // A dangling key cannot be repaired.
+        assert_eq!(repair_cut_args("read", "{\"path\": \"x\", \"lim"), None);
+        // An escaped backslash before the cut does not end the string early.
+        assert_eq!(repair_cut_args("read", "{\"path\": \"a\\\\b"), Some(json!({"path": "a\\b"})));
     }
 
     #[test]

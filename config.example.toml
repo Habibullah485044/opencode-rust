@@ -87,6 +87,9 @@ reuse_gate = true
 # Project map in the system prompt (files and their main functions/types,
 # most relevant first) in about this many tokens; 0 turns it off.
 # repo_map_tokens = 1000
+# Mission mode (/mission <goal>): most step runs before the mission pauses
+# (/mission resume carries on); 0 = no limit.
+# mission_max_steps = 50
 
 # F-08: check the work after every run that changed files (unset = off).
 # On failure the agent gets the output and up to verify_max_rounds tries to fix it.

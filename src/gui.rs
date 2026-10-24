@@ -1371,6 +1371,7 @@ pub const GUI_COMMANDS: &[(&str, &str, &str)] = &[
     ("compact", "", "Summarize old messages to make room"),
     ("review", "", "Review the uncommitted changes"),
     ("deep", "[n] <task>", "Try the task n times (default 3) in separate copies, keep the best checked one"),
+    ("mission", "<goal> | status | stop | resume", "Mission mode: works on the goal step by step, on its own, until it is done"),
     ("undo", "", "Put the files back as they were before the last run"),
     ("redo", "", "Re-apply what /undo put back"),
     ("init", "", "Write a starter AGENTS.md for this project"),
@@ -1443,6 +1444,40 @@ fn gui_command(gs: &mut GuiState, st: &Arc<server::AppState>, rt: &tokio::runtim
             rt.spawn(async move { st2.kick_review(sid2).await });
             gs.busy = true;
         }
+        "mission" => match crate::commands::classify(line) {
+            Some(crate::commands::Command::MissionCtl(what)) if what == "status" => {
+                say(gs, server::mission_report(st, &sid));
+            }
+            Some(crate::commands::Command::MissionCtl(what)) if what == "stop" => {
+                let (st2, sid2) = (st.clone(), sid.clone());
+                rt.spawn(async move { st2.abort_run(&sid2).await });
+                say(gs, "Stopping the mission — /mission resume carries on.".into());
+            }
+            Some(crate::commands::Command::MissionCtl(_)) => {
+                let (st2, sid2) = (st.clone(), sid.clone());
+                rt.spawn(async move { st2.kick_mission(sid2, None).await });
+                gs.busy = true;
+            }
+            Some(crate::commands::Command::Mission { kind, goal }) => {
+                let (effort, goal) = crate::mission::split_effort(&goal);
+                let mission = crate::mission::Mission { kind: kind.unwrap_or(crate::mission::MissionKind::Custom), effort, goal };
+                if gs.title() == NEW_CHAT {
+                    let _ = st.db.set_session_title(&sid, &clip(&mission.goal, 40));
+                    refresh_sessions(gs, st);
+                }
+                let (st2, sid2) = (st.clone(), sid.clone());
+                if mission.kind.read_only() {
+                    st.set_mode(&sid, crate::agents::AgentMode::Plan);
+                    let brief = mission.briefing();
+                    rt.spawn(async move { st2.kick_run(sid2, brief).await });
+                } else {
+                    let goal = mission.goal_for_mission_mode();
+                    rt.spawn(async move { st2.kick_mission(sid2, Some(goal)).await });
+                }
+                gs.busy = true;
+            }
+            _ => say(gs, "Usage: /mission <goal>, or /mission status | stop | resume.".into()),
+        },
         "deep" => match crate::commands::classify(line) {
             Some(crate::commands::Command::Deep { attempts, task }) => {
                 if gs.title() == NEW_CHAT {
