@@ -113,6 +113,25 @@ fn list_sql(conn: &Connection, session_id: &str) -> rusqlite::Result<Vec<TodoIte
     rows.collect()
 }
 
+/// The real id for what the model wrote: the id itself, a list position
+/// ("1", "#2": models often count instead of copying the id), or a unique
+/// start of an id. `None` = no such todo.
+fn resolve_id(conn: &Connection, session_id: &str, id: &str) -> rusqlite::Result<Option<String>> {
+    let items = list_sql(conn, session_id)?;
+    let id = id.trim();
+    if items.iter().any(|i| i.id == id) {
+        return Ok(Some(id.to_string()));
+    }
+    if let Ok(n) = id.trim_start_matches('#').parse::<usize>() {
+        return Ok(n.checked_sub(1).and_then(|i| items.get(i)).map(|i| i.id.clone()));
+    }
+    let mut starts = items.iter().filter(|i| !id.is_empty() && i.id.starts_with(id));
+    Ok(match (starts.next(), starts.next()) {
+        (Some(one), None) => Some(one.id.clone()),
+        _ => None,
+    })
+}
+
 fn exec_sql(conn: &Connection, session_id: &str, op: TodoOp) -> rusqlite::Result<TodoResult> {
     let find = |id: &str| {
         conn.query_row(
@@ -137,6 +156,9 @@ fn exec_sql(conn: &Connection, session_id: &str, op: TodoOp) -> rusqlite::Result
         }
         TodoOp::List => TodoResult::Listed { items: list_sql(conn, session_id)? },
         TodoOp::Complete { id } => {
+            let Some(id) = resolve_id(conn, session_id, &id)? else {
+                return Ok(TodoResult::NotFound { id });
+            };
             conn.execute(
                 "UPDATE todos SET completed=1 WHERE session_id=?1 AND id=?2",
                 params![session_id, id],
@@ -147,6 +169,9 @@ fn exec_sql(conn: &Connection, session_id: &str, op: TodoOp) -> rusqlite::Result
             }
         }
         TodoOp::Remove { id } => {
+            let Some(id) = resolve_id(conn, session_id, &id)? else {
+                return Ok(TodoResult::NotFound { id });
+            };
             let n = conn.execute("DELETE FROM todos WHERE session_id=?1 AND id=?2", params![session_id, id])?;
             if n > 0 { TodoResult::Removed { id } } else { TodoResult::NotFound { id } }
         }
@@ -156,6 +181,26 @@ fn exec_sql(conn: &Connection, session_id: &str, op: TodoOp) -> rusqlite::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_position_or_id_start_finds_the_todo() {
+        let store = TodoStore::new();
+        let sid = "s";
+        let mut ids = Vec::new();
+        for c in ["one", "two"] {
+            let TodoResult::Added { item } = store.exec(sid, TodoOp::Add { content: c.into() }) else { panic!() };
+            ids.push(item.id);
+        }
+        let TodoResult::Completed { item } = store.exec(sid, TodoOp::Complete { id: "2".into() }) else {
+            panic!("position 2")
+        };
+        assert_eq!(item.content, "two");
+        let TodoResult::Removed { id } = store.exec(sid, TodoOp::Remove { id: "#1".into() }) else { panic!("#1") };
+        assert_eq!(id, ids[0]);
+        assert!(matches!(store.exec(sid, TodoOp::Complete { id: "5".into() }), TodoResult::NotFound { .. }));
+        let start: String = ids[1].chars().take(4).collect();
+        assert!(matches!(store.exec(sid, TodoOp::Complete { id: start }), TodoResult::Completed { .. }));
+    }
 
     #[test]
     fn add_list_complete_remove() {

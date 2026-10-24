@@ -904,6 +904,22 @@ fn turbo_streak(st: &Shared, session_id: &str) -> u32 {
 }
 
 /// True when the session's todo list still has open work.
+/// Was the last turbo continuation answered without a single tool call?
+fn continuation_answered_without_tools(st: &Shared, session_id: &str) -> bool {
+    let Ok(msgs) = st.db.messages(session_id) else { return false };
+    let Some(cont) = msgs.iter().rposition(|m| {
+        m.role == "user"
+            && m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.starts_with(TURBO_CONTINUE_PREFIX)))
+    }) else {
+        return false;
+    };
+    // Only when nothing the user wrote came after it.
+    let after = &msgs[cont + 1..];
+    !after.is_empty()
+        && !after.iter().any(|m| m.role == "user" && !m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.starts_with("[app] ") || text.starts_with(VERIFY_PREFIX))))
+        && !after.iter().any(|m| m.parts.iter().any(|p| matches!(p, Part::ToolCall { .. })))
+}
+
 fn todos_open(st: &Shared, session_id: &str) -> bool {
     matches!(
         st.todo_store.exec(session_id, crate::todo::TodoOp::List),
@@ -935,10 +951,31 @@ fn turbo_continuation(st: &Shared, session_id: &str, result: &Result<String>) ->
     if !todos_open(st, session_id) || turbo_streak(st, session_id) >= TURBO_MAX_CONTINUATIONS {
         return None;
     }
+    // A continuation answered with words only ("the job is complete"): the
+    // model is done and the open todo is a leftover. Another round would
+    // resend the whole chat for the same answer (seen: 8 rounds, ~360K
+    // tokens, for nothing).
+    if continuation_answered_without_tools(st, session_id) {
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: "turbo: stopping — the model says it is done, though a todo is still open".into(),
+        });
+        return None;
+    }
+    let open: Vec<String> = match st.todo_store.exec(session_id, crate::todo::TodoOp::List) {
+        crate::todo::TodoResult::Listed { items } => items
+            .iter()
+            .filter(|i| !i.completed)
+            .map(|i| format!("{} ({})", i.content, i.id))
+            .collect(),
+        _ => Vec::new(),
+    };
     Some(format!(
         "{TURBO_CONTINUE_PREFIX} you have full access and must not ask the \
          user anything. Make the most reasonable decision yourself, keep \
-         working on the remaining todos until none are open, and finish the job."
+         working on the remaining todos until none are open, and finish the job. \
+         Open todos: {}. One that is already done: mark it complete with its id.",
+        open.join("; ")
     ))
 }
 
@@ -1482,7 +1519,14 @@ impl AppState {
         let skills_list = skills::load_skills(&workspace);
         let agents_md = skills::load_agents_md(&workspace);
         let baked = skills::load_baked(&self.skill_base);
-        let lessons = load_lessons(self, &workspace);
+        // Read once per chat: a lesson saved by this chat's fix round would
+        // otherwise change the system prompt, and every later request would
+        // miss the prompt cache. New lessons apply from the next chat.
+        let lessons = {
+            static FROZEN: std::sync::OnceLock<Mutex<HashMap<String, Option<String>>>> = std::sync::OnceLock::new();
+            let mut frozen = FROZEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+            frozen.entry(session_id.to_string()).or_insert_with(|| load_lessons(self, &workspace)).clone()
+        };
         let request = self.first_request(session_id).unwrap_or_default();
         let map = crate::repomap::for_chat(session_id, &workspace, &self.state_dir, &request, self.cfg.agent.repo_map_tokens);
         agents::compose_system(PromptInputs {
@@ -1715,11 +1759,15 @@ impl AppState {
         }
         let (system, tools, count) = self.request_overhead(session_id);
         out.push_str(&format!(
-            "
-Each request of this chat starts with about {} tokens before the conversation:              instructions {}, tool list {} ({count} tools).",
+            "\nEach request of this chat starts with about {} tokens before the conversation: \
+             instructions {}, tool list {} ({count} tools).",
             short_count((system + tools) as u64),
             short_count(system as u64),
             short_count(tools as u64),
+        ));
+        out.push_str(&format!(
+            "\nEvery request is logged in {} (cached share, and whether it started like the one before).",
+            self.state_dir.join("cache.log").display()
         ));
         out
     }
@@ -1902,6 +1950,78 @@ fn apply_loop_guard(
     Ok(keep)
 }
 
+/// Did this request start the same way as the chat's previous one? Prompt
+/// caches only reuse an unchanged start, so a change here is a miss we
+/// caused. Returns how it differs: "same start", "first request",
+/// "tool list changed", "system prompt changed" or "message N (role)
+/// changed" (N counts from 1 after the system prompt).
+fn prefix_change(session_id: &str, msgs: &[ChatMsg], specs: &[crate::provider::ToolSpec]) -> String {
+    use std::hash::{Hash, Hasher};
+    // Per chat: hash of the tool list, hash of each message.
+    type Seen = HashMap<String, (u64, Vec<u64>)>;
+    static LAST: std::sync::OnceLock<Mutex<Seen>> = std::sync::OnceLock::new();
+    let hash = |s: &str| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut h);
+        h.finish()
+    };
+    let tools = hash(&serde_json::to_string(specs).unwrap_or_default());
+    let now: Vec<u64> = msgs.iter().map(|m| hash(&serde_json::to_string(m).unwrap_or_default())).collect();
+    let mut last = LAST.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let note = match last.get(session_id) {
+        None => "first request".to_string(),
+        Some((t, _)) if *t != tools => "tool list changed".to_string(),
+        Some((_, prev)) => match prev.iter().zip(&now).position(|(a, b)| a != b) {
+            None if now.len() >= prev.len() => "same start".to_string(),
+            None => "history got shorter (compacted or undone)".to_string(),
+            Some(0) => "system prompt changed".to_string(),
+            Some(i) => format!("message {i} ({}) changed", msgs[i].role),
+        },
+    };
+    last.insert(session_id.to_string(), (tools, now));
+    note
+}
+
+/// One line per model request in `<state_dir>/cache.log`: tokens in, how
+/// many came from the provider's cache, and whether our side kept the start
+/// of the request the same. "same start" with a low share = the provider
+/// lost its cache (it expired, or another server answered).
+fn log_cache(st: &AppState, session_id: &str, usage: Option<&crate::provider::Usage>, prefix: &str) {
+    if session_id.is_empty() {
+        return;
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = match usage {
+        Some(u) => format!(
+            "{secs} {} in={} cached={} ({}%) out={} {prefix}\n",
+            short_id(session_id),
+            u.input,
+            u.cached,
+            (u.cached * 100).checked_div(u.input).unwrap_or(0),
+            u.output
+        ),
+        None => format!("{secs} {} no usage reported {prefix}\n", short_id(session_id)),
+    };
+    let _ = std::fs::create_dir_all(&st.state_dir);
+    let path = st.state_dir.join("cache.log");
+    // Keep it small: start over past 2 MB.
+    if std::fs::metadata(&path).map(|m| m.len() > 2_000_000).unwrap_or(false) {
+        let _ = std::fs::remove_file(&path);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+fn short_id(id: &str) -> &str {
+    let start = id.len().saturating_sub(8);
+    id.get(start..).unwrap_or(id)
+}
+
 /// Most "do it now" nudges per run.
 const MAX_NUDGES: u32 = 2;
 /// Sent when a reply only announced work. Starts with a marker so it never
@@ -2005,6 +2125,8 @@ pub async fn run_loop(
         // F-07: compact first when the context is nearly full.
         auto_compact_if_needed(st, session_id, &opts.system, &specs, abort).await;
         let msgs = build_chat_messages(st, session_id, &opts.system)?;
+        let prefix_note = prefix_change(session_id, &msgs, &specs);
+        let mut request_usage: Option<crate::provider::Usage> = None;
         // B-29: copy the client out of the lock; never hold it while waiting.
         let client = st.client.lock().await.clone();
         let model = opts.model.as_deref().unwrap_or(&client.model);
@@ -2077,7 +2199,10 @@ pub async fn run_loop(
                         });
                     }
                 }
-                StreamEvent::Usage(u) => st.record_usage(session_id, &u),
+                StreamEvent::Usage(u) => {
+                    st.record_usage(session_id, &u);
+                    request_usage = Some(*u);
+                }
                 StreamEvent::Done { finish_reason: fr } => {
                     finish_reason = fr.clone();
                     break;
@@ -2090,6 +2215,7 @@ pub async fn run_loop(
             continue;
         }
 
+        log_cache(st, session_id, request_usage.as_ref(), &prefix_note);
         let calls = acc.finish();
         // B-03: "length" = the model hit its output token limit.
         let truncated = finish_reason.as_deref() == Some("length");
@@ -4228,6 +4354,27 @@ mod tests {
     }
 
     #[test]
+    fn prefix_change_says_where_a_request_stopped_matching() {
+        let m = |role: &str, text: &str| ChatMsg {
+            role: role.into(),
+            content: Some(text.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let sid = format!("prefix-{}", std::process::id());
+        let tools = tools::tool_specs();
+        let a = vec![m("system", "s"), m("user", "hi")];
+        assert_eq!(prefix_change(&sid, &a, &tools), "first request");
+        let b = vec![m("system", "s"), m("user", "hi"), m("assistant", "yo"), m("user", "more")];
+        assert_eq!(prefix_change(&sid, &b, &tools), "same start", "only new messages at the end");
+        let c = vec![m("system", "s"), m("user", "hi"), m("assistant", "CHANGED"), m("user", "more")];
+        assert_eq!(prefix_change(&sid, &c, &tools), "message 2 (assistant) changed");
+        let d = vec![m("system", "s2"), m("user", "hi")];
+        assert_eq!(prefix_change(&sid, &d, &tools), "system prompt changed");
+        assert_eq!(prefix_change(&sid, &d, &tools[..2]), "tool list changed");
+    }
+
+    #[test]
     fn announced_work_is_spotted() {
         for t in [
             "I'll replace index.html with a complete, self-contained file meeting every requirement.",
@@ -4312,6 +4459,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("index.html")).unwrap(), "<h1>Ember</h1>\n");
         assert_eq!(hits.load(Ordering::SeqCst), 3, "announce, nudge → write, summary");
         assert_eq!(st.first_request(&s.id).as_deref(), Some("build the page"), "the nudge is not the user's request");
+        // Every request is in the cache log, and each one started like the last.
+        let log = std::fs::read_to_string(st.state_dir.join("cache.log")).unwrap_or_default();
+        let mine: Vec<&str> = log.lines().filter(|l| l.contains(short_id(&s.id))).collect();
+        assert_eq!(mine.len(), 3, "{log}");
+        assert!(mine[0].ends_with("first request") && mine[1..].iter().all(|l| l.ends_with("same start")), "{log}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4632,7 +4784,10 @@ data: [DONE]
                     )
             })
             .count();
-        assert_eq!(continues, TURBO_MAX_CONTINUATIONS as usize, "the cap holds");
+        // The mock only ever answers in words: after one continuation it has
+        // said it is done, so no more rounds are paid for (the cap of
+        // TURBO_MAX_CONTINUATIONS is checked in `turbo_streak_caps_and_resets`).
+        assert_eq!(continues, 1, "a words-only answer ends the chain");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         while let Ok(ev) = rx.try_recv() {
             assert!(!matches!(ev, ServerEvent::RunFinished { .. }), "only one RunFinished");
@@ -6126,7 +6281,10 @@ data: [DONE]
         // The fixed failure became a lesson that later prompts carry.
         let lessons = load_lessons(&st, &dir).expect("a lesson was saved");
         assert!(lessons.starts_with("- ") && lessons.contains("failed (exit 1)") && lessons.contains("fixed by: done"), "{lessons}");
-        assert!(st.composed_system(&s.id).contains("## Lessons from earlier runs in this project"));
+        // The next chat carries it; this chat keeps its prompt (prompt cache).
+        let next = st.db.create_session("next", None).unwrap();
+        assert!(st.composed_system(&next.id).contains("## Lessons from earlier runs in this project"));
+        assert!(!st.composed_system(&s.id).contains("## Lessons from earlier runs"), "same prompt for the rest of this chat");
         record_lesson(&st, &dir, "1. `x` failed (exit 1)", "again");
         assert_eq!(load_lessons(&st, &dir).unwrap().lines().count(), 2, "a new problem adds a line");
         record_lesson(&st, &dir, "1. `x` failed (exit 1)", "third");
