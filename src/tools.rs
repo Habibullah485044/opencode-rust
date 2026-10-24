@@ -592,7 +592,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// `/c/Users/x` (Git Bash / MSYS form) → `C:/Users/x`. `None` for any
 /// other path.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn msys_to_windows(raw: &str) -> Option<String> {
+pub(crate) fn msys_to_windows(raw: &str) -> Option<String> {
     let rest = raw.strip_prefix('/')?;
     let mut chars = rest.chars();
     let drive = chars.next().filter(char::is_ascii_alphabetic)?;

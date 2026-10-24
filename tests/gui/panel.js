@@ -757,6 +757,54 @@
   ok("no git hides the chip", document.getElementById("git-wrap").hidden);
   ok("six starter templates", document.querySelectorAll("#empty .chip").length === 6);
 
+  // Terminal panel.
+  var termEl = document.getElementById("term");
+  ok("terminal starts hidden", termEl.hidden);
+  sent = [];
+  click("term-btn");
+  ok("the Terminal button opens it and tells Rust", !termEl.hidden && (last("term_open") || {}).open === true, JSON.stringify(sent));
+  window.showTerm({ cwd: "C:\\proj", shell: "Git Bash", text: "$ npm test\nok 3 tests\n", running: "term7",
+    jobs: [{ id: "job2", title: "npm run dev", running: true, exit: null, text: "Local: http://localhost:5173\n" }] });
+  ok("output shows", document.getElementById("term-out").textContent.indexOf("ok 3 tests") >= 0);
+  ok("folder shows", document.getElementById("term-cwd").textContent === "C:\\proj");
+  ok("a running command shows Stop", !document.getElementById("term-stop").hidden);
+  var termTabs = document.querySelectorAll("#term-tabs .term-tab");
+  ok("one tab for me, one per agent job", termTabs.length === 2 && termTabs[1].textContent.indexOf("npm run dev") >= 0);
+  var tIn = document.getElementById("term-input");
+  sent = [];
+  tIn.value = "ls -la";
+  key(tIn, "Enter");
+  ok("Enter runs the command", (last("term_run") || {}).command === "ls -la" && tIn.value === "", JSON.stringify(sent));
+  key(tIn, "ArrowUp");
+  ok("Up recalls the last command", tIn.value === "ls -la");
+  tIn.value = "";
+  sent = [];
+  tIn.dispatchEvent(new KeyboardEvent("keydown", { key: "c", ctrlKey: true, bubbles: true, cancelable: true }));
+  ok("Ctrl+C stops the running command", count("term_stop") === 1 && !(last("term_stop") || {}).id, JSON.stringify(sent));
+  termTabs[1].click();
+  ok("a job tab shows the job's output", document.getElementById("term-out").textContent.indexOf("localhost:5173") >= 0 && tIn.disabled);
+  sent = [];
+  click("term-stop");
+  ok("Stop on a job tab stops that job", (last("term_stop") || {}).id === "job2", JSON.stringify(sent));
+  document.getElementById("input").value = "";
+  click("term-send");
+  ok("Send to chat puts the output in the message box", document.getElementById("input").value.indexOf("localhost:5173") >= 0);
+  document.getElementById("input").value = "";
+  sent = [];
+  tIn.value = "clear";
+  document.querySelectorAll("#term-tabs .term-tab")[0].click();
+  tIn.value = "clear";
+  key(tIn, "Enter");
+  ok("typing clear clears instead of running", count("term_clear") === 1 && count("term_run") === 0, JSON.stringify(sent));
+  window.showTerm({ cwd: "C:\\proj", shell: "Git Bash", text: "", running: null, jobs: [] });
+  ok("no running command hides Stop", document.getElementById("term-stop").hidden);
+  window.showTerm({ cwd: "C:\\Users\\me\\Desktop\\site", shell: "Git Bash", text: "", running: null, jobs: [] });
+  ok("a long folder shows its last two parts", document.getElementById("term-cwd").textContent === "\u2026/Desktop/site" &&
+    document.getElementById("term-cwd").title === "C:\\Users\\me\\Desktop\\site", document.getElementById("term-cwd").textContent);
+  sent = [];
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "`", code: "Backquote", ctrlKey: true, bubbles: true, cancelable: true }));
+  ok("Ctrl+` hides it again", termEl.hidden && (last("term_open") || {}).open === false, JSON.stringify(sent));
+
   // Deep attempts show as agent cards without Open/Stop.
   var deepAgents = Object.assign(payload(basePage), { agents: [
     { id: "deep-1-1", name: "attempt 1", task: "t", state: "working", detail: "write out.txt", secs: 3 }

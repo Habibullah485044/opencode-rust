@@ -79,6 +79,13 @@ pub struct GuiState {
     pub followups: Vec<(String, String)>,
     /// The last status check, in words (tooltip of the API pill).
     pub api_detail: String,
+    /// Terminal panel: shown or not, its folder (`None` = the chat's
+    /// project), what was typed there, and the last view sent to the page.
+    pub term_open: bool,
+    pub term_cwd: Option<std::path::PathBuf>,
+    pub term_entries: Vec<TermEntry>,
+    pub term_root: std::cell::RefCell<std::path::PathBuf>,
+    pub term_last: std::cell::RefCell<String>,
     /// The project's git branch and how many files changed, if git.
     pub git: Option<(String, usize)>,
     /// Read the git state again (after a run, a chat switch).
@@ -204,6 +211,11 @@ impl Default for GuiState {
             file_matches: (String::new(), Vec::new()),
             followups: Vec::new(),
             api_detail: String::new(),
+            term_open: false,
+            term_cwd: None,
+            term_entries: Vec::new(),
+            term_root: std::cell::RefCell::new(std::path::PathBuf::from(".")),
+            term_last: std::cell::RefCell::new(String::new()),
             git: None,
             git_stale: true,
             question: None,
@@ -936,6 +948,14 @@ pub enum IpcMsg {
     LoadChanges,
     /// Make a new git branch in the chat's project and switch to it.
     NewBranch(String),
+    /// Terminal panel: shown or hidden.
+    TermOpen(bool),
+    /// Terminal panel: run a command (or `cd`).
+    TermRun(String),
+    /// Terminal panel: stop a command (`None` = the running one typed there).
+    TermStop(Option<String>),
+    /// Terminal panel: forget what was typed and printed.
+    TermClear,
     /// `@` autocomplete: project files matching the text.
     FindFiles(String),
     /// Send line comments from the Changes view to the agent.
@@ -1029,6 +1049,13 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "export" => Some(IpcMsg::Export),
         "pick_files" => Some(IpcMsg::PickFiles),
         "load_changes" => Some(IpcMsg::LoadChanges),
+        "term_open" => Some(IpcMsg::TermOpen(v.get("open")?.as_bool()?)),
+        "term_run" => {
+            let c = v.get("command")?.as_str()?.trim().to_string();
+            if c.is_empty() { None } else { Some(IpcMsg::TermRun(c)) }
+        }
+        "term_stop" => Some(IpcMsg::TermStop(v.get("id").and_then(|i| i.as_str()).map(str::to_string))),
+        "term_clear" => Some(IpcMsg::TermClear),
         "new_branch" => Some(IpcMsg::NewBranch(v.get("name")?.as_str()?.trim().to_string())),
         "find_files" => Some(IpcMsg::FindFiles(v.get("query").and_then(|q| q.as_str()).unwrap_or("").to_string())),
         "review_comments" => Some(IpcMsg::ReviewComments(
@@ -1144,6 +1171,7 @@ fn normalize_url(raw: &str) -> Result<String, String> {
 /// B-37: only the entries that changed since the last paint are sent.
 fn paint(webview: &wry::WebView, gs: &GuiState) {
     let _ = webview.evaluate_script(&format!("window.render&&window.render({})", gs.paint_payload()));
+    send_term(webview, gs);
     // A Changes view is sent once, apart from the frequent repaints.
     if let Some(json) = gs.changes_out.borrow_mut().take() {
         let _ = webview.evaluate_script(&format!("window.showChanges&&window.showChanges({json})"));
@@ -1501,6 +1529,128 @@ fn load_zoom(state_dir: &std::path::Path) -> f64 {
 
 fn save_zoom(state_dir: &std::path::Path, z: f64) {
     let _ = std::fs::write(state_dir.join("zoom.txt"), format!("{z}"));
+}
+
+/// One line of work in the terminal panel's own tab.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TermEntry {
+    /// A command run as a background job (its output lives in `jobs`).
+    Job(String),
+    /// Text the app printed itself (`cd`, a command that could not start).
+    Note(String),
+}
+
+/// Most output shown per command in the terminal tab, and per agent job.
+const TERM_TAIL: usize = 8_000;
+const JOB_TAIL: usize = 20_000;
+
+/// The terminal panel's view: the folder, the shell, the user's tab (what
+/// was typed and printed) and one tab per background job of the agent.
+fn term_view(gs: &GuiState, cwd: &std::path::Path) -> serde_json::Value {
+    let jobs = crate::tools::jobs::list(TERM_TAIL.max(JOB_TAIL));
+    let tail = |s: &str, max: usize| -> String {
+        if s.len() <= max {
+            return s.to_string();
+        }
+        let mut start = s.len() - max;
+        while !s.is_char_boundary(start) {
+            start += 1;
+        }
+        s[start..].to_string()
+    };
+    let mut text = String::new();
+    let mut running = None;
+    for e in gs.term_entries.iter().rev().take(30).collect::<Vec<_>>().into_iter().rev() {
+        match e {
+            TermEntry::Note(t) => text.push_str(t),
+            TermEntry::Job(id) => {
+                let Some(j) = jobs.iter().find(|j| &j.id == id) else { continue };
+                text.push_str(&format!("$ {}\n", j.command));
+                text.push_str(&tail(&j.tail, TERM_TAIL));
+                if !text.ends_with('\n') && !text.is_empty() {
+                    text.push('\n');
+                }
+                match &j.exit {
+                    Some(how) => text.push_str(&format!("[{how}]\n")),
+                    None => running = Some(j.id.clone()),
+                }
+            }
+        }
+    }
+    let agent_jobs: Vec<serde_json::Value> = jobs
+        .iter()
+        .filter(|j| !j.by_user)
+        .map(|j| {
+            serde_json::json!({
+                "id": j.id,
+                "title": j.command,
+                "running": j.exit.is_none(),
+                "exit": j.exit,
+                "text": tail(&j.tail, JOB_TAIL),
+            })
+        })
+        .collect();
+    let shell = match crate::tools::shell_kind() {
+        crate::permissions::Shell::Posix if cfg!(windows) => "Git Bash",
+        crate::permissions::Shell::Posix => "sh",
+        crate::permissions::Shell::Cmd => "cmd",
+    };
+    serde_json::json!({
+        "cwd": cwd.display().to_string(),
+        "shell": shell,
+        "text": text,
+        "running": running,
+        "jobs": agent_jobs,
+    })
+}
+
+/// Send the terminal view when the panel is open and something changed.
+fn send_term(webview: &wry::WebView, gs: &GuiState) {
+    if !gs.term_open {
+        return;
+    }
+    let cwd = gs.term_cwd.clone().unwrap_or_else(|| gs.term_root.borrow().clone());
+    let json = term_view(gs, &cwd).to_string();
+    if *gs.term_last.borrow() != json {
+        let _ = webview.evaluate_script(&format!("window.showTerm&&window.showTerm({json})"));
+        *gs.term_last.borrow_mut() = json;
+    }
+}
+
+/// `cd`, `cd <dir>` (and `cd ~`, `/c/...`): the folder to switch to, or why
+/// not. `None` = not a plain `cd` (it runs in the shell like any command).
+fn cd_target(
+    command: &str,
+    cwd: &std::path::Path,
+    root: &std::path::Path,
+) -> Option<std::result::Result<std::path::PathBuf, String>> {
+    let rest = command.strip_prefix("cd").filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))?;
+    let arg = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+    if ["&&", "||", ";", "|"].iter().any(|op| arg.contains(op)) {
+        return None;
+    }
+    let dir = if arg.is_empty() {
+        root.to_path_buf()
+    } else if arg == "~" || arg.starts_with("~/") {
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(std::path::PathBuf::from)?;
+        home.join(arg.trim_start_matches('~').trim_start_matches('/'))
+    } else {
+        let arg = crate::tools::msys_to_windows(arg).unwrap_or_else(|| arg.to_string());
+        cwd.join(arg)
+    };
+    Some(match std::fs::canonicalize(&dir) {
+        Ok(d) if d.is_dir() => Ok(strip_verbatim(d)),
+        _ => Err(format!("cd: no such folder: {}", dir.display())),
+    })
+}
+
+/// `\\?\C:\x` (from canonicalize on Windows) -> `C:\x`.
+fn strip_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => std::path::PathBuf::from(rest),
+        _ => p,
+    }
 }
 
 /// Branch name and number of changed files, when `root` is in a git repo.
@@ -2133,7 +2283,8 @@ pub async fn run(
         // Never overwrite `Exit`: every callback starts here, so resetting it
         // would strand a windowless process after the user closes the window.
         if !matches!(*control_flow, ControlFlow::Exit) {
-            *control_flow = if gs.approval.is_some() || bridge.busy() {
+            let term_live = gs.term_open && crate::tools::jobs::list(0).iter().any(|j| j.exit.is_none());
+            *control_flow = if gs.approval.is_some() || bridge.busy() || term_live {
                 ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(500))
             } else {
                 ControlFlow::Wait
@@ -2162,8 +2313,11 @@ pub async fn run(
                     gs.sessions_stale = false;
                     refresh_sessions(&mut gs, &st);
                 }
+                // A running command's new output reaches an open terminal.
+                send_term(&webview, &gs);
                 if gs.git_stale {
                     gs.git_stale = false;
+                    *gs.term_root.borrow_mut() = chat_root(&gs, &st);
                     gs.git = git_state(&chat_root(&gs, &st));
                     changed = true;
                 }
@@ -2344,6 +2498,50 @@ pub async fn run(
                         UiMsg::Ipc(IpcMsg::FindFiles(query)) => {
                             let items = find_project_files(&chat_root(&gs, &st), &query, 12);
                             gs.file_matches = (query, items);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::TermOpen(open)) => {
+                            gs.term_open = open;
+                            *gs.term_root.borrow_mut() = chat_root(&gs, &st);
+                            gs.term_last.borrow_mut().clear(); // send the view again when shown
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::TermRun(command)) => {
+                            let cwd = gs.term_cwd.clone().unwrap_or_else(|| chat_root(&gs, &st));
+                            if let Some(target) = cd_target(&command, &cwd, &chat_root(&gs, &st)) {
+                                let note = match target {
+                                    Ok(dir) => {
+                                        let text = format!("$ {command}\n{}\n", dir.display());
+                                        gs.term_cwd = Some(dir);
+                                        text
+                                    }
+                                    Err(e) => format!("$ {command}\n{e}\n"),
+                                };
+                                gs.term_entries.push(TermEntry::Note(note));
+                            } else {
+                                // Jobs read their pipes on tokio tasks.
+                                let _guard = rt.enter();
+                                match crate::tools::jobs::spawn(&command, &cwd, true) {
+                                    Ok(id) => gs.term_entries.push(TermEntry::Job(id)),
+                                    Err(e) => gs.term_entries.push(TermEntry::Note(format!("$ {command}\ncould not start: {e:#}\n"))),
+                                }
+                            }
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::TermStop(id)) => {
+                            let running = crate::tools::jobs::list(0);
+                            let target = id.or_else(|| {
+                                running.iter().rev().find(|j| j.by_user && j.exit.is_none()).map(|j| j.id.clone())
+                            });
+                            if let Some(id) = target {
+                                rt.spawn(async move {
+                                    let _ = crate::tools::jobs::stop(&id).await;
+                                });
+                            }
+                        }
+                        UiMsg::Ipc(IpcMsg::TermClear) => {
+                            gs.term_entries.clear();
+                            crate::tools::jobs::clear_user_jobs();
                             changed = true;
                         }
                         UiMsg::Ipc(IpcMsg::NewBranch(name)) => {
@@ -3026,6 +3224,59 @@ mod tests {
         g.input = "second message".into();
         submit_and_name(&mut g, &st);
         assert_eq!(g.title(), "prefill repro marker one");
+    }
+
+    #[test]
+    fn terminal_ipc_messages() {
+        assert_eq!(parse_ipc(r#"{"type":"term_open","open":true}"#), Some(IpcMsg::TermOpen(true)));
+        assert_eq!(parse_ipc(r#"{"type":"term_run","command":" ls "}"#), Some(IpcMsg::TermRun("ls".into())));
+        assert_eq!(parse_ipc(r#"{"type":"term_run","command":"  "}"#), None, "nothing to run");
+        assert_eq!(parse_ipc(r#"{"type":"term_stop"}"#), Some(IpcMsg::TermStop(None)));
+        assert_eq!(parse_ipc(r#"{"type":"term_stop","id":"job3"}"#), Some(IpcMsg::TermStop(Some("job3".into()))));
+        assert_eq!(parse_ipc(r#"{"type":"term_clear"}"#), Some(IpcMsg::TermClear));
+    }
+
+    #[test]
+    fn terminal_cd_is_handled_by_the_app() {
+        let root = std::env::temp_dir().join(format!("ocrs-cd-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let root = strip_verbatim(std::fs::canonicalize(&root).unwrap());
+        assert_eq!(cd_target("cd sub", &root, &root), Some(Ok(root.join("sub"))));
+        assert_eq!(cd_target("cd \"sub\"", &root, &root), Some(Ok(root.join("sub"))));
+        assert_eq!(cd_target("cd", &root.join("sub"), &root), Some(Ok(root.clone())), "bare cd goes to the project");
+        assert_eq!(cd_target("cd ..", &root.join("sub"), &root), Some(Ok(root.clone())));
+        assert!(matches!(cd_target("cd nope", &root, &root), Some(Err(e)) if e.contains("no such folder")));
+        assert_eq!(cd_target("cd sub && ls", &root, &root), None, "a compound line runs in the shell");
+        assert_eq!(cd_target("cdk deploy", &root, &root), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn terminal_shows_a_command_and_its_output() {
+        let dir = std::env::temp_dir();
+        let id = crate::tools::jobs::spawn("echo hello-term", &dir, true).unwrap();
+        assert!(id.starts_with("term"), "{id}");
+        for _ in 0..100 {
+            if crate::tools::jobs::list(0).iter().any(|j| j.id == id && j.exit.is_some()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // The pipe readers may finish just after the exit is seen.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut g = GuiState::new();
+        g.term_entries.push(TermEntry::Note("$ cd x\nC:\\x\n".into()));
+        g.term_entries.push(TermEntry::Job(id.clone()));
+        let v = term_view(&g, &dir);
+        let text = v["text"].as_str().unwrap();
+        assert!(text.starts_with("$ cd x\n"), "{text}");
+        assert!(text.contains("$ echo hello-term\nhello-term"), "{text}");
+        assert!(text.contains("[exited with code 0]"), "{text}");
+        assert!(v["running"].is_null());
+        assert!(
+            v["jobs"].as_array().unwrap().iter().all(|j| j["id"] != id.as_str()),
+            "the user's own commands are not agent job tabs"
+        );
     }
 
     #[test]

@@ -1036,7 +1036,7 @@
     font-weight: 800;
     font-size: 20px;
   }
-  #empty h1 { font-size: 22px; font-weight: 600; color: #fff; letter-spacing: -0.01em; text-align: center; }
+  #empty h1 { font-size: 22px; font-weight: 600; color: var(--text); letter-spacing: -0.01em; text-align: center; }
   #empty p { font-size: 14px; color: var(--text-muted); max-width: 420px; text-align: center; line-height: 1.55; }
   #empty .chips {
     display: grid;
@@ -1228,6 +1228,64 @@
     flex: none;
   }
   #agents[hidden] { display: none; }
+
+  /* ---- Terminal panel: commands in the project folder, and the agent's
+     background jobs (dev servers, watchers) as tabs ---- */
+  #term {
+    max-width: 820px;
+    width: 100%;
+    margin: 0 auto 6px;
+    padding: 0 32px;
+    flex: none;
+  }
+  #term[hidden] { display: none; }
+  .term-box {
+    border: 1px solid var(--line-strong);
+    background: var(--panel);
+    border-radius: var(--radius);
+    display: flex;
+    flex-direction: column;
+    height: 260px;
+    overflow: hidden;
+  }
+  .term-head { display: flex; align-items: center; gap: 4px; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  #term-tabs { display: flex; gap: 2px; min-width: 0; overflow-x: auto; flex: 1; }
+  .term-tab {
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 12px;
+    padding: 3px 9px;
+    border-radius: var(--radius-s);
+    cursor: pointer;
+    white-space: nowrap;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .term-tab.on { background: var(--surface-3); color: var(--text); }
+  .term-tab .live { color: var(--ok, #6cc28a); margin-right: 4px; }
+  .term-act { border: 0; background: transparent; color: var(--text-muted); font: inherit; font-size: 12px; padding: 3px 8px; border-radius: var(--radius-s); cursor: pointer; white-space: nowrap; }
+  .term-act:hover { color: var(--text); background: var(--surface-2); }
+  #term-out {
+    flex: 1;
+    margin: 0;
+    padding: 8px 10px;
+    overflow: auto;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text-soft);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .term-row { display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 12px; }
+  .term-row[hidden] { display: none; }
+  #term-cwd { color: var(--accent-strong); white-space: nowrap; max-width: 40%; overflow: hidden; text-overflow: ellipsis; }
+  #term-input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; }
+  #term-stop { border: 1px solid var(--line-strong); }
+  #term-stop[hidden] { display: none; }
   .ag-box {
     border: 1px solid var(--line);
     background: var(--panel);
@@ -1743,6 +1801,7 @@
           <div id="cstatus">
             <span>Ready</span>
           </div>
+          <button class="header-btn" id="term-btn" title="Terminal: run commands in this project, see the agent's background jobs (Ctrl+`)">Terminal</button>
           <button class="header-btn" id="changes-btn" title="See what changed in this project, comment on lines">Changes</button>
           <button class="header-btn" id="export-btn" title="Save this chat as a Markdown file in the project">Export</button>
           <button class="header-btn" id="open-editor-btn" hidden title="Open this project's folder in your code editor">Open in editor</button>
@@ -1795,6 +1854,24 @@
               <span class="chip-t">Review my changes</span>
               <span class="chip-d">Bugs and risks in the diff</span>
             </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Terminal panel -->
+      <div id="term" hidden>
+        <div class="term-box">
+          <div class="term-head">
+            <div id="term-tabs" role="tablist"></div>
+            <button type="button" class="term-act" id="term-send" title="Put this output in the message box">Send to chat</button>
+            <button type="button" class="term-act" id="term-clear" title="Clear what was typed and printed here">Clear</button>
+            <button type="button" class="term-act" id="term-close" title="Hide the terminal (Ctrl+`)" aria-label="Hide the terminal">×</button>
+          </div>
+          <pre id="term-out"></pre>
+          <div class="term-row" id="term-row">
+            <span id="term-cwd"></span><span>$</span>
+            <input id="term-input" placeholder="Run a command in this folder (no interactive programs)" spellcheck="false" autocomplete="off" />
+            <button type="button" class="term-act" id="term-stop" hidden title="Stop the running command (Ctrl+C)">Stop</button>
           </div>
         </div>
       </div>
@@ -2056,6 +2133,104 @@
     b.setAttribute("aria-pressed", on ? "true" : "false");
     b.textContent = on ? "Deep: on" : "Deep";
   }
+  // ---- Terminal panel ----
+  var termData = null;
+  var termTab = "me";
+  var termHistory = [];
+  var termHistPos = -1;
+  function termOpen() { var t = document.getElementById("term"); return !!t && !t.hidden; }
+  function toggleTerm(open) {
+    var t = document.getElementById("term");
+    if (!t) return;
+    t.hidden = !open;
+    postToRust({ type: "term_open", open: open });
+    if (open) {
+      var ti = document.getElementById("term-input");
+      if (ti && termTab === "me") ti.focus();
+    }
+  }
+  function termText() {
+    if (!termData) return "";
+    if (termTab === "me") return termData.text || "";
+    var j = (termData.jobs || []).filter(function (x) { return x.id === termTab; })[0];
+    return j ? (j.text || "") + (j.exit ? "\n[" + j.exit + "]" : "") : "";
+  }
+  function renderTerm() {
+    var d = termData;
+    if (!d) return;
+    var jobs = d.jobs || [];
+    if (termTab !== "me" && !jobs.some(function (j) { return j.id === termTab; })) termTab = "me";
+    var tabs = document.getElementById("term-tabs");
+    tabs.textContent = "";
+    var addTab = function (id, label, live, title) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "term-tab" + (termTab === id ? " on" : "");
+      b.setAttribute("role", "tab");
+      b.setAttribute("data-id", id);
+      b.title = title;
+      if (live) {
+        var dot = document.createElement("span");
+        dot.className = "live";
+        dot.textContent = "\u25cf";
+        b.appendChild(dot);
+      }
+      b.appendChild(document.createTextNode(label));
+      b.addEventListener("click", function () { termTab = id; renderTerm(); });
+      tabs.appendChild(b);
+    };
+    addTab("me", "Terminal \u00b7 " + (d.shell || "shell"), !!d.running, "Commands you run here");
+    jobs.forEach(function (j) { addTab(j.id, j.id + ": " + j.title, j.running, "Started by the agent: " + j.title); });
+    var out = document.getElementById("term-out");
+    var atEnd = out.scrollHeight - out.scrollTop - out.clientHeight < 24;
+    var text = termText();
+    if (out.textContent !== text) {
+      out.textContent = text;
+      if (atEnd) out.scrollTop = out.scrollHeight;
+    }
+    var mine = termTab === "me";
+    var input = document.getElementById("term-input");
+    input.disabled = !mine;
+    input.placeholder = mine ? "Run a command in this folder (no interactive programs)" : "Output of a job the agent started";
+    var cwd = document.getElementById("term-cwd");
+    // The last two folders; the full path is the tooltip.
+    var parts = String(d.cwd || "").split(/[\\/]/).filter(Boolean);
+    cwd.textContent = parts.length > 2 ? "…" + "/" + parts.slice(-2).join("/") : (d.cwd || "");
+    cwd.title = d.cwd || "";
+    var job = mine ? null : jobs.filter(function (j) { return j.id === termTab; })[0];
+    document.getElementById("term-stop").hidden = mine ? !d.running : !(job && job.running);
+  }
+  window.showTerm = function (d) { termData = d; renderTerm(); };
+  function termRun() {
+    var input = document.getElementById("term-input");
+    var cmd = (input.value || "").trim();
+    if (!cmd) return;
+    if (cmd === "clear" || cmd === "cls") {
+      postToRust({ type: "term_clear" });
+    } else {
+      postToRust({ type: "term_run", command: cmd });
+    }
+    if (termHistory[termHistory.length - 1] !== cmd) termHistory.push(cmd);
+    termHistPos = -1;
+    input.value = "";
+    var out = document.getElementById("term-out");
+    out.scrollTop = out.scrollHeight;
+  }
+  function termStop() {
+    postToRust(termTab === "me" ? { type: "term_stop" } : { type: "term_stop", id: termTab });
+  }
+  function termSendToChat() {
+    var text = termText().replace(/\s+$/, "");
+    if (!text) return;
+    if (text.length > 3000) text = "\u2026" + text.slice(text.length - 3000);
+    var ta = document.getElementById("input");
+    if (!ta) return;
+    var block = "Terminal output:\n```\n" + text + "\n```\n";
+    ta.value = ta.value ? ta.value.replace(/\s*$/, "") + "\n" + block : block;
+    ta.dispatchEvent(new Event("input"));
+    ta.focus();
+  }
+
   function sendQueued() {
     if (!queuedMsg) return;
     postToRust({ type: "send", text: queuedMsg.text });
@@ -4151,6 +4326,33 @@
         if (btn && btn.getAttribute("data-copy")) copyCode(btn.getAttribute("data-copy"), btn);
       });
     }
+
+    // Terminal panel
+    var termBtn = document.getElementById("term-btn");
+    if (termBtn) termBtn.addEventListener("click", function () { toggleTerm(!termOpen()); });
+    document.getElementById("term-close").addEventListener("click", function () { toggleTerm(false); });
+    document.getElementById("term-clear").addEventListener("click", function () { postToRust({ type: "term_clear" }); });
+    document.getElementById("term-send").addEventListener("click", termSendToChat);
+    document.getElementById("term-stop").addEventListener("click", termStop);
+    var termInput = document.getElementById("term-input");
+    termInput.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") { ev.preventDefault(); termRun(); return; }
+      if (ev.key === "c" && ev.ctrlKey && !termInput.value && termData && termData.running) { ev.preventDefault(); termStop(); return; }
+      if (ev.key === "Escape") { toggleTerm(false); document.getElementById("input").focus(); return; }
+      if (ev.key === "ArrowUp" || ev.key === "ArrowDown") {
+        if (!termHistory.length) return;
+        ev.preventDefault();
+        if (ev.key === "ArrowUp") termHistPos = Math.min(termHistPos + 1, termHistory.length - 1);
+        else termHistPos = Math.max(termHistPos - 1, -1);
+        termInput.value = termHistPos < 0 ? "" : termHistory[termHistory.length - 1 - termHistPos];
+      }
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.ctrlKey && (ev.key === "`" || ev.code === "Backquote")) {
+        ev.preventDefault();
+        toggleTerm(!termOpen());
+      }
+    });
 
     // Deep toggle
     var deepToggle = document.getElementById("deep-btn");
