@@ -2255,6 +2255,8 @@ pub async fn run_loop(
     let mut loop_guard = LoopGuard::default();
     // Replies that only said what the model would do next (see `announces_work`).
     let mut nudges = 0;
+    // The history was summarized once this run because it was too long.
+    let mut compacted = false;
     // Spec list: base tools + MCP tools (+ spawn), then filter by mode/role.
     let mut specs = tools::tool_specs();
     // Browser tools only work while a GUI panel is attached. Advertising them
@@ -2313,7 +2315,23 @@ pub async fn run_loop(
         let model = opts.model.as_deref().unwrap_or(&client.model);
         // A rate-limit wait can be long: Stop must still end it.
         let mut stream = tokio::select! {
-            s = client.stream(model, &msgs, &specs) => s?,
+            s = client.stream(model, &msgs, &specs) => match s {
+                Ok(s) => s,
+                // Too long for the model: summarize the older part once,
+                // then ask again, instead of ending on the error.
+                Err(e) if !compacted && is_context_overflow(&format!("{e:#}")) => {
+                    compacted = true;
+                    let _ = st.events.send(ServerEvent::Note {
+                        session_id: session_id.to_string(),
+                        text: "the chat got too long for the model — summarizing the older part and trying again".into(),
+                    });
+                    match crate::compact::compact(st, session_id, abort).await {
+                        Ok(_) => continue,
+                        Err(ce) => return Err(e.context(format!("the chat is too long for the model and could not be shortened: {ce:#}"))),
+                    }
+                }
+                Err(e) => return Err(e),
+            },
             _ = async {
                 while !abort.load(Ordering::SeqCst) {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -3804,7 +3822,40 @@ fn build_chat_messages(st: &Shared, session_id: &str, system: &str) -> Result<Ve
     }
     // New (B-04): repair what a crash, an abort or a compaction can leave
     // behind before the provider sees it (see `repair_history`).
-    Ok(repair_history(out))
+    let mut out = repair_history(out);
+    // Chat templates (Qwen's among them) refuse a request with no user
+    // message, and a compacted chat can keep only tool steps in its tail.
+    if !out.iter().any(|m| m.role == "user") {
+        let at = usize::from(out.first().is_some_and(|m| m.role == "system"));
+        out.insert(at, ChatMsg {
+            role: "user".into(),
+            content: Some("(The earlier conversation is summarized above. Continue with the task.)".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    Ok(out)
+}
+
+/// Does a provider error say the request was too long for the model? Also
+/// the Qwen template's "No user query found", which is what a server that
+/// silently drops the oldest messages to fit produces.
+pub fn is_context_overflow(err: &str) -> bool {
+    let e = err.to_lowercase();
+    [
+        "no user query found",
+        "context length",
+        "context window",
+        "context_length_exceeded",
+        "maximum context",
+        "exceeds the context",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+        "reduce the length",
+    ]
+    .iter()
+    .any(|k| e.contains(k))
 }
 
 /// New (B-04): the result sent for a tool call that never finished.
@@ -4685,6 +4736,25 @@ mod tests {
         assert!(denies_file_access("I don't have access to your file system. Could you upload the files?"));
         assert!(!denies_file_access("I read the folder: it has 3 files, main.rs, lib.rs and Cargo.toml."));
         assert!(!denies_file_access("I can't access the network from here, so I could not download the page."));
+    }
+
+    #[test]
+    fn context_overflow_errors_are_recognised() {
+        assert!(is_context_overflow("provider returned 500 Internal Server Error: {\"error\":\"Jinja Exception: No user query found in messages.\"}"));
+        assert!(is_context_overflow("This model's maximum context length is 32768 tokens"));
+        assert!(!is_context_overflow("provider returned 401 Unauthorized"));
+    }
+
+    /// A request always carries a user message, even when the stored
+    /// history (after a compaction) has only tool steps.
+    #[tokio::test]
+    async fn a_request_always_has_a_user_message() {
+        let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let s = st.db.create_session("u", None).unwrap();
+        st.db.add_message(&s.id, "assistant", &[Part::Text { text: "working".into() }]).unwrap();
+        let msgs = build_chat_messages(&st, &s.id, "sys").unwrap();
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "user", "inserted right after the system prompt");
     }
 
     #[test]

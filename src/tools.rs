@@ -719,15 +719,27 @@ fn read_file(workspace: &Path, path: &str, offset: i64, limit: i64) -> Result<St
     // numbers; 0 and 1 both mean "from the top".
     let skip = (offset.max(1) - 1) as usize;
     let lines: Vec<&str> = text.lines().collect();
-    let slice: Vec<String> = lines
-        .iter()
-        .skip(skip)
-        .take(limit)
-        .enumerate()
-        .map(|(i, l)| format!("{:>6}\t{}", skip + i + 1, cap_line(l)))
-        .collect();
-    let mut out = slice.join("\n");
-    if skip + limit < lines.len() {
+    // A total cap too: 500 long lines (minified code) were one huge result
+    // that pushed a whole chat past the model's context.
+    let mut out = String::new();
+    let mut shown = 0;
+    for (i, l) in lines.iter().skip(skip).take(limit).enumerate() {
+        let row = format!("{:>6}\t{}", skip + i + 1, cap_line(l));
+        if !out.is_empty() && out.len() + row.len() > READ_MAX_TOTAL_CHARS {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&row);
+        shown += 1;
+    }
+    if shown < limit.min(lines.len().saturating_sub(skip)) {
+        out.push_str(&format!(
+            "\n… [output cut at {READ_MAX_TOTAL_CHARS} characters; continue with offset {}, or grep for what you need]",
+            skip + shown + 1
+        ));
+    } else if skip + limit < lines.len() {
         out.push_str(&format!(
             "\n… [{} more lines; continue with offset {}]",
             lines.len() - skip - limit,
@@ -742,6 +754,8 @@ fn read_file(workspace: &Path, path: &str, offset: i64, limit: i64) -> Result<St
 const READ_MAX_BYTES: u64 = 20_000_000;
 /// Longest line the read tool shows, in characters (B-30).
 const READ_MAX_LINE_CHARS: usize = 2000;
+/// Most characters one read returns (~10K tokens).
+const READ_MAX_TOTAL_CHARS: usize = 40_000;
 
 /// Cut one very long line, for example in a minified file (B-30).
 fn cap_line(line: &str) -> std::borrow::Cow<'_, str> {
