@@ -25,8 +25,8 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "read",
-            "Read a file as numbered lines. offset: first line (1-based); limit: how many (default 500).",
-            json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}),
+            "Read a file's numbered lines (offset: first line; limit: 500). outline:true = its functions/types with lines.",
+            json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"},"outline":{"type":"boolean"}},"required":["path"]}),
         ),
         spec(
             "write",
@@ -45,7 +45,7 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "grep",
-            "Regex search in files (respects .gitignore); returns path:line matches.",
+            "Regex search in files (respects .gitignore); gives path:line matches.",
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"case_insensitive":{"type":"boolean"}},"required":["pattern"]}),
         ),
         spec(
@@ -55,12 +55,12 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "list",
-            "List directory entries (one level).",
+            "List a folder (one level).",
             json!({"type":"object","properties":{"path":{"type":"string"}}}),
         ),
         spec(
             "todo",
-            "Todo list of this chat, for tracking long work. add needs content; complete and remove need id.",
+            "This chat's todo list for long work: add (content), complete/remove (id).",
             json!({"type":"object","properties":{"op":{"type":"string","enum":["add","list","complete","remove"]},"content":{"type":"string"},"id":{"type":"string"}},"required":["op"]}),
         ),
         spec(
@@ -117,6 +117,9 @@ pub async fn execute(
                 .unwrap_or(120)
                 .clamp(1, 600);
             bash(cmd, workspace, Duration::from_secs(timeout), abort).await
+        }
+        "read" if args.get("outline").and_then(Value::as_bool).unwrap_or(false) => {
+            read_outline(workspace, arg_str(args, "path")?)
         }
         "read" => read_file(
             workspace,
@@ -667,6 +670,20 @@ pub fn confine_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
     // Step 4: the resolved path must still be inside the workspace.
     let inside = real.strip_prefix(&root).map_err(|_| outside())?;
     Ok(workspace.join(inside))
+}
+
+/// `read` with `outline: true` (see `repomap::outline_text`).
+fn read_outline(workspace: &Path, path: &str) -> Result<String> {
+    let abs = confine_path(workspace, path)?;
+    if abs.is_dir() {
+        bail!("{path} is a directory — use the list tool to see its contents");
+    }
+    let size = std::fs::metadata(&abs).with_context(|| format!("reading {}", abs.display()))?.len();
+    if size > READ_MAX_BYTES {
+        bail!("{path} is {size} bytes, too big to outline (limit {READ_MAX_BYTES}). Use grep.");
+    }
+    let bytes = std::fs::read(&abs).with_context(|| format!("reading {}", abs.display()))?;
+    Ok(crate::repomap::outline_text(path, &String::from_utf8_lossy(&bytes), &abs))
 }
 
 fn read_file(workspace: &Path, path: &str, offset: i64, limit: i64) -> Result<String> {
@@ -1571,6 +1588,15 @@ mod tests {
         let abort = std::sync::atomic::AtomicBool::new(false);
         let out = bash("echo hi", dir.path(), Duration::from_secs(10), &abort).await.unwrap();
         assert!(out.contains("hi"));
+    }
+
+    #[test]
+    fn read_outline_lists_parts_with_lines() {
+        let dir = TempDir::new("read-outline");
+        std::fs::write(dir.path().join("app.py"), "import os\n\nclass Cart:\n    def add(self):\n        pass\n").unwrap();
+        let out = read_outline(dir.path(), "app.py").unwrap();
+        assert!(out.contains("     3  class Cart") && out.contains("     4  def add"), "{out}");
+        assert!(read_outline(dir.path(), ".").unwrap_err().to_string().contains("list"));
     }
 
     #[test]

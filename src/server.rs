@@ -1483,6 +1483,8 @@ impl AppState {
         let agents_md = skills::load_agents_md(&workspace);
         let baked = skills::load_baked(&self.skill_base);
         let lessons = load_lessons(self, &workspace);
+        let request = self.first_request(session_id).unwrap_or_default();
+        let map = crate::repomap::for_chat(session_id, &workspace, &self.state_dir, &request, self.cfg.agent.repo_map_tokens);
         agents::compose_system(PromptInputs {
             workspace: &workspace,
             mode,
@@ -1492,7 +1494,8 @@ impl AppState {
             ponytail: self.ponytail_level(session_id),
             baked: &baked,
             lessons: lessons.as_deref(),
-            web: self.first_request(session_id).is_some_and(|t| agents::is_web_task(&t)),
+            web: agents::is_web_task(&request),
+            map: Some(&map),
         })
     }
 
@@ -6280,6 +6283,39 @@ fn short_count(n: u64) -> String {
 /// `part` as a whole percent of `whole` (0 when `whole` is 0).
 fn percent(part: u64, whole: u64) -> u64 {
     if whole == 0 { 0 } else { part * 100 / whole }
+}
+
+#[cfg(test)]
+mod repo_map_tests {
+    use super::*;
+
+    /// The chat's system prompt carries the project map, ranked by the
+    /// chat's first message, and keeps the same map for the whole chat
+    /// (a new file does not change it, so the cached prefix stays valid).
+    #[tokio::test]
+    async fn the_map_is_in_the_prompt_and_stays_for_the_chat() {
+        let dir = std::env::temp_dir().join(format!("ocrs-mapchat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/cart.js"), "export function addItem(cart, item) {}\n").unwrap();
+        std::fs::write(dir.join("src/util.js"), "export function pad(s) {}\n").unwrap();
+        let st = build_state_ephemeral(crate::config::Config::default(), dir.clone()).await;
+        let s = st.db.create_session("m", None).unwrap();
+        st.db.add_message(&s.id, "user", &[Part::Text { text: "addItem adds the same item twice".into() }]).unwrap();
+        let first = st.composed_system(&s.id);
+        let map = &first[first.find("## Project map").expect("map in the prompt")..];
+        let cart = map.find("src/cart.js: addItem()").expect("cart listed");
+        assert!(cart < map.find("src/util.js").unwrap(), "the named file first: {map}");
+        std::fs::write(dir.join("src/new.js"), "export function later() {}\n").unwrap();
+        assert_eq!(st.composed_system(&s.id), first, "same prompt for the rest of the chat");
+        // Off: no map.
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.repo_map_tokens = 0;
+        let off = build_state_ephemeral(cfg, dir.clone()).await;
+        let s2 = off.db.create_session("m", None).unwrap();
+        assert!(!off.composed_system(&s2.id).contains("## Project map"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

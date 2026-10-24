@@ -279,6 +279,7 @@ async fn run_child(st: &Shared, id: &str) -> Result<(&'static str, String)> {
         baked: &crate::skills::load_baked(&st.skill_base),
         lessons: crate::server::load_lessons(st, &project_ws).as_deref(),
         web: crate::agents::is_web_task(&run.task),
+        map: Some(&crate::repomap::for_chat(id, &project_ws, &st.state_dir, &run.task, st.cfg.agent.repo_map_tokens)),
     });
     // B-27: the shared prompt says "ask when unclear"; a child has nobody to ask.
     const CHILD_RULES: &str = "\n\n## Running as a subagent\n\n\

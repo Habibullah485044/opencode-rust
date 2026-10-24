@@ -19,6 +19,7 @@ pub mod permissions;
 #[cfg(feature = "gui")]
 pub mod preview;
 pub mod provider;
+pub mod repomap;
 pub mod server;
 pub mod settings;
 pub mod sessions;

@@ -321,6 +321,8 @@ pub struct PromptInputs<'a> {
     pub lessons: Option<&'a str>,
     /// The chat is about a web page: add the web design rules.
     pub web: bool,
+    /// The project map (`repomap::for_chat`), already formatted.
+    pub map: Option<&'a str>,
 }
 
 /// Rules for web pages (measurable ones, from what v0, bolt and the
@@ -466,6 +468,10 @@ pub fn compose_system(p: PromptInputs<'_>) -> String {
     if p.web {
         out.push_str(WEB_GUIDE);
     }
+    // Fixed for the chat, so it sits before the parts that can change.
+    if let Some(map) = p.map.filter(|m| !m.trim().is_empty()) {
+        out.push_str(map.trim_end());
+    }
     if let Some(lessons) = p.lessons.filter(|l| !l.trim().is_empty()) {
         out.push_str(
             "\n\n## Lessons from earlier runs in this project\n\n\
@@ -505,6 +511,7 @@ mod tests {
                 baked: &[],
                 lessons: None,
                 web: false,
+                map: None,
             })
         };
         assert!(!text(PonytailLevel::Off).contains("lazy senior developer"), "off drops the rules");
@@ -541,6 +548,7 @@ mod tests {
             baked: &[],
             lessons: None,
             web: false,
+            map: None,
         });
         assert!(text.contains("lazy senior developer"), "the rules are still active");
         let index = crate::skills::skill_index(&skills);
@@ -616,6 +624,7 @@ mod tests {
             baked: &[],
             lessons: None,
             web: false,
+            map: None,
         });
         assert!(text.contains("opencode-rust"), "default base");
         assert!(text.contains("Project instructions (AGENTS.md)"));
@@ -639,6 +648,7 @@ mod tests {
             baked: &[],
             lessons: None,
             web: false,
+            map: None,
         });
         assert!(
             text.contains("lazy senior developer"),
@@ -675,6 +685,7 @@ mod tests {
             baked: &[],
             lessons: None,
             web: false,
+            map: None,
         });
         assert!(
             !text.contains(".openclaw"),
@@ -699,6 +710,7 @@ mod tests {
             baked: &[],
             lessons: None,
             web: false,
+            map: None,
         });
         assert!(text.contains("no tool calls"), "explicit no-tools rule");
         assert!(text.to_lowercase().contains("greets you"), "greeting named");
@@ -722,6 +734,7 @@ mod tests {
             baked: &baked,
             lessons: None,
             web: false,
+            map: None,
         });
         assert!(
             text.contains("## Skill: deploy — always active"),

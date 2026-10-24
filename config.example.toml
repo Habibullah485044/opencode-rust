@@ -84,6 +84,9 @@ reuse_gate = true
 # Deep mode (/deep <task>): attempts at one task, each in its own git
 # worktree; every attempt is checked and the best one is applied (max 5).
 # deep_attempts = 3
+# Project map in the system prompt (files and their main functions/types,
+# most relevant first) in about this many tokens; 0 turns it off.
+# repo_map_tokens = 1000
 
 # F-08: check the work after every run that changed files (unset = off).
 # On failure the agent gets the output and up to verify_max_rounds tries to fix it.
