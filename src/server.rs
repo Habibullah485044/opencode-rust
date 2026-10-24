@@ -2142,7 +2142,8 @@ pub const NUDGE_TEXT: &str = "[app] You said what you will do but made no tool c
 /// that mentions a plan earlier on does not count, and never fires on a
 /// question or on "let me know".
 pub fn announces_work(text: &str) -> bool {
-    let t = text.trim();
+    let cleaned = strip_invisible(text);
+    let t = cleaned.trim();
     if t.is_empty() || t.ends_with('?') || t.chars().count() > 1500 {
         return false;
     }
@@ -2167,6 +2168,12 @@ pub fn announces_work(text: &str) -> bool {
         let clause = s.rsplit([',', ';', '—']).next().unwrap_or(s).trim();
         STARTS.iter().any(|p| s.starts_with(p) || clause.starts_with(p))
     })
+}
+
+/// Text without zero-width characters. Some models start every reply with
+/// a few U+200B, which hid "I'll …" from `announces_work` (seen live).
+pub fn strip_invisible(text: &str) -> String {
+    text.chars().filter(|c| !matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}')).collect()
 }
 
 /// Our tool for a name another agent uses (`list_files`, `Bash`,
@@ -2225,7 +2232,7 @@ pub fn tool_alias(name: &str, input: &Value) -> Option<(&'static str, Value)> {
 /// your local folder… paste the contents")? Only short replies count, so a
 /// real answer that mentions access in passing does not.
 pub fn denies_file_access(text: &str) -> bool {
-    let t = text.to_lowercase().replace('\u{2019}', "'");
+    let t = strip_invisible(text).to_lowercase().replace('\u{2019}', "'");
     if t.chars().count() > 2500 {
         return false;
     }
@@ -2403,6 +2410,10 @@ pub async fn run_loop(
 
         log_cache(st, session_id, request_usage.as_ref(), &prefix_note);
         let mut calls = acc.finish();
+        if text.contains(['\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}']) {
+            text = strip_invisible(&text);
+            shown = shown.min(text.len());
+        }
         // Some models (Qwen through Ollama/llama.cpp without a tool parser)
         // write their tool calls into the reply text. Run them as calls
         // instead of showing XML and ending the turn.
@@ -4674,6 +4685,13 @@ mod tests {
         assert!(denies_file_access("I don't have access to your file system. Could you upload the files?"));
         assert!(!denies_file_access("I read the folder: it has 3 files, main.rs, lib.rs and Cargo.toml."));
         assert!(!denies_file_access("I can't access the network from here, so I could not download the page."));
+    }
+
+    #[test]
+    fn invisible_characters_do_not_hide_an_announcement() {
+        assert!(announces_work("\u{200b}\u{200b}I'll read the reverse-engineering doc and map out the extracted files."));
+        assert!(denies_file_access("\u{200b}I can't see your local folder, please paste the files."));
+        assert_eq!(strip_invisible("\u{feff}a\u{200b}b"), "ab");
     }
 
     #[test]
