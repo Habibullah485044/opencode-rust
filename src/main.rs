@@ -290,7 +290,8 @@ COMMANDS (in TUI, most also headless — type / for the palette, F1 for the refe
   /init            Create a starter AGENTS.md
   /team <goal>     Team mode: plan → parallel workers → synthesis
   /plan /build     Read-only plan mode vs normal build mode
-  /mission [kind] <goal>  Run a briefing at an effort level
+  /mission [kind] <goal>  Mission mode: plan steps, work on them alone until done
+  /mission status|stop|resume  Show, stop or carry on the chat's mission
   /edit <file> <what>     Inline edit: one completion, diff preview
   /compact         Summarize old history, keep the recent tail
   /fork            Branch the current session into a child session

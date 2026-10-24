@@ -23,6 +23,9 @@ const MAX_ATTEMPTS: i64 = 3;
 /// Step runs that end in an error (provider down, network) in a row before
 /// the mission pauses instead of burning through its steps.
 const MAX_ERRORS_IN_A_ROW: usize = 3;
+/// A plan never grows past this many steps: more ADDs count as NEXT, so a
+/// coordinator that keeps finding "one more thing" cannot run forever.
+const MAX_PLAN_STEPS: usize = 20;
 
 const COORDINATOR: &str = "You coordinate an autonomous coding mission. Workers with full tool \
 access do the steps you assign, one at a time, in the project folder. You never do the work \
@@ -64,7 +67,7 @@ fn parse_verdict(reply: &str) -> Verdict {
     for line in reply.lines() {
         let l = line.trim().trim_start_matches(['*', '#', '-', ' ', '`']);
         let upper = l.to_ascii_uppercase();
-        let after = |word: &str| l[word.len()..].trim_start_matches([':', ' ', '-', '—']).trim().to_string();
+        let after = |word: &str| l[word.len()..].trim_start_matches([':', ' ', '-', '—', '*']).trim().to_string();
         if upper.starts_with("REDO") {
             return Verdict::Redo(after("REDO"));
         }
@@ -283,7 +286,9 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, abort: 
         agent_status(st, &info, "working", if attempts > 1 { format!("try {attempts}") } else { "starting…".into() });
         let m_now = st.db.mission(session_id)?.expect("mission exists");
         let brief = step_brief(&m_now, n, &step, redo_reason.as_deref());
-        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        // No slack: files the previous step wrote a moment ago must not
+        // count as this step's (they would show up in its receipt).
+        let since = std::time::SystemTime::now();
         let run = agent_inner(st, &child.id, &brief, abort).await;
         if abort.load(Ordering::SeqCst) {
             st.db.mission_step_update(step.id, "pending", attempts - 1, &step.result, None)?;
@@ -347,7 +352,7 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, abort: 
                 agent_status(st, &info, "failed", "gave up after 3 tries".into());
                 say(st, session_id, format!("✗ Step {n} failed after {MAX_ATTEMPTS} tries ({why}); moving on."));
             }
-            Verdict::Add(new_step) => {
+            Verdict::Add(new_step) if m.steps.len() < MAX_PLAN_STEPS => {
                 st.db.mission_step_update(step.id, "done", attempts, &receipt, None)?;
                 st.db.mission_step_insert_after(session_id, step.id, &new_step)?;
                 agent_status(st, &info, "done", first_line.clone());
@@ -360,7 +365,7 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, abort: 
                 // The coordinator says the goal is reached: what is left is not needed.
                 return Ok(true);
             }
-            Verdict::Next => {
+            Verdict::Next | Verdict::Add(_) => {
                 st.db.mission_step_update(step.id, "done", attempts, &receipt, None)?;
                 agent_status(st, &info, "done", first_line.clone());
                 say(st, session_id, format!("✓ Step {n}: {} — {first_line}", step.title));
@@ -387,6 +392,158 @@ mod tests {
         assert_eq!(parse_steps(reply), ["Build the page layout", "Add the cart", "Check that the whole result works"]);
         assert_eq!(parse_steps("- one step\n- two step"), ["one step", "two step"]);
         assert!(parse_steps("I will do it all at once.").is_empty());
+    }
+
+    /// A whole mission against a fake model: the coordinator plans two
+    /// steps, adds a third after the first, and ends with DONE. Each step
+    /// writes its file in its own child chat; receipts and the final state
+    /// are saved, and the user's approval mode is back afterwards.
+    #[tokio::test]
+    async fn a_mission_plans_works_adds_a_step_and_finishes() {
+        use axum::{routing::post, Router};
+        let dir = std::env::temp_dir().join(format!("ocrs-mission-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sse_text = |t: &str| {
+            let frame = serde_json::json!({"choices":[{"delta":{"content":t},"finish_reason":"stop"}]});
+            format!("data: {frame}\n\ndata: [DONE]\n\n")
+        };
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<Value>| async move {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                let all = |role: &str| -> String {
+                    msgs.iter().filter(|m| m["role"] == role).filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n")
+                };
+                let last_role = msgs.last().and_then(|m| m["role"].as_str()).unwrap_or("").to_string();
+                let user = all("user");
+                let payload = if user.contains("Split the mission") {
+                    sse_text("1. Write a.txt\n2. Write b.txt")
+                } else if user.contains("Decide what happens next") {
+                    let report = user.split("Report of step").nth(1).unwrap_or("").to_string();
+                    sse_text(if report.contains("a.txt") {
+                        "ADD: Write c.txt"
+                    } else if report.contains("c.txt") {
+                        "NEXT"
+                    } else {
+                        "DONE — the goal is reached"
+                    })
+                } else if user.contains("[mission step") {
+                    let brief = user.lines().find(|l| l.starts_with("[mission step")).unwrap_or("").to_string();
+                    let file = ["a.txt", "b.txt", "c.txt"].into_iter().find(|f| brief.contains(f)).unwrap_or("x.txt");
+                    if last_role == "tool" {
+                        sse_text(&format!("Wrote {file}."))
+                    } else {
+                        let args = serde_json::json!({"path": file, "content": "ok\n"}).to_string();
+                        let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                            {"index":0,"id":"w1","function":{"name":"write","arguments":args}}
+                        ]},"finish_reason":null}]});
+                        format!("data: {chunk}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
+                    }
+                } else {
+                    sse_text("?")
+                };
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("mission", None).unwrap();
+        let mut rx = st.events.subscribe();
+
+        let out = run_mission(&st, &s.id, Some("make three files"), &Arc::new(AtomicBool::new(false))).await.unwrap();
+        assert!(out.starts_with("**Mission complete**"), "{out}");
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            assert!(dir.join(f).is_file(), "{f} written");
+        }
+        let m = st.db.mission(&s.id).unwrap().unwrap();
+        assert_eq!(m.status, "done");
+        let titles: Vec<&str> = m.steps.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["Write a.txt", "Write c.txt", "Write b.txt"], "the added step runs right after step 1");
+        assert!(m.steps.iter().all(|s| s.status == "done"));
+        assert!(m.steps[0].result.contains("Files changed: a.txt"), "{}", m.steps[0].result);
+        assert!(m.steps.iter().all(|s| s.child_id.is_some()), "each step ran in its own chat");
+        assert_eq!(st.perm_mode(), PermissionMode::Default, "approval mode put back");
+        let mut cards = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::AgentStatus { parent_id, state, .. } = ev {
+                cards += (parent_id == s.id && state == "done") as usize;
+            }
+        }
+        assert_eq!(cards, 3, "one finished card per step");
+        let chat: Vec<String> = st.db.messages(&s.id).unwrap().iter().flat_map(|m| m.parts.clone()).filter_map(|p| match p {
+            Part::Text { text } => Some(text),
+            _ => None,
+        }).collect();
+        assert!(chat.iter().any(|t| t.starts_with("**Mission plan**")));
+        assert!(chat.iter().any(|t| t.contains("Added next: Write c.txt")));
+        assert!(mission_report(&st, &s.id).contains("Mission (done)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A step the coordinator never accepts is tried MAX_ATTEMPTS times,
+    /// then marked failed, and the mission ends instead of looping.
+    #[tokio::test]
+    async fn a_step_that_is_never_accepted_fails_after_three_tries() {
+        use axum::{routing::post, Router};
+        let dir = std::env::temp_dir().join(format!("ocrs-mission-redo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = worker_runs.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<Value>| {
+                let w = w.clone();
+                async move {
+                    let user: String = body["messages"].as_array().cloned().unwrap_or_default().iter()
+                        .filter(|m| m["role"] == "user").filter_map(|m| m["content"].as_str().map(str::to_string)).collect();
+                    let text = if user.contains("Split the mission") {
+                        "1. Make it perfect"
+                    } else if user.contains("Decide what happens next") {
+                        "REDO: not perfect yet"
+                    } else {
+                        w.fetch_add(1, Ordering::SeqCst);
+                        "I looked at it."
+                    };
+                    let frame = serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]});
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], format!("data: {frame}\n\ndata: [DONE]\n\n"))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("m", None).unwrap();
+        let out = run_mission(&st, &s.id, Some("perfection"), &Arc::new(AtomicBool::new(false))).await.unwrap();
+        let m = st.db.mission(&s.id).unwrap().unwrap();
+        assert_eq!((m.steps[0].status.as_str(), m.steps[0].attempts), ("failed", MAX_ATTEMPTS), "{out}");
+        assert!(out.contains("1 failed"), "{out}");
+        // Each try is one worker run; the nudge may add one request per try.
+        let runs = worker_runs.load(Ordering::SeqCst);
+        assert!((3..=9).contains(&runs), "three tries, not an endless loop: {runs}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resume_without_a_mission_says_how_to_start_one() {
+        let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let s = st.db.create_session("m", None).unwrap();
+        let err = run_mission(&st, &s.id, None, &Arc::new(AtomicBool::new(false))).await.unwrap_err();
+        assert!(format!("{err}").contains("/mission <goal>"));
     }
 
     #[test]

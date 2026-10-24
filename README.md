@@ -95,7 +95,8 @@ Inside the terminal UI, type `/` for the command palette or press F1:
 | `/export [path]` | Write the transcript to Markdown |
 | `/help` | Command and key reference |
 | `/init` | Create a starter `AGENTS.md` |
-| `/mission [kind] <goal>` | Run a briefing (Explore / Commit / Merge PR / Custom) |
+| `/mission [kind] <goal>` | Mission mode: a coordinator splits the goal into steps; each step runs as its own worker run, is checked (tests, page check) and gets a receipt; then the coordinator goes on, redoes the step (3 tries), adds a step or finishes. Works without you (approvals are automatic while it runs, deny rules still apply) until the goal is reached or `agent.mission_max_steps` (50; 0 = no limit). An Explore mission is one read-only run. The Mission button in the desktop app does this for one message |
+| `/mission status` / `stop` / `resume` | The plan with each step's state and receipt; stop; carry on after a stop, pause or restart |
 | `/model [id]` | Show or switch the model |
 | `/deep [n] <task>` | Deep mode: try the task n times (default 3, at most 5), each in its own git worktree; every attempt is checked (tests/build, page check) and the best one is applied (`/undo` takes it back). The Deep button in the desktop app does the same for one message |
 | `/parallel <task>` | Same as `/deep 2 <task>` |

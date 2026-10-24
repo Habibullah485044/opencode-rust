@@ -814,6 +814,22 @@
   ok("a deep attempt card has no buttons", !!deepCard && deepCard.querySelectorAll(".ag-btn").length === 0);
   window.render(payload(basePage));
 
+  // Mission toggle: the next message goes out as /mission, once; it and
+  // Deep exclude each other.
+  var mta = document.getElementById("input");
+  click("mission-btn");
+  ok("Mission turns on", document.getElementById("mission-btn").classList.contains("on"));
+  click("deep-btn");
+  ok("Deep turns Mission off", !document.getElementById("mission-btn").classList.contains("on") &&
+    document.getElementById("deep-btn").classList.contains("on"));
+  click("mission-btn");
+  ok("Mission turns Deep off", !document.getElementById("deep-btn").classList.contains("on"));
+  sent = [];
+  mta.value = "build the shop and test it";
+  key(mta, "Enter");
+  ok("a message with Mission on is sent as /mission", (last("send") || {}).text === "/mission build the shop and test it", JSON.stringify(sent));
+  ok("Mission is for one message", !document.getElementById("mission-btn").classList.contains("on"));
+
   // Deep toggle: the next message goes out as /deep, once.
   var dta = document.getElementById("input");
   click("deep-btn");
