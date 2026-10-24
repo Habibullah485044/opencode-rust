@@ -98,6 +98,21 @@
     --think: #4f46e5;
     --hover: rgba(2, 132, 199, 0.06);
   }
+  /* Pure black: true #000 surfaces with the same sky accent (deep on OLED
+     screens, and the most contrast for the sky blue). */
+  :root[data-theme="black"] {
+    --bg: #000000;
+    --panel: #000000;
+    --surface: #07090d;
+    --surface-2: #0d1219;
+    --surface-3: #141b25;
+    --code-bg: #05080c;
+    --line: rgba(125, 211, 252, 0.10);
+    --line-strong: rgba(125, 211, 252, 0.18);
+    --aurora: radial-gradient(900px 380px at 78% -8%, rgba(56, 189, 248, 0.14), transparent 62%);
+    --scrim: rgba(0, 0, 0, 0.80);
+  }
+
   /* The black half of the light theme: these areas take the dark tokens. */
   :root[data-theme="light"] #titlebar,
   :root[data-theme="light"] #side {
@@ -2211,8 +2226,9 @@
       <label for="set-theme">Appearance</label>
       <select id="set-theme">
         <option value="system">Same as Windows</option>
-        <option value="dark">Dark</option>
-        <option value="light">Light</option>
+        <option value="dark">Midnight sky (dark)</option>
+        <option value="black">Pure black</option>
+        <option value="light">Day sky (light)</option>
       </select>
       <p class="set-path" id="set-path"></p>
       <div class="set-actions">
@@ -3519,7 +3535,7 @@
     });
   }
 
-  // ---- Appearance: dark, light, or follow Windows ----
+  // ---- Appearance: dark, pure black, light, or follow Windows ----
   function savedTheme() {
     try { return localStorage.getItem("habi.theme") || "system"; } catch (e) { return "system"; }
   }
@@ -3527,6 +3543,7 @@
     var light = choice === "light" ||
       (choice === "system" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
     if (light) document.documentElement.setAttribute("data-theme", "light");
+    else if (choice === "black") document.documentElement.setAttribute("data-theme", "black");
     else document.documentElement.removeAttribute("data-theme");
   }
   applyTheme(savedTheme());

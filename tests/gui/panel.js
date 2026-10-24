@@ -579,6 +579,14 @@
   document.getElementById("set-theme").value = "dark";
   document.getElementById("set-form").dispatchEvent(new Event("submit", { cancelable: true }));
   ok("dark removes it again", !document.documentElement.hasAttribute("data-theme"));
+  click("settings-btn");
+  document.getElementById("set-theme").value = "black";
+  document.getElementById("set-form").dispatchEvent(new Event("submit", { cancelable: true }));
+  ok("pure black applies", document.documentElement.getAttribute("data-theme") === "black" &&
+    getComputedStyle(document.body).backgroundColor === "rgb(0, 0, 0)", getComputedStyle(document.body).backgroundColor);
+  click("settings-btn");
+  document.getElementById("set-theme").value = "dark";
+  document.getElementById("set-form").dispatchEvent(new Event("submit", { cancelable: true }));
   var dta = document.getElementById("input");
   var chatA = payload(basePage); chatA.session = "chat-a";
   var chatB = payload(basePage); chatB.session = "chat-b";
