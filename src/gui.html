@@ -861,6 +861,22 @@
     white-space: pre-wrap;
   }
 
+  .u-rewind {
+    border: 0;
+    background: transparent;
+    color: var(--text-dim);
+    font: inherit;
+    font-size: 11.5px;
+    padding: 1px 6px;
+    border-radius: var(--radius-s);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.12s, color 0.12s, background 0.12s;
+  }
+  .e-row.u:hover .u-rewind, .u-rewind:focus-visible, .u-rewind.confirm { opacity: 1; }
+  .u-rewind:hover { color: var(--text); background: var(--hover); }
+  .u-rewind.confirm { color: var(--warn); background: var(--warn-soft); }
+
   /* Assistant: plain text on the page, like a document, not a card. */
   .e-row.a { align-items: stretch; }
   .assistant-header { display: flex; align-items: center; gap: 8px; }
@@ -1369,6 +1385,13 @@
     border-radius: var(--radius-s);
   }
   #queue-cancel:hover { color: var(--text); background: var(--surface-2); }
+  #queue-chip { flex-wrap: wrap; }
+  #queue-more { flex-basis: 100%; display: grid; gap: 4px; }
+  #queue-more:empty { display: none; }
+  .queue-row { display: flex; align-items: center; gap: 8px; padding: 3px 0 0; border-top: 1px dashed var(--accent-line); }
+  .queue-row-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+  .queue-x { border: 0; background: transparent; color: var(--text-muted); width: 22px; height: 22px; border-radius: var(--radius-s); cursor: pointer; font-size: 15px; line-height: 1; }
+  .queue-x:hover { color: var(--text); background: var(--surface-2); }
 
   /* ---- A4: spawned agents for this chat ---- */
   #agents {
@@ -2080,6 +2103,7 @@
           <span class="queue-label">Queued — sends when this run ends:</span>
           <span id="queue-text"></span>
           <button type="button" id="queue-cancel" title="Remove the queued message" aria-label="Remove the queued message">×</button>
+          <div id="queue-more"></div>
         </div>
         <div id="comp">
           <textarea id="input" rows="1" placeholder="Message Habi or ask a question…" autocomplete="off" spellcheck="false"></textarea>
@@ -2101,7 +2125,7 @@
               </div>
             </div>
             <button type="button" id="mission-btn" class="mode-toggle" aria-pressed="false"
-                    title="Mission: the next message becomes a mission — planned into steps and worked on by itself until it is done, no approvals needed (Stop ends it, /mission resume carries on)">Mission</button>
+                    title="Mission (works with Deep: then every step is a Deep run): the next message becomes a mission — planned into steps and worked on by itself until it is done, no approvals needed (Stop ends it, /mission resume carries on)">Mission</button>
             <button type="button" id="deep-btn" aria-pressed="false"
                     title="Deep: send the next message as several attempts in separate copies of the project; the app checks each one and keeps the best (uses more tokens)">Deep</button>
             <div class="mode-switch" id="mode-switch" role="radiogroup" aria-label="Permission mode">
@@ -2272,7 +2296,12 @@
 
   // ---- Prompt history (Up/Down) and the queue for messages typed while busy ----
   var historyPos = -1, historyDraft = "";
-  var queuedMsg = null; // { text, session }
+  // Messages typed while a run is going, sent one per finished run, in order.
+  var queue = []; // [{ text, session }]
+  // After sending one, wait for its run to start (and end) before the next:
+  // the first paint after a send may still say "not busy".
+  var queueWaitUntil = 0;
+  var composeSeq = 0;
   var currentSession = "";
   var lastAttachSeq = 0;
   function loadHistory() {
@@ -2287,11 +2316,37 @@
   function renderQueue() {
     var box = document.getElementById("queue-chip");
     if (!box) return;
-    box.hidden = !queuedMsg;
-    if (queuedMsg) document.getElementById("queue-text").textContent = queuedMsg.text;
+    var mine = queue.filter(function (q) { return q.session === currentSession; });
+    box.hidden = !mine.length;
+    if (!mine.length) return;
+    document.getElementById("queue-text").textContent = mine[0].text;
+    document.querySelector("#queue-chip .queue-label").textContent =
+      mine.length > 1 ? "Queued (" + mine.length + ") — sent in order as each run ends:" : "Queued — sends when this run ends:";
+    var more = document.getElementById("queue-more");
+    more.textContent = "";
+    mine.slice(1).forEach(function (q) {
+      var row = document.createElement("div");
+      row.className = "queue-row";
+      var t = document.createElement("span");
+      t.className = "queue-row-text";
+      t.textContent = q.text;
+      var x = document.createElement("button");
+      x.type = "button";
+      x.className = "queue-x";
+      x.title = "Remove this queued message";
+      x.setAttribute("aria-label", "Remove this queued message");
+      x.textContent = "\u00d7";
+      x.addEventListener("click", function () {
+        queue.splice(queue.indexOf(q), 1);
+        renderQueue();
+      });
+      row.appendChild(t);
+      row.appendChild(x);
+      more.appendChild(row);
+    });
   }
   function queueMessage(text) {
-    queuedMsg = { text: text, session: currentSession };
+    queue.push({ text: text, session: currentSession });
     var input = document.getElementById("input");
     if (input) { input.value = ""; input.dispatchEvent(new Event("input")); }
     renderQueue();
@@ -2315,8 +2370,6 @@
     b.classList.toggle("on", on);
     b.setAttribute("aria-pressed", on ? "true" : "false");
     b.textContent = on ? "Mission: on" : "Mission";
-    // One at a time: a mission is not also a Deep run.
-    if (on) setDeep(false);
   }
   function setDeep(on) {
     var b = document.getElementById("deep-btn");
@@ -2424,10 +2477,13 @@
   }
 
   function sendQueued() {
-    if (!queuedMsg) return;
-    postToRust({ type: "send", text: queuedMsg.text });
-    rememberPrompt(queuedMsg.text);
-    queuedMsg = null;
+    var i = -1;
+    for (var k = 0; k < queue.length; k++) if (queue[k].session === currentSession) { i = k; break; }
+    if (i < 0) return;
+    var q = queue.splice(i, 1)[0];
+    postToRust({ type: "send", text: q.text });
+    rememberPrompt(q.text);
+    queueWaitUntil = Date.now() + 3000;
     renderQueue();
   }
   var panelOpen = false;
@@ -2744,6 +2800,31 @@
       ub.className = "e-bubble-u";
       ub.textContent = text.replace(/^›\s*/, "");
       row.appendChild(ub);
+      // Rewind: take the chat (and the files) back to before this message,
+      // and put the message back in the box to edit.
+      var rw = document.createElement("button");
+      rw.type = "button";
+      rw.className = "u-rewind";
+      rw.textContent = "\u21b6 Rewind";
+      rw.title = "Remove this message and everything after it, put the project's files back to before it, and edit it again";
+      rw.addEventListener("click", function () {
+        if (!rw.classList.contains("confirm")) {
+          rw.classList.add("confirm");
+          rw.textContent = "Rewind to here? Files go back too — click again";
+          setTimeout(function () { rw.classList.remove("confirm"); rw.textContent = "\u21b6 Rewind"; }, 4000);
+          return;
+        }
+        var mine = ub.textContent;
+        var later = 0;
+        var rows = document.querySelectorAll("#log .e-bubble-u");
+        var seen = false;
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i] === ub) { seen = true; continue; }
+          if (seen && rows[i].textContent === mine) later++;
+        }
+        postToRust({ type: "rewind", text: mine, skip: later });
+      });
+      row.appendChild(rw);
     } else if (e.k === "a") {
       row.className = "e-row a";
       var head = document.createElement("div");
@@ -3738,7 +3819,7 @@
         apitxt.textContent = "API Connected · " + d.api[1] + "ms";
       } else {
         api.className = "api down";
-        apitxt.textContent = "API Offline";
+        apitxt.textContent = /rejected the API key/.test(d.api_detail || "") ? "API key rejected" : "API Offline";
       }
       api.title = d.api_detail || "";
     }
@@ -3749,8 +3830,12 @@
       var u = d.usage;
       if (u && u.input > 0) {
         var pct = Math.floor((u.cached * 100) / u.input);
-        usageLine.innerHTML = "Cache <b>" + pct + "%</b> · " + shortCount(u.input) +
-          " in · " + shortCount(u.output) + " out";
+        // A provider that never reports cache use is not "0% cached".
+        var cacheText = (u.cached === 0 && (u.requests || 0) >= 2) ? "Cache not reported" : "Cache <b>" + pct + "%</b>";
+        usageLine.innerHTML = cacheText + " · " + shortCount(u.input) + " in · " + shortCount(u.output) + " out";
+        usageLine.title = "Tokens of this chat, including its Deep attempts. " +
+          (u.cached === 0 ? "This provider reports no prompt-cache use, so every request is billed in full (if it bills)." :
+            pct + "% of the input was read from the provider's prompt cache (cheaper).");
         usageLine.hidden = false;
       } else {
         usageLine.hidden = true;
@@ -3792,7 +3877,9 @@
     currentSession = nextSession;
     // The run ended: send what was queued for this chat. Another chat on
     // screen keeps the queue until its own chat is back and idle.
-    if (queuedMsg && !busyNow && queuedMsg.session === currentSession) sendQueued();
+    if (busyNow) queueWaitUntil = 0; // the sent message's run started
+    var queuedHere = queue.some(function (q) { return q.session === currentSession; });
+    if (queuedHere && !busyNow && Date.now() >= queueWaitUntil) sendQueued();
     if (wasBusy !== busyNow) renderQueue();
     // Autocomplete data: commands, and the files for the last "@" query.
     acCommands = d.commands || acCommands;
@@ -3841,6 +3928,17 @@
         document.getElementById("git-branch").textContent = g.branch;
         document.getElementById("git-count").textContent = g.changed ? "\u00b7 " + g.changed : "";
         document.getElementById("git-chip").title = "On " + g.branch + (g.changed ? " \u00b7 " + g.changed + " changed file" + (g.changed === 1 ? "" : "s") : " \u00b7 nothing changed");
+      }
+    }
+    // Text put back in the composer (after a rewind), once per change.
+    var cmp = d.compose;
+    if (cmp && cmp.seq && cmp.seq !== composeSeq) {
+      composeSeq = cmp.seq;
+      var cin = document.getElementById("input");
+      if (cin && cmp.text) {
+        cin.value = cmp.text;
+        cin.dispatchEvent(new Event("input"));
+        cin.focus();
       }
     }
     // ask_user: the question with one button per answer (typing still works).
@@ -4134,19 +4232,17 @@
       var v = input.value.trim();
       if (!v) {
         // Ctrl+Enter on an empty composer sends what is queued, now.
-        if (queuedMsg) sendQueued();
+        if (queue.length) { queueWaitUntil = 0; sendQueued(); }
         return;
       }
       var text = input.value;
       // Deep is for one message: it costs several runs.
-      var deepBtn = document.getElementById("deep-btn");
-      if (deepBtn && deepBtn.classList.contains("on") && v.charAt(0) !== "/") {
-        text = "/deep " + v;
+      var deepOn = document.getElementById("deep-btn").classList.contains("on");
+      var missionOn = document.getElementById("mission-btn").classList.contains("on");
+      if (v.charAt(0) !== "/" && (deepOn || missionOn)) {
+        // Both on: a mission whose every step is a Deep run.
+        text = missionOn ? "/mission " + (deepOn ? "--deep " : "") + v : "/deep " + v;
         setDeep(false);
-      }
-      var missionBtn = document.getElementById("mission-btn");
-      if (missionBtn && missionBtn.classList.contains("on") && v.charAt(0) !== "/") {
-        text = "/mission " + v;
         setMission(false);
       }
       postToRust({ type: "send", text: text });
@@ -4280,8 +4376,12 @@
     if (queueCancel) {
       queueCancel.addEventListener("click", function () {
         // Put the text back so nothing typed is lost.
-        if (queuedMsg && input && !input.value) input.value = queuedMsg.text;
-        queuedMsg = null;
+        var firstHere = -1;
+        for (var k = 0; k < queue.length; k++) if (queue[k].session === currentSession) { firstHere = k; break; }
+        if (firstHere >= 0) {
+          var q0 = queue.splice(firstHere, 1)[0];
+          if (input && !input.value) input.value = q0.text;
+        }
         renderQueue();
         refreshSend();
       });
@@ -4561,11 +4661,7 @@
 
     // Deep toggle
     var deepToggle = document.getElementById("deep-btn");
-    if (deepToggle) deepToggle.addEventListener("click", function () {
-      var on = !deepToggle.classList.contains("on");
-      setDeep(on);
-      if (on) setMission(false);
-    });
+    if (deepToggle) deepToggle.addEventListener("click", function () { setDeep(!deepToggle.classList.contains("on")); });
     var missionToggle = document.getElementById("mission-btn");
     if (missionToggle) missionToggle.addEventListener("click", function () { setMission(!missionToggle.classList.contains("on")); });
 

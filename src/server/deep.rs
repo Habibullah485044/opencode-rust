@@ -231,7 +231,16 @@ pub(super) async fn run_deep(
         ));
     }
     let Some(best) = best else {
-        out.push_str("\nNo attempt produced a change, so nothing was applied.");
+        // Every attempt hit the provider's door, not the task: say that.
+        let unreachable = scored.iter().all(|s| s.failed.as_deref().is_some_and(|e| e.contains("provider request to")));
+        if unreachable {
+            out.push_str(
+                "\nThe provider could not be reached during the attempts (the network or the endpoint was down), \
+                 so nothing was tried and nothing was applied. Send it again once the header says API Connected.",
+            );
+        } else {
+            out.push_str("\nNo attempt produced a change, so nothing was applied.");
+        }
         return Ok(out);
     };
     let winner = &scored[best - 1];

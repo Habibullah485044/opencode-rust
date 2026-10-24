@@ -532,6 +532,50 @@
   ok("Up in an empty composer recalls the last prompt", qta.value === "next step please", qta.value);
   key(qta, "ArrowDown");
   ok("Down goes back to what was being typed", qta.value === "", qta.value);
+
+  // Several queued messages go one per finished run, in order.
+  window.render(busyPage);
+  sent = [];
+  qta.value = "first"; key(qta, "Enter");
+  qta.value = "second"; key(qta, "Enter");
+  ok("two messages queue up", document.querySelectorAll("#queue-more .queue-row").length === 1 &&
+    document.querySelector("#queue-chip .queue-label").textContent.indexOf("(2)") >= 0 &&
+    document.getElementById("queue-text").textContent === "first");
+  window.render(payload(basePage));
+  ok("the first goes when the run ends", count("send") === 1 && (last("send") || {}).text === "first", JSON.stringify(sent));
+  window.render(payload(basePage));
+  ok("the second waits for the first one's run", count("send") === 1, JSON.stringify(sent));
+  window.render(busyPage);
+  window.render(payload(basePage));
+  ok("the second goes when that run ends", count("send") === 2 && (last("send") || {}).text === "second" &&
+    document.getElementById("queue-chip").hidden, JSON.stringify(sent));
+  window.render(busyPage);
+  qta.value = "a"; key(qta, "Enter");
+  qta.value = "b"; key(qta, "Enter");
+  document.querySelector("#queue-more .queue-x").click();
+  ok("a queued message can be removed", document.querySelectorAll("#queue-more .queue-row").length === 0 &&
+    document.getElementById("queue-text").textContent === "a");
+  click("queue-cancel");
+  window.render(payload(basePage));
+  qta.value = "";
+
+  // Rewind a message: two clicks (confirm), then the core is asked; the
+  // text the core sends back lands in the composer.
+  window.render(Object.assign(payload(basePage), { entries: [
+    { k: "u", t: "\u203a make it blue" }, { k: "a", t: "Done." }, { k: "u", t: "\u203a make it blue" }, { k: "a", t: "Again." }
+  ], entries_from: 0, entries_len: 4 }));
+  var rws = document.querySelectorAll("#log .u-rewind");
+  sent = [];
+  rws[0].click();
+  ok("the first click asks to confirm", count("rewind") === 0 && rws[0].classList.contains("confirm"));
+  rws[0].click();
+  var rwMsg = last("rewind") || {};
+  ok("the second click rewinds, skipping the later same text", rwMsg.text === "make it blue" && rwMsg.skip === 1, JSON.stringify(sent));
+  window.render(Object.assign(payload(basePage), { entries: [], entries_from: 0, entries_len: 0, compose: { seq: 7, text: "make it blue" } }));
+  ok("the rewound text is back in the composer", qta.value === "make it blue", qta.value);
+  qta.value = "";
+  window.render(Object.assign(payload(basePage), { compose: { seq: 7, text: "make it blue" } }));
+  ok("the same text is not put back twice", qta.value === "");
   var edPage = payload(basePage);
   edPage.editors = ["VS Code", "Zed"];
   window.render(edPage);
@@ -836,10 +880,15 @@
   click("mission-btn");
   ok("Mission turns on", document.getElementById("mission-btn").classList.contains("on"));
   click("deep-btn");
-  ok("Deep turns Mission off", !document.getElementById("mission-btn").classList.contains("on") &&
+  ok("Mission and Deep can be on together", document.getElementById("mission-btn").classList.contains("on") &&
     document.getElementById("deep-btn").classList.contains("on"));
+  sent = [];
+  mta.value = "ship the shop";
+  key(mta, "Enter");
+  ok("both on: a mission whose steps are Deep runs", (last("send") || {}).text === "/mission --deep ship the shop", JSON.stringify(sent));
+  ok("both turn off after one message", !document.getElementById("mission-btn").classList.contains("on") &&
+    !document.getElementById("deep-btn").classList.contains("on"));
   click("mission-btn");
-  ok("Mission turns Deep off", !document.getElementById("deep-btn").classList.contains("on"));
   sent = [];
   mta.value = "build the shop and test it";
   key(mta, "Enter");

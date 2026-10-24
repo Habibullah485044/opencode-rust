@@ -742,6 +742,22 @@ impl Db {
         Ok(())
     }
 
+    /// Delete message `from_id` and every later message of the chat (rewind).
+    /// Returns how many went.
+    pub fn delete_messages_from(&self, session_id: &str, from_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let (t, row): (i64, i64) = conn.query_row(
+            "SELECT created_at, rowid FROM messages WHERE id=?1 AND session_id=?2",
+            params![from_id, session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let n = conn.execute(
+            "DELETE FROM messages WHERE session_id=?1 AND (created_at > ?2 OR (created_at = ?2 AND rowid >= ?3))",
+            params![session_id, t, row],
+        )?;
+        Ok(n)
+    }
+
     pub fn messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

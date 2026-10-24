@@ -86,6 +86,9 @@ pub struct GuiState {
     pub term_entries: Vec<TermEntry>,
     pub term_root: std::cell::RefCell<std::path::PathBuf>,
     pub term_last: std::cell::RefCell<String>,
+    /// Text to put in the composer (after a rewind), with a counter so the
+    /// page applies each one once.
+    pub compose: (u64, String),
     /// The project's git branch and how many files changed, if git.
     pub git: Option<(String, usize)>,
     /// Read the git state again (after a run, a chat switch).
@@ -216,6 +219,7 @@ impl Default for GuiState {
             term_entries: Vec::new(),
             term_root: std::cell::RefCell::new(std::path::PathBuf::from(".")),
             term_last: std::cell::RefCell::new(String::new()),
+            compose: (0, String::new()),
             git: None,
             git_stale: true,
             question: None,
@@ -817,6 +821,7 @@ impl GuiState {
             "followups": self.followups.iter().map(|(l, t)| serde_json::json!({ "label": l, "text": t })).collect::<Vec<_>>(),
             "git": self.git.as_ref().map(|(b, n)| serde_json::json!({ "branch": b, "changed": n })),
             "attach": { "seq": self.attach.0, "items": self.attach.1 },
+            "compose": { "seq": self.compose.0, "text": self.compose.1 },
             "question": self.question.as_ref().map(|(q, o)| serde_json::json!({ "text": q, "options": o })),
             "settings": {
                 "base_url": self.settings.base_url,
@@ -956,6 +961,9 @@ pub enum IpcMsg {
     TermStop(Option<String>),
     /// Terminal panel: forget what was typed and printed.
     TermClear,
+    /// Rewind the chat to before this user message (`skip` = later
+    /// messages with the same text to pass over).
+    Rewind { text: String, skip: usize },
     /// `@` autocomplete: project files matching the text.
     FindFiles(String),
     /// Send line comments from the Changes view to the agent.
@@ -1056,6 +1064,10 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         }
         "term_stop" => Some(IpcMsg::TermStop(v.get("id").and_then(|i| i.as_str()).map(str::to_string))),
         "term_clear" => Some(IpcMsg::TermClear),
+        "rewind" => Some(IpcMsg::Rewind {
+            text: v.get("text")?.as_str()?.to_string(),
+            skip: v.get("skip").and_then(|s| s.as_u64()).unwrap_or(0) as usize,
+        }),
         "new_branch" => Some(IpcMsg::NewBranch(v.get("name")?.as_str()?.trim().to_string())),
         "find_files" => Some(IpcMsg::FindFiles(v.get("query").and_then(|q| q.as_str()).unwrap_or("").to_string())),
         "review_comments" => Some(IpcMsg::ReviewComments(
@@ -2573,6 +2585,30 @@ pub async fn run(
                                     let _ = crate::tools::jobs::stop(&id).await;
                                 });
                             }
+                        }
+                        UiMsg::Ipc(IpcMsg::Rewind { text, skip }) => {
+                            let sid = gs.session.clone().unwrap_or_default();
+                            let note = if gs.busy || gs.running.contains(&sid) {
+                                "Stop the run first, then rewind.".to_string()
+                            } else {
+                                match server::rewind_chat(&st, &sid, &text, skip) {
+                                    Ok(r) => {
+                                        load_session(&mut gs, &st, &sid);
+                                        let shown = text.trim().trim_start_matches('\u{203a}').trim().to_string();
+                                        gs.compose = (gs.compose.0 + 1, shown);
+                                        let files = match (r.undone, &r.problem) {
+                                            (0, _) => "no file changes to put back".to_string(),
+                                            (n, None) => format!("files put back to before it ({n} undo step(s); /redo brings them back)"),
+                                            (n, Some(p)) => format!("{n} undo step(s), but: {p}"),
+                                        };
+                                        format!("Rewound: {} message(s) removed, {files}. Your message is back in the box to edit.", r.messages)
+                                    }
+                                    Err(e) => format!("Could not rewind: {e:#}"),
+                                }
+                            };
+                            gs.push(EntryKind::System, note);
+                            gs.git_stale = true;
+                            changed = true;
                         }
                         UiMsg::Ipc(IpcMsg::TermClear) => {
                             gs.term_entries.clear();

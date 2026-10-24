@@ -480,10 +480,15 @@ impl AppState {
                     st.cfg.provider.api,
                     &key,
                 );
-                let (ok, got) = match req.send().await {
+                let (mut ok, got) = match req.send().await {
                     Ok(r) => (r.status().is_success(), r.status().to_string()),
                     Err(e) => (false, heartbeat_error(&e)),
                 };
+                let mut got = got;
+                if ok && st.client.lock().await.key_rejected.load(Ordering::Relaxed) {
+                    ok = false;
+                    got = format!("{got}, but chat requests get 401/403: the provider rejected the API key");
+                }
                 let latency_ms = t0.elapsed().as_millis() as u64;
                 let detail = format!("GET {base}/models → {got} ({latency_ms} ms)");
                 // Say it once per change, so a failing check is never silent.
@@ -1304,8 +1309,16 @@ impl AppState {
     /// the goal step by step without the user until it is done
     /// (`mission_run`). Stop ends it like any run; resume carries on.
     pub async fn kick_mission(self: &Shared, session_id: String, goal: Option<String>) {
+        // `/mission --deep <goal>`: every step is a Deep run.
+        let (deep, goal) = match goal {
+            Some(g) => match g.trim_start().strip_prefix("--deep") {
+                Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => (true, Some(rest.trim().to_string())),
+                _ => (false, Some(g)),
+            },
+            None => (false, None),
+        };
         self.kick_task(session_id, move |st, sid, flag| async move {
-            let res = mission_run::run_mission(&st, &sid, goal.as_deref(), &flag).await;
+            let res = mission_run::run_mission(&st, &sid, goal.as_deref(), deep, &flag).await;
             if st.is_superseded(&sid, &flag).await {
                 return;
             }
@@ -2046,6 +2059,76 @@ fn short_id(id: &str) -> &str {
     id.get(start..).unwrap_or(id)
 }
 
+/// The words a user message is matched by when rewinding: what the chat
+/// shows (`/mission x`, `/deep 3 x`) and what is stored (`[mission] x`,
+/// `[deep mode, 3 attempts] x`) come out the same.
+fn rewind_key(text: &str) -> String {
+    let t = text.trim().trim_start_matches('\u{203a}').trim();
+    let t = t
+        .strip_prefix("[mission] ")
+        .or_else(|| t.strip_prefix("/mission "))
+        .or_else(|| t.strip_prefix("[deep mode, ").and_then(|r| r.split_once("] ").map(|(_, g)| g)))
+        .or_else(|| {
+            t.strip_prefix("/deep ").map(|r| {
+                let (first, rest) = r.split_once(' ').unwrap_or((r, ""));
+                if first.parse::<usize>().is_ok() && !rest.is_empty() { rest } else { r }
+            })
+        })
+        .unwrap_or(t);
+    t.trim().to_string()
+}
+
+/// What a rewind did.
+pub struct Rewound {
+    pub messages: usize,
+    pub undone: usize,
+    /// Undo could not put every file back.
+    pub problem: Option<String>,
+}
+
+/// Rewind chat `session_id` to before the user message that reads `text`
+/// (`skip` = how many later messages with the same text to pass over):
+/// the project's files go back to the undo points taken since the message
+/// before it, and that message and everything after it are deleted.
+pub fn rewind_chat(st: &AppState, session_id: &str, text: &str, skip: usize) -> Result<Rewound> {
+    let key = rewind_key(text);
+    let msgs = st.db.messages(session_id)?;
+    let user_text = |m: &Message| -> String {
+        m.parts.iter().filter_map(|p| if let Part::Text { text } = p { Some(text.as_str()) } else { None }).collect()
+    };
+    let hits: Vec<usize> = msgs
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user" && rewind_key(&user_text(m)) == key)
+        .map(|(i, _)| i)
+        .collect();
+    let Some(&at) = hits.iter().rev().nth(skip) else {
+        anyhow::bail!("that message is not in this chat's history any more");
+    };
+    // Undo points taken after the previous user message belong to the runs
+    // being rewound.
+    let bound = msgs[..at].iter().rev().find(|m| m.role == "user").map(|m| m.created_at).unwrap_or(0);
+    let ws = st.workspace_for(session_id);
+    let mut undone = 0;
+    let mut problem = None;
+    while undone < 50 {
+        match crate::gitsnap::newest_undo_time(&ws, &st.state_dir) {
+            Some(t) if t > bound => match crate::gitsnap::undo(&ws, &st.state_dir) {
+                Ok(Some(_)) => undone += 1,
+                Ok(None) => break,
+                Err(e) => {
+                    undone += 1;
+                    problem = Some(format!("{e:#}"));
+                    break;
+                }
+            },
+            _ => break,
+        }
+    }
+    let messages = st.db.delete_messages_from(session_id, &msgs[at].id)?;
+    Ok(Rewound { messages, undone, problem })
+}
+
 /// Most "do it now" nudges per run.
 const MAX_NUDGES: u32 = 2;
 /// Sent when a reply only announced work. Starts with a marker so it never
@@ -2167,6 +2250,8 @@ pub async fn run_loop(
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut acc = ToolCallAccumulator::default();
+        // How much of `text` was already streamed to the clients.
+        let mut shown = 0usize;
         let mut finish_reason: Option<String> = None;
         // Poll the stream in racing with the abort flag: a replaced run must
         // exit promptly even when the transport yields nothing at all.
@@ -2209,10 +2294,20 @@ pub async fn run_loop(
             match &ev {
                 StreamEvent::Text(t) => {
                     text.push_str(t);
-                    let _ = st.events.send(ServerEvent::AssistantDelta {
-                        session_id: session_id.to_string(),
-                        text: t.clone(),
+                    // Show the reply as it comes, but not a tool call the model
+                    // writes as text (`<tool_call>…`): hold back from its start,
+                    // and a possible start at the very end, until we know.
+                    let limit = text.find("<tool_call").unwrap_or_else(|| {
+                        let tail = text.rfind('<').filter(|&i| "<tool_call>".starts_with(&text[i..]));
+                        tail.unwrap_or(text.len())
                     });
+                    if limit > shown {
+                        let _ = st.events.send(ServerEvent::AssistantDelta {
+                            session_id: session_id.to_string(),
+                            text: text[shown..limit].to_string(),
+                        });
+                        shown = limit;
+                    }
                 }
                 StreamEvent::Reasoning(t) => {
                     reasoning.push_str(t);
@@ -2240,7 +2335,24 @@ pub async fn run_loop(
         }
 
         log_cache(st, session_id, request_usage.as_ref(), &prefix_note);
-        let calls = acc.finish();
+        let mut calls = acc.finish();
+        // Some models (Qwen through Ollama/llama.cpp without a tool parser)
+        // write their tool calls into the reply text. Run them as calls
+        // instead of showing XML and ending the turn.
+        if calls.is_empty() && text.contains("<tool_call>") {
+            let (rest, found) = crate::provider::calls_in_text(&text);
+            if !found.is_empty() {
+                text = rest;
+                calls = found;
+            }
+        }
+        // Text held back above that turned out not to be a call: show it now.
+        if calls.is_empty() && shown < text.len() && text.is_char_boundary(shown) {
+            let _ = st.events.send(ServerEvent::AssistantDelta {
+                session_id: session_id.to_string(),
+                text: text[shown..].to_string(),
+            });
+        }
         // B-03: "length" = the model hit its output token limit.
         let truncated = finish_reason.as_deref() == Some("length");
         if truncated {
@@ -4379,6 +4491,53 @@ mod tests {
     }
 
     #[test]
+    fn rewind_matches_shown_and_stored_text() {
+        assert_eq!(rewind_key("\u{203a} make it blue"), "make it blue");
+        assert_eq!(rewind_key("/mission ship it"), rewind_key("[mission] ship it"));
+        assert_eq!(rewind_key("/deep 3 fix it"), rewind_key("[deep mode, 3 attempts] fix it"));
+        assert_eq!(rewind_key("/deep fix it"), "fix it");
+    }
+
+    /// Rewinding a message puts the files back to before its run and drops
+    /// it and what came after; rewinding further goes further back.
+    #[tokio::test]
+    async fn rewind_puts_files_and_chat_back() {
+        let dir = std::env::temp_dir().join(format!("ocrs-rewind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| crate::gitsnap::git(&dir, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "core.autocrlf", "false"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let st = build_state_ephemeral(crate::config::Config::default(), dir.clone()).await;
+        let s = st.db.create_session("r", None).unwrap();
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(15));
+        // Two runs, each as run_agent does it: snapshot, message, change, reply.
+        for (ask, content) in [("first", "two\n"), ("second", "three\n")] {
+            pause();
+            crate::gitsnap::record_before_run(&dir, &st.state_dir, "pre-run").unwrap();
+            pause();
+            st.db.add_message(&s.id, "user", &[Part::Text { text: ask.into() }]).unwrap();
+            std::fs::write(dir.join("a.txt"), content).unwrap();
+            st.db.add_message(&s.id, "assistant", &[Part::Text { text: "done".into() }]).unwrap();
+        }
+        let r = rewind_chat(&st, &s.id, "\u{203a} second", 0).unwrap();
+        assert_eq!((r.messages, r.undone), (2, 1));
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "two\n", "the second run is undone");
+        assert_eq!(st.db.messages(&s.id).unwrap().len(), 2, "the first exchange stays");
+        let r = rewind_chat(&st, &s.id, "first", 0).unwrap();
+        assert_eq!((r.messages, r.undone), (2, 1));
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n", "back to before the first run");
+        assert!(st.db.messages(&s.id).unwrap().is_empty());
+        assert!(rewind_chat(&st, &s.id, "first", 0).is_err(), "nothing left to rewind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn prefix_change_says_where_a_request_stopped_matching() {
         let m = |role: &str, text: &str| ChatMsg {
             role: role.into(),
@@ -4904,6 +5063,43 @@ data: [DONE]
         .await
         .expect("a heartbeat arrives");
         assert!(ok, "the key was sent, so the endpoint reports up");
+    }
+
+    /// A provider that lists its models without a key but rejects chat
+    /// requests with 401: the status check must say the key was rejected
+    /// instead of "connected".
+    #[tokio::test]
+    async fn heartbeat_reports_a_rejected_key() {
+        use axum::{http::StatusCode as Code, routing::{get, post}, Router};
+        let app = Router::new()
+            .route("/v1/models", get(|| async { (Code::OK, "{\"data\":[]}") }))
+            .route("/v1/chat/completions", post(|| async { (Code::UNAUTHORIZED, "{\"error\":\"invalid API token\"}") }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "m".into();
+        cfg.provider.api_key = "wrong".into();
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        let s = st.db.create_session("k", None).unwrap();
+        let err = one_shot(&st, "s", "hi", &AtomicBool::new(false), false).await.unwrap_err();
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
+        let _ = s;
+        let mut rx = st.events.subscribe();
+        st.start_heartbeat();
+        let (ok, detail) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(ServerEvent::Heartbeat { ok, detail, .. }) = rx.recv().await {
+                    return (ok, detail);
+                }
+            }
+        })
+        .await
+        .expect("a heartbeat arrives");
+        assert!(!ok && detail.contains("rejected the API key"), "{ok} {detail}");
     }
 
     /// B-09: a waiting approval can be fetched again (after a lag) and is

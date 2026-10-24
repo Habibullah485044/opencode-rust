@@ -186,6 +186,7 @@ pub(super) async fn run_mission(
     st: &Shared,
     session_id: &str,
     goal: Option<&str>,
+    deep: bool,
     abort: &Arc<AtomicBool>,
 ) -> Result<String> {
     let note = |text: String| {
@@ -220,7 +221,10 @@ pub(super) async fn run_mission(
         st.set_perm_mode(PermissionMode::Turbo);
         note("mission: approvals are automatic until the mission ends (deny rules still apply)".into());
     }
-    let result = steps_loop(st, session_id, &ws, abort).await;
+    if deep {
+        note(format!("mission: each step is a Deep run ({} attempts, the best checked one kept)", st.cfg.agent.deep_attempts));
+    }
+    let result = steps_loop(st, session_id, &ws, deep, abort).await;
     if before != PermissionMode::Turbo {
         st.set_perm_mode(before);
     }
@@ -255,7 +259,7 @@ pub(super) async fn run_mission(
 
 /// Work through the steps. `Ok(true)` = mission complete, `Ok(false)` = the
 /// step limit was reached.
-async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, abort: &Arc<AtomicBool>) -> Result<bool> {
+async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: bool, abort: &Arc<AtomicBool>) -> Result<bool> {
     let limit = st.cfg.agent.mission_max_steps;
     let mut runs = 0usize;
     let mut errors = 0usize;
@@ -289,7 +293,22 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, abort: 
         // No slack: files the previous step wrote a moment ago must not
         // count as this step's (they would show up in its receipt).
         let since = std::time::SystemTime::now();
-        let run = agent_inner(st, &child.id, &brief, abort).await;
+        // Deep: the step is tried several times in separate copies and the
+        // best checked attempt is applied. Without git it runs once.
+        let run = if deep {
+            match super::deep::run_deep(st, &child.id, &brief, st.cfg.agent.deep_attempts, abort).await {
+                Ok(summary) => {
+                    if !summary.is_empty() {
+                        st.db.add_message(&child.id, "assistant", &[Part::Text { text: summary.clone() }])?;
+                    }
+                    Ok(summary)
+                }
+                Err(e) if format!("{e:#}").contains("needs a git repository") => agent_inner(st, &child.id, &brief, abort).await,
+                Err(e) => Err(e),
+            }
+        } else {
+            agent_inner(st, &child.id, &brief, abort).await
+        };
         if abort.load(Ordering::SeqCst) {
             st.db.mission_step_update(step.id, "pending", attempts - 1, &step.result, None)?;
             agent_status(st, &info, "failed", "stopped".into());
@@ -458,7 +477,7 @@ mod tests {
         let s = st.db.create_session("mission", None).unwrap();
         let mut rx = st.events.subscribe();
 
-        let out = run_mission(&st, &s.id, Some("make three files"), &Arc::new(AtomicBool::new(false))).await.unwrap();
+        let out = run_mission(&st, &s.id, Some("make three files"), false, &Arc::new(AtomicBool::new(false))).await.unwrap();
         assert!(out.starts_with("**Mission complete**"), "{out}");
         for f in ["a.txt", "b.txt", "c.txt"] {
             assert!(dir.join(f).is_file(), "{f} written");
@@ -528,7 +547,7 @@ mod tests {
         cfg.provider.model = "mock".into();
         let st = build_state_ephemeral(cfg, dir.clone()).await;
         let s = st.db.create_session("m", None).unwrap();
-        let out = run_mission(&st, &s.id, Some("perfection"), &Arc::new(AtomicBool::new(false))).await.unwrap();
+        let out = run_mission(&st, &s.id, Some("perfection"), false, &Arc::new(AtomicBool::new(false))).await.unwrap();
         let m = st.db.mission(&s.id).unwrap().unwrap();
         assert_eq!((m.steps[0].status.as_str(), m.steps[0].attempts), ("failed", MAX_ATTEMPTS), "{out}");
         assert!(out.contains("1 failed"), "{out}");
@@ -542,7 +561,7 @@ mod tests {
     async fn resume_without_a_mission_says_how_to_start_one() {
         let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
         let s = st.db.create_session("m", None).unwrap();
-        let err = run_mission(&st, &s.id, None, &Arc::new(AtomicBool::new(false))).await.unwrap_err();
+        let err = run_mission(&st, &s.id, None, false, &Arc::new(AtomicBool::new(false))).await.unwrap_err();
         assert!(format!("{err}").contains("/mission <goal>"));
     }
 

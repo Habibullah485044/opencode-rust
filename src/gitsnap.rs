@@ -493,6 +493,14 @@ fn step(
     restored.map(|_| Some(m))
 }
 
+/// When the newest undo point was taken (ms), if there is one.
+pub fn newest_undo_time(workspace: &Path, state_dir: &Path) -> Option<i64> {
+    let root = snap_root(state_dir, workspace);
+    let (undo_path, _) = stack_paths(&root);
+    let id = read_stack(&undo_path).last().cloned()?;
+    load_manifest(&root, &id).ok().map(|m| m.created_at)
+}
+
 /// Restore the most recent snapshot (undo). `Ok(None)` = nothing to undo.
 pub fn undo(workspace: &Path, state_dir: &Path) -> Result<Option<Manifest>> {
     let root = snap_root(state_dir, workspace);

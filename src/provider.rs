@@ -35,6 +35,12 @@ pub struct Client {
     /// Shared by all clones: when one request hits a rate limit, every
     /// request of the app waits until it is over.
     gate: std::sync::Arc<RateGate>,
+    /// The provider answered a chat request with 401/403: the API key is
+    /// wrong, expired or out of credit. Cleared by the next request that
+    /// succeeds. Shared by all clones. The status check (`GET /models`)
+    /// cannot see this: many providers list their models without a key, so
+    /// the header said "connected" while every chat request failed.
+    pub key_rejected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// When to send prompt-caching markers (`provider.prompt_cache`).
     prompt_cache: crate::config::PromptCache,
     /// Ask OpenAI-style servers for usage at the end (`provider.stream_usage`).
@@ -44,6 +50,7 @@ pub struct Client {
     /// `provider.images`: auto / on / off.
     images: String,
 }
+
 
 /// Token counts of one reply, normalised across providers. `input` is the
 /// whole prompt (cached part included); `cached` of it was read from the
@@ -199,6 +206,7 @@ impl Client {
             retry_base: std::time::Duration::from_secs(1),
             rate_limit_wait: std::time::Duration::ZERO,
             gate: Default::default(),
+            key_rejected: Default::default(),
             prompt_cache: crate::config::PromptCache::Auto,
             stream_usage: true,
             reasoning_effort: None,
@@ -241,9 +249,15 @@ impl Client {
             // Each arm gives: error text, "worth retrying?", server's wait,
             // "rate limited?".
             let (mut msg, retryable, retry_after, limited) = match build().send().await {
-                Ok(resp) if resp.status().is_success() => return Ok(resp),
+                Ok(resp) if resp.status().is_success() => {
+                    self.key_rejected.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(resp);
+                }
                 Ok(resp) => {
                     let status = resp.status();
+                    if matches!(status.as_u16(), 401 | 403) {
+                        self.key_rejected.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let retry_after = retry_after_secs(resp.headers());
                     let text = resp.text().await.unwrap_or_default();
                     let msg = format!(
@@ -673,6 +687,7 @@ impl ToolCallAccumulator {
     }
 
     /// Returns final calls; args parsed as JSON (falls back to {"raw": args}).
+    /// See also [`calls_in_text`] for models that write calls as text.
     /// B-21: empty args become `{}`; a missing id gets a generated one.
     pub fn finish(self) -> Vec<(String, String, Value)> {
         self.calls
@@ -828,6 +843,118 @@ pub fn with_auth(req: reqwest::RequestBuilder, api: ProviderApi, api_key: &str) 
                 req.header("x-api-key", api_key)
             }
         }
+    }
+}
+
+
+/// Tool calls a model wrote into its reply text instead of the API's
+/// `tool_calls` field (Qwen and Hermes-style chat templates served without
+/// a tool parser, e.g. some Ollama/llama.cpp setups). Two forms:
+///
+/// ```text
+/// <tool_call><function=list><parameter=path>.</parameter></function></tool_call>
+/// <tool_call>{"name": "list", "arguments": {"path": "."}}</tool_call>
+/// ```
+///
+/// Returns the text with the calls taken out, and the calls (id, name,
+/// arguments). No `<tool_call>` = the text unchanged and no calls.
+pub fn calls_in_text(text: &str) -> (String, Vec<(String, String, Value)>) {
+    let mut calls = Vec::new();
+    let mut rest = String::new();
+    let mut s = text;
+    while let Some(start) = s.find("<tool_call>") {
+        rest.push_str(&s[..start]);
+        let after = &s[start + "<tool_call>".len()..];
+        let (body, next) = match after.find("</tool_call>") {
+            Some(end) => (&after[..end], &after[end + "</tool_call>".len()..]),
+            None => (after, ""), // cut off: take what is there
+        };
+        if let Some(call) = parse_one_text_call(body) {
+            let id = format!("txt_{}_{}", calls.len(), std::process::id());
+            calls.push((id, call.0, call.1));
+        } else {
+            rest.push_str(&s[start..start + "<tool_call>".len()]);
+            rest.push_str(body);
+        }
+        s = next;
+    }
+    rest.push_str(s);
+    if calls.is_empty() {
+        return (text.to_string(), calls);
+    }
+    (rest.trim().to_string(), calls)
+}
+
+fn parse_one_text_call(body: &str) -> Option<(String, Value)> {
+    let b = body.trim();
+    // JSON form.
+    if b.starts_with('{') {
+        let v: Value = serde_json::from_str(b).ok()?;
+        let name = v.get("name")?.as_str()?.to_string();
+        let args = match v.get("arguments").or_else(|| v.get("parameters")) {
+            Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({ "raw": s })),
+            Some(a) => a.clone(),
+            None => serde_json::json!({}),
+        };
+        return Some((name, args));
+    }
+    // XML form: <function=NAME> <parameter=KEY>VALUE</parameter> ... </function>
+    let f = b.find("<function=")?;
+    let after = &b[f + "<function=".len()..];
+    let name_end = after.find('>')?;
+    let name = after[..name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    let mut p = &after[name_end + 1..];
+    while let Some(ps) = p.find("<parameter=") {
+        let a = &p[ps + "<parameter=".len()..];
+        let Some(ke) = a.find('>') else { break };
+        let key = a[..ke].trim().to_string();
+        let v = &a[ke + 1..];
+        let (raw, next) = match v.find("</parameter>") {
+            Some(ve) => (&v[..ve], &v[ve + "</parameter>".len()..]),
+            None => (v.split("</function>").next().unwrap_or(v), ""),
+        };
+        // One newline around the value belongs to the template, not the value.
+        let raw = raw.strip_prefix('\n').unwrap_or(raw);
+        let raw = raw.strip_suffix('\n').unwrap_or(raw);
+        let value = match serde_json::from_str::<Value>(raw.trim()) {
+            Ok(v @ (Value::Number(_) | Value::Bool(_) | Value::Array(_) | Value::Object(_))) => v,
+            _ => Value::String(raw.to_string()),
+        };
+        args.insert(key, value);
+        p = next;
+    }
+    Some((name, Value::Object(args)))
+}
+
+#[cfg(test)]
+mod text_call_tests {
+    use super::*;
+
+    #[test]
+    fn qwen_xml_calls_in_text_are_read() {
+        let t = "Let me look.\n<tool_call>\n<function=list>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+        let (rest, calls) = calls_in_text(t);
+        assert_eq!(rest, "Let me look.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "list");
+        assert_eq!(calls[0].2, serde_json::json!({"path": "."}));
+        let t = "<tool_call><function=read><parameter=path>src/a.rs</parameter><parameter=limit>40</parameter></function></tool_call>\n<tool_call><function=write><parameter=path>b.txt</parameter><parameter=content>\nline1\nline2\n</parameter></function></tool_call>";
+        let (_, calls) = calls_in_text(t);
+        assert_eq!(calls[0].2, serde_json::json!({"path": "src/a.rs", "limit": 40}));
+        assert_eq!(calls[1].2, serde_json::json!({"path": "b.txt", "content": "line1\nline2"}));
+    }
+
+    #[test]
+    fn json_calls_in_text_are_read_and_plain_text_is_left_alone() {
+        let (rest, calls) = calls_in_text("<tool_call>{\"name\": \"glob\", \"arguments\": {\"pattern\": \"**/*.rs\"}}</tool_call>");
+        assert_eq!((rest.as_str(), calls[0].1.as_str()), ("", "glob"));
+        assert_eq!(calls[0].2, serde_json::json!({"pattern": "**/*.rs"}));
+        let (rest, calls) = calls_in_text("Plain answer, no calls.");
+        assert!(calls.is_empty() && rest == "Plain answer, no calls.");
     }
 }
 
