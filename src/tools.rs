@@ -392,6 +392,9 @@ pub mod jobs {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         scrub_secrets(&mut cmd);
+        // Its own process group, so `stop` (kill_tree) reaches what it started.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd.spawn().with_context(|| format!("starting `{command}`"))?;
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let id = if by_user { format!("term{n}") } else { format!("job{n}") };

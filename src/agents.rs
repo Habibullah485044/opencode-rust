@@ -387,7 +387,9 @@ pub fn ponytail_section(level: PonytailLevel) -> String {
 fn ponytail_prompt_rules() -> &'static str {
     static RULES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     RULES.get_or_init(|| {
-        let text = ponytail_rules();
+        // A Windows checkout with autocrlf builds the file in with CRLF.
+        let owned = ponytail_rules().replace("\r\n", "\n");
+        let text = owned.as_str();
         let body = text.split_once("\n---\n").and_then(|(_, rest)| rest.split_once("\n---\n"));
         let body = body.map_or(text, |(_, b)| b);
         let body = body.split("\n## Levels").next().unwrap_or(body);

@@ -12,7 +12,7 @@
 //! show it. One browser process loads a harness page with one iframe per
 //! width; a probe script injected into each frame measures and reports back.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -160,12 +160,19 @@ async fn dump_dom(exe: &Path, url: &str, timeout: Duration) -> Result<String> {
     .arg(url)
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::null())
+    .stderr(std::process::Stdio::piped())
     .kill_on_drop(true);
     let child = cmd.spawn().with_context(|| format!("starting {}", exe.display()))?;
     let out = tokio::time::timeout(timeout, child.wait_with_output()).await;
     let out = out.map_err(|_| anyhow!("the browser did not finish within {}s", timeout.as_secs()))??;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let dom = String::from_utf8_lossy(&out.stdout).into_owned();
+    if dom.trim().is_empty() {
+        // e.g. Linux without a usable sandbox: say why instead of "no probe result".
+        let err = String::from_utf8_lossy(&out.stderr);
+        let tail: String = err.trim().chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+        bail!("the browser printed no page ({}): {tail}", out.status);
+    }
+    Ok(dom)
 }
 
 // ------------------------------------------------------------ local server
