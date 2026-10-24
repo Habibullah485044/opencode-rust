@@ -814,6 +814,14 @@
   ok("a deep attempt card has no buttons", !!deepCard && deepCard.querySelectorAll(".ag-btn").length === 0);
   window.render(payload(basePage));
 
+  // A plan with states renders as a checklist.
+  window.render(Object.assign(payload(basePage), { entries: [{ k: "a", t: "Plan:\n[x] 1. Layout\n[>] 2. Cards\n[ ] 3. Cart\n[!] 4. Deploy" }], entries_from: 0, entries_len: 1 }));
+  var cks = document.querySelectorAll("#log .ck");
+  ok("plan lines become checklist items", cks.length === 4 && cks[0].classList.contains("done") &&
+    cks[1].classList.contains("now") && cks[2].classList.contains("todo") && cks[3].classList.contains("fail") &&
+    cks[1].textContent === "Cards", cks.length + " " + (cks[1] && cks[1].textContent));
+  window.render(Object.assign(payload(basePage), { entries: [], entries_from: 0, entries_len: 0 }));
+
   // Mission toggle: the next message goes out as /mission, once; it and
   // Deep exclude each other.
   var mta = document.getElementById("input");
