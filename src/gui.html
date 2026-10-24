@@ -389,8 +389,10 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 11px;
-    font-weight: 600;
+    font-size: 10.5px;
+    font-weight: 650;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
     color: var(--text-dim);
     margin: 14px 10px 4px;
     user-select: none;
@@ -745,7 +747,6 @@
     padding: 0 16px 0 22px;
     border-bottom: 1px solid var(--line);
     background: transparent;
-    backdrop-filter: blur(6px);
     z-index: 10;
     flex: none;
   }
@@ -969,8 +970,8 @@
   /* Reasoning: collapsed by default, out of the way. */
   .thinking-box {
     border-radius: var(--radius);
-    border: 1px solid var(--line);
-    background: transparent;
+    border: 1px solid rgba(165, 180, 252, 0.16);
+    background: linear-gradient(180deg, rgba(165, 180, 252, 0.05), transparent);
     overflow: hidden;
   }
   .thinking-box summary {
@@ -998,7 +999,7 @@
     opacity: 0.7;
   }
   .thinking-box[open] summary::after { transform: rotate(45deg); }
-  .thinking-box summary:hover { color: var(--text-soft); background: rgba(255, 255, 255, 0.02); }
+  .thinking-box summary:hover { color: var(--text-soft); background: var(--hover); }
   .thinking-pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--think); opacity: 0.8; }
   .thinking-content {
     padding: 4px 14px 12px 26px;
@@ -1571,6 +1572,25 @@
   .mode-btn.manual.on { background: rgba(165, 180, 252, 0.16); color: var(--think); box-shadow: inset 0 0 0 1px rgba(165, 180, 252, 0.35); }
   .mode-btn.turbo.on { background: var(--warn-soft); color: var(--warn); }
 
+  /* While a run is going, a slow sky light runs along the composer's edge
+     (a gradient border drawn by a mask, so the inside stays untouched). */
+  #comp { position: relative; }
+  #comp.busy::after {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(90deg, transparent 0%, rgba(56, 189, 248, 0.0) 20%, #7dd3fc 50%, rgba(56, 189, 248, 0.0) 80%, transparent 100%) 0 0 / 200% 100%;
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    animation: edgeRun 2.6s linear infinite;
+    pointer-events: none;
+  }
+  @keyframes edgeRun { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+  @media (prefers-reduced-motion: reduce) { #comp.busy::after { animation: none; background-position: 50% 0; } }
+
   /* Turbo grants blanket access, so the composer itself says so. */
   #comp.turbo { border-color: rgba(231, 179, 90, 0.45); }
   #comp.turbo:focus-within { border-color: rgba(231, 179, 90, 0.7); box-shadow: 0 0 0 3px rgba(231, 179, 90, 0.08); }
@@ -1757,13 +1777,13 @@
     width: 40px;
     height: 40px;
     border-radius: 11px;
-    background: var(--surface);
-    border: 1px solid var(--line);
+    background: var(--grad-soft);
+    border: 1px solid var(--accent-line);
     display: grid;
     place-items: center;
     color: var(--text-muted);
     font-size: 18px;
-    filter: grayscale(1);
+    box-shadow: var(--glow);
   }
   #bcontent b { font-size: 14px; font-weight: 600; color: var(--text); }
   #bcontent .sub { font-size: 12.5px; color: var(--text-muted); max-width: 260px; line-height: 1.55; }
@@ -1779,7 +1799,7 @@
     cursor: pointer;
     transition: background 0.12s;
   }
-  #bcontent .cta:hover { background: var(--surface-3); }
+  #bcontent .cta:hover { background: var(--accent-soft); border-color: var(--accent-line); }
 
   /* ---- D1: approval modal ----
      The engine blocks the tool call until this is answered. The native preview
@@ -3739,6 +3759,8 @@
     // ---- F-06: while a run is going the send button becomes Stop ----
     var wasBusy = busyNow;
     busyNow = !!d.busy;
+    var compBox = document.getElementById("comp");
+    if (compBox) compBox.classList.toggle("busy", busyNow);
     // Switching chats: keep what was typed in the old one, bring back the new one's.
     var nextSession = d.session || "";
     if (nextSession !== currentSession) {
