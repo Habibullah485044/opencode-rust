@@ -243,6 +243,9 @@ pub struct AppState {
     /// Goal B: the GUI's preview webview, when one is running. Headless and
     /// TUI runs have none, and `browser_*` tools say so instead of hanging.
     pub browser: Mutex<Option<crate::browser::Handle>>,
+    /// The model's context window as the provider reports it in `/models`
+    /// (`context_window`, `context_length`…). 0 = not known.
+    pub detected_context: std::sync::atomic::AtomicUsize,
 }
 
 pub type Shared = Arc<AppState>;
@@ -294,6 +297,7 @@ pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
         skill_base,
         mcp: AsyncMutex::new(mcp),
         browser: Mutex::new(None),
+        detected_context: std::sync::atomic::AtomicUsize::new(0),
     }))
 }
 
@@ -349,6 +353,7 @@ pub async fn build_state_ephemeral_skills(
         skill_base,
         mcp: AsyncMutex::new(mcp),
         browser: Mutex::new(None),
+        detected_context: std::sync::atomic::AtomicUsize::new(0),
     })
 }
 
@@ -481,7 +486,35 @@ impl AppState {
                     &key,
                 );
                 let (mut ok, got) = match req.send().await {
-                    Ok(r) => (r.status().is_success(), r.status().to_string()),
+                    Ok(r) => {
+                        let ok = r.status().is_success();
+                        let status = r.status().to_string();
+                        if ok {
+                            let model = st.current_model().await;
+                            let mut known = None;
+                            if let Ok(body) = r.json::<Value>().await {
+                                known = context_from_models(&body, &model);
+                            }
+                            // Ollama's OpenAI endpoint carries no context
+                            // metadata at all; its native /api/ps does
+                            // (`context_length`). Without this fallback the
+                            // window is never known on a local Ollama and
+                            // every limit-aware guard (auto-compaction,
+                            // fitting tool results, the output budget)
+                            // silently stays off.
+                            if known.is_none()
+                                && st.detected_context.load(Ordering::Relaxed) == 0
+                                && matches!(st.cfg.provider.api, crate::config::ProviderApi::OpenAi)
+                            {
+                                known = probe_ollama_context(&http, &base, &key, &model).await;
+                            }
+                            if let Some(n) = known {
+                                st.detected_context.store(n, Ordering::Relaxed);
+                                st.client.lock().await.set_context_limit(n);
+                            }
+                        }
+                        (ok, status)
+                    }
                     Err(e) => (false, heartbeat_error(&e)),
                 };
                 let mut got = got;
@@ -1060,7 +1093,7 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
                        broken outside the diff…"
                     .to_string(),
             });
-            if let Err(e) = run_review(st, session_id, &abort).await {
+            if let Err(e) = run_review(st, session_id, Some(started_at), &abort).await {
                 let _ = st.events.send(ServerEvent::Note {
                     session_id: session_id.to_string(),
                     text: format!("ponytail review failed: {e}"),
@@ -1276,7 +1309,7 @@ impl AppState {
         };
         let st2 = self.clone();
         tokio::spawn(async move {
-            let res = run_review(&st2, &session_id, &flag).await;
+            let res = run_review(&st2, &session_id, None, &flag).await;
             let superseded = {
                 let busy = st2.busy.read().await;
                 busy.get(&session_id)
@@ -1838,9 +1871,11 @@ pub(crate) fn tool_allowed(mode: AgentMode, opts: &LoopOpts, name: &str) -> bool
     }
 }
 
-/// F-07: rough size of the next request in tokens: about 4 characters per
-/// token for the messages and the tool list. Good enough to decide when to
-/// compact; not a billing number.
+/// F-07: rough size of the next request in tokens: about 3 characters per
+/// token for the messages and the tool list. Code and tool results tokenize
+/// worse than prose (closer to 3 chars/token), and measuring low would let
+/// requests overflow a small window. Good enough to decide when to compact;
+/// not a billing number.
 fn estimate_tokens(msgs: &[ChatMsg], specs: &[crate::provider::ToolSpec]) -> usize {
     let mut chars = serde_json::to_string(specs).map_or(0, |s| s.len());
     for m in msgs {
@@ -1849,7 +1884,101 @@ fn estimate_tokens(msgs: &[ChatMsg], specs: &[crate::provider::ToolSpec]) -> usi
             chars += c.function.name.len() + c.function.arguments.len() + 16;
         }
     }
-    chars / 4
+    chars / 3
+}
+
+/// The model's context window: `agent.context_tokens` when set, else what
+/// the provider reported (0 = unknown, nothing is limited).
+pub fn context_limit(st: &AppState) -> usize {
+    match st.cfg.agent.context_tokens {
+        0 => st.detected_context.load(Ordering::Relaxed),
+        n => n,
+    }
+}
+
+/// The context window a `/models` answer reports for `model` (Ollama,
+/// LM Studio, vLLM and OpenRouter each name the field differently).
+pub fn context_from_models(body: &Value, model: &str) -> Option<usize> {
+    let list = body.get("data").and_then(Value::as_array)?;
+    let entry = list.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model)).or_else(|| list.first())?;
+    ["context_window", "context_length", "max_context_length", "loaded_context_length", "max_model_len"]
+        .iter()
+        .find_map(|k| entry.get(*k).and_then(Value::as_u64))
+        .or_else(|| entry.pointer("/top_provider/context_length").and_then(Value::as_u64))
+        .map(|n| n as usize)
+        .filter(|n| *n >= 1024)
+}
+
+/// Ollama's native `GET /api/ps`: each loaded model's allocated context
+/// under `context_length` (`name`/`model` is its tag). `/v1/models` (the
+/// OpenAI endpoint) carries no context metadata, so this is where an
+/// Ollama context window is found.
+pub fn context_from_ollama_ps(body: &Value, model: &str) -> Option<usize> {
+    let list = body.get("models").and_then(Value::as_array)?;
+    let norm = |s: &str| s.trim().trim_end_matches(":latest").to_string();
+    let want = norm(model);
+    let entry = list
+        .iter()
+        .find(|m| {
+            ["name", "model"]
+                .iter()
+                .any(|k| m.get(*k).and_then(Value::as_str).is_some_and(|n| norm(n) == want))
+        })
+        .or_else(|| list.first())?;
+    entry.get("context_length").and_then(Value::as_u64).map(|n| n as usize).filter(|n| *n >= 1024)
+}
+
+/// Best-effort `GET {base minus /v1}/api/ps` (an Ollama server, also the
+/// one behind the token proxy in `kaggle_setup_cell.py`). `None` for any
+/// other server — the caller then simply knows no context size.
+async fn probe_ollama_context(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    model: &str,
+) -> Option<usize> {
+    let root = base.trim_end_matches('/').trim_end_matches("/v1");
+    let req = crate::provider::with_auth(
+        http.get(format!("{root}/api/ps")),
+        crate::config::ProviderApi::OpenAi,
+        key,
+    );
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: Value = resp.json().await.ok()?;
+    context_from_ollama_ps(&body, model)
+}
+
+/// Shorten old tool results in a request that would not fit the context
+/// window (the stored chat keeps them in full): first everything but the
+/// five newest results (last-5 observations in full is the measured sweet
+/// spot for weak models), then those too. Returns how many were shortened.
+fn fit_tool_results(msgs: &mut [ChatMsg], limit: usize) -> usize {
+    // What the tool list and the reply need on top of the messages.
+    const OVERHEAD: usize = 2_500;
+    let size = |m: &[ChatMsg]| estimate_tokens(m, &[]) + OVERHEAD;
+    if limit == 0 || size(msgs) * 10 <= limit * 9 {
+        return 0;
+    }
+    let tools: Vec<usize> = msgs.iter().enumerate().filter(|(_, m)| m.role == "tool").map(|(i, _)| i).collect();
+    let mut cut = 0;
+    for (keep_newest, cap) in [(5usize, 1_500usize), (0, 600)] {
+        let older = tools.len().saturating_sub(keep_newest);
+        for &i in &tools[..older] {
+            let Some(c) = msgs[i].content.as_mut() else { continue };
+            if c.chars().count() > cap {
+                let head: String = c.chars().take(cap).collect();
+                *c = format!("{head}\n… [shortened to fit the model's context window; run the tool again if you need the rest]");
+                cut += 1;
+            }
+        }
+        if size(msgs) * 10 <= limit * 9 {
+            break;
+        }
+    }
+    cut
 }
 
 /// F-07: compact the session when the next request would use 80% or more
@@ -1863,7 +1992,7 @@ async fn auto_compact_if_needed(
     abort: &AtomicBool,
 ) {
     static FAILED_AT: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
-    let limit = st.cfg.agent.context_tokens;
+    let limit = context_limit(st);
     if limit == 0 {
         return;
     }
@@ -2137,6 +2266,16 @@ pub const NUDGE_TEXT: &str = "[app] You said what you will do but made no tool c
     Do it now with your tools. Reply without a tool call only when the whole task is done (then give a \
     short summary of what you changed), or when you need the user to decide something (then ask).";
 
+/// Appended to a reply that hit the model's output token limit.
+const CUT_OFF_NOTE: &str = "\n\n[reply cut off: the model reached its output token limit]";
+/// Appended to the kept part of a reply whose stream kept breaking off.
+const BROKE_OFF_NOTE: &str =
+    "\n\n[reply broke off: the connection dropped mid-reply; the part that arrived is kept]";
+/// Asks for the rest of a reply the output token limit cut short.
+const CONTINUE_TEXT: &str = "[app] Your reply was cut short by the output token limit. Continue exactly \
+    where you stopped — do not repeat what was already said. If the whole task is done now, end with \
+    one short line instead.";
+
 /// Does a reply end by announcing work it did not do ("I'll build it now.",
 /// "Let me fix that:")? Looks at the last two sentences only, so a summary
 /// that mentions a plan earlier on does not count, and never fires on a
@@ -2351,6 +2490,8 @@ pub async fn run_loop(
             tokio::time::interval(std::time::Duration::from_millis(200));
         abort_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut dropped = false;
+        // The stream broke off for good: the part that arrived is kept.
+        let mut broke_off = false;
         loop {
             let ev = tokio::select! {
                 ev = stream.next() => ev,
@@ -2381,7 +2522,16 @@ pub async fn run_loop(
                     dropped = true;
                     break;
                 }
-                Err(e) => return Err(e),
+                // The stream keeps breaking off (tunnel, proxy): throwing
+                // the reply away and failing the run loses work the user
+                // already watched stream in. Keep what arrived instead.
+                Err(e) => {
+                    if text.is_empty() && acc.is_empty() {
+                        return Err(e);
+                    }
+                    broke_off = true;
+                    break;
+                }
             };
             match &ev {
                 StreamEvent::Text(t) => {
@@ -2457,11 +2607,23 @@ pub async fn run_loop(
                 text: "the model's reply was cut off by its output token limit".to_string(),
             });
             if calls.is_empty() {
-                text.push_str("\n\n[reply cut off: the model reached its output token limit]");
+                text.push_str(CUT_OFF_NOTE);
+            }
+        }
+        if broke_off {
+            let _ = st.events.send(ServerEvent::Note {
+                session_id: session_id.to_string(),
+                text: format!(
+                    "the connection broke off {} time(s) — keeping the part of the reply that arrived",
+                    stream_drops.max(1)
+                ),
+            });
+            if calls.is_empty() {
+                text.push_str(BROKE_OFF_NOTE);
             }
         }
         let cut_off = |v: &Value| v.as_object().map(|o| o.len() == 1 && o.contains_key("raw")).unwrap_or(false);
-        if truncated && calls.iter().any(|(_, _, input)| cut_off(input)) {
+        if (truncated || broke_off) && calls.iter().any(|(_, _, input)| cut_off(input)) {
             let mut parts = Vec::new();
             if !reasoning.is_empty() {
                 parts.push(Part::Reasoning { text: reasoning.clone() });
@@ -2505,6 +2667,18 @@ pub async fn run_loop(
         }
 
         if calls.is_empty() {
+            // A healthy transport cut by the output limit mid-task: ask for
+            // the rest instead of ending the turn on half an answer.
+            if truncated && nudges < MAX_NUDGES && !text.trim().is_empty() {
+                nudges += 1;
+                let _ = st.events.send(ServerEvent::Note {
+                    session_id: session_id.to_string(),
+                    text: "the reply hit its output limit mid-way — asking the model to continue".into(),
+                });
+                st.db
+                    .add_message(session_id, "user", &[Part::Text { text: CONTINUE_TEXT.to_string() }])?;
+                continue;
+            }
             // "I'll build it now." and no tool call: weak models end their
             // turn on a plan. Nothing happened, so ask once or twice for the
             // work itself instead of reporting the plan as the answer.
@@ -2941,21 +3115,82 @@ const REVIEW_MAX_STEPS: usize = 10;
 /// Most replies one run asks again after they broke off mid-stream.
 const MAX_STREAM_DROPS: u32 = 3;
 
-pub async fn run_review(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) -> Result<String> {
-    st.db.add_message(
-        session_id,
-        "user",
-        &[Part::Text {
-            text: "Review the current uncommitted changes in this workspace \
-                   (ponytail-review). Report findings ordered by severity, and \
-                   check callers outside the diff."
-                .to_string(),
-        }],
-    )?;
+/// The uncommitted changes of `ws` as text for the review (at most about
+/// 12K characters). `None` = not a git repository, or nothing changed.
+fn review_diff(ws: &std::path::Path) -> Option<String> {
+    let files = crate::changes::collect(ws).ok()?;
+    if files.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for f in &files {
+        let part = format!("### {} ({})\n```diff\n{}\n```\n", f.path, f.status, f.diff.trim_end());
+        if out.len() + part.len() > 12_000 {
+            out.push_str(&format!("… and {} more changed file(s); read them if needed.\n", files.len() - out.matches("### ").count()));
+            break;
+        }
+        out.push_str(&part);
+    }
+    Some(out)
+}
+
+/// What the review should look at: the workspace's uncommitted changes
+/// (git), else the files the run itself wrote (the tools track every
+/// write/edit — a project without git can still be reviewed). `since`
+/// bounds the tracked writes (the run's start); `None` = anything this
+/// app run recorded. `None` back = nothing known to review.
+fn review_targets(ws: &std::path::Path, since: Option<std::time::SystemTime>) -> Option<String> {
+    if let Some(diff) = review_diff(ws) {
+        return Some(diff);
+    }
+    let files = crate::keepbest::written_since(ws, since.unwrap_or(std::time::UNIX_EPOCH));
+    if files.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for f in &files {
+        let rel = f.strip_prefix(ws).unwrap_or(f);
+        let content = std::fs::read_to_string(f).unwrap_or_else(|_| "(unreadable)".to_string());
+        let part = format!("### {} (changed by the run)\n```\n{}\n```\n", rel.display(), content.trim_end());
+        if out.len() + part.len() > 12_000 {
+            out.push_str(&format!("… and {} more changed file(s); read them if needed.\n", files.len() - out.matches("### ").count()));
+            break;
+        }
+        out.push_str(&part);
+    }
+    Some(out)
+}
+
+pub async fn run_review(
+    st: &Shared,
+    session_id: &str,
+    since: Option<std::time::SystemTime>,
+    abort: &Arc<AtomicBool>,
+) -> Result<String> {
+    // What to review goes into the request: the review runs read-only (no
+    // git, no shell), and a model told to "find the changes" without them
+    // spent its steps saying tools were blocked.
+    let ws = st.workspace_for(session_id);
+    let changes = review_targets(&ws, since);
+    let prompt = match &changes {
+        Some(c) => format!(
+            "Review the current uncommitted changes in this workspace \
+             (ponytail-review). Report findings ordered by severity, and \
+             check callers outside the diff. The changes:\n\n{c}"
+        ),
+        None => "Review the current uncommitted changes in this workspace \
+                 (ponytail-review). Report findings ordered by severity, and \
+                 check callers outside the diff. No tracked changes were found \
+                 here (not a git repository, and the run recorded no file writes) \
+                 — look around read-only and say in one line if there is nothing to review."
+            .to_string(),
+    };
+    st.db.add_message(session_id, "user", &[Part::Text { text: prompt }])?;
     let system = format!(
-        "{}\n\nWorkspace: {}. Read-only tools only (read/glob/grep); report in full.",
+        "{}\n\nWorkspace: {}. The changes are in the user's message. Read-only tools only: list, read, glob, grep \
+         (call them; never describe a call). Report in full.",
         crate::agents::ponytail_review_rules(),
-        st.workspace_for(session_id).display()
+        ws.display()
     );
     // Read-only work: the small model when one is set, and a short leash
     // (the review resends the chat's history with every step).
@@ -2963,8 +3198,8 @@ pub async fn run_review(st: &Shared, session_id: &str, abort: &Arc<AtomicBool>) 
         model: st.cfg.provider.small_model.clone(),
         max_steps: Some(REVIEW_MAX_STEPS.min(st.cfg.agent.max_steps)),
         system,
-        emit_activity: false,
-        allow: Some(vec!["read".to_string(), "glob".to_string(), "grep".to_string()]),
+        emit_activity: true,
+        allow: Some(vec!["list".to_string(), "read".to_string(), "glob".to_string(), "grep".to_string()]),
         can_spawn: false,
         workspace: st.run_workspace(session_id),
         agent: None,
@@ -3823,6 +4058,7 @@ fn build_chat_messages(st: &Shared, session_id: &str, system: &str) -> Result<Ve
     // New (B-04): repair what a crash, an abort or a compaction can leave
     // behind before the provider sees it (see `repair_history`).
     let mut out = repair_history(out);
+    fit_tool_results(&mut out, context_limit(st));
     // Chat templates (Qwen's among them) refuse a request with no user
     // message, and a compacted chat can keep only tool steps in its tail.
     if !out.iter().any(|m| m.role == "user") {
@@ -3849,6 +4085,7 @@ pub fn is_context_overflow(err: &str) -> bool {
         "context_length_exceeded",
         "maximum context",
         "exceeds the context",
+        "prompt too long",
         "too many tokens",
         "prompt is too long",
         "input is too long",
@@ -4736,6 +4973,45 @@ mod tests {
         assert!(denies_file_access("I don't have access to your file system. Could you upload the files?"));
         assert!(!denies_file_access("I read the folder: it has 3 files, main.rs, lib.rs and Cargo.toml."));
         assert!(!denies_file_access("I can't access the network from here, so I could not download the page."));
+    }
+
+    #[test]
+    fn the_context_window_is_read_from_models() {
+        let ollama = json!({"object":"list","data":[{"id":"qwen3.8","object":"model","context_window":16384}]});
+        assert_eq!(context_from_models(&ollama, "qwen3.8"), Some(16384));
+        let router = json!({"data":[{"id":"a","top_provider":{"context_length":131072}}]});
+        assert_eq!(context_from_models(&router, "a"), Some(131072));
+        assert_eq!(context_from_models(&json!({"data":[{"id":"x"}]}), "x"), None);
+    }
+
+    /// Ollama's `/v1/models` carries no context metadata; its native
+    /// `/api/ps` does (`context_length`). Without this fallback the window
+    /// is never known on a local Ollama and every fit-to-window guard
+    /// silently stays off.
+    #[test]
+    fn ollama_reports_the_context_window_on_api_ps() {
+        let ps = json!({"models":[{"name":"qwen3.8:27b-iq4_xs:latest","model":"qwen3.8:27b-iq4_xs","context_length":8192}]});
+        assert_eq!(context_from_ollama_ps(&ps, "qwen3.8:27b-iq4_xs"), Some(8192));
+        assert_eq!(context_from_ollama_ps(&ps, "elsewhere:latest"), Some(8192), "first entry fallback");
+        assert_eq!(context_from_ollama_ps(&json!({"models":[]}), "x"), None);
+        assert_eq!(context_from_ollama_ps(&json!({"models":[{"name":"x"}]}), "x"), None, "no field = unknown");
+    }
+
+    #[test]
+    fn old_tool_results_shrink_to_fit_a_small_window() {
+        let m = |role: &str, text: String| ChatMsg { role: role.into(), content: Some(text), tool_calls: None, tool_call_id: None };
+        let big = "x".repeat(20_000);
+        let mut msgs = vec![m("system", "s".into()), m("user", "u".into())];
+        for _ in 0..4 {
+            msgs.push(m("tool", big.clone()));
+        }
+        let cut = fit_tool_results(&mut msgs, 16_384);
+        assert!(cut >= 2, "{cut}");
+        assert!(estimate_tokens(&msgs, &[]) + 2_500 <= 16_384, "fits now");
+        assert!(msgs[5].content.as_ref().unwrap().len() < 20_000 || msgs[2].content.as_ref().unwrap().contains("shortened"));
+        let mut small = vec![m("user", "hi".into()), m("tool", "ok".into())];
+        assert_eq!(fit_tool_results(&mut small, 16_384), 0, "a small request is left alone");
+        assert_eq!(fit_tool_results(&mut msgs.clone(), 0), 0, "no known limit, nothing cut");
     }
 
     #[test]
@@ -5892,7 +6168,7 @@ data: [DONE]
         let s = st.db.create_session("p", None).unwrap();
         let mut rx = st.events.subscribe();
 
-        let out = run_review(&st, &s.id, &Arc::new(AtomicBool::new(false)))
+        let out = run_review(&st, &s.id, None, &Arc::new(AtomicBool::new(false)))
             .await
             .unwrap();
         assert_eq!(out, "Hello", "review streamed its findings");
@@ -5902,6 +6178,139 @@ data: [DONE]
                 "review never ends the turn itself — the caller does"
             );
         }
+    }
+
+    /// A reply the output token limit cut off mid-task is continued, not
+    /// silently finished half-done (the "stops mid" complaint).
+    #[tokio::test]
+    async fn a_cut_off_reply_is_continued_not_finished() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::AtomicUsize;
+        let dir = std::env::temp_dir().join(format!("ocrs-cutoff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |_body: axum::extract::Json<Value>| {
+                let calls = calls2.clone();
+                async move {
+                    let payload = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"half answ\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n"
+                    } else {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"er: done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                    };
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        payload.to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("cut", None).unwrap();
+
+        run_agent(&st, &s.id, "do the work", Arc::new(AtomicBool::new(false))).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the model was asked to continue");
+        let msgs = st.db.messages(&s.id).unwrap();
+        assert!(
+            msgs.iter().any(|m| m.role == "user"
+                && m.parts.iter().any(|p| matches!(p, Part::Text { text }
+                    if text.contains("cut short by the output token limit")))),
+            "continuation asked"
+        );
+        let all: String = msgs
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                Part::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(all.contains("half answ") && all.contains("er: done"), "{all}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stream that keeps breaking off mid-reply (tunnel, proxy): the run
+    /// keeps the part that arrived instead of throwing the reply away and
+    /// failing after three retries.
+    #[tokio::test]
+    async fn a_broken_stream_keeps_the_part_that_arrived() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::AtomicUsize;
+        let dir = std::env::temp_dir().join(format!("ocrs-dropped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |_body: axum::extract::Json<Value>| {
+                let calls = calls2.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Two good SSE chunks, then the connection breaks — the
+                    // reply is cut mid-way. Each item waits a little first so
+                    // its bytes reach the client before the break: an error
+                    // the instant the body fails looks like a failed request
+                    // to the client (hyper: IncompleteMessage), never a
+                    // stream that broke off mid-reply.
+                    let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = vec![
+                        Ok(axum::body::Bytes::from_static(
+                            b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
+                        )),
+                        Ok(axum::body::Bytes::from_static(
+                            b"data: {\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":null}]}\n\n",
+                        )),
+                        Err(std::io::Error::other("connection reset")),
+                    ];
+                    let stream = futures::stream::iter(chunks).then(|item| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        item
+                    });
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        axum::body::Body::from_stream(stream),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("drop", None).unwrap();
+
+        run_agent(&st, &s.id, "say hi", Arc::new(AtomicBool::new(false))).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "three retries, then the kept partial");
+        let msgs = st.db.messages(&s.id).unwrap();
+        let all: String = msgs
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                Part::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(all.contains("Hello world"), "{all}");
+        assert!(all.contains("[reply broke off"), "the marker explains the cut: {all}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Plain-text mock provider: replies "Hello" to any chat request.
@@ -6812,8 +7221,11 @@ data: [DONE]
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The estimator counts about 3 characters per token on purpose
+    /// (`estimate_tokens`): code and tool results tokenize worse than prose,
+    /// and measuring low would let requests overflow a small window.
     #[test]
-    fn token_estimate_is_about_four_chars_per_token() {
+    fn token_estimate_is_about_three_chars_per_token() {
         let msgs = vec![ChatMsg {
             role: "user".into(),
             content: Some("x".repeat(4000)),
@@ -6821,7 +7233,7 @@ data: [DONE]
             tool_call_id: None,
         }];
         let n = estimate_tokens(&msgs, &[]);
-        assert!((1000..1010).contains(&n), "{n}");
+        assert!((1330..1345).contains(&n), "{n}");
     }
 
     #[tokio::test]
@@ -7058,7 +7470,10 @@ mod prompt_budget_tests {
         let st = super::build_state_ephemeral(crate::config::Config::default(), dir.clone()).await;
         let s = st.db.create_session("m", None).unwrap();
         let (system, tools, count) = st.request_overhead(&s.id);
-        assert!(system <= 900, "system prompt ~{system} tokens");
+        // 900 → 1000 for the all-tools calling guide (the tool names and
+        // arguments a weak model needs spelled out; the user asked for it
+        // after the model kept calling tools wrong).
+        assert!(system <= 1000, "system prompt ~{system} tokens");
         // 1150 → 1200 for `check_page` (~70 tokens; `todo` was trimmed to pay
         // for most of it): checking the rendered page is the cheapest fix.
         // 1200 → 1250 for `ask_user` and multi-edit (read/glob/grep were

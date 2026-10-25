@@ -116,7 +116,10 @@ pub struct ProviderCfg {
     pub model: String,
     /// "openai" (default) or "anthropic".
     pub api: ProviderApi,
-    /// Longest reply in tokens. Anthropic requires it; "openai" ignores it.
+    /// Longest reply in tokens. Anthropic requires it. OpenAI-style servers
+    /// get it as `max_tokens`, bounded to the room the context window has
+    /// left (when its size is known), so a small window cannot cut replies
+    /// off mid-text.
     pub max_tokens: u32,
     /// Optional cheaper model for hidden tasks (compaction, planning).
     pub small_model: Option<String>,

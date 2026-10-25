@@ -49,6 +49,11 @@ pub struct Client {
     reasoning_effort: Option<String>,
     /// `provider.images`: auto / on / off.
     images: String,
+    /// The model's context window in tokens as the server reported it
+    /// (0 = unknown). Bounds `max_tokens` to the room that is actually
+    /// left in the window, so a reply is not cut off mid-text by a full
+    /// window (seen with Ollama on a 8K context).
+    context: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 
@@ -211,7 +216,14 @@ impl Client {
             stream_usage: true,
             reasoning_effort: None,
             images: "auto".into(),
+            context: Default::default(),
         })
+    }
+
+    /// Record the model's context window (from `/models` or Ollama's
+    /// `/api/ps`); 0 = unknown.
+    pub fn set_context_limit(&self, n: usize) {
+        self.context.store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Build the client from the `[provider]` config section.
@@ -333,7 +345,11 @@ impl Client {
         if self.stream_usage {
             body["stream_options"] = json!({ "include_usage": true });
         }
-        if let Some(effort) = &self.reasoning_effort {
+        // GPT-6 Luna Chat Completions requires reasoning_effort="none"
+        // when function tools are supplied.
+        if !tools.is_empty() && model.eq_ignore_ascii_case("gpt-6-luna") {
+            body["reasoning_effort"] = json!("none");
+        } else if let Some(effort) = &self.reasoning_effort {
             // OpenAI's own API takes `reasoning_effort`; OpenRouter and most
             // routers take `reasoning.effort`.
             if self.base_url.contains("api.openai.com") {
@@ -347,6 +363,20 @@ impl Client {
         }
         if self.cache_markers(model) {
             add_openai_cache_markers(&mut body);
+        }
+        // Bound the reply to the room the context window has left. Sending
+        // nothing lets a small server generate until the window is full and
+        // cut the reply off mid-text; sending the raw config value could
+        // overshoot the window and get the request rejected. Only sent when
+        // the window is known — a strict server would otherwise reject a
+        // max_tokens that does not fit.
+        let limit = self.context.load(std::sync::atomic::Ordering::Relaxed);
+        if limit > 0 {
+            let est = serde_json::to_string(&body).map(|s| s.len() / 4).unwrap_or(0);
+            let room = limit.saturating_sub(est).saturating_sub(256);
+            if room > 0 {
+                body["max_tokens"] = json!((self.max_tokens as usize).min(room));
+            }
         }
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self
@@ -686,6 +716,11 @@ impl ToolCallAccumulator {
         slot
     }
 
+    /// No call fragments arrived at all.
+    pub fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+
     /// Returns final calls; args parsed as JSON (falls back to {"raw": args}).
     /// See also [`calls_in_text`] for models that write calls as text.
     /// B-21: empty args become `{}`; a missing id gets a generated one.
@@ -899,24 +934,29 @@ fn parse_one_text_call(body: &str) -> Option<(String, Value)> {
         return Some((name, args));
     }
     // XML form: <function=NAME> <parameter=KEY>VALUE</parameter> ... </function>
-    let f = b.find("<function=")?;
-    let after = &b[f + "<function=".len()..];
+    // Weak models drop pieces of it (seen: `function=bash>` without `<`, a
+    // value with no `</parameter>`), so only `function=` / `parameter=`
+    // and the `>` after the name are required.
+    let f = b.find("function=")?;
+    let after = &b[f + "function=".len()..];
     let name_end = after.find('>')?;
-    let name = after[..name_end].trim().to_string();
-    if name.is_empty() {
+    let name = after[..name_end].trim().trim_matches(['"', '\'']).to_string();
+    if name.is_empty() || name.contains(char::is_whitespace) {
         return None;
     }
     let mut args = serde_json::Map::new();
     let mut p = &after[name_end + 1..];
-    while let Some(ps) = p.find("<parameter=") {
-        let a = &p[ps + "<parameter=".len()..];
+    while let Some(ps) = p.find("parameter=") {
+        let a = &p[ps + "parameter=".len()..];
         let Some(ke) = a.find('>') else { break };
-        let key = a[..ke].trim().to_string();
+        let key = a[..ke].trim().trim_matches(['"', '\'']).to_string();
         let v = &a[ke + 1..];
-        let (raw, next) = match v.find("</parameter>") {
-            Some(ve) => (&v[..ve], &v[ve + "</parameter>".len()..]),
-            None => (v.split("</function>").next().unwrap_or(v), ""),
-        };
+        // The value ends at `</parameter>`, else at the next parameter or
+        // the end of the function, whichever comes first.
+        let ends = [v.find("</parameter>"), v.find("<parameter="), v.find("\nparameter="), v.find("</function>")];
+        let end = ends.iter().flatten().min().copied().unwrap_or(v.len());
+        let raw = &v[..end];
+        let next = if v[end..].starts_with("</parameter>") { &v[end + "</parameter>".len()..] } else { &v[end..] };
         // One newline around the value belongs to the template, not the value.
         let raw = raw.strip_prefix('\n').unwrap_or(raw);
         let raw = raw.strip_suffix('\n').unwrap_or(raw);
@@ -948,6 +988,20 @@ mod text_call_tests {
         assert_eq!(calls[1].2, serde_json::json!({"path": "b.txt", "content": "line1\nline2"}));
     }
 
+    /// Seen live: the `<` before `function=` missing, and a value without
+    /// its closing tag.
+    #[test]
+    fn broken_xml_calls_are_still_read() {
+        let t = "<tool_call>\nfunction=bash>\n<parameter=command>\ncd C:\\x && git status\n</parameter>\n<parameter=description>\nCheck git\n</parameter>\n</function>\n</tool_call>";
+        let (rest, calls) = calls_in_text(t);
+        assert_eq!(rest, "");
+        assert_eq!(calls[0].1, "bash");
+        assert_eq!(calls[0].2["command"], "cd C:\\x && git status");
+        let t = "<tool_call><function=read><parameter=path>a.txt<parameter=limit>5</function></tool_call>";
+        let (_, calls) = calls_in_text(t);
+        assert_eq!(calls[0].2, serde_json::json!({"path": "a.txt", "limit": 5}));
+    }
+
     #[test]
     fn json_calls_in_text_are_read_and_plain_text_is_left_alone() {
         let (rest, calls) = calls_in_text("<tool_call>{\"name\": \"glob\", \"arguments\": {\"pattern\": \"**/*.rs\"}}</tool_call>");
@@ -961,6 +1015,59 @@ mod text_call_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `max_tokens` bounds the reply to the room the context window has
+    /// left (a small server otherwise generates until the window is full
+    /// and cuts the reply off mid-text) — but is only sent when the window
+    /// is known, because a strict server rejects a max_tokens that does
+    /// not fit.
+    #[tokio::test]
+    async fn max_tokens_is_bounded_by_the_known_context_window() {
+        use axum::{routing::post, Router};
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+        let got: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let got2 = got.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<Value>| {
+                let got = got2.clone();
+                async move {
+                    *got.lock().unwrap() = Some(body.0);
+                    let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        payload.to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = Client::new(&format!("http://{addr}/v1"), "", "stub", 10).unwrap();
+        let msgs = vec![ChatMsg {
+            role: "user".into(),
+            content: Some("hi".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        // Unknown context: nothing sent.
+        let mut s = client.stream("stub", &msgs, &[]).await.unwrap();
+        let _ = s.next().await;
+        assert!(got.lock().unwrap().take().unwrap().get("max_tokens").is_none());
+
+        // Known context: bounded to the room that is left.
+        client.set_context_limit(4_000);
+        let mut s = client.stream("stub", &msgs, &[]).await.unwrap();
+        let _ = s.next().await;
+        let body = got.lock().unwrap().take().unwrap();
+        let max = body["max_tokens"].as_u64().expect("max_tokens sent");
+        assert!(max > 0 && max <= 4_000 - 256, "bounded to the window's room: {max}");
+    }
 
     /// Build an SSE `data:` line from a real JSON value — no hand-escaping.
     fn sse_data(v: &Value) -> String {

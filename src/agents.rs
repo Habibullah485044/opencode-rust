@@ -325,6 +325,19 @@ pub struct PromptInputs<'a> {
     pub map: Option<&'a str>,
 }
 
+/// How to use the tools, said plainly: small local models (seen with a
+/// Qwen 27B) described calls instead of making them, used other agents'
+/// tool names, or claimed they could not see the files. Every tool with
+/// its arguments — kept short, because this is in every request.
+const TOOL_GUIDE: &str = "\n\n## Tools\n\n\
+Call tools for real — never write \"I'll use X\" without calling it, never ask the user to paste \
+files (you can read them). One call per step; read the result. \
+list(path) · read(path,offset,limit,outline) · glob(pattern) · grep(pattern,path) · \
+write(path,content) · edit(path,old_str,new_str) · bash(command; background,job,stop) · \
+webfetch(url|query) · todo(op,content,id) · ask_user(question,options) · check_page(path,expect_text) · \
+spawn(subagent: explore|research|plan|worker|review, task) · browser_*(GUI panel) · \
+mcp_call(server,tool,args).";
+
 /// Rules for web pages (measurable ones, from what v0, bolt and the
 /// frontend-design guidance share), added only to chats about a page.
 const WEB_GUIDE: &str = "\n\n## Web pages\n\n\
@@ -416,8 +429,7 @@ fn ponytail_level_rule(level: PonytailLevel) -> Option<String> {
 pub fn compose_system(p: PromptInputs<'_>) -> String {
     let base = p.configured.map(str::to_string).unwrap_or_else(|| {
         format!(
-            "You are opencode-rust, a coding agent running in {}.\n\
-             Use the provided tools to inspect and modify the workspace. Be concise. \
+            "You are opencode-rust, a coding agent running in {}. Be concise. \
              When done with the user's request, reply with a short summary of what you did.",
             p.workspace.display()
         )
@@ -467,6 +479,7 @@ pub fn compose_system(p: PromptInputs<'_>) -> String {
         out.push_str(&format!("\n\n## Skill: {} — always active\n\n", s.name));
         out.push_str(s.body.trim());
     }
+    out.push_str(TOOL_GUIDE);
     if p.web {
         out.push_str(WEB_GUIDE);
     }

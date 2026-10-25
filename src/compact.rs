@@ -179,7 +179,7 @@ pub async fn compact(
     let lines = transcript_lines(&prefix);
     // F-07: with a known context size the transcript gets at most half of
     // it, so the summary request itself fits.
-    let budget = match st.cfg.agent.context_tokens {
+    let budget = match crate::server::context_limit(st) {
         0 => BUDGET,
         t => t.saturating_mul(2).min(BUDGET),
     };
