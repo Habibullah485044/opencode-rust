@@ -905,7 +905,17 @@ pub fn calls_in_text(text: &str) -> (String, Vec<(String, String, Value)>) {
             None => (after, ""), // cut off: take what is there
         };
         if let Some(call) = parse_one_text_call(body) {
-            let id = format!("txt_{}_{}", calls.len(), std::process::id());
+            // Unique across replies: a per-reply index alone made every
+            // reply's first call `txt_0_<pid>`, so a chat full of text calls
+            // repeated the same ids and the results no longer paired with
+            // their calls (seen live in a saved session).
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = format!(
+                "txt_{}_{}_{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                calls.len()
+            );
             calls.push((id, call.0, call.1));
         } else {
             rest.push_str(&s[start..start + "<tool_call>".len()]);
@@ -1000,6 +1010,17 @@ mod text_call_tests {
         let t = "<tool_call><function=read><parameter=path>a.txt<parameter=limit>5</function></tool_call>";
         let (_, calls) = calls_in_text(t);
         assert_eq!(calls[0].2, serde_json::json!({"path": "a.txt", "limit": 5}));
+    }
+
+    #[test]
+    fn text_call_ids_are_unique_across_replies() {
+        // The call marker is spelled with escapes here so this payload
+        // never contains it.
+        let t = "\x3ctool_call\x3e\x3cfunction=list\x3e\x3cparameter=path\x3e.\x3c/parameter\x3e\x3c/function\x3e\x3c/tool_call\x3e";
+        let (_, a) = calls_in_text(t);
+        let (_, b) = calls_in_text(t);
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert_ne!(a[0].0, b[0].0, "a second reply's call must not reuse the first reply's id");
     }
 
     #[test]

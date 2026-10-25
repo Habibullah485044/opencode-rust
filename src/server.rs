@@ -2309,6 +2309,16 @@ pub fn announces_work(text: &str) -> bool {
     })
 }
 
+/// Some proxies report an upstream failure as if it were the model's
+/// reply: a whole message like "[Error: HTTP 500: …]". That is an error
+/// page, not an answer — saving it teaches the model to echo error text
+/// as answers (seen live when a tunnel's proxy wrapped its failures into
+/// the reply stream).
+pub fn is_wrapped_error(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with("[Error: HTTP") && t.ends_with(']')
+}
+
 /// Text without zero-width characters. Some models start every reply with
 /// a few U+200B, which hid "I'll …" from `announces_work` (seen live).
 pub fn strip_invisible(text: &str) -> String {
@@ -2582,6 +2592,34 @@ pub async fn run_loop(
             text = strip_invisible(&text);
             shown = shown.min(text.len());
         }
+        // An upstream failure served as fake reply text (see
+        // `is_wrapped_error`). Never save it as an answer: shorten the
+        // chat when it says the request was too long, ask again, and fail
+        // with the message when it keeps coming back.
+        if calls.is_empty() && is_wrapped_error(&text) {
+            if !compacted && is_context_overflow(&text) {
+                compacted = true;
+                let _ = st.events.send(ServerEvent::Note {
+                    session_id: session_id.to_string(),
+                    text: "the chat got too long for the model — summarizing the older part and trying again".into(),
+                });
+                if crate::compact::compact(st, session_id, abort).await.is_ok() {
+                    continue;
+                }
+            }
+            if stream_drops < MAX_STREAM_DROPS {
+                stream_drops += 1;
+                let _ = st.events.send(ServerEvent::Note {
+                    session_id: session_id.to_string(),
+                    text: format!(
+                        "the provider sent an error instead of a reply — asking again \
+                         ({stream_drops}/{MAX_STREAM_DROPS})"
+                    ),
+                });
+                continue;
+            }
+            return Err(anyhow::anyhow!("the provider kept answering with an error: {}", text.trim()));
+        }
         // Some models (Qwen through Ollama/llama.cpp without a tool parser)
         // write their tool calls into the reply text. Run them as calls
         // instead of showing XML and ending the turn.
@@ -2761,7 +2799,17 @@ pub async fn run_loop(
             let denied = if abort.load(Ordering::SeqCst) {
                 Some("not run: the run was aborted".to_string())
             } else if !tool_allowed(mode, opts, &name) {
-                Some("tool blocked: not allowed in this mode/role".to_string())
+                // Naming the tools that DO work turns "everything is
+                // blocked" flailing into one corrected call (seen live in
+                // the review run: it tried Bash twice, then claimed even
+                // grep was blocked).
+                Some(match &opts.allow {
+                    Some(allow) => format!(
+                        "tool blocked: this run can only call these tools: {}",
+                        allow.join(", ")
+                    ),
+                    None => "tool blocked: not allowed in this mode/role".to_string(),
+                })
             } else if crate::tools::is_job_control(&name, &input) {
                 None // reading or stopping a job it was allowed to start
             } else if !check_permission_preview(
@@ -3180,15 +3228,18 @@ pub async fn run_review(
         ),
         None => "Review the current uncommitted changes in this workspace \
                  (ponytail-review). Report findings ordered by severity, and \
-                 check callers outside the diff. No tracked changes were found \
-                 here (not a git repository, and the run recorded no file writes) \
-                 — look around read-only and say in one line if there is nothing to review."
+                 check callers outside the diff. No changed files were tracked \
+                 here (not a git repository, and what a shell command writes is \
+                 invisible to this app) — so use list, read, glob and grep to find \
+                 what looks new or changed in the workspace and review that. If \
+                 the workspace really is empty, say so in one line."
             .to_string(),
     };
     st.db.add_message(session_id, "user", &[Part::Text { text: prompt }])?;
     let system = format!(
-        "{}\n\nWorkspace: {}. The changes are in the user's message. Read-only tools only: list, read, glob, grep \
-         (call them; never describe a call). Report in full.",
+        "{}\n\nWorkspace: {}. The changes are in the user's message. You have NO bash and NO git — \
+         calling them gets you 'tool blocked' and wastes your steps. Your tools are exactly: \
+         list, read, glob, grep. Call them; never describe a call. Report in full.",
         crate::agents::ponytail_review_rules(),
         ws.display()
     );
@@ -6310,6 +6361,109 @@ data: [DONE]
             .collect();
         assert!(all.contains("Hello world"), "{all}");
         assert!(all.contains("[reply broke off"), "the marker explains the cut: {all}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A proxy that reports an upstream failure as fake reply text (seen
+    /// live: a wrapped "[Error: HTTP 500: …]" arriving as the model's
+    /// words) must never be saved as an answer — the run asks again.
+    #[tokio::test]
+    async fn an_error_page_in_place_of_a_reply_is_never_saved() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::AtomicUsize;
+        let dir = std::env::temp_dir().join(format!("ocrs-errpage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |_body: axum::extract::Json<Value>| {
+                let calls = calls2.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    let content = if n < 2 {
+                        "[Error: HTTP 500: {\"error\":\"upstream exploded\"}]"
+                    } else {
+                        "all good"
+                    };
+                    let payload = format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+                        serde_json::to_string(content).unwrap()
+                    );
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("errpage", None).unwrap();
+
+        run_agent(&st, &s.id, "hi", Arc::new(AtomicBool::new(false))).await;
+
+        let msgs = st.db.messages(&s.id).unwrap();
+        let all: String = msgs
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                Part::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!all.contains("upstream exploded"), "the error page must not be saved: {all}");
+        assert!(all.contains("all good"), "{all}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A provider that answers only with wrapped errors fails the run with
+    /// the error — never as a silent fake answer.
+    #[tokio::test]
+    async fn a_provider_that_only_sends_error_pages_fails_the_run() {
+        use axum::{routing::post, Router};
+        let dir = std::env::temp_dir().join(format!("ocrs-erronly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |_body: axum::extract::Json<Value>| async move {
+                let content = "[Error: HTTP 503: {\"error\":\"down\"}]";
+                let payload = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+                    serde_json::to_string(content).unwrap()
+                );
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("erronly", None).unwrap();
+
+        run_agent(&st, &s.id, "hi", Arc::new(AtomicBool::new(false))).await;
+
+        let msgs = st.db.messages(&s.id).unwrap();
+        let all: String = msgs
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                Part::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!all.contains("[Error: HTTP"), "no fake answer may be saved: {all}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
