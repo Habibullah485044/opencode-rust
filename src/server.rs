@@ -490,28 +490,8 @@ impl AppState {
                         let ok = r.status().is_success();
                         let status = r.status().to_string();
                         if ok {
-                            let model = st.current_model().await;
-                            let mut known = None;
-                            if let Ok(body) = r.json::<Value>().await {
-                                known = context_from_models(&body, &model);
-                            }
-                            // Ollama's OpenAI endpoint carries no context
-                            // metadata at all; its native /api/ps does
-                            // (`context_length`). Without this fallback the
-                            // window is never known on a local Ollama and
-                            // every limit-aware guard (auto-compaction,
-                            // fitting tool results, the output budget)
-                            // silently stays off.
-                            if known.is_none()
-                                && st.detected_context.load(Ordering::Relaxed) == 0
-                                && matches!(st.cfg.provider.api, crate::config::ProviderApi::OpenAi)
-                            {
-                                known = probe_ollama_context(&http, &base, &key, &model).await;
-                            }
-                            if let Some(n) = known {
-                                st.detected_context.store(n, Ordering::Relaxed);
-                                st.client.lock().await.set_context_limit(n);
-                            }
+                            let body = r.json::<Value>().await.ok();
+                            st.note_context(body.as_ref(), &http, &base, &key).await;
                         }
                         (ok, status)
                     }
@@ -533,6 +513,72 @@ impl AppState {
                 }
                 let _ = st.events.send(ServerEvent::Heartbeat { ok, latency_ms, detail });
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+        });
+    }
+
+    /// Learn the context window a `/models` answer reports and store it, so
+    /// every limit-aware guard works: fitting tool results, auto-compaction
+    /// and the output budget all read it, and all stay off while it is 0.
+    ///
+    /// Ollama's OpenAI endpoint carries no context metadata at all; its
+    /// native `/api/ps` does (`context_length`). Without that fallback the
+    /// window is never known on a local Ollama.
+    async fn note_context(
+        self: &Shared,
+        body: Option<&Value>,
+        http: &reqwest::Client,
+        base: &str,
+        key: &str,
+    ) -> Option<usize> {
+        let model = self.current_model().await;
+        let mut known = body.and_then(|b| context_from_models(b, &model));
+        if known.is_none()
+            && self.detected_context.load(Ordering::Relaxed) == 0
+            && matches!(self.cfg.provider.api, crate::config::ProviderApi::OpenAi)
+        {
+            known = probe_ollama_context(http, base, key, &model).await;
+        }
+        if let Some(n) = known {
+            self.detected_context.store(n, Ordering::Relaxed);
+            self.client.lock().await.set_context_limit(n);
+        }
+        known
+    }
+
+    /// One `/models` call at startup.
+    ///
+    /// The heartbeat is what learns the window, and a headless run never
+    /// starts it (nothing displays the health line) — so `context_limit`
+    /// stayed 0, every limit-aware guard stayed off, and a chat that grew
+    /// past the model's window was silently trimmed by the server. That trim
+    /// takes the OLDEST messages, the user's request among them, and chat
+    /// templates like Qwen's then fail the request with "No user query found
+    /// in messages". Learned once up front, the guards work in every run
+    /// (seen 2026-10-26 against a 16384-token model).
+    pub fn start_context_probe(self: &Shared) {
+        let st = self.clone();
+        tokio::spawn(async move {
+            let Ok(base) = st.cfg.effective_base_url() else { return };
+            let key = st.cfg.provider.api_key.clone();
+            let Ok(http) = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(4))
+                .timeout(std::time::Duration::from_secs(12))
+                .build()
+            else {
+                return;
+            };
+            let req = crate::provider::with_auth(
+                http.get(format!("{base}/models")),
+                st.cfg.provider.api,
+                &key,
+            );
+            let body = match req.send().await {
+                Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
+                _ => None,
+            };
+            if let Some(n) = st.note_context(body.as_ref(), &http, &base, &key).await {
+                eprintln!("[api] model context window: {n} tokens");
             }
         });
     }
@@ -5596,6 +5642,47 @@ data: [DONE]
         .await
         .expect("a heartbeat arrives");
         assert!(ok, "the key was sent, so the endpoint reports up");
+    }
+
+    /// The window the provider reports is learned at startup, without the
+    /// heartbeat: a headless run never starts the heartbeat, and with the
+    /// window unknown every guard that fits or compacts the chat stays off
+    /// (seen 2026-10-26 — the chat outgrew the model, the server trimmed the
+    /// oldest messages including the user's request, and the Qwen template
+    /// failed every step with "No user query found in messages").
+    #[tokio::test]
+    async fn the_context_window_is_learned_without_a_heartbeat() {
+        use axum::{routing::get, Router};
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async {
+                "{\"object\":\"list\",\"data\":[{\"id\":\"m\",\"context_window\":16384}]}"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1/");
+        cfg.provider.model = "m".into();
+        assert_eq!(cfg.agent.context_tokens, 0, "nothing configured: it must be detected");
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        assert_eq!(context_limit(&st), 0, "unknown before the probe");
+        st.start_context_probe();
+        let learned = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let n = context_limit(&st);
+                if n > 0 {
+                    return n;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the window is learned from /models");
+        assert_eq!(learned, 16_384);
     }
 
     /// A provider that lists its models without a key but rejects chat

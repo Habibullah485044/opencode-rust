@@ -160,6 +160,10 @@ fn run() -> Result<()> {
         if !headless {
             state.start_heartbeat();
         }
+        // The window the model reports drives fitting the chat to it and
+        // compacting it; a headless run has no heartbeat to learn it, so ask
+        // once here (a duplicate of the heartbeat's first check otherwise).
+        state.start_context_probe();
         let boot_ms = t0.elapsed().as_millis();
         // New (S-01): say where the HTTP API token is (never the token).
         eprintln!("[api] {}", server::api_token_note(&state.state_dir));
