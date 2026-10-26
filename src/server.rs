@@ -4156,6 +4156,7 @@ fn build_chat_messages(st: &Shared, session_id: &str, system: &str) -> Result<Ve
     // behind before the provider sees it (see `repair_history`).
     let mut out = repair_history(out);
     fit_tool_results(&mut out, context_limit(st));
+    keep_task_near_the_tail(&mut out);
     // Chat templates (Qwen's among them) refuse a request with no user
     // message, and a compacted chat can keep only tool steps in its tail.
     if !out.iter().any(|m| m.role == "user") {
@@ -4168,6 +4169,50 @@ fn build_chat_messages(st: &Shared, session_id: &str, system: &str) -> Result<Ve
         });
     }
     Ok(out)
+}
+
+/// Keep the user's request near the END of a long chat as well as at its
+/// front.
+///
+/// A server that drops the head of a long request (this one does: the same
+/// request with the task at the front dies, with the task at the end it
+/// answers) leaves a chat of nothing but assistant/tool steps, and chat
+/// templates then raise "No user query found in messages" — the template
+/// runs while rendering, before any token trimming, so only the server
+/// dropping messages can cause it. Seen live, twice, in the middle of a
+/// review run. The reminder is the app's own note, not a new instruction.
+fn keep_task_near_the_tail(msgs: &mut Vec<ChatMsg>) {
+    /// Steps after the request that are still safe to send as they are.
+    /// Twelve messages is a conservative bound, not a measured cliff: the
+    /// same request answers with the task at the end and fails with it at
+    /// the front, and a chat of 122 tiny messages answered, so the server's
+    /// drop has no published threshold to aim at.
+    const TAIL_STEPS: usize = 12;
+    if let Some(i) = msgs.iter().rposition(|m| m.role == "user") {
+        if msgs.len() - 1 - i <= TAIL_STEPS {
+            return;
+        }
+    }
+    // The task itself: the newest user message that is not one of the app's
+    // own notes (they all start with "[app]").
+    let Some(task) = msgs
+        .iter()
+        .rev()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .find(|t| !t.trim_start().starts_with("[app]"))
+    else {
+        return;
+    };
+    let task: String = task.trim().chars().take(240).collect();
+    msgs.push(ChatMsg {
+        role: "user".into(),
+        content: Some(format!(
+            "[app] Reminder of the task you are working on: \"{task}\". Continue it; do not start over."
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+    });
 }
 
 /// Does a provider error say the request was too long for the model? Also
@@ -5116,6 +5161,74 @@ mod tests {
         assert!(is_context_overflow("provider returned 500 Internal Server Error: {\"error\":\"Jinja Exception: No user query found in messages.\"}"));
         assert!(is_context_overflow("This model's maximum context length is 32768 tokens"));
         assert!(!is_context_overflow("provider returned 401 Unauthorized"));
+    }
+
+    /// The task must not live only at the FRONT of a long chat: this server
+    /// drops the head of a long request before its chat template renders,
+    /// and the Qwen template then raises "No user query found in messages"
+    /// (seen live, twice, in the middle of a review run).
+    #[tokio::test]
+    async fn a_long_tool_chain_keeps_the_task_near_the_tail() {
+        let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let s = st.db.create_session("u", None).unwrap();
+        st.db
+            .add_message(&s.id, "user", &[Part::Text { text: "Write SUMMARY.md from notes/.".into() }])
+            .unwrap();
+        for i in 0..20 {
+            st.db
+                .add_message(
+                    &s.id,
+                    "assistant",
+                    &[
+                        Part::Text { text: format!("step {i}") },
+                        Part::ToolCall {
+                            id: format!("c{i}"),
+                            name: "list".into(),
+                            input: json!({"path": "."}),
+                        },
+                    ],
+                )
+                .unwrap();
+            st.db
+                .add_message(
+                    &s.id,
+                    "tool",
+                    &[Part::ToolResult { tool_id: format!("c{i}"), output: "ok".into(), is_error: false }],
+                )
+                .unwrap();
+        }
+        let msgs = build_chat_messages(&st, &s.id, "sys").unwrap();
+        let tail = &msgs[msgs.len() - 13..];
+        assert!(
+            tail.iter().any(|m| m.role == "user"),
+            "the task stays near the tail: {:?}",
+            tail.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+        let last = msgs.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert!(
+            last.content.as_deref().is_some_and(|c| c.contains("Write SUMMARY.md from notes/.")),
+            "and it quotes the task itself: {:?}",
+            last.content
+        );
+        // A short chat is sent as it is.
+        let st2 = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let s2 = st2.db.create_session("u", None).unwrap();
+        st2.db
+            .add_message(&s2.id, "user", &[Part::Text { text: "Say hi.".into() }])
+            .unwrap();
+        st2.db
+            .add_message(
+                &s2.id,
+                "assistant",
+                &[Part::ToolCall { id: "c0".into(), name: "list".into(), input: json!({"path": "."}) }],
+            )
+            .unwrap();
+        st2.db
+            .add_message(&s2.id, "tool", &[Part::ToolResult { tool_id: "c0".into(), output: "ok".into(), is_error: false }])
+            .unwrap();
+        let short = build_chat_messages(&st2, &s2.id, "sys").unwrap();
+        assert_eq!(short.len(), 4, "no reminder in a short chat");
     }
 
     /// A request always carries a user message, even when the stored
@@ -7714,7 +7827,10 @@ mod prompt_budget_tests {
         // 900 → 1000 for the all-tools calling guide (the tool names and
         // arguments a weak model needs spelled out; the user asked for it
         // after the model kept calling tools wrong).
-        assert!(system <= 1000, "system prompt ~{system} tokens");
+        // 1000 → 1100 for spelling one call out: this model wrote the
+        // arguments with no tool name, which nothing can run, and the guide
+        // then fixed it live.
+        assert!(system <= 1100, "system prompt ~{system} tokens");
         // 1150 → 1200 for `check_page` (~70 tokens; `todo` was trimmed to pay
         // for most of it): checking the rendered page is the cheapest fix.
         // 1200 → 1250 for `ask_user` and multi-edit (read/glob/grep were
