@@ -336,7 +336,11 @@ list(path) · read(path,offset,limit,outline) · glob(pattern) · grep(pattern,p
 write(path,content) · edit(path,old_str,new_str) · bash(command; background,job,stop) · \
 webfetch(url|query) · todo(op,content,id) · ask_user(question,options) · check_page(path,expect_text) · \
 spawn(subagent: explore|research|plan|worker|review, task) · browser_*(GUI panel) · \
-mcp_call(server,tool,args).";
+mcp_call(server,tool,args).\n\n\
+The argument names above are the ones that work (`path`, not `file_path`). Where the server has no \
+tool parser and you write the call as text, spell it exactly: \
+\x3ctool_call\x3e{\"name\":\"read\",\"arguments\":{\"path\":\"a.md\"}}\x3c/tool_call\x3e — \
+the name is what makes it a call; bare arguments (`{\"path\":\"a.md\"}`) call nothing.";
 
 /// Rules for web pages (measurable ones, from what v0, bolt and the
 /// frontend-design guidance share), added only to chats about a page.
@@ -729,6 +733,18 @@ mod tests {
         });
         assert!(text.contains("no tool calls"), "explicit no-tools rule");
         assert!(text.to_lowercase().contains("greets you"), "greeting named");
+    }
+
+    /// Listing the tools is not enough: this model (Qwen 27B) wrote a call
+    /// with the arguments but no tool name (see `provider::calls_in_text`),
+    /// and nothing can run that. The guide has to say how to spell a call
+    /// and which argument names are the ones that work.
+    #[test]
+    fn the_tool_guide_shows_how_to_spell_a_call() {
+        assert!(TOOL_GUIDE.contains("`path`, not `file_path`"), "argument names are named");
+        assert!(TOOL_GUIDE.contains("\x3ctool_call\x3e"), "a call is spelled out");
+        assert!(TOOL_GUIDE.contains("\"name\""), "and where the tool name goes");
+        assert!(TOOL_GUIDE.contains("call nothing"), "the nameless form is called out");
     }
 
     #[test]
