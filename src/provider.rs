@@ -932,14 +932,29 @@ pub fn calls_in_text(text: &str) -> (String, Vec<(String, String, Value)>) {
 
 fn parse_one_text_call(body: &str) -> Option<(String, Value)> {
     let b = body.trim();
-    // JSON form.
+    // JSON form. The name is under `name` (OpenAI's shape), or `tool` /
+    // `function`: writing a call by hand this model picked `tool` and put
+    // the arguments next to it (seen live 2026-10-26), and a call that is
+    // not read leaves the turn ending with the XML as the answer.
     if b.starts_with('{') {
         let v: Value = serde_json::from_str(b).ok()?;
-        let name = v.get("name")?.as_str()?.to_string();
+        let name = ["name", "tool", "function"]
+            .iter()
+            .find_map(|k| v.get(*k)?.as_str())?
+            .to_string();
         let args = match v.get("arguments").or_else(|| v.get("parameters")) {
             Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({ "raw": s })),
             Some(a) => a.clone(),
-            None => serde_json::json!({}),
+            // Flat form: the arguments are the object's other keys.
+            None => {
+                let mut flat = v.clone();
+                if let Some(o) = flat.as_object_mut() {
+                    for k in ["name", "tool", "function"] {
+                        o.remove(k);
+                    }
+                }
+                flat
+            }
         };
         return Some((name, args));
     }
@@ -1030,6 +1045,21 @@ mod text_call_tests {
         assert_eq!(calls[0].2, serde_json::json!({"pattern": "**/*.rs"}));
         let (rest, calls) = calls_in_text("Plain answer, no calls.");
         assert!(calls.is_empty() && rest == "Plain answer, no calls.");
+    }
+
+    /// The flat form: the tool under `tool`, its arguments beside it, no
+    /// `arguments` wrapper. Read live off this model, and unread it made a
+    /// whole run end with the XML printed as the answer.
+    #[test]
+    fn flat_json_calls_are_read() {
+        let t = "\x3ctool_call\x3e\n{\"tool\":\"read\",\"path\":\"notes/a.md\"}\n\x3c/tool_call\x3e";
+        let (rest, calls) = calls_in_text(t);
+        assert_eq!(rest, "");
+        assert_eq!((calls.len(), calls[0].1.as_str()), (1, "read"));
+        assert_eq!(calls[0].2, serde_json::json!({"path": "notes/a.md"}));
+        // A bare name with no arguments stays an empty call.
+        let (_, calls) = calls_in_text("\x3ctool_call\x3e{\"tool\":\"list\"}\x3c/tool_call\x3e");
+        assert_eq!(calls[0].2, serde_json::json!({}));
     }
 }
 
