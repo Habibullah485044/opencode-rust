@@ -12,12 +12,49 @@
 /// Text the app sends as a user message during a final check.
 pub const FINAL_CHECK_PREFIX: &str = "[final check]";
 
+/// Text the app sends as a user message for the design review.
+pub const DESIGN_REVIEW_PREFIX: &str = "[design review]";
+
+/// What makes a page look AI-made. Seen live: five runs on four models
+/// all opened with "A little … *happiness*." on cream with a serif headline
+/// and a round badge. Named, so the model can see it in its own page.
+pub const AI_LOOK: &str = "- a hero headline with one word in coloured italics (\"A little crumb of *happiness*.\")\n\
+- a small uppercase label above the headline (\"YOUR WORKSPACE · 00 BOARDS\")\n\
+- round or rotated \"stamp\" badges (\"Baked with love\", \"Fresh today\")\n\
+- cream or beige background with a serif display font as the default look\n\
+- copy like \"Made with love\", \"Crafted with care\", \"Welcome to\", \"Make room for…\"\n\
+- three icons in a row with a line of text each; gradient blobs; emoji as icons\n\
+- a marketing hero on an app: an app opens on its working screen (the board, the inbox)";
+
+/// The design review request: the screenshots (as `[image: path]`), the
+/// brief, and the look to avoid. One round: judge, fix, look again.
+pub fn design_review_request(goal: &str, design: Option<&str>, shots: &[std::path::PathBuf]) -> String {
+    let pictures: Vec<String> = shots.iter().map(|p| format!("[image: {}]", p.display())).collect();
+    format!(
+        "{DESIGN_REVIEW_PREFIX} Here are screenshots of what you built (desktop 1440px, phone 390px).\n\
+         Goal: {goal}\nDesign brief: {}\n\n\
+         Look at them as the client's art director. Does it look made for this business and its \
+         people, or like a template? These mark a page as AI-made; count each one you see:\n{AI_LOOK}\n\n\
+         Then fix the biggest problems in the code (layout, type, colour, imagery, copy). Keep what \
+         already works. After the changes, run check_page with look: true and judge again. Reply \
+         with: what you changed, and one line per item above: `SEEN` or `CLEAR`.\n{}",
+        design.unwrap_or("none given: choose a direction that fits this business and say it"),
+        pictures.join("\n")
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Spec {
     pub goal: String,
     pub output: String,
     pub done_when: Vec<String>,
     pub assuming: Vec<String>,
+    /// For something people look at (a site, an app screen): who it is for,
+    /// the mood, and a visual direction that fits this business.
+    pub design: Option<String>,
+    /// The skills that fit this task (names from the skill menu), read and
+    /// followed by the worker.
+    pub skills: Vec<String>,
 }
 
 /// Worth a spec call? Short chatter, slash commands and the app's own
@@ -37,7 +74,7 @@ likely means and say so under ASSUMING.";
 /// The request for the spec call. `context` is what the chat said last (a
 /// follow-up like "why is it a txt?" needs it); `files` the project's
 /// top-level names (an empty folder means: build from scratch).
-pub fn prompt(request: &str, context: Option<&str>, files: &[String]) -> String {
+pub fn prompt(request: &str, context: Option<&str>, files: &[String], skill_menu: &str) -> String {
     let mut p = String::new();
     if let Some(c) = context.filter(|c| !c.trim().is_empty()) {
         let c: String = c.chars().take(1500).collect();
@@ -47,11 +84,20 @@ pub fn prompt(request: &str, context: Option<&str>, files: &[String]) -> String 
         "Project folder: {}\n\nThe user's request:\n{request}\n\n",
         if files.is_empty() { "empty".to_string() } else { files.join(", ") }
     ));
+    if !skill_menu.trim().is_empty() {
+        p.push_str(&format!(
+            "The agent's skills (a SKILL.md each, with the method for that kind of work):\n{skill_menu}\n\n\
+             After DONE WHEN and ASSUMING, add one line: SKILLS: <1 to 3 skill names from this list \
+             that fit the task, best first, comma separated, or none>\n\n"
+        ));
+    }
     p.push_str(
         "Reply in exactly this form:\n\
          KIND: task | question | chat\n\
          GOAL: <one sentence: what the user wants, in their words>\n\
          OUTPUT: <what they get: which files, in which format, where>\n\
+         DESIGN: <only for something people look at: who it is for, the mood, and a visual \
+         direction that fits this business (palette, type, layout), not a default look>\n\
          DONE WHEN:\n\
          - <a check a tool call can prove: the file exists and opens as a PNG, a command prints X, \
          check_page shows Y at phone and desktop width>\n\
@@ -91,6 +137,17 @@ pub fn parse(reply: &str) -> Option<Spec> {
         } else if upper.starts_with("OUTPUT") {
             spec.output = value("OUTPUT");
             list = None;
+        } else if upper.starts_with("SKILLS") {
+            spec.skills = value("SKILLS")
+                .split(',')
+                .map(|n| n.trim().trim_matches(['`', '*', '"', '.']).to_string())
+                .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("none") && !n.starts_with('<'))
+                .take(3)
+                .collect();
+            list = None;
+        } else if upper.starts_with("DESIGN") {
+            spec.design = Some(value("DESIGN")).filter(|d| !d.is_empty() && !d.starts_with('<'));
+            list = None;
         } else if upper.starts_with("DONE WHEN") {
             list = Some("done");
         } else if upper.starts_with("ASSUMING") {
@@ -127,7 +184,11 @@ pub fn from_goal(text: &str) -> Option<Spec> {
 }
 
 fn details(s: &Spec) -> String {
-    let mut out = format!("Output: {}\nDone when:", s.output);
+    let mut out = format!("Output: {}\n", s.output);
+    if let Some(d) = &s.design {
+        out.push_str(&format!("Design: {d}\n"));
+    }
+    out.push_str("Done when:");
     for d in &s.done_when {
         out.push_str(&format!("\n- {d}"));
     }
@@ -137,16 +198,25 @@ fn details(s: &Spec) -> String {
             out.push_str(&format!("\n- {a}"));
         }
     }
+    if !s.skills.is_empty() {
+        out.push_str(&format!("\nSkills: {}", s.skills.join(", ")));
+    }
     out
 }
 
 /// What the worker gets next to the request.
 pub fn for_model(s: &Spec) -> String {
     format!(
-        "Work spec for this request (written before work started):\n{}\n\nBuild to this spec. \
+        "Work spec for this request (written before work started):\n{}\n\n{}Build to this spec. \
          Before you finish, prove every done-when item with a tool call (open or run what you \
          made); the app checks them again after you.",
-        for_user(s).replacen("**Spec** — ", "Goal: ", 1)
+        for_user(s).replacen("**Spec** — ", "Goal: ", 1),
+        if s.skills.is_empty() {
+            String::new()
+        } else {
+            let files: Vec<String> = s.skills.iter().map(|n| format!("`.opencode/skills/{n}/SKILL.md`")).collect();
+            format!("First read these skills and follow their method: {}.\n", files.join(", "))
+        }
     )
 }
 
@@ -218,12 +288,27 @@ mod tests {
     }
 
     #[test]
+    fn a_design_brief_is_read_and_handed_on() {
+        let reply = "KIND: task\nGOAL: A site for a bakery\nOUTPUT: index.html\n\
+                     DESIGN: families nearby; warm, playful; tomato red and flour white, chunky sans\n\
+                     DONE WHEN:\n- check_page passes";
+        let s = parse(reply).unwrap();
+        assert_eq!(s.design.as_deref(), Some("families nearby; warm, playful; tomato red and flour white, chunky sans"));
+        assert!(for_model(&s).contains("Design: families nearby"));
+        assert_eq!(parse("KIND: task\nGOAL: x\nOUTPUT: y\nDESIGN: <only for…>\nDONE WHEN:\n- z").unwrap().design, None);
+        let review = design_review_request("A site", s.design.as_deref(), &["d.png".into()]);
+        assert!(review.starts_with(DESIGN_REVIEW_PREFIX) && review.contains("[image: d.png]") && review.contains("coloured italics"));
+    }
+
+    #[test]
     fn a_mission_goal_keeps_its_spec() {
         let s = Spec {
             goal: "Draw a heart".into(),
             output: "heart.png".into(),
             done_when: vec!["heart.png is a PNG".into()],
             assuming: vec![],
+            design: None,
+            skills: vec![],
         };
         let stored = with_goal("make a heart\nfrom 0 and 1", &s);
         let back = from_goal(&stored).unwrap();
@@ -260,8 +345,25 @@ mod tests {
 
     #[test]
     fn the_prompt_carries_the_context() {
-        let p = prompt("why is it a txt?", Some("Created image.txt"), &["binary-image".into()]);
+        let p = prompt("why is it a txt?", Some("Created image.txt"), &["binary-image".into()], "- frontend-design: Distinctive interfaces");
         assert!(p.contains("Created image.txt") && p.contains("binary-image") && p.contains("why is it a txt?"));
-        assert!(prompt("x", None, &[]).contains("Project folder: empty"));
+        assert!(prompt("x", None, &[], "").contains("Project folder: empty"));
+        assert!(p.contains("SKILLS:") && p.contains("frontend-design: Distinctive"), "the skill menu to pick from");
+        assert!(!prompt("x", None, &[], "").contains("SKILLS:"), "no skills, no question about them");
+    }
+
+    #[test]
+    fn the_skills_that_fit_are_picked_and_handed_on() {
+        let reply = "KIND: task\nGOAL: A bakery site\nOUTPUT: index.html\nDONE WHEN:\n- check_page passes\n\
+                     ASSUMING:\n- one page\nSKILLS: `frontend-design`, build-anything, test-driven-development, extra";
+        let s = parse(reply).unwrap();
+        assert_eq!(s.skills, ["frontend-design", "build-anything", "test-driven-development"], "three at most");
+        let note = for_model(&s);
+        assert!(note.contains("First read these skills") && note.contains(".opencode/skills/frontend-design/SKILL.md"), "{note}");
+        assert!(for_user(&s).contains("Skills: frontend-design, build-anything"));
+        assert!(parse("KIND: task\nGOAL: x\nOUTPUT: y\nDONE WHEN:\n- z\nSKILLS: none").unwrap().skills.is_empty());
+        // A mission keeps the pick with its goal.
+        let back = from_goal(&with_goal("make a site", &s)).unwrap();
+        assert_eq!(back.skills, s.skills);
     }
 }

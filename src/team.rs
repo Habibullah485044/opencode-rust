@@ -48,7 +48,7 @@ pub async fn run_team(
     st.db.add_message(session_id, "user", &[Part::Text { text: format!("/team {goal}") }])?;
 
     // 1. PLANNER — read-only agent proposes subtasks as JSON.
-    let subtasks = plan(st, goal, &abort).await?;
+    let subtasks = crate::server::tagged("team", session_id, plan(st, goal, &abort)).await?;
     let _ = st.events.send(ServerEvent::AssistantDelta {
         session_id: session_id.to_string(),
         text: format!("[team] plan: {} subtask(s)\n", subtasks.len()),
@@ -105,7 +105,7 @@ pub async fn run_team(
     let verdict = if abort.load(std::sync::atomic::Ordering::SeqCst) {
         "skipped: the run was aborted".to_string()
     } else {
-        match review(st, goal, &reports, &abort).await {
+        match crate::server::tagged("team", session_id, review(st, goal, &reports, &abort)).await {
             Ok(v) => v,
             Err(e) => format!("reviewer unavailable: {e:#}"),
         }

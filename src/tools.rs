@@ -71,8 +71,9 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         spec(
             "check_page",
             "Open a page (a file, or http://localhost:PORT/ of a running app) at phone and \
-             desktop width; lists what is broken, fix it all. expect_text: names it must show.",
-            json!({"type":"object","properties":{"path":{"type":"string"},"expect_text":{"type":"array","items":{"type":"string"}}}}),
+             desktop width; lists what is broken, fix it all. expect_text: names it must show. \
+             look: true also shows you screenshots, to judge the design.",
+            json!({"type":"object","properties":{"path":{"type":"string"},"expect_text":{"type":"array","items":{"type":"string"}},"look":{"type":"boolean"}}}),
         ),
     ]
 }
@@ -304,6 +305,7 @@ async fn bash(
     #[cfg(unix)]
     child.process_group(0);
     let mut child = child.spawn().context("spawning shell")?;
+    adopt_into_job(&child);
     let pid = child.id();
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
@@ -396,6 +398,7 @@ pub mod jobs {
         #[cfg(unix)]
         cmd.process_group(0);
         let mut child = cmd.spawn().with_context(|| format!("starting `{command}`"))?;
+        adopt_into_job(&child);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let id = if by_user { format!("term{n}") } else { format!("job{n}") };
         let out = Arc::new(Mutex::new(Vec::new()));
@@ -544,6 +547,35 @@ pub mod jobs {
             kill_tree(pid).await;
         }
     }
+
+    /// [`stop_all`] for code that cannot wait on the runtime (the GUI's
+    /// event loop runs inside it and never returns).
+    pub fn stop_all_now() {
+        let pids: Vec<u32> = {
+            let map = jobs().lock().unwrap_or_else(|e| e.into_inner());
+            map.values()
+                .filter(|j| j.exit.lock().unwrap_or_else(|e| e.into_inner()).is_none())
+                .filter_map(|j| j.pid)
+                .collect()
+        };
+        for pid in pids {
+            #[cfg(windows)]
+            winjob::kill(pid);
+            #[cfg(windows)]
+            let mut cmd = {
+                let mut c = std::process::Command::new("taskkill");
+                c.args(["/T", "/F", "/PID", &pid.to_string()]);
+                c
+            };
+            #[cfg(not(windows))]
+            let mut cmd = {
+                let mut c = std::process::Command::new("kill");
+                c.args(["-s", "KILL", "--", &format!("-{pid}")]);
+                c
+            };
+            let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+    }
 }
 
 async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
@@ -554,10 +586,114 @@ async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec
     buf
 }
 
+/// Windows: every shell Habi starts runs in a Job Object. Its descendants
+/// join the job by themselves, so killing the job ends all of them, where
+/// `taskkill /T` (which follows parent ids) missed Git Bash's forked
+/// children on a busy machine and a dev server outlived Habi. The jobs close
+/// when Habi exits for any reason (window closed, crash), and the system
+/// then ends what is left in them (`KILL_ON_JOB_CLOSE`).
+#[cfg(windows)]
+mod winjob {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    struct Job(HANDLE);
+    // SAFETY: a job handle is a kernel object handle; it may be used and
+    // closed from any thread.
+    unsafe impl Send for Job {}
+
+    impl Job {
+        fn active(&self) -> u32 {
+            let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            // SAFETY: `info` is the struct this information class fills.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    Some(self.0),
+                    JobObjectBasicAccountingInformation,
+                    &mut info as *mut _ as *mut std::ffi::c_void,
+                    std::mem::size_of_val(&info) as u32,
+                    None,
+                )
+            };
+            if ok.is_ok() { info.ActiveProcesses } else { 0 }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from CreateJobObjectW and is closed once.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn jobs() -> &'static Mutex<HashMap<u32, Job>> {
+        static J: OnceLock<Mutex<HashMap<u32, Job>>> = OnceLock::new();
+        J.get_or_init(Default::default)
+    }
+
+    /// Put the process `pid` (just started, handle `process`) in a new job.
+    pub fn adopt(pid: u32, process: std::os::windows::io::RawHandle) {
+        // SAFETY: plain Win32 calls with valid arguments; the info struct is
+        // the one the information class expects.
+        let job = unsafe {
+            let Ok(h) = CreateJobObjectW(None, windows::core::PCWSTR::null()) else { return };
+            let job = Job(h);
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of_val(&info) as u32,
+            );
+            if set.is_err() || AssignProcessToJobObject(job.0, HANDLE(process)).is_err() {
+                return;
+            }
+            job
+        };
+        let mut map = jobs().lock().unwrap_or_else(|e| e.into_inner());
+        // Jobs whose processes have all ended are not needed any more.
+        map.retain(|_, j| j.active() > 0);
+        map.insert(pid, job);
+    }
+
+    /// End everything in the job of `pid`. False when it has none.
+    pub fn kill(pid: u32) -> bool {
+        let map = jobs().lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(&pid) {
+            // SAFETY: a live job handle from `adopt`.
+            Some(job) => unsafe { TerminateJobObject(job.0, 1).is_ok() },
+            None => false,
+        }
+    }
+}
+
+/// Put a just-started shell in its own Job Object (Windows; see `winjob`).
+fn adopt_into_job(child: &tokio::process::Child) {
+    #[cfg(windows)]
+    if let (Some(pid), Some(handle)) = (child.id(), child.raw_handle()) {
+        winjob::adopt(pid, handle);
+    }
+    #[cfg(not(windows))]
+    let _ = child;
+}
+
 /// New (B-06): kill a shell and everything it started. Linux/macOS: signal
-/// the shell's process group (see `bash`). Windows: taskkill walks the tree.
+/// the shell's process group (see `bash`). Windows: end its Job Object, and
+/// taskkill walks the tree too (a shell started before its job existed).
 async fn kill_tree(pid: Option<u32>) {
     let Some(pid) = pid else { return };
+    #[cfg(windows)]
+    winjob::kill(pid);
     #[cfg(windows)]
     let mut cmd = {
         let mut c = tokio::process::Command::new("taskkill");
@@ -645,27 +781,34 @@ pub fn confine_read_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
         Ok(p) if !p.exists() => Ok(user_skill_file(raw).unwrap_or(p)),
         Ok(p) => Ok(p),
         Err(e) => {
-            let Some(skills) = crate::skills::user_config_dir().map(|d| d.join("skills")) else { return Err(e) };
-            let Ok(root) = skills.canonicalize() else { return Err(e) };
-            match confine_path(&root, raw) {
-                Ok(p) if p.starts_with(&root) => Ok(p),
-                _ => Err(e),
+            for skills in crate::skills::shared_skill_dirs() {
+                let Ok(root) = skills.canonicalize() else { continue };
+                if let Ok(p) = confine_path(&root, raw) {
+                    if p.starts_with(&root) {
+                        return Ok(p);
+                    }
+                }
             }
+            Err(e)
         }
     }
 }
 
-/// `.opencode/skills/<rest>` in the user's skills folder: `<rest>` itself,
-/// or (a path without the skill's name) the one skill that has `<rest>`.
+/// `.opencode/skills/<rest>` in a shared skills folder (the user's, the ones
+/// Habi ships): `<rest>` itself, or (a path without the skill's name) the
+/// one skill that has `<rest>`.
 fn user_skill_file(raw: &str) -> Option<PathBuf> {
     let norm = raw.replace('\\', "/");
     let rest = norm.trim_start_matches("./").strip_prefix(".opencode/skills/")?;
-    let root = crate::skills::user_config_dir()?.join("skills");
-    let direct = root.join(rest);
-    if direct.exists() {
+    let roots = crate::skills::shared_skill_dirs();
+    if let Some(direct) = roots.iter().map(|r| r.join(rest)).find(|p| p.exists()) {
         return Some(direct);
     }
-    let mut found = std::fs::read_dir(&root).ok()?.flatten().map(|d| d.path().join(rest)).filter(|p| p.exists());
+    let mut found = roots
+        .iter()
+        .filter_map(|r| std::fs::read_dir(r).ok())
+        .flat_map(|d| d.flatten().map(|e| e.path().join(rest)))
+        .filter(|p| p.exists());
     let one = found.next()?;
     found.next().is_none().then_some(one)
 }
@@ -1497,6 +1640,9 @@ mod tests {
         assert!(!dir.path().join("marker.txt").exists(), "the background child must die too");
     }
 
+    /// Tests that start background jobs run one at a time (see `stop_all`).
+    static JOB_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// A dev server the agent started in the background must not outlive
     /// Habi: `stop_all` (run on exit) ends it and what it started.
     #[tokio::test]
@@ -1504,11 +1650,24 @@ mod tests {
         if shell_kind() != crate::permissions::Shell::Posix {
             return;
         }
+        // `stop_all` stops every job, also another test's: take turns.
+        let _turn = JOB_TESTS.lock().await;
         let dir = TempDir::new("jobs-stop-all");
-        jobs::start("(sleep 2; echo late > marker.txt) & sleep 30", dir.path()).unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let started = jobs::start("(sleep 8; echo late > marker.txt) & echo UP; sleep 30", dir.path()).unwrap();
+        let id = started.split_whitespace().nth(1).unwrap().to_string();
+        // Under a full test run the shell can take seconds to start: stop it
+        // once its child exists, and always well before the child's 8 s are
+        // up (a marker written before the stop proves nothing either way).
+        let mut up = String::new();
+        for _ in 0..60 {
+            up.push_str(&jobs::output(&id).unwrap());
+            if up.contains("UP") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         jobs::stop_all().await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(9)).await;
         assert!(!dir.path().join("marker.txt").exists(), "the job's child must die too");
     }
 
@@ -1586,6 +1745,7 @@ mod tests {
         if shell_kind() != crate::permissions::Shell::Posix {
             return;
         }
+        let _turn = JOB_TESTS.lock().await;
         let dir = TempDir::new("jobs");
         let no = std::sync::atomic::AtomicBool::new(false);
         let started = execute("bash", &json!({"command": "echo ONE$((0+1)); sleep 1; echo TWO$((1+1)); sleep 30", "background": true}), dir.path(), &no)

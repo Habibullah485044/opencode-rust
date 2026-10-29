@@ -119,6 +119,12 @@ fn migrate_projects(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The clock the database uses, for tests that build on it.
+#[cfg(test)]
+pub fn now_ms_for_tests() -> i64 {
+    now_ms()
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -211,6 +217,49 @@ const USAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS usage (
     PRIMARY KEY (session_id, day)
 );";
 
+/// One row per model request, for the usage dashboard: which chat, which
+/// model and what for (chat, spec, final check, review…). `input` includes
+/// `cached`. Prices are per 1M tokens in the user's currency (US$ by default).
+const USAGE_LOG_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    input INTEGER NOT NULL,
+    cached INTEGER NOT NULL,
+    cache_write INTEGER NOT NULL,
+    output INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS usage_log_ts ON usage_log (ts);
+CREATE TABLE IF NOT EXISTS prices (
+    model TEXT PRIMARY KEY,
+    input REAL NOT NULL,
+    cached REAL NOT NULL,
+    output REAL NOT NULL
+);";
+
+/// One model request from the log.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageEntry {
+    pub ts: i64,
+    pub session_id: String,
+    pub model: String,
+    pub purpose: String,
+    pub input: u64,
+    pub cached: u64,
+    pub cache_write: u64,
+    pub output: u64,
+}
+
+/// Price of a model per 1M tokens: fresh input, cached input, output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Price {
+    pub input: f64,
+    pub cached: f64,
+    pub output: f64,
+}
+
 /// Summed token counts (`/usage`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageTotals {
@@ -287,6 +336,7 @@ impl Db {
         )?;
         migrate_approvals(&conn)?;
         conn.execute_batch(USAGE_SCHEMA)?;
+        conn.execute_batch(USAGE_LOG_SCHEMA)?;
         conn.execute_batch(MISSION_SCHEMA)?;
         migrate_projects(&conn)?;
         Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
@@ -315,6 +365,7 @@ impl Db {
         )?;
         migrate_approvals(&conn)?;
         conn.execute_batch(USAGE_SCHEMA)?;
+        conn.execute_batch(USAGE_LOG_SCHEMA)?;
         conn.execute_batch(MISSION_SCHEMA)?;
         migrate_projects(&conn)?;
         Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
@@ -579,6 +630,58 @@ impl Db {
                requests = requests + 1, input = input + ?3, cached = cached + ?4,
                cache_write = cache_write + ?5, output = output + ?6",
             params![session_id, day, u.input as i64, u.cached as i64, u.cache_write as i64, u.output as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Record one model request: the daily totals and the detailed log.
+    pub fn add_usage_entry(&self, session_id: &str, model: &str, purpose: &str, u: &crate::provider::Usage) -> Result<()> {
+        self.add_usage(session_id, u)?;
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO usage_log (ts, session_id, model, purpose, input, cached, cache_write, output)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![now_ms(), session_id, model, purpose, u.input as i64, u.cached as i64, u.cache_write as i64, u.output as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Logged requests since `from_ms` (epoch ms), oldest first.
+    pub fn usage_log(&self, from_ms: i64) -> Result<Vec<UsageEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ts, session_id, model, purpose, input, cached, cache_write, output
+             FROM usage_log WHERE ts >= ?1 ORDER BY ts, id",
+        )?;
+        let rows = stmt.query_map(params![from_ms], |r| {
+            Ok(UsageEntry {
+                ts: r.get(0)?,
+                session_id: r.get(1)?,
+                model: r.get(2)?,
+                purpose: r.get(3)?,
+                input: r.get::<_, i64>(4)? as u64,
+                cached: r.get::<_, i64>(5)? as u64,
+                cache_write: r.get::<_, i64>(6)? as u64,
+                output: r.get::<_, i64>(7)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every model's price (per 1M tokens), by model name.
+    pub fn prices(&self) -> Result<std::collections::HashMap<String, Price>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT model, input, cached, output FROM prices")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, Price { input: r.get(1)?, cached: r.get(2)?, output: r.get(3)? }))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?)
+    }
+
+    pub fn set_price(&self, model: &str, p: Price) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO prices (model, input, cached, output) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (model) DO UPDATE SET input = ?2, cached = ?3, output = ?4",
+            params![model, p.input, p.cached, p.output],
         )?;
         Ok(())
     }

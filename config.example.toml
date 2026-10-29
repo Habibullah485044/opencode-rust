@@ -77,6 +77,9 @@ auto_review = true
 sharpen = true
 # After a run with a spec: the model proves each done-when item with tools.
 final_check = true
+# After a run that changed a web page: the model looks at desktop and phone
+# screenshots and fixes the design by eye (needs a model that takes images).
+design_review = true
 reuse_gate = true
 
 # F-05: give each `worker` subagent and team worker its own git worktree.

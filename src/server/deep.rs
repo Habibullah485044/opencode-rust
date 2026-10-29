@@ -163,7 +163,7 @@ pub(super) async fn run_deep(
                     cache_write: u.cache_write,
                     output: u.output,
                 };
-                st.record_usage(session_id, &usage);
+                st.record_usage_as("deep attempt", session_id, &st.current_model().await, &usage);
             }
             (res, u.input + u.output)
         }

@@ -139,7 +139,7 @@ async fn summarize(st: &Shared, transcript: &str, abort: &AtomicBool) -> Result<
         }
         match ev? {
             StreamEvent::Text(t) => text.push_str(&t),
-            StreamEvent::Usage(u) => st.record_usage("", &u),
+            StreamEvent::Usage(u) => st.record_usage("", &model, &u),
             StreamEvent::Done { finish_reason } => {
                 // B-03: a cut-off summary would replace real history.
                 if finish_reason.as_deref() == Some("length") {
@@ -184,7 +184,7 @@ pub async fn compact(
         t => t.saturating_mul(2).min(BUDGET),
     };
     let transcript = render_transcript_within(&lines, budget);
-    let summary = summarize(st, &transcript, abort).await?;
+    let summary = crate::server::tagged("compaction", session_id, summarize(st, &transcript, abort)).await?;
     if summary.is_empty() {
         bail!("summarizer returned an empty summary — compaction cancelled");
     }

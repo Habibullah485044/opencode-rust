@@ -211,6 +211,8 @@ pub(super) async fn run_mission(
         let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
     };
     let ws = st.workspace_for(session_id);
+    // Pages changed from here on are the mission's (a resume counts from the resume).
+    let mission_started = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
     if let Some(goal) = goal {
         st.db.add_message(session_id, "user", &[Part::Text { text: format!("[mission] {goal}") }])?;
         // The goal is kept with its spec: the plan, every step brief and the
@@ -218,7 +220,7 @@ pub(super) async fn run_mission(
         let spec = make_spec(st, session_id, goal, abort).await;
         let goal = spec.as_ref().map_or_else(|| goal.to_string(), |s| crate::spec::with_goal(goal, s));
         note("mission: planning the steps…".into());
-        let steps = plan(st, &ws, &goal, abort).await;
+        let steps = tagged("mission planning", session_id, plan(st, &ws, &goal, abort)).await;
         if abort.load(Ordering::SeqCst) {
             anyhow::bail!("aborted");
         }
@@ -261,6 +263,16 @@ pub(super) async fn run_mission(
                 Some(false) => "\nFinal check: not every done-when item could be proven — see the final check chat.".into(),
                 None => "\nFinal check: could not run (provider unreachable) — check the result yourself.".into(),
             };
+        }
+    }
+    // The pages the mission changed, judged by eye (a mission is where the
+    // biggest sites get built, and it skipped this until the wiring audit).
+    if matches!(result, Ok(true)) && !abort.load(Ordering::SeqCst) {
+        let goal = st.db.mission(session_id)?.map(|m| m.goal).unwrap_or_default();
+        let spec = crate::spec::from_goal(&goal);
+        let child = st.db.create_session("mission design review", Some(session_id))?;
+        if design_review(st, &child.id, &goal, spec.as_ref(), mission_started, true, abort).await.is_some() {
+            checked.push_str("\nDesign review: done — see the design review chat.");
         }
     }
     if before != PermissionMode::Turbo {
@@ -333,7 +345,7 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
         let since = std::time::SystemTime::now();
         // Deep: the step is tried several times in separate copies and the
         // best checked attempt is applied. Without git it runs once.
-        let run = if deep {
+        let run = tagged("mission step", &child.id, async { if deep {
             match super::deep::run_deep(st, &child.id, &brief, st.cfg.agent.deep_attempts, abort).await {
                 Ok(summary) => {
                     if !summary.is_empty() {
@@ -346,7 +358,7 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
             }
         } else {
             agent_inner(st, &child.id, &brief, abort).await
-        };
+        } }).await;
         if abort.load(Ordering::SeqCst) {
             st.db.mission_step_update(step.id, "pending", attempts - 1, &step.result, None)?;
             agent_status(st, &info, "failed", "stopped".into());
@@ -386,6 +398,8 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
                     output: "the work of this step".into(),
                     done_when: vec![check.to_string()],
                     assuming: vec![],
+                    design: None,
+                    skills: vec![],
                 };
                 Some(final_check(st, &child.id, &spec, abort).await)
             }
@@ -423,7 +437,7 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
         // The coordinator sees this step as the one just worked on.
         st.db.mission_step_update(step.id, "working", attempts, &receipt, None)?;
         let m = st.db.mission(session_id)?.expect("mission exists");
-        let verdict = review(st, &m, n, &receipt, abort).await;
+        let verdict = tagged("mission planning", session_id, review(st, &m, n, &receipt, abort)).await;
         let first_line: String = report.trim().lines().next().unwrap_or("").chars().take(200).collect();
         redo_reason = None;
         match verdict {

@@ -145,9 +145,27 @@ pub fn load_dir(dir: &Path) -> Vec<Doc> {
 /// Search dirs for skills, in priority order (workspace first).
 pub fn skill_dirs(workspace: &Path) -> Vec<PathBuf> {
     let mut v = vec![workspace.join(".opencode").join("skills")];
+    v.extend(shared_skill_dirs());
+    v
+}
+
+/// Skill folders outside any project, in priority order: the user's own
+/// (`~/.config/opencode-rust/skills`), then the ones Habi ships with: a
+/// `skills` folder next to the program, and the source tree's `skills`
+/// when it runs from a checkout (`cargo run`).
+pub fn shared_skill_dirs() -> Vec<PathBuf> {
+    let mut v = Vec::new();
     if let Some(u) = user_config_dir() {
         v.push(u.join("skills"));
     }
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("skills"))) {
+        v.push(dir);
+    }
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
+    v.push(source);
+    v.retain(|d| d.is_dir());
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|d| seen.insert(d.canonicalize().unwrap_or_else(|_| d.clone())));
     v
 }
 
@@ -217,17 +235,40 @@ pub fn resolve_command(workspace: &Path, input: &str) -> Option<(String, Doc)> {
 
 /// One-line-per-skill index (`- name: description`) for the system prompt.
 pub fn skill_index(skills: &[Doc]) -> String {
+    // Many skills (Habi ships ~40): their descriptions would cost every
+    // request ~2.5K tokens. Then only the names; the spec step reads the
+    // full menu and picks the skills that fit each task.
+    if skills.len() > SKILLS_LISTED_IN_FULL {
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        return format!("- {}", names.join(", "));
+    }
     skills
         .iter()
         .map(|s| {
-            // A skill from the user's folder (installed for every project) is
-            // not under the workspace: name its file so it can be read.
-            let user = user_config_dir().map(|d| d.join("skills")).is_some_and(|d| s.path.starts_with(&d));
-            if user {
+            // A skill from outside the project (the user's folder, the ones
+            // Habi ships) is not under the workspace: name its file.
+            let shared = shared_skill_dirs().iter().any(|d| s.path.starts_with(d));
+            if shared {
                 format!("- {} ({}): {}", s.name, s.path.display(), s.description)
             } else {
                 format!("- {}: {}", s.name, s.description)
             }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Up to this many skills are listed with their descriptions in the prompt.
+pub const SKILLS_LISTED_IN_FULL: usize = 12;
+
+/// Every skill with its description, one line each: what the spec step
+/// chooses from (sent once per task, not with every request).
+pub fn skill_menu(skills: &[Doc]) -> String {
+    skills
+        .iter()
+        .map(|s| {
+            let d: String = s.description.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(220).collect();
+            format!("- {}: {d}", s.name)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -544,10 +585,15 @@ mod tests {
         std::fs::create_dir_all(&skills).unwrap();
         std::fs::write(skills.join("alpha.md"), "---\ndescription: Does alpha\n---\nA").unwrap();
         let all = load_skills(&ws);
-        // Skills installed in the user's own folder are listed too (with
-        // their file); this test only looks at its own.
-        let index = skill_index(&all);
-        assert!(index.lines().any(|l| l == "- alpha: Does alpha"), "{index}");
+        // Shared skills (the user's, the ones Habi ships) are listed too;
+        // this test looks at its own.
+        let own: Vec<Doc> = all.iter().filter(|d| d.name == "alpha").cloned().collect();
+        assert_eq!(skill_index(&own), "- alpha: Does alpha");
+        assert!(skill_menu(&all).lines().any(|l| l == "- alpha: Does alpha"));
+        // Many skills: names only (their descriptions would cost every request).
+        let many: Vec<Doc> = (0..=SKILLS_LISTED_IN_FULL).map(|i| Doc { name: format!("s{i}"), ..own[0].clone() }).collect();
+        let short = skill_index(&many);
+        assert!(short.starts_with("- s0, s1") && !short.contains("Does alpha"), "{short}");
         assert!(find_skill(&ws, "alpha").is_ok());
         assert!(find_skill(&ws, "beta").is_err());
         let _ = std::fs::remove_dir_all(&ws);

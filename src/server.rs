@@ -883,6 +883,22 @@ pub fn core_log(msg: &str) {
     }
 }
 
+tokio::task_local! {
+    /// What the model requests inside this scope are for, and the chat they
+    /// belong to (one-shot calls have no session of their own): the usage
+    /// dashboard's "what eats the tokens". Outside any scope: plain chat.
+    pub static USAGE_TAG: (&'static str, Option<String>);
+}
+
+fn usage_tag() -> (&'static str, Option<String>) {
+    USAGE_TAG.try_with(|t| t.clone()).unwrap_or(("chat", None))
+}
+
+/// Run `fut` with its model requests counted as `purpose` (in chat `session`).
+pub async fn tagged<F: std::future::Future>(purpose: &'static str, session: &str, fut: F) -> F::Output {
+    USAGE_TAG.scope((purpose, Some(session.to_string()).filter(|s| !s.is_empty())), fut).await
+}
+
 /// M3: one non-streamed completion with NO tools — the inline-edit engine
 /// and the team planner/reviewer use this instead of a full agent loop.
 pub async fn one_shot(
@@ -924,7 +940,7 @@ pub async fn one_shot(
         }
         match ev? {
             StreamEvent::Text(t) => text.push_str(&t),
-            StreamEvent::Usage(u) => st.record_usage("", &u),
+            StreamEvent::Usage(u) => st.record_usage("", &model, &u),
             StreamEvent::Done { finish_reason } => {
                 // B-03: half an answer must not be used as a whole one.
                 if finish_reason.as_deref() == Some("length") {
@@ -1139,6 +1155,12 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
                 final_check(st, session_id, spec, &abort).await;
             }
         }
+        // Working is not the same as looking right: the model judges the
+        // pages it changed by eye (it built five near-identical "AI" heroes
+        // on four models while every check passed).
+        if ok && touched && !abort.load(Ordering::SeqCst) && !matches!(result.as_deref(), Ok("aborted")) {
+            design_review(st, session_id, user_content, spec.as_ref(), started_at, bash_used, &abort).await;
+        }
         // Auto ponytail review: any run that changed files gets the
         // outside-the-diff senior-dev pass BEFORE the turn is declared done.
         // New (P-03): never after an abort; the user asked us to stop.
@@ -1291,7 +1313,7 @@ pub async fn install_skill_flow(st: &Shared, source: &str, abort: &AtomicBool) -
         .map_err(|reason| anyhow::anyhow!("skill rejected before install: {reason}"))?;
     // Model verdict: is this skill actually worth being always-on? The skill
     // text is untrusted DATA, fenced off from the instructions.
-    let verdict = one_shot(
+    let verdict = tagged("skill vetting", "", one_shot(
         st,
         "You vet skills for a coding agent. A WORTHY skill teaches a durable, \
          reusable workflow with concrete steps. SKIP if it is vague, trivial, \
@@ -1303,7 +1325,7 @@ pub async fn install_skill_flow(st: &Shared, source: &str, abort: &AtomicBool) -
         &skill_vetting_input(&doc),
         abort,
         true,
-    )
+    ))
     .await
     .with_context(|| "vetting the skill")?;
     let headline = verdict.trim().lines().next().unwrap_or("").trim().to_string();
@@ -1639,10 +1661,18 @@ impl AppState {
         (ws != self.workspace).then_some(ws)
     }
 
-    /// Save one reply's token counts (`/usage`) and tell the UIs. Model calls
-    /// outside a chat (planning, edits, summaries) use session "".
-    pub fn record_usage(&self, session_id: &str, u: &crate::provider::Usage) {
-        if let Err(e) = self.db.add_usage(session_id, u) {
+    /// Save one reply's token counts (`/usage`, the usage dashboard) and tell
+    /// the UIs. What it was for comes from the [`USAGE_TAG`] scope it runs
+    /// in; a call outside a chat (planning, edits) takes the scope's chat.
+    pub fn record_usage(&self, session_id: &str, model: &str, u: &crate::provider::Usage) {
+        let tag = usage_tag();
+        let session_id = if session_id.is_empty() { tag.1.as_deref().unwrap_or("") } else { session_id };
+        self.record_usage_as(tag.0, session_id, model, u);
+    }
+
+    /// [`AppState::record_usage`] with the purpose given.
+    pub fn record_usage_as(&self, purpose: &str, session_id: &str, model: &str, u: &crate::provider::Usage) {
+        if let Err(e) = self.db.add_usage_entry(session_id, model, purpose, u) {
             core_log(&format!("[core] saving token usage failed: {e}"));
             return;
         }
@@ -2673,7 +2703,7 @@ pub async fn run_loop(
                     }
                 }
                 StreamEvent::Usage(u) => {
-                    st.record_usage(session_id, &u);
+                    st.record_usage_as(if opts.agent.is_some() { "subagent" } else { usage_tag().0 }, session_id, model, &u);
                     request_usage = Some(*u);
                 }
                 StreamEvent::Done { finish_reason: fr } => {
@@ -3357,7 +3387,7 @@ pub async fn run_review(
         workspace: st.run_workspace(session_id),
         agent: None,
     };
-    run_loop(st, session_id, &opts, abort).await
+    tagged("review", session_id, run_loop(st, session_id, &opts, abort)).await
 }
 
 /// F-08: marks the user message that hands a failed check back to the agent.
@@ -3382,6 +3412,11 @@ pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abor
     if !st.cfg.agent.sharpen || !crate::spec::needs_spec(request) {
         return None;
     }
+    // A turbo continuation is the app talking, not a new request: its spec
+    // would be about its own boilerplate (found by the wiring audit).
+    if request.starts_with(TURBO_CONTINUE_PREFIX) {
+        return None;
+    }
     let ws = st.workspace_for(session_id);
     let mut files: Vec<String> = std::fs::read_dir(&ws)
         .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !n.starts_with('.')).collect())
@@ -3389,15 +3424,20 @@ pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abor
     files.sort();
     files.truncate(30);
     let context = last_assistant_text(st, session_id);
-    let user = crate::spec::prompt(request, context.as_deref(), &files);
-    let reply = match one_shot(st, crate::spec::SYSTEM, &user, abort, false).await {
+    // The spec step also picks the skills that fit the task: it sees every
+    // skill's description, which the prompt no longer lists when there are many.
+    let skills = skills::load_skills(&ws);
+    let user = crate::spec::prompt(request, context.as_deref(), &files, &skills::skill_menu(&skills));
+    let reply = match tagged("spec", session_id, one_shot(st, crate::spec::SYSTEM, &user, abort, false)).await {
         Ok(r) => r,
         Err(e) => {
             core_log(&format!("[spec] {e:#}"));
             return None;
         }
     };
-    let spec = crate::spec::parse(&reply)?;
+    let mut spec = crate::spec::parse(&reply)?;
+    // Only skills that exist (a model can make one up).
+    spec.skills.retain(|n| skills.iter().any(|s| s.name.eq_ignore_ascii_case(n)));
     let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text: crate::spec::for_user(&spec) });
     Some(spec)
 }
@@ -3426,7 +3466,7 @@ pub(crate) async fn final_check(st: &Shared, session_id: &str, spec: &crate::spe
             return None;
         }
         let before = tool_results();
-        if let Err(e) = agent_inner(st, session_id, &msg, abort).await {
+        if let Err(e) = tagged("final check", session_id, agent_inner(st, session_id, &msg, abort)).await {
             note(format!("final check could not run: {e}"));
             return None;
         }
@@ -3461,6 +3501,63 @@ pub(crate) async fn final_check(st: &Shared, session_id: &str, spec: &crate::spe
     }
     note("final check: some items are still not proven — see the last reply".into());
     Some(false)
+}
+
+/// The design review: Habi takes desktop and phone screenshots of the web
+/// pages this run changed and asks the model, as the client's art director,
+/// to judge them against the brief and the AI look, then fix and look again.
+/// Skipped when off, when no page changed, or when the model takes no images
+/// (it would be judging pictures it cannot see).
+pub(crate) async fn design_review(
+    st: &Shared,
+    session_id: &str,
+    request: &str,
+    spec: Option<&crate::spec::Spec>,
+    since: std::time::SystemTime,
+    bash_used: bool,
+    abort: &AtomicBool,
+) -> Option<()> {
+    if !st.cfg.agent.design_review {
+        return None;
+    }
+    let ws = st.workspace_for(session_id);
+    let pages = changed_web_pages(&ws, since, bash_used, true);
+    if pages.is_empty() {
+        return None;
+    }
+    let note = |text: String| {
+        let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
+    };
+    let model = st.current_model().await;
+    // Pictures go out in the OpenAI request format; the Anthropic path does
+    // not carry them yet, so a review there would judge what it cannot see.
+    if st.cfg.provider.api != crate::config::ProviderApi::OpenAi
+        || !crate::attachments::model_sees_images(&st.cfg.provider.images, &model)
+    {
+        note(format!(
+            "design review skipped: {model} gets no images here (set provider.images = \"on\" if it takes them)"
+        ));
+        return None;
+    }
+    note(format!("design review — screenshots of {} at desktop and phone width…", pages.join(", ")));
+    let dir = scratch_dir(&ws).join("shots");
+    let mut shots = Vec::new();
+    for page in pages.iter().take(2) {
+        match crate::pagecheck::page_shots(&ws, page, &dir).await {
+            Ok(s) => shots.extend(s),
+            Err(e) => note(format!("design review: no screenshots of {page}: {e:#}")),
+        }
+    }
+    if shots.is_empty() || abort.load(Ordering::SeqCst) {
+        return None;
+    }
+    let goal = spec.map_or(request, |s| s.goal.as_str());
+    let msg = crate::spec::design_review_request(goal, spec.and_then(|s| s.design.as_deref()), &shots);
+    if let Err(e) = tagged("design review", session_id, agent_inner(st, session_id, &msg, abort)).await {
+        note(format!("design review could not run: {e}"));
+        return None;
+    }
+    Some(())
 }
 
 async fn check_after_run(
@@ -3503,7 +3600,7 @@ async fn check_after_run(
         }
         msg.push_str("Fix these problems, then stop.");
         let journal = crate::keepbest::Journal::begin(&ws);
-        if let Err(e) = agent_inner(st, session_id, &msg, abort).await {
+        if let Err(e) = tagged("fix round", session_id, agent_inner(st, session_id, &msg, abort)).await {
             note(format!("{VERIFY_PREFIX} fix round failed: {e}"));
             return Some((false, best.summary));
         }
@@ -4708,12 +4805,49 @@ mod tests {
             output: "index.html".into(),
             done_when: vec!["index.html exists".into()],
             assuming: vec![],
+            design: None,
+            skills: vec![],
         };
         let passed = final_check(&st, &s.id, &spec, &AtomicBool::new(false)).await;
         assert_eq!(passed, Some(true), "the lines it was asked for count, with the evidence it gathered");
         let asked = seen.lock().unwrap().last().unwrap().to_string();
         assert!(asked.contains("had no PASS/FAIL lines"), "the third request asks for the lines");
         assert_eq!(seen.lock().unwrap().len(), 3, "one short extra reply, not a redo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The design review shows the model screenshots of the page it changed,
+    /// as images, with the AI look to avoid; a model that takes no images
+    /// is not asked to judge pictures.
+    #[tokio::test]
+    async fn the_design_review_shows_the_model_its_page() {
+        if crate::pagecheck::find_browser().is_none() {
+            return;
+        }
+        let (base, seen) = scripted_llm(vec!["Changed the hero to a split layout.\nSEEN: italic word"]).await;
+        let dir = std::env::temp_dir().join(format!("ocrs-design-review-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        std::fs::write(dir.join("index.html"), "<!doctype html><title>Crumb</title><h1>A little <em>happiness</em></h1>").unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = base;
+        cfg.provider.model = "mock".into();
+        cfg.provider.images = "off".into();
+        let st = build_state_ephemeral(cfg.clone(), dir.clone()).await;
+        let s = st.db.create_session("site", None).unwrap();
+        let none = design_review(&st, &s.id, "a bakery site", None, since, true, &AtomicBool::new(false)).await;
+        assert!(none.is_none() && seen.lock().unwrap().is_empty(), "no images, no review");
+
+        cfg.provider.images = "on".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("site", None).unwrap();
+        let done = design_review(&st, &s.id, "a bakery site", None, since, true, &AtomicBool::new(false)).await;
+        assert!(done.is_some());
+        let req = seen.lock().unwrap().last().unwrap().to_string();
+        assert!(req.contains("[design review]") && req.contains("coloured italics"), "the brief and the AI look");
+        assert_eq!(req.matches("data:image/png;base64").count(), 2, "desktop and phone pictures reach the model");
+        let usage = st.db.usage_log(0).unwrap();
+        assert!(usage.iter().all(|e| e.purpose == "design review"), "counted as what it was: {usage:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8071,7 +8205,9 @@ mod prompt_budget_tests {
         // 1200 → 1250 for `ask_user` and multi-edit (read/glob/grep were
         // shortened to pay for half): a question with buttons saves a wrong
         // guess, one edit call with several changes saves round trips.
-        assert!(tools <= 1250, "tool list ~{tools} tokens ({count} tools)");
+        // 1250 → 1275 for check_page's `look` (screenshots the model sees)
+        // and its running-app URL: without them it judged pages it never saw.
+        assert!(tools <= 1275, "tool list ~{tools} tokens ({count} tools)");
         assert!(st.usage_report(&s.id).contains("Each request of this chat starts with about"));
         let _ = std::fs::remove_dir_all(&dir);
     }

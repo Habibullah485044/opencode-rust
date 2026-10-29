@@ -611,6 +611,54 @@
     background: var(--scrim);
   }
   #changes[hidden] { display: none; }
+  /* Token usage dashboard (Settings → Token usage). */
+  #usage {
+    position: fixed; inset: 0; z-index: 150; display: grid; place-items: center;
+    padding: 24px; background: var(--scrim); animation: fadeIn 0.12s ease-out;
+  }
+  #usage[hidden] { display: none; }
+  .use-card { width: min(1180px, 100%); height: min(860px, 100%); display: flex; flex-direction: column; }
+  .use-range { display: flex; gap: 4px; }
+  .use-range button { font-size: 12px; padding: 4px 10px; }
+  .use-card .use-range button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-strong); }
+  .use-body { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 18px 22px; display: flex; flex-direction: column; gap: 16px; }
+  .use-body > * { flex-shrink: 0; }
+  .use-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .use-kpi { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-l); padding: 12px 14px; }
+  .use-kpi .k { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); }
+  .use-kpi .v { font-size: 22px; font-weight: 600; color: var(--text-strong); margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .use-kpi .s { font-size: 12px; color: var(--text-soft); margin-top: 2px; }
+  .use-kpi.cost .v { color: var(--accent-strong); }
+  .use-panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-l); padding: 12px 14px; min-width: 0; }
+  .use-panel h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: var(--text-strong); display: flex; gap: 8px; align-items: baseline; }
+  .use-panel h3 small { font-weight: 400; color: var(--text-muted); font-size: 12px; }
+  .use-two { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 540px), 1fr)); gap: 16px; }
+  .use-panel { overflow-x: auto; }
+  .use-card .hist-head button:not(.hist-close), .use-t button {
+    background: transparent; color: var(--text-soft); border: 1px solid var(--line-strong);
+    border-radius: var(--radius); padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .use-card .hist-head button:not(.hist-close):hover, .use-t button:hover { background: var(--hover); color: var(--text-strong); }
+  .use-legend { display: flex; gap: 14px; font-size: 12px; color: var(--text-soft); margin-bottom: 6px; }
+  .use-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .use-fresh { background: var(--accent); fill: var(--accent); }
+  .use-cached { background: var(--lime); fill: var(--lime); }
+  .use-out { background: var(--violet); fill: var(--violet); }
+  .use-chart svg { width: 100%; display: block; }
+  .use-chart text { fill: var(--text-muted); font-size: 10px; }
+  .use-chart .grid { stroke: var(--line); }
+  table.use-t { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .use-t th { text-align: right; font-weight: 500; color: var(--text-muted); padding: 4px 6px; border-bottom: 1px solid var(--line-strong); white-space: nowrap; }
+  .use-t td { text-align: right; padding: 5px 6px; border-bottom: 1px solid var(--line); color: var(--text); white-space: nowrap; }
+  .use-t th:first-child, .use-t td:first-child { text-align: left; }
+  .use-t td.name { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+  .use-t td.dim { color: var(--text-muted); }
+  .use-share { display: block; height: 3px; margin-top: 3px; background: var(--grad); border-radius: 2px; }
+  .use-scroll { max-height: 320px; overflow-y: auto; }
+  .use-t input { width: 80px; text-align: right; font: inherit; background: var(--code-bg); color: var(--text); border: 1px solid var(--line-strong); border-radius: var(--radius-s); padding: 3px 6px; }
+  .use-note { font-size: 12px; color: var(--text-muted); margin: 8px 0 0; }
+  .use-empty { color: var(--text-muted); font-size: 13px; padding: 18px 0; text-align: center; }
+  .set-usage { width: 100%; text-align: left; margin-top: 4px; }
   .chg-card { width: min(1100px, 100%); height: min(780px, 100%); display: flex; flex-direction: column; }
   .chg-sub { color: var(--text-muted); font-size: 12px; }
   .chg-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px 1fr; }
@@ -2567,11 +2615,33 @@
         <option value="black">Pure black</option>
         <option value="light">Paper terminal (light)</option>
       </select>
+      <label>Token usage</label>
+      <button type="button" id="set-usage" class="set-usage" title="Tokens and costs by day, model, purpose and chat">Token usage &amp; costs &rarr;</button>
       <p class="set-path" id="set-path"></p>
       <div class="set-actions">
         <button type="submit" id="set-save">Save</button>
       </div>
     </form>
+  </div>
+</div>
+
+<!-- Token usage dashboard: Settings → Token usage. -->
+<div id="usage" hidden>
+  <div class="hist-card use-card" role="dialog" aria-modal="true" aria-label="Token usage">
+    <div class="hist-head">
+      <b>Token usage</b>
+      <span class="chg-sub" id="use-sub"></span>
+      <span style="flex:1"></span>
+      <div class="use-range" id="use-range">
+        <button type="button" data-days="1">Today</button>
+        <button type="button" data-days="7">7 days</button>
+        <button type="button" data-days="30">30 days</button>
+        <button type="button" data-days="0">All time</button>
+      </div>
+      <button type="button" id="use-refresh" title="Load again">Refresh</button>
+      <button class="hist-close" id="use-close" title="Close (Esc)">&times;</button>
+    </div>
+    <div class="use-body" id="use-body"></div>
   </div>
 </div>
 
@@ -3853,6 +3923,224 @@
     if (box.hidden) { box.hidden = false; overlayHooks.open(); }
     renderChanges();
   };
+  // ---- Token usage dashboard (Settings → Token usage) ----
+  var useData = null;
+  var useDays = 7;
+  function useTok(n) {
+    n = n || 0;
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+    if (n >= 1e4) return (n / 1e3).toFixed(1) + "K";
+    return String(n);
+  }
+  function useCost(c, unpriced) {
+    if (c == null) return "—";
+    var s = c === 0 ? "$0" : c < 0.01 ? "$" + c.toFixed(4) : "$" + c.toFixed(2);
+    return unpriced ? s + "+" : s;
+  }
+  function useEl(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function useTable(cols, rows) {
+    var t = useEl("table", "use-t");
+    var hr = useEl("tr");
+    cols.forEach(function (c) { hr.appendChild(useEl("th", null, c)); });
+    t.appendChild(useEl("thead")).appendChild(hr);
+    var tb = t.appendChild(useEl("tbody"));
+    rows.forEach(function (r) { tb.appendChild(r); });
+    return t;
+  }
+  function useRow(cells) {
+    var tr = useEl("tr");
+    cells.forEach(function (c) {
+      if (c instanceof Node) { var td = useEl("td"); td.appendChild(c); tr.appendChild(td); }
+      else if (c && typeof c === "object") tr.appendChild(useEl("td", c.cls, c.text));
+      else tr.appendChild(useEl("td", null, c));
+    });
+    return tr;
+  }
+  function useNameCell(name, share, title) {
+    var d = useEl("div");
+    var n = useEl("div", null, name);
+    if (title) n.title = title;
+    d.appendChild(n);
+    var bar = useEl("span", "use-share");
+    bar.style.width = Math.max(2, Math.round(share * 100)) + "%";
+    d.appendChild(bar);
+    return d;
+  }
+  function useGroupRows(list, total) {
+    var max = Math.max.apply(null, [1].concat(list.map(function (g) { return g.sum.input + g.sum.output; })));
+    return list.map(function (g) {
+      var s = g.sum;
+      return useRow([
+        useNameCell(g.name || g.title || "—", (s.input + s.output) / max, g.title || g.name),
+        String(s.requests), useTok(s.input), useTok(s.cached), useTok(s.output),
+        useCost(s.cost, s.unpriced),
+        { text: total.cost > 0 ? Math.round(100 * s.cost / total.cost) + "%" : "—", cls: "dim" }
+      ]);
+    });
+  }
+  function useChart(daily) {
+    // Drawn at its real width: a stretched SVG stretches its labels too.
+    var W = Math.max(320, (document.getElementById("use-body").clientWidth || 900) - 64), H = 170, padL = 44, padB = 18, padT = 6;
+    var max = Math.max.apply(null, [1].concat(daily.map(function (d) { return d.sum.input + d.sum.output; })));
+    var ns = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    function add(tag, attrs, text) {
+      var e = document.createElementNS(ns, tag);
+      for (var k in attrs) e.setAttribute(k, attrs[k]);
+      if (text != null) e.textContent = text;
+      svg.appendChild(e);
+      return e;
+    }
+    [0, 0.5, 1].forEach(function (f) {
+      var y = padT + (H - padT - padB) * (1 - f);
+      add("line", { x1: padL, x2: W, y1: y, y2: y, "class": "grid" });
+      add("text", { x: padL - 6, y: y + 3, "text-anchor": "end" }, useTok(Math.round(max * f)));
+    });
+    var n = daily.length, slot = (W - padL) / Math.max(1, n), bw = Math.max(2, Math.min(28, slot * 0.7));
+    var every = Math.ceil(n / 12);
+    daily.forEach(function (d, i) {
+      var s = d.sum, x = padL + i * slot + (slot - bw) / 2, base = H - padB, scale = (H - padT - padB) / max;
+      [["use-fresh", s.input - s.cached], ["use-cached", s.cached], ["use-out", s.output]].forEach(function (p) {
+        var h = Math.max(0, p[1]) * scale;
+        if (h <= 0) return;
+        var r = add("rect", { x: x, y: base - h, width: bw, height: h, "class": p[0] });
+        var t = document.createElementNS(ns, "title");
+        t.textContent = d.day + " — fresh input " + useTok(s.input - s.cached) + ", cached " + useTok(s.cached) +
+          ", output " + useTok(s.output) + ", " + s.requests + " requests, " + useCost(s.cost, s.unpriced);
+        r.appendChild(t);
+        base -= h;
+      });
+      if (i % every === 0 || i === n - 1) add("text", { x: x + bw / 2, y: H - 4, "text-anchor": "middle" }, d.day.slice(5));
+    });
+    return svg;
+  }
+  function renderUsage() {
+    var d = useData || {};
+    var body = document.getElementById("use-body");
+    body.textContent = "";
+    [].forEach.call(document.querySelectorAll("#use-range button"), function (b) {
+      b.setAttribute("aria-pressed", String(Number(b.dataset.days) === (d.days || 0)));
+    });
+    var t = d.total || { requests: 0, input: 0, cached: 0, output: 0, cost: 0, unpriced: 0 };
+    document.getElementById("use-sub").textContent = t.requests + " request" + (t.requests === 1 ? "" : "s");
+    var kpis = useEl("div", "use-kpis");
+    function kpi(k, v, s, cls) {
+      var e = useEl("div", "use-kpi" + (cls ? " " + cls : ""));
+      e.appendChild(useEl("div", "k", k));
+      e.appendChild(useEl("div", "v", v));
+      if (s) e.appendChild(useEl("div", "s", s));
+      kpis.appendChild(e);
+    }
+    var hit = t.input ? Math.round(100 * t.cached / t.input) : 0;
+    kpi("Cost", useCost(t.cost, t.unpriced), t.unpriced ? t.unpriced + " request(s) have no price yet" : "from your prices below", "cost");
+    kpi("Requests", String(t.requests), "model calls");
+    kpi("Input", useTok(t.input), useTok(t.input - t.cached) + " fresh");
+    kpi("Cached", useTok(t.cached), hit + "% of input from cache");
+    kpi("Output", useTok(t.output), t.requests ? useTok(Math.round(t.output / t.requests)) + " per request" : "");
+    body.appendChild(kpis);
+    if (!t.requests) {
+      body.appendChild(useEl("div", "use-empty", "No model requests in this range yet. They show here from now on."));
+    } else {
+      var chart = useEl("div", "use-panel use-chart");
+      var h = chart.appendChild(useEl("h3", null, "Tokens per day"));
+      h.appendChild(useEl("small", null, "hover a bar for the details"));
+      var lg = chart.appendChild(useEl("div", "use-legend"));
+      [["use-fresh", "Fresh input"], ["use-cached", "Cached input"], ["use-out", "Output"]].forEach(function (p) {
+        var s = useEl("span");
+        s.appendChild(useEl("i", p[0]));
+        s.appendChild(document.createTextNode(p[1]));
+        lg.appendChild(s);
+      });
+      chart.appendChild(useChart(d.daily || []));
+      body.appendChild(chart);
+      var cols = ["Requests", "Input", "Cached", "Output", "Cost", "Share"];
+      var two = useEl("div", "use-two");
+      var pp = useEl("div", "use-panel");
+      var ph = pp.appendChild(useEl("h3", null, "What used the tokens"));
+      ph.appendChild(useEl("small", null, "chat, spec, final check, review, mission…"));
+      pp.appendChild(useTable(["Purpose"].concat(cols), useGroupRows(d.purposes || [], t)));
+      two.appendChild(pp);
+      var mp = useEl("div", "use-panel");
+      mp.appendChild(useEl("h3", null, "By model"));
+      mp.appendChild(useTable(["Model"].concat(cols), useGroupRows(d.models || [], t)));
+      two.appendChild(mp);
+      body.appendChild(two);
+      var cp = useEl("div", "use-panel");
+      var ch = cp.appendChild(useEl("h3", null, "By chat"));
+      ch.appendChild(useEl("small", null, "the 15 that cost the most"));
+      cp.appendChild(useTable(["Chat"].concat(cols), useGroupRows(d.chats || [], t)));
+      body.appendChild(cp);
+      var rp = useEl("div", "use-panel");
+      var rh = rp.appendChild(useEl("h3", null, "Recent requests"));
+      rh.appendChild(useEl("small", null, "newest first, last 100"));
+      var rows = (d.recent || []).map(function (r) {
+        var when = new Date(r.ts);
+        return useRow([
+          { text: when.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " " +
+            when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }), cls: "dim" },
+          { text: r.chat || "—", cls: "name" }, r.purpose, r.model,
+          useTok(r.input), useTok(r.cached), useTok(r.output), useCost(r.cost, false)
+        ]);
+      });
+      var sc = useEl("div", "use-scroll");
+      sc.appendChild(useTable(["When", "Chat", "Purpose", "Model", "Input", "Cached", "Output", "Cost"], rows));
+      rp.appendChild(sc);
+      body.appendChild(rp);
+    }
+    var pr = useEl("div", "use-panel");
+    var prh = pr.appendChild(useEl("h3", null, "Prices"));
+    prh.appendChild(useEl("small", null, "US$ per 1 million tokens, from your provider's price list"));
+    var prows = (d.prices || []).map(function (p) {
+      var cur = p.price || {};
+      var ins = ["input", "cached", "output"].map(function (k) {
+        var i = useEl("input");
+        i.type = "number"; i.min = "0"; i.step = "any"; i.dataset.k = k;
+        i.value = cur[k] != null ? String(cur[k]) : "";
+        i.placeholder = "0";
+        i.setAttribute("aria-label", p.model + " " + k + " price");
+        return i;
+      });
+      var save = useEl("button", null, "Save");
+      save.type = "button";
+      save.addEventListener("click", function () {
+        var v = {};
+        ins.forEach(function (i) { v[i.dataset.k] = Number(i.value || 0); });
+        postToRust({ type: "set_price", model: p.model, input: v.input, cached: v.cached, output: v.output });
+      });
+      return useRow([{ text: p.model, cls: "name" }, ins[0], ins[1], ins[2], save]);
+    });
+    if (prows.length) pr.appendChild(useTable(["Model", "Input", "Cached input", "Output", ""], prows));
+    else pr.appendChild(useEl("div", "use-empty", "Models show here after their first request."));
+    if (d.older_requests) {
+      pr.appendChild(useEl("p", "use-note", d.older_requests + " earlier request(s) in this range were counted " +
+        "before this dashboard existed: they are in /usage, without model or purpose."));
+    }
+    body.appendChild(pr);
+  }
+  window.showUsage = function (data) {
+    useData = data || {};
+    useDays = useData.days || 0;
+    var box = document.getElementById("usage");
+    if (box.hidden) { box.hidden = false; overlayHooks.open(); }
+    renderUsage();
+  };
+  function openUsage(days) {
+    if (days != null) useDays = days;
+    postToRust({ type: "load_usage", days: useDays || null });
+  }
+  function closeUsage() {
+    var box = document.getElementById("usage");
+    if (!box || box.hidden) return;
+    box.hidden = true;
+    overlayHooks.close();
+  }
   function closeChanges() {
     var box = document.getElementById("changes");
     if (!box || box.hidden) return;
@@ -4785,6 +5073,18 @@
     if (changesBtn) changesBtn.addEventListener("click", function () { postToRust({ type: "load_changes" }); });
     document.getElementById("chg-refresh").addEventListener("click", function () { postToRust({ type: "load_changes" }); });
     document.getElementById("chg-close").addEventListener("click", closeChanges);
+    document.getElementById("set-usage").addEventListener("click", function () { closeSettings(); openUsage(); });
+    document.getElementById("use-close").addEventListener("click", closeUsage);
+    document.getElementById("use-refresh").addEventListener("click", function () { openUsage(); });
+    [].forEach.call(document.querySelectorAll("#use-range button"), function (b) {
+      b.addEventListener("click", function () { openUsage(Number(b.dataset.days)); });
+    });
+    document.getElementById("usage").addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") { ev.preventDefault(); closeUsage(); }
+    });
+    document.getElementById("usage").addEventListener("click", function (ev) {
+      if (ev.target.id === "usage") closeUsage();
+    });
     document.getElementById("changes").addEventListener("keydown", function (ev) {
       if (ev.key === "Escape") { ev.preventDefault(); closeChanges(); }
     });

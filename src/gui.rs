@@ -102,6 +102,10 @@ pub struct GuiState {
     pub attach: (u64, Vec<String>),
     /// The Changes view waiting to be sent to the page (JSON), once.
     pub changes_out: std::cell::RefCell<Option<String>>,
+    /// The token usage dashboard waiting to be sent (JSON), once, and the
+    /// range it shows (days; `None` = all time) for a refresh.
+    pub usage_out: std::cell::RefCell<Option<String>>,
+    pub usage_days: Option<i64>,
     /// New (B-37): the entries as the page last received them, and for which
     /// chat, so a paint only sends what changed. `RefCell` because painting
     /// only has `&GuiState`.
@@ -226,6 +230,8 @@ impl Default for GuiState {
             settings: GuiSettings::default(),
             attach: (0, Vec::new()),
             changes_out: std::cell::RefCell::new(None),
+            usage_out: std::cell::RefCell::new(None),
+            usage_days: Some(7),
             sent: std::cell::RefCell::new(Vec::new()),
             sent_session: std::cell::RefCell::new(None),
         }
@@ -951,6 +957,10 @@ pub enum IpcMsg {
     PickFiles,
     /// Open the Changes view (the project's diff).
     LoadChanges,
+    /// Open the token usage dashboard for the last N days (`None` = all time).
+    LoadUsage(Option<i64>),
+    /// Set a model's price per 1M tokens (dashboard).
+    SetPrice { model: String, price: crate::db::Price },
     /// Make a new git branch in the chat's project and switch to it.
     NewBranch(String),
     /// Terminal panel: shown or hidden.
@@ -1057,6 +1067,15 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "export" => Some(IpcMsg::Export),
         "pick_files" => Some(IpcMsg::PickFiles),
         "load_changes" => Some(IpcMsg::LoadChanges),
+        "load_usage" => Some(IpcMsg::LoadUsage(v.get("days").and_then(serde_json::Value::as_i64).filter(|d| *d > 0))),
+        "set_price" => {
+            let model = v.get("model")?.as_str()?.trim().to_string();
+            let n = |k: &str| v.get(k).and_then(serde_json::Value::as_f64).filter(|x| x.is_finite() && *x >= 0.0);
+            (!model.is_empty()).then_some(IpcMsg::SetPrice {
+                model,
+                price: crate::db::Price { input: n("input")?, cached: n("cached")?, output: n("output")? },
+            })
+        }
         "term_open" => Some(IpcMsg::TermOpen(v.get("open")?.as_bool()?)),
         "term_run" => {
             let c = v.get("command")?.as_str()?.trim().to_string();
@@ -1188,6 +1207,9 @@ fn paint(webview: &wry::WebView, gs: &GuiState) {
     if let Some(json) = gs.changes_out.borrow_mut().take() {
         let _ = webview.evaluate_script(&format!("window.showChanges&&window.showChanges({json})"));
     }
+    if let Some(json) = gs.usage_out.borrow_mut().take() {
+        let _ = webview.evaluate_script(&format!("window.showUsage&&window.showUsage({json})"));
+    }
 }
 
 /// New (S-18): may the main window go to `uri`? Only our own page: WebView2
@@ -1278,6 +1300,11 @@ pub fn is_local_url(url: &str) -> bool {
 
 /// New (B-42): the newest chat, if it has no messages yet (reuse it instead of
 /// creating another empty "New chat").
+/// Milliseconds since 1970 (the usage log's clock).
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
 /// Where plain chats work. The start folder, unless it is no project: Habi's
 /// own source (`cargo run` there put a user's mission into this code), the
 /// folder the program sits in, the home folder, a system folder or a drive
@@ -2684,6 +2711,20 @@ pub async fn run(
                             *gs.changes_out.borrow_mut() = Some(json.to_string());
                             changed = true;
                         }
+                        UiMsg::Ipc(IpcMsg::LoadUsage(days)) => {
+                            gs.usage_days = days;
+                            let json = crate::usage::dashboard(&st.db, days, epoch_ms());
+                            *gs.usage_out.borrow_mut() = Some(json.to_string());
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::SetPrice { model, price }) => {
+                            if let Err(e) = st.db.set_price(&model, price) {
+                                gs.push(EntryKind::Error, format!("saving the price failed: {e}"));
+                            }
+                            let json = crate::usage::dashboard(&st.db, gs.usage_days, epoch_ms());
+                            *gs.usage_out.borrow_mut() = Some(json.to_string());
+                            changed = true;
+                        }
                         UiMsg::Ipc(IpcMsg::ReviewComments(comments)) => {
                             if !comments.is_empty() {
                                 gs.input = crate::changes::comments_message(&comments);
@@ -2961,6 +3002,9 @@ pub async fn run(
             Event::LoopDestroyed => {
                 eprintln!("[gui] window closed — exiting");
                 notify_cleanup(&window);
+                // The event loop never returns, so main's stop_all is never
+                // reached: dev servers the agent started would outlive the window.
+                crate::tools::jobs::stop_all_now();
                 *control_flow = ControlFlow::Exit;
             }
             _ => {}
@@ -3609,6 +3653,14 @@ mod tests {
             Some(IpcMsg::NewInProject("prj_1".into()))
         );
         assert_eq!(parse_ipc(r#"{"type":"add_project"}"#), Some(IpcMsg::AddProject(None)));
+        // Usage dashboard: a range in days (none = all time) and prices.
+        assert_eq!(parse_ipc(r#"{"type":"load_usage","days":7}"#), Some(IpcMsg::LoadUsage(Some(7))));
+        assert_eq!(parse_ipc(r#"{"type":"load_usage","days":null}"#), Some(IpcMsg::LoadUsage(None)));
+        assert_eq!(
+            parse_ipc(r#"{"type":"set_price","model":"gpt-6-sol","input":2,"cached":0.5,"output":8}"#),
+            Some(IpcMsg::SetPrice { model: "gpt-6-sol".into(), price: crate::db::Price { input: 2.0, cached: 0.5, output: 8.0 } })
+        );
+        assert_eq!(parse_ipc(r#"{"type":"set_price","model":"m","input":-1,"cached":0,"output":0}"#), None, "no negative prices");
         assert_eq!(
             parse_ipc(r#"{"type":"add_project","path":"C:/code/app"}"#),
             Some(IpcMsg::AddProject(Some("C:/code/app".into())))

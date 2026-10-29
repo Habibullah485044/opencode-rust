@@ -112,7 +112,7 @@ pub fn model_sees_images(setting: &str, model: &str) -> bool {
         "off" => false,
         _ => {
             let m = model.to_ascii_lowercase();
-            ["vl", "vision", "gpt-4o", "gpt-4.1", "gpt-5", "claude", "gemini", "llava", "pixtral", "gemma-3", "omni"]
+            ["vl", "vision", "gpt-4o", "gpt-4.1", "gpt-5", "gpt-6", "gpt-7", "claude", "gemini", "llava", "pixtral", "gemma-3", "omni"]
                 .iter()
                 .any(|k| m.contains(k))
         }
@@ -124,7 +124,39 @@ pub fn model_sees_images(setting: &str, model: &str) -> bool {
 /// are not resent with every later request.
 pub fn attach_images(body: &mut serde_json::Value) {
     let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else { return };
-    let Some(last) = msgs.iter_mut().rev().find(|m| m["role"] == "user") else { return };
+    // Screenshots from the latest tool results (`check_page` with look,
+    // `browser_screenshot`): a tool message cannot carry an image, so they
+    // follow as a user note. Only the latest results: older pictures are not
+    // resent with every request.
+    let last_assistant = msgs.iter().rposition(|m| m["role"] == "assistant");
+    let shots: Vec<String> = match last_assistant {
+        Some(i) => msgs[i + 1..]
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str())
+            .flat_map(image_paths)
+            .filter_map(|p| data_url(&p))
+            .collect(),
+        None => Vec::new(),
+    };
+    if !shots.is_empty() {
+        let mut parts = vec![serde_json::json!({
+            "type": "text",
+            "text": "[app] The screenshots from the tool results above, so you can see them:"
+        })];
+        parts.extend(shots.into_iter().map(|url| serde_json::json!({ "type": "image_url", "image_url": { "url": url } })));
+        msgs.push(serde_json::json!({ "role": "user", "content": parts }));
+        return;
+    }
+    // The user's own message: not an `[app]` note (a server without a system
+    // role gets the instructions as one at the end, found by the audit).
+    let Some(last) = msgs
+        .iter_mut()
+        .rev()
+        .find(|m| m["role"] == "user" && !m["content"].as_str().is_some_and(|t| t.starts_with("[app]")))
+    else {
+        return;
+    };
     let Some(text) = last["content"].as_str().map(str::to_string) else { return };
     let images: Vec<String> = image_paths(&text).iter().filter_map(|p| data_url(p)).collect();
     if images.is_empty() {
@@ -168,8 +200,23 @@ mod tests {
         assert!(body["messages"][0]["content"].is_string(), "older messages stay text");
 
         assert!(model_sees_images("auto", "nvidia/nemotron-3.5-super-vl:free"));
+        assert!(model_sees_images("auto", "gpt-6-sol"), "the gpt-6 models take images");
         assert!(!model_sees_images("auto", "deepseek/deepseek-chat"));
         assert!(!model_sees_images("off", "gpt-4o"));
+
+        // A screenshot named in the latest tool result reaches the model as
+        // an image in a user note (a tool message cannot carry one).
+        let mut body = serde_json::json!({"messages": [
+            {"role": "user", "content": "build the page"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": format!("check_page: ok\n[image: {}]", shot.display())}
+        ]});
+        attach_images(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4, "a note with the picture follows the tool result");
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(msgs[3]["content"][1]["type"], "image_url");
+        assert!(msgs[2]["content"].is_string(), "the tool result itself stays text");
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

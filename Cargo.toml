@@ -55,14 +55,16 @@ wry = { version = "0.57", optional = true }
 # or wry's ICoreWebView2 and ours are different types.
 [target.'cfg(windows)'.dependencies]
 webview2-com = { version = "0.39", optional = true }
-windows = { version = "0.62", optional = true, features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Security_Cryptography"] }
+# Not optional: background jobs run in a Job Object (tools.rs), with or
+# without the GUI.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Security_Cryptography", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [features]
 # `gui` = the desktop window (`--gui`) and the `preview` subcommand.
 # Without it (`cargo build --no-default-features`) the crate needs no
 # GTK/WebKit on Linux; the terminal UI and headless mode still work.
 default = ["gui"]
-gui = ["dep:tao", "dep:wry", "dep:webview2-com", "dep:windows"]
+gui = ["dep:tao", "dep:wry", "dep:webview2-com"]
 
 [profile.release]
 opt-level = "z"

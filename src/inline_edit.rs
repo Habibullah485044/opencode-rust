@@ -86,7 +86,7 @@ pub async fn propose(
     let old = std::fs::read_to_string(&abs)
         .with_context(|| format!("reading {} (not UTF-8 text?)", abs.display()))?;
     let user = format!("FILE: {path}\n\n<file>\n{old}\n</file>\n\nINSTRUCTION: {instruction}");
-    let raw = one_shot(st, SYSTEM, &user, abort, false).await?;
+    let raw = crate::server::tagged("inline edit", "", one_shot(st, SYSTEM, &user, abort, false)).await?;
     let new = finish_reply(&raw, &old);
     if new == old {
         bail!("model returned the file unchanged");

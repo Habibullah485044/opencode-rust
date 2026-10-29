@@ -136,15 +136,24 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "browser_screenshot",
-            "Save a PNG of what the preview panel shows right now and return its file path \
-             and size (Windows desktop app only). You cannot see the image; use it to hand \
-             the user a file.",
+            "Take a PNG of what the preview panel shows right now (Windows desktop app). You \
+             see the image if your model takes images: look at it to judge the design.",
             json!({"type":"object","properties":{}}),
         ),
     ]
 }
 
 /// Dispatch one `browser_*` tool call. `None` = not ours.
+/// A screenshot result with its picture named as `[image: path]`: the
+/// request builder sends it to a model that takes images (it used to get
+/// only the path, and a note that it could not see it).
+fn with_image(out: &str) -> String {
+    match serde_json::from_str::<Value>(out).ok().and_then(|v| v["path"].as_str().map(str::to_string)) {
+        Some(path) => format!("{out}\n[image: {path}]"),
+        None => out.to_string(),
+    }
+}
+
 pub async fn execute(
     handle: &Handle,
     name: &str,
@@ -196,7 +205,7 @@ pub async fn execute(
                 .call("wait", json!({ "selector": selector, "text": text, "ms": ms }))
                 .await
         }
-        "browser_screenshot" => handle.call("screenshot", json!({})).await,
+        "browser_screenshot" => handle.call("screenshot", json!({})).await.map(|out| with_image(&out)),
         "browser_press" => {
             let key = input.get("key").and_then(Value::as_str).unwrap_or("").trim();
             if key.is_empty() {

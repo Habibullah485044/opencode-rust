@@ -314,6 +314,10 @@ pub struct AgentCfg {
     /// After a run with a spec, make the model prove each done-when item
     /// with tool calls and fix what fails (one fix round at most).
     pub final_check: bool,
+    /// After a run that changed a web page: show the model desktop and phone
+    /// screenshots of it and have it judge and fix the design by eye. Needs a
+    /// model that takes images (`provider.images`).
+    pub design_review: bool,
     /// F-05: give each `worker` subagent and team worker its own git
     /// worktree. Their changes come back as a patch file instead of landing
     /// in the workspace. Off by default.
@@ -371,6 +375,7 @@ impl Default for AgentCfg {
             auto_review: true,
             sharpen: true,
             final_check: true,
+            design_review: true,
             reuse_gate: true,
             context_tokens: 0,
         }

@@ -135,6 +135,23 @@ pub fn find_browser() -> Option<PathBuf> {
 /// and the extras are switched off. Outside hosts do not resolve: the check
 /// is fast, private and the same every time (web fonts fall back).
 async fn dump_dom(exe: &Path, url: &str, timeout: Duration) -> Result<String> {
+    headless(exe, url, timeout, Capture::Dom).await
+}
+
+/// Save a PNG of `url` in a `width` x `height` window at `out`.
+async fn screenshot(exe: &Path, url: &str, out: &Path, width: u32, height: u32) -> Result<()> {
+    // A busy machine sometimes makes Edge quit without saving: one more try.
+    let mut last = None;
+    for _ in 0..2 {
+        match headless(exe, url, Duration::from_secs(120), Capture::Shot { out, width, height }).await {
+            Ok(_) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("no screenshot")).context(format!("screenshot of {url}")))
+}
+
+async fn headless(exe: &Path, url: &str, timeout: Duration, capture: Capture<'_>) -> Result<String> {
     static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _turn = ONE_AT_A_TIME.lock().await;
     // The lock above is per process. Another Habi (the GUI next to a
@@ -153,14 +170,34 @@ async fn dump_dom(exe: &Path, url: &str, timeout: Duration) -> Result<String> {
     } else {
         std::env::temp_dir().join(format!("opencode-rust-pagecheck-profile-{}", std::process::id()))
     };
-    let dom = dump_dom_with(exe, url, timeout, &profile).await;
+    let out = run_headless(exe, url, timeout, &profile, capture).await;
+    // Edge's helper processes outlive the main one for a moment and keep the
+    // profile. A run started meanwhile hands its job to that dying instance
+    // and quits with nothing done (seen: the phone screenshot right after the
+    // desktop one, on a busy machine). Wait until the profile is free.
+    let lockfile = profile.join("lockfile");
+    for _ in 0..50 {
+        if !lockfile.exists() || std::fs::remove_file(&lockfile).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     if lock.is_none() {
         let _ = std::fs::remove_dir_all(&profile);
     }
-    dom
+    out
 }
 
-async fn dump_dom_with(exe: &Path, url: &str, timeout: Duration, profile: &Path) -> Result<String> {
+/// What one headless browser run produces.
+#[derive(Clone, Copy)]
+enum Capture<'a> {
+    /// The final DOM, printed.
+    Dom,
+    /// A PNG of the window (`width` x `height`) saved at `out`.
+    Shot { out: &'a Path, width: u32, height: u32 },
+}
+
+async fn run_headless(exe: &Path, url: &str, timeout: Duration, profile: &Path, capture: Capture<'_>) -> Result<String> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args([
         "--headless=new",
@@ -175,12 +212,15 @@ async fn dump_dom_with(exe: &Path, url: &str, timeout: Duration, profile: &Path)
         "--hide-scrollbars",
         "--mute-audio",
         "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE localhost , EXCLUDE 127.0.0.1",
-        "--virtual-time-budget=4000",
-        "--window-size=1600,1000",
     ])
-    .arg(format!("--user-data-dir={}", profile.display()))
-    .arg("--dump-dom")
-    .arg(url)
+    .arg(format!("--user-data-dir={}", profile.display()));
+    match capture {
+        Capture::Dom => cmd.args(["--virtual-time-budget=4000", "--window-size=1600,1000", "--dump-dom"]),
+        Capture::Shot { out, width, height } => {
+            cmd.arg(format!("--window-size={width},{height}")).arg(format!("--screenshot={}", out.display()))
+        }
+    };
+    cmd.arg(url)
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped())
@@ -189,7 +229,14 @@ async fn dump_dom_with(exe: &Path, url: &str, timeout: Duration, profile: &Path)
     let out = tokio::time::timeout(timeout, child.wait_with_output()).await;
     let out = out.map_err(|_| anyhow!("the browser did not finish within {}s", timeout.as_secs()))??;
     let dom = String::from_utf8_lossy(&out.stdout).into_owned();
-    if dom.trim().is_empty() {
+    if let Capture::Shot { out: file, .. } = capture {
+        if !file.is_file() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let tail: String = err.trim().chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
+            bail!("the browser saved no screenshot ({}): {tail}", out.status);
+        }
+    }
+    if matches!(capture, Capture::Dom) && dom.trim().is_empty() {
         // e.g. Linux without a usable sandbox: say why instead of "no probe result".
         let err = String::from_utf8_lossy(&out.stderr);
         let tail: String = err.trim().chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
@@ -207,19 +254,35 @@ struct Preview {
 
 static PREVIEW: tokio::sync::OnceCell<Arc<Preview>> = tokio::sync::OnceCell::const_new();
 
+/// Serve `app` on its own thread and runtime. These servers are kept for
+/// the life of the process (their address is remembered); spawned on the
+/// caller's runtime they died with it, and every later check got
+/// "connection refused" (seen in the tests, where each test has a runtime).
+fn serve_forever(listener: std::net::TcpListener, app: axum::Router) -> Result<()> {
+    listener.set_nonblocking(true)?;
+    std::thread::Builder::new().name("habi-pagecheck-server".into()).spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+        rt.block_on(async move {
+            if let Ok(listener) = tokio::net::TcpListener::from_std(listener) {
+                let _ = axum::serve(listener, app).await;
+            }
+        });
+    })?;
+    Ok(())
+}
+
 async fn preview() -> Result<Arc<Preview>> {
     PREVIEW
         .get_or_try_init(|| async {
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
             let addr = listener.local_addr()?;
             let p = Arc::new(Preview { addr, roots: Mutex::new(HashMap::new()) });
             let app = axum::Router::new()
                 .route("/p/{token}/{*path}", axum::routing::get(serve_file))
                 .route("/c/{token}/{*path}", axum::routing::get(serve_harness))
+                .route("/frame", axum::routing::get(serve_frame))
                 .with_state(p.clone());
-            tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
-            });
+            serve_forever(listener, app)?;
             Ok::<_, anyhow::Error>(p)
         })
         .await
@@ -327,6 +390,21 @@ async fn serve_file(
         .into_response()
 }
 
+/// `/frame?w=390&h=1500&src=<url>`: the page in a frame of that width.
+/// Headless Edge lays a window out at least ~490px wide even when asked for
+/// 390 (and then crops the picture), so a phone screenshot frames the page.
+async fn serve_frame(axum::extract::RawQuery(query): axum::extract::RawQuery) -> Resp {
+    use axum::response::IntoResponse;
+    let q = query.unwrap_or_default();
+    let num = |k: &str, d: u32| q.split('&').find_map(|kv| kv.strip_prefix(k)).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (w, h) = (num("w=", 390), num("h=", 1500));
+    let src = q.split_once("src=").map_or("", |(_, s)| s).replace('"', "%22");
+    let html = format!(
+        "<!doctype html><html><body style=\"margin:0;background:#fff\"><iframe src=\"{src}\" width=\"{w}\" height=\"{h}\" style=\"border:0;display:block\"></iframe></body></html>"
+    );
+    ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+}
+
 /// One iframe per width (`?w=375,1440`); each frame reports to `__report`.
 async fn serve_harness(
     axum::extract::Path((token, path)): axum::extract::Path<(String, String)>,
@@ -385,15 +463,13 @@ async fn app_proxy(origin: &str) -> Result<std::net::SocketAddr> {
     if let Some(addr) = map.lock().unwrap_or_else(|e| e.into_inner()).get(origin) {
         return Ok(*addr);
     }
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     let addr = listener.local_addr()?;
     let app = axum::Router::new()
         .route(PROXY_HARNESS, axum::routing::get(proxy_harness))
         .fallback(proxy_pass)
         .with_state(Arc::new(AppProxy { origin: origin.to_string() }));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    serve_forever(listener, app)?;
     map.lock().unwrap_or_else(|e| e.into_inner()).insert(origin.to_string(), addr);
     Ok(addr)
 }
@@ -490,6 +566,43 @@ async fn app_running(origin: &str) -> bool {
     client.get(origin).send().await.is_ok()
 }
 
+/// Desktop (1440px) and phone (390px) screenshots of a page, saved in `dir`
+/// as `<name>-desktop.png` and `<name>-phone.png`. `raw` is what check_page
+/// takes: a file in `root`, or the URL of a running app. These are what the
+/// model looks at to judge the design (the probe only reads the DOM).
+pub async fn page_shots(root: &Path, raw: &str, dir: &Path) -> Result<Vec<PathBuf>> {
+    let exe = find_browser().ok_or_else(|| {
+        anyhow!("no Edge or Chrome found to take screenshots with (set OPENCODE_RUST_BROWSER to its path)")
+    })?;
+    let url = match local_app_url(raw) {
+        Some((origin, path)) if app_running(&origin).await => format!("{origin}{path}"),
+        _ => {
+            let page = page_arg(root, raw)?;
+            if !crate::tools::confine_path(root, &page)?.is_file() {
+                return Err(missing_page(root, &page));
+            }
+            page_url(root, &page).await?
+        }
+    };
+    std::fs::create_dir_all(dir)?;
+    let name: String = raw
+        .trim_start_matches("http://")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(40)
+        .collect();
+    let name = if name.is_empty() { "page".to_string() } else { name };
+    let desktop = dir.join(format!("{name}-desktop.png"));
+    screenshot(&exe, &url, &desktop, 1440, 1600).await?;
+    let p = preview().await?;
+    let phone = dir.join(format!("{name}-phone.png"));
+    screenshot(&exe, &format!("http://{}/frame?w=390&h=1500&src={url}", p.addr), &phone, 390, 1500).await?;
+    Ok(vec![desktop, phone])
+}
+
 /// Check the page at `path` of the app running at `origin`, through the proxy.
 pub async fn check_app(origin: &str, path: &str, widths: &[u32], expect: &[String]) -> Result<Report> {
     let exe = find_browser().ok_or_else(|| {
@@ -511,7 +624,11 @@ addEventListener('error',function(e){var t=e.target;if(t&&t!==window&&(t.src||t.
 else{__errs.push(String(e.message||'error'))}},true);\
 addEventListener('unhandledrejection',function(e){__errs.push('unhandled promise rejection: '+e.reason)});\
 (function(){var ce=console.error;console.error=function(){try{__errs.push([].map.call(arguments,String).join(' '))}catch(x){}\
-return ce.apply(console,arguments)}})();</script>";
+return ce.apply(console,arguments)}})();\
+window.__inflight=0;(function(){var f=window.fetch;if(f){window.fetch=function(){__inflight++;\
+return f.apply(this,arguments).finally(function(){__inflight--})}}\
+var o=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){__inflight++;\
+this.addEventListener('loadend',function(){__inflight--});return o.apply(this,arguments)}})();</script>";
 
 /// Runs after the page's own scripts. Every finding is written as a sentence
 /// the model can act on.
@@ -569,9 +686,16 @@ function run(){
  if(window.parent&&window.parent!==window&&window.parent.__report){window.parent.__report(o)}
  else{var sc=document.createElement('script');sc.type='application/json';sc.id='__probe';sc.textContent=JSON.stringify(o);document.body.appendChild(sc);}
 }
-function later(){setTimeout(function(){try{run()}catch(e){var o={w:innerWidth,problems:['the page check itself failed: '+e],ok:[],text:''};
- if(window.parent&&window.parent.__report)window.parent.__report(o)}},900)}
-if(document.readyState==='loading')addEventListener('DOMContentLoaded',later);else later();
+// After 0.9 s, and once the page's own requests (an app's API) are answered,
+// at most 6 s: judging the page before its data arrives judges half a page.
+// A request counts as done when its headers arrive, before the page reads
+// the body and draws it: so wait for 300 ms with nothing in flight.
+function later(){var t0=Date.now(),quiet=0;(function wait(){if((window.__inflight||0)>0)quiet=0;else quiet+=100;
+ if(quiet<300&&Date.now()-t0<6000){setTimeout(wait,100);return}
+ try{run()}catch(e){var o={w:innerWidth,problems:['the page check itself failed: '+e],ok:[],text:''};
+ if(window.parent&&window.parent.__report)window.parent.__report(o)}})()}
+function start(){setTimeout(later,900)}
+if(document.readyState==='loading')addEventListener('DOMContentLoaded',start);else start();
 })();</script>"#;
 
 fn inject_probe(html: &str) -> String {
@@ -746,7 +870,21 @@ pub async fn run_tool(root: &Path, input: &Value) -> Result<(String, Report)> {
         Some((origin, path)) if app_running(&origin).await => check_app(&origin, &path, &widths, &expect).await?,
         _ => check(root, &page_arg(root, raw)?, &widths, &expect).await?,
     };
-    Ok((report.render(), report))
+    let mut text = report.render();
+    // `look`: the pictures too, so the model judges the design by eye.
+    if input.get("look").and_then(Value::as_bool).unwrap_or(false) {
+        let dir = crate::server::scratch_dir(root).join("shots");
+        match page_shots(root, raw, &dir).await {
+            Ok(shots) => {
+                text.push_str("\nScreenshots (desktop 1440px, phone 390px):");
+                for s in shots {
+                    text.push_str(&format!("\n[image: {}]", s.display()));
+                }
+            }
+            Err(e) => text.push_str(&format!("\nNo screenshots: {e:#}")),
+        }
+    }
+    Ok((text, report))
 }
 
 fn web_ext(p: &Path) -> &'static str {
@@ -816,6 +954,29 @@ pub fn recently_modified(root: &Path, since: std::time::SystemTime) -> Vec<PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pictures the model judges: real PNGs at desktop and phone width
+    /// (the phone one laid out at 390px, not cropped from a wider window).
+    #[tokio::test]
+    async fn screenshots_are_taken_at_desktop_and_phone_width() {
+        if find_browser().is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ocrs-shots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), "<!doctype html><title>t</title><body style=\"margin:0\"><h1>Hello</h1></body>").unwrap();
+        let shots = page_shots(&dir, "index.html", &dir.join("shots")).await.unwrap();
+        let size = |p: &Path| {
+            let b = std::fs::read(p).unwrap();
+            (u32::from_be_bytes([b[16], b[17], b[18], b[19]]), u32::from_be_bytes([b[20], b[21], b[22], b[23]]))
+        };
+        assert_eq!(shots.len(), 2);
+        assert_eq!(size(&shots[0]), (1440, 1600), "desktop");
+        assert_eq!(size(&shots[1]), (390, 1500), "phone");
+        let (text, _) = run_tool(&dir, &serde_json::json!({"path": "index.html", "look": true})).await.unwrap();
+        assert_eq!(crate::attachments::image_paths(&text).len(), 2, "look: true names both pictures: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn local_app_urls_are_told_apart() {

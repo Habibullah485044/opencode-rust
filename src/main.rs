@@ -373,7 +373,7 @@ async fn headless_run(
                 if skills.is_empty() {
                     println!("[skills] none found");
                 } else {
-                    println!("{}", opencode_rust::skills::skill_index(&skills));
+                    println!("{}", opencode_rust::skills::skill_menu(&skills));
                 }
                 return Ok(());
             }
@@ -1071,7 +1071,7 @@ async fn tui_run(
                         } else {
                             format!(
                                 "[skills]\n{}\n",
-                                opencode_rust::skills::skill_index(&skills)
+                                opencode_rust::skills::skill_menu(&skills)
                             )
                         };
                         let _ = st.events.send(server::ServerEvent::AssistantDelta {

@@ -1,0 +1,28 @@
+Skills shipped with Habi (opencode-rust)
+=========================================
+
+build-anything/ is Habi's own (it vendors MCode Stack and REA under
+build-anything/references/, with their licences and SOURCE.txt files).
+
+From https://github.com/anthropics/skills (commit ca45fc496a3436251f191354091d557da31c15b5),
+Apache License 2.0 (each skill's LICENSE.txt):
+  algorithmic-art, canvas-design, claude-api, doc-coauthoring,
+  frontend-design, internal-comms, mcp-builder, skill-creator,
+  slack-gif-creator, theme-factory, web-artifacts-builder, webapp-testing
+Not included: docx, pdf, pptx, xlsx (source-available, all rights reserved
+by Anthropic, not licensed for redistribution) and academy-guide,
+brand-guidelines, discernment-nudge (about Claude's own products and chat
+behaviour, not coding work).
+
+From https://github.com/obra/superpowers (commit 2ce8aa15d05bd57213e6f746f953aafb7ded7a8b),
+MIT License, Copyright (c) Jesse Vincent (LICENSE-superpowers.txt):
+  brainstorming, diagnosing-superpowers, dispatching-parallel-agents,
+  executing-plans, finishing-a-development-branch, receiving-code-review,
+  requesting-code-review, subagent-driven-development, systematic-debugging,
+  test-driven-development, using-git-worktrees, using-superpowers,
+  verification-before-completion, writing-plans, writing-skills
+
+These skills were written for Claude Code. Habi maps their tool names in
+its system prompt: Skill tool = read that SKILL.md, TodoWrite = todo,
+Task/subagent = spawn, Bash/Read/Write/Edit/Grep/Glob = Habi's tools.
+Habi's spec step picks the 1-3 skills that fit each task.

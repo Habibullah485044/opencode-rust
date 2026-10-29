@@ -362,7 +362,10 @@ three-icon feature row.\n\
 - One message and one main action per section; a large display size in the type scale; \
 generous space; vary section layouts (split, grid, full-bleed) instead of stacking centred \
 blocks. Hover and focus states, consistent radius and shadow, a <title>, alt text.\n\
-- The smallest-change rule is about code, never about this finish: lean code, full design.";
+- The smallest-change rule is about code, never about this finish: lean code, full design.\n\
+- Never the AI look: one coloured italic word in the headline, an uppercase label above it, \
+round stamp badges, cream and serif as the default, \"Made with love\" copy. An app opens on \
+its working screen, not a marketing hero. check_page with look: true shows you the page.";
 
 /// True when a request is about building or changing a web page.
 pub fn is_web_task(text: &str) -> bool {
@@ -478,9 +481,10 @@ pub fn compose_system(p: PromptInputs<'_>) -> String {
             "\n\n## Skills\n\n\
              These are all of your skills; the list is already complete, so answer \
              questions about what you can do from it instead of running commands to \
-             look for skills. Read a skill's file only when you are about to use it.\n\
-             Skill files live in `{}/.opencode/skills/`, except a skill shown with a path \
-             in brackets: read that path. Files a skill mentions sit next to its SKILL.md.\n\n",
+             look for skills. Read a skill's file only when you are about to use it: \
+             `{}/.opencode/skills/<name>/SKILL.md`, or the path in brackets when one is shown. Files a skill mentions sit next to its SKILL.md. Skills written for other \
+             agents name their tools: Skill tool = read that SKILL.md, TodoWrite = todo, \
+             Task/subagent = spawn, Bash = bash, Read/Write/Edit/Grep/Glob = read/write/edit/grep/glob.\n\n",
             p.workspace.display()
         ));
         out.push_str(&skills::skill_index(p.skills));
