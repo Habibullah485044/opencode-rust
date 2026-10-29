@@ -162,6 +162,7 @@ pub(super) async fn run_deep(
                     cached: u.cached,
                     cache_write: u.cache_write,
                     output: u.output,
+                    cost_micros: u.cost_micros,
                 };
                 st.record_usage(session_id, &usage);
             }

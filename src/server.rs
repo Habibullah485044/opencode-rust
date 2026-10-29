@@ -1612,6 +1612,8 @@ impl AppState {
     /// Save one reply's token counts (`/usage`) and tell the UIs. Model calls
     /// outside a chat (planning, edits, summaries) use session "".
     pub fn record_usage(&self, session_id: &str, u: &crate::provider::Usage) {
+        let priced = u.priced(&self.cfg.provider);
+        let u = &priced;
         if let Err(e) = self.db.add_usage(session_id, u) {
             core_log(&format!("[core] saving token usage failed: {e}"));
             return;
@@ -1836,13 +1838,14 @@ impl AppState {
     pub fn usage_report(&self, session_id: &str) -> String {
         let rows = [
             ("This chat", self.db.usage_totals(Some(session_id), None)),
+            ("Today", self.db.usage_totals(None, Some(1))),
             ("Last 7 days", self.db.usage_totals(None, Some(7))),
             ("All time", self.db.usage_totals(None, None)),
         ];
         let mut out = String::from("Token usage (cached = read from the provider's prompt cache)\n");
         out.push_str(&format!(
-            "  {:<12} {:>8} {:>9} {:>17} {:>9}\n",
-            "", "requests", "input", "cached", "output"
+            "  {:<12} {:>8} {:>9} {:>17} {:>9} {:>9}\n",
+            "", "requests", "input", "cached", "output", "cost"
         ));
         let mut week = crate::db::UsageTotals::default();
         for (label, t) in rows {
@@ -1851,13 +1854,20 @@ impl AppState {
                 week = t;
             }
             out.push_str(&format!(
-                "  {:<12} {:>8} {:>9} {:>17} {:>9}\n",
+                "  {:<12} {:>8} {:>9} {:>17} {:>9} {:>9}\n",
                 label,
                 t.requests,
                 short_count(t.input),
                 format!("{} ({}%)", short_count(t.cached), percent(t.cached, t.input)),
                 short_count(t.output),
+                dollars(t.cost_micros),
             ));
+        }
+        if week.requests > 0 && week.cost_micros == 0 {
+            out.push_str(
+                "Cost unknown: OpenRouter reports it; for another provider set price_input and \
+                 price_output (dollars per million tokens) under [provider].\n",
+            );
         }
         if week.requests == 0 {
             out.push_str("No model calls recorded yet.");
@@ -2306,6 +2316,10 @@ pub fn rewind_chat(st: &AppState, session_id: &str, text: &str, skip: usize) -> 
 
 /// Most "do it now" nudges per run.
 const MAX_NUDGES: u32 = 2;
+/// Tools that only look (model router): a step after these may go to the
+/// small model, and a small-model reply that calls anything else is redone
+/// by the main model.
+const READ_ONLY_TOOLS: [&str; 5] = ["read", "list", "glob", "grep", "todo"];
 /// Sent when a reply only announced work. Starts with a marker so it never
 /// counts as the user's words (`first_request`, transcripts).
 pub const NUDGE_TEXT: &str = "[app] You said what you will do but made no tool call, so nothing happened. \
@@ -2491,6 +2505,11 @@ pub async fn run_loop(
     // Replies cut off mid-stream (dropped connection, stall, error frame)
     // that were asked again in this run.
     let mut stream_drops = 0u32;
+    // Model router (`provider.router`): the last step only read, so this
+    // one may go to the small model; `force_strong` after it wanted more.
+    let mut last_read_only = false;
+    let mut force_strong = false;
+    let tool_ws = opts.workspace.clone().unwrap_or_else(|| st.workspace_for(session_id));
     for _step in 0..max_steps {
         if abort.load(Ordering::SeqCst) {
             return Ok("aborted".into());
@@ -2507,7 +2526,19 @@ pub async fn run_loop(
         let mut request_usage: Option<crate::provider::Usage> = None;
         // B-29: copy the client out of the lock; never hold it while waiting.
         let client = st.client.lock().await.clone();
-        let model = opts.model.as_deref().unwrap_or(&client.model);
+        let small = st.cfg.provider.small_model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+        let routed = st.cfg.provider.router
+            && opts.model.is_none()
+            && last_read_only
+            && !force_strong
+            && small.is_some_and(|m| m != client.model);
+        force_strong = false;
+        // A routed reply is held back until it is known to stand: one that
+        // wants to change something is dropped unseen and asked again.
+        let model = match small.filter(|_| routed) {
+            Some(m) => m,
+            None => opts.model.as_deref().unwrap_or(&client.model),
+        };
         // A rate-limit wait can be long: Stop must still end it.
         let mut stream = tokio::select! {
             s = client.stream(model, &msgs, &specs) => match s {
@@ -2599,7 +2630,7 @@ pub async fn run_loop(
                         let tail = text.rfind('<').filter(|&i| "<tool_call>".starts_with(&text[i..]));
                         tail.unwrap_or(text.len())
                     });
-                    if limit > shown {
+                    if limit > shown && !routed {
                         let _ = st.events.send(ServerEvent::AssistantDelta {
                             session_id: session_id.to_string(),
                             text: text[shown..limit].to_string(),
@@ -2609,7 +2640,7 @@ pub async fn run_loop(
                 }
                 StreamEvent::Reasoning(t) => {
                     reasoning.push_str(t);
-                    if opts.emit_activity {
+                    if opts.emit_activity && !routed {
                         let _ = st.events.send(ServerEvent::ReasoningDelta {
                             session_id: session_id.to_string(),
                             text: t.clone(),
@@ -2675,6 +2706,20 @@ pub async fn run_loop(
                 text = rest;
                 calls = found;
             }
+        }
+        // The small model wants to change something: that is the strong
+        // model's job. Nothing of this reply was shown or saved.
+        if routed && calls.iter().any(|(_, n, _)| !READ_ONLY_TOOLS.contains(&n.as_str())) {
+            force_strong = true;
+            continue;
+        }
+        // A routed reply that stands: show the text before its calls now.
+        if routed && !calls.is_empty() && !text.is_empty() {
+            let _ = st.events.send(ServerEvent::AssistantDelta {
+                session_id: session_id.to_string(),
+                text: text.clone(),
+            });
+            shown = text.len();
         }
         // Text held back above that turned out not to be a call: show it now.
         if calls.is_empty() && shown < text.len() && text.is_char_boundary(shown) {
@@ -2836,6 +2881,9 @@ pub async fn run_loop(
         // (Concrete boxed type: a `dyn Future + Send` here deadlocks the
         // auto-trait proof for the run_loop ↔ spawn recursion.)
         let mut spawns = Vec::new();
+        last_read_only = calls.iter().all(|(_, n, _)| READ_ONLY_TOOLS.contains(&n.as_str()));
+        // Files this step wrote or edited, for `agent.check_edits`.
+        let mut edited: Vec<PathBuf> = Vec::new();
         for (id, name, input) in calls {
             let detail = tool_detail_for(st, opts, &name, &input);
             tool_started(st, opts, session_id, &id, &name, &detail);
@@ -2888,6 +2936,13 @@ pub async fn run_loop(
                 Some(m) => (m, false),
                 None => execute_for(st, session_id, opts, &name, &input, abort).await,
             };
+            if ok && matches!(name.as_str(), "write" | "edit") {
+                if let Some(p) = input.get("path").and_then(Value::as_str) {
+                    if let Ok(p) = crate::tools::confine_path(&tool_ws, p) {
+                        edited.push(p);
+                    }
+                }
+            }
             finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
         }
         // Join the parallel spawns; results are recorded in call order.
@@ -2896,6 +2951,21 @@ pub async fn run_loop(
             meta.into_iter().zip(futures::future::join_all(futs).await)
         {
             finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
+        }
+        // Errors in what this step changed go back to the model now, not
+        // after it already reported the work as done.
+        if st.cfg.agent.check_edits && !edited.is_empty() && !abort.load(Ordering::SeqCst) {
+            let limit = std::time::Duration::from_secs(st.cfg.agent.verify_timeout_secs.clamp(10, 120));
+            if let Some(report) = crate::editcheck::check(&tool_ws, &edited, limit).await {
+                let _ = st.events.send(ServerEvent::Note {
+                    session_id: session_id.to_string(),
+                    text: format!(
+                        "the changed files have errors — showing them to the model ({} line(s))",
+                        report.lines().count().saturating_sub(1)
+                    ),
+                });
+                st.db.add_message(session_id, "user", &[Part::Text { text: report }])?;
+            }
         }
         // The user was asked: stop until they answer.
         if let Some(question) = asked.filter(|_| opts.agent.is_none() && !st.turbo()) {
@@ -4627,6 +4697,93 @@ mod tests {
         assert_eq!((t.requests, t.input, t.cached, t.output), (3, 6000, 3000, 15));
         assert!(st.usage_report(&s.id).contains("3.0K (50%)"), "{}", st.usage_report(&s.id));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Router, edit check and cost together. After a read, the step goes to
+    /// the small model; it wants to write, so its reply is dropped unseen
+    /// and the main model is asked instead. The main model writes broken
+    /// JSON and the next request carries the `[check]` errors. OpenRouter's
+    /// `usage.cost` adds up, the dropped request included.
+    #[tokio::test]
+    async fn router_hands_writes_to_the_main_model_and_edits_are_checked() {
+        use axum::{routing::post, Router};
+        fn call(id: &str, name: &str, args: Value) -> Value {
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": id,
+                "function": {"name": name, "arguments": args.to_string()}}]}, "finish_reason": "tool_calls"}]})
+        }
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let seen2 = seen.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::extract::Json(body): axum::extract::Json<Value>| {
+                let seen = seen2.clone();
+                async move {
+                    let n = {
+                        let mut s = seen.lock().unwrap();
+                        s.push(body);
+                        s.len()
+                    };
+                    let first = match n {
+                        1 => call("m1", "read", json!({"path": "a.txt"})),
+                        2 => call("s1", "write", json!({"path": "small.txt", "content": "x"})),
+                        3 => call("m2", "write", json!({"path": "a.json", "content": "{\"x\": 1,}"})),
+                        _ => json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]}),
+                    };
+                    let usage = json!({"choices": [], "usage": {
+                        "prompt_tokens": 100, "completion_tokens": 5, "cost": 0.001}});
+                    let payload = format!("data: {first}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let dir = std::env::temp_dir().join(format!("ocrs-router-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello\n").unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = format!("http://{addr}/v1");
+        cfg.provider.model = "mock".into();
+        cfg.provider.small_model = Some("small".into());
+        cfg.provider.router = true;
+        cfg.agent.auto_review = false;
+        cfg.agent.auto_verify = false;
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        st.set_perm_mode(PermissionMode::Turbo);
+        let s = st.db.create_session("router", None).unwrap();
+        run_agent(&st, &s.id, "fix the json", Arc::new(AtomicBool::new(false))).await;
+
+        let bodies = seen.lock().unwrap().clone();
+        let models: Vec<&str> = bodies.iter().map(|b| b["model"].as_str().unwrap_or("")).collect();
+        assert_eq!(models, ["mock", "small", "mock", "mock"]);
+        assert!(!dir.join("small.txt").exists(), "the small model's write never ran");
+        assert!(!bodies[2].to_string().contains("small.txt"), "its reply was never saved");
+        let last = bodies[3]["messages"].to_string();
+        assert!(last.contains("[check]") && last.contains("a.json:1:") && last.contains("invalid JSON"), "{last}");
+        let t = st.db.usage_totals(Some(&s.id), None).unwrap();
+        assert_eq!((t.requests, t.cost_micros), (4, 4000));
+        assert!(st.usage_report(&s.id).contains("$0.0040"), "{}", st.usage_report(&s.id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prices_give_a_cost_only_when_the_provider_gave_none() {
+        let mut p = crate::config::ProviderCfg::default();
+        let u = crate::provider::Usage { input: 1_000_000, cached: 500_000, cache_write: 0, output: 100_000, cost_micros: 0 };
+        assert_eq!(u.priced(&p).cost_micros, 0, "no prices, no cost");
+        p.price_input = 3.0;
+        p.price_output = 15.0;
+        p.price_cached = 0.3;
+        // 0.5M fresh × $3 + 0.5M cached × $0.30 + 0.1M out × $15 = $3.15
+        assert_eq!(u.priced(&p).cost_micros, 3_150_000);
+        let reported = crate::provider::Usage { cost_micros: 7, ..u };
+        assert_eq!(reported.priced(&p).cost_micros, 7);
+        assert_eq!(dollars(3_150_000), "$3.15");
+        assert_eq!(dollars(1234), "$0.0012");
+        assert_eq!(dollars(0), "-");
     }
 
     /// F-12: a server with the token "t" and a client for it.
@@ -7765,6 +7922,15 @@ mod b29_tests {
 }
 
 /// 1234 → "1.2K", 3_400_000 → "3.4M" (for `/usage`).
+/// Millionths of a dollar as "$0.0123" (four places under a dollar), "-" when unknown.
+pub fn dollars(micros: u64) -> String {
+    if micros == 0 {
+        return "-".into();
+    }
+    let d = micros as f64 / 1e6;
+    if d < 1.0 { format!("${d:.4}") } else { format!("${d:.2}") }
+}
+
 fn short_count(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
@@ -7830,7 +7996,10 @@ mod prompt_budget_tests {
         // 1000 → 1100 for spelling one call out: this model wrote the
         // arguments with no tool name, which nothing can run, and the guide
         // then fixed it live.
-        assert!(system <= 1100, "system prompt ~{system} tokens");
+        // 1100 → 1300 for the built-in skills (website-builder, fix-tests,
+        // git-commit, security-check): every chat now has a Skills section
+        // (~170 tokens, header included; cached after the first request).
+        assert!(system <= 1300, "system prompt ~{system} tokens");
         // 1150 → 1200 for `check_page` (~70 tokens; `todo` was trimmed to pay
         // for most of it): checking the rendered page is the cheapest fix.
         // 1200 → 1250 for `ask_user` and multi-edit (read/glob/grep were

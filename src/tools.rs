@@ -118,6 +118,12 @@ pub async fn execute(
                 .clamp(1, 600);
             bash(cmd, workspace, Duration::from_secs(timeout), abort).await
         }
+        "read" if crate::skills::builtin_skill_text(workspace, args.get("path").and_then(Value::as_str).unwrap_or(""))
+            .is_some() =>
+        {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            Ok(crate::skills::builtin_skill_text(workspace, path).unwrap_or_default().to_string())
+        }
         "read" if args.get("outline").and_then(Value::as_bool).unwrap_or(false) => {
             read_outline(workspace, arg_str(args, "path")?)
         }

@@ -810,7 +810,7 @@ mod cache_tests {
         let mut st = SseState::default();
         st.line(r#"data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":3000,"cache_creation_input_tokens":200,"output_tokens":1}}}"#).unwrap();
         let ev = st.line(r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":55}}"#).unwrap();
-        let want = crate::provider::Usage { input: 3212, cached: 3000, cache_write: 200, output: 55 };
+        let want = crate::provider::Usage { input: 3212, cached: 3000, cache_write: 200, output: 55, cost_micros: 0 };
         assert!(matches!(&ev[0], StreamEvent::Usage(u) if *u == want), "{ev:?}");
         assert!(matches!(ev[1], StreamEvent::Done { .. }));
     }

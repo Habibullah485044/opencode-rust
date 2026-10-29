@@ -753,6 +753,7 @@
     text-overflow: ellipsis;
   }
   .usage-line b { font-weight: 600; color: var(--ok); }
+  .usage-line b.usage-cost { color: var(--yellow, var(--warn)); }
 
   /* ---- Chat column ---- */
   #chat {
@@ -4170,10 +4171,15 @@
         var pct = Math.floor((u.cached * 100) / u.input);
         // A provider that never reports cache use is not "0% cached".
         var cacheText = (u.cached === 0 && (u.requests || 0) >= 2) ? "Cache not reported" : "Cache <b>" + pct + "%</b>";
-        usageLine.innerHTML = cacheText + " · " + shortCount(u.input) + " in · " + shortCount(u.output) + " out";
+        // Cost in millionths of a dollar; 0 = the provider gives none and no price is set.
+        var cost = u.cost_micros || 0;
+        var costText = cost > 0 ? " · <b class=\"usage-cost\">$" + (cost / 1e6).toFixed(cost < 1e6 ? 4 : 2) + "</b>" : "";
+        usageLine.innerHTML = cacheText + " · " + shortCount(u.input) + " in · " + shortCount(u.output) + " out" + costText;
         usageLine.title = "Tokens of this chat, including its Deep attempts. " +
           (u.cached === 0 ? "This provider reports no prompt-cache use, so every request is billed in full (if it bills)." :
-            pct + "% of the input was read from the provider's prompt cache (cheaper).");
+            pct + "% of the input was read from the provider's prompt cache (cheaper).") +
+          (cost > 0 ? " Cost so far: $" + (cost / 1e6).toFixed(4) + "." :
+            " Cost unknown: OpenRouter reports it; for other providers set price_input/price_output under [provider].");
         usageLine.hidden = false;
       } else {
         usageLine.hidden = true;

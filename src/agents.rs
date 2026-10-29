@@ -471,8 +471,13 @@ pub fn compose_system(p: PromptInputs<'_>) -> String {
              These are all of your skills; the list is already complete, so answer \
              questions about what you can do from it instead of running commands to \
              look for skills. Read a skill's file only when you are about to use it.\n\
-             Skill files live in `{}/.opencode/skills/`.\n\n",
-            p.workspace.display()
+             Skill files live in `{}/.opencode/skills/`.{}\n\n",
+            p.workspace.display(),
+            if p.skills.iter().any(|s| s.path.starts_with(skills::BUILTIN_DIR)) {
+                " Built-in ones: read `builtin-skills/<name>.md`."
+            } else {
+                ""
+            }
         ));
         out.push_str(&skills::skill_index(p.skills));
     }
