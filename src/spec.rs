@@ -165,6 +165,17 @@ pub fn check_request(s: &Spec) -> String {
     )
 }
 
+/// The follow-up when the model checked but wrote no PASS/FAIL lines.
+pub fn lines_request(s: &Spec) -> String {
+    let items: Vec<String> = s.done_when.iter().enumerate().map(|(i, d)| format!("{}. {d}", i + 1)).collect();
+    format!(
+        "{FINAL_CHECK_PREFIX} Your reply had no PASS/FAIL lines. From what you just checked, reply \
+         with one line per item: `PASS: <item> — <the evidence you saw>` or `FAIL: <item> — <what is \
+         wrong>`. Call a tool again only for an item you did not check.\n{}",
+        items.join("\n")
+    )
+}
+
 /// The follow-up when items still fail, or were "passed" without a look.
 pub fn retry_request(problem: &str) -> String {
     format!(

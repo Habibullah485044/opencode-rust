@@ -70,8 +70,8 @@ pub fn tool_specs() -> Vec<crate::provider::ToolSpec> {
         ),
         spec(
             "check_page",
-            "Open a page in a real browser at phone and desktop width; lists what is broken. \
-             Run after changing a page and fix all it reports. expect_text: names it must show.",
+            "Open a page (a file, or http://localhost:PORT/ of a running app) at phone and \
+             desktop width; lists what is broken, fix it all. expect_text: names it must show.",
             json!({"type":"object","properties":{"path":{"type":"string"},"expect_text":{"type":"array","items":{"type":"string"}}}}),
         ),
     ]

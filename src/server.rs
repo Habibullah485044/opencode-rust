@@ -3416,7 +3416,12 @@ pub(crate) async fn final_check(st: &Shared, session_id: &str, spec: &crate::spe
     };
     note(format!("final check — proving {} item(s) with tools…", spec.done_when.len()));
     let mut msg = crate::spec::check_request(spec);
-    for round in 1..=2 {
+    let mut fixed = false;
+    let mut asked_for_lines = false;
+    // Tool calls of the round being judged. Carried over when only the
+    // PASS/FAIL lines are asked for (the looking was done); reset for a fix.
+    let mut looked = false;
+    loop {
         if abort.load(Ordering::SeqCst) {
             return None;
         }
@@ -3425,22 +3430,33 @@ pub(crate) async fn final_check(st: &Shared, session_id: &str, spec: &crate::spe
             note(format!("final check could not run: {e}"));
             return None;
         }
-        let looked = tool_results() > before;
+        looked |= tool_results() > before;
         let (pass, fails) = crate::spec::verdicts(&last_assistant_text(st, session_id).unwrap_or_default());
         let problem = if !looked {
             "you answered without calling a tool, so nothing was proven".to_string()
         } else if fails.is_empty() && pass > 0 {
-            note(format!("final check passed — {pass} item(s) proven{}", if round > 1 { " after a fix round" } else { "" }));
+            note(format!("final check passed — {pass} item(s) proven{}", if fixed { " after a fix round" } else { "" }));
             return Some(true);
+        } else if fails.is_empty() && !asked_for_lines {
+            // Seen live: a mission step checked everything, then wrote a
+            // report without the lines, and the whole step was redone. Asking
+            // for the lines costs one short reply.
+            asked_for_lines = true;
+            note("final check: the reply had no PASS/FAIL lines — asking for them".into());
+            msg = crate::spec::lines_request(spec);
+            continue;
         } else if fails.is_empty() {
             note("final check: the reply had no PASS/FAIL lines".into());
             return Some(false);
         } else {
             fails.join("; ")
         };
-        if round == 1 {
-            note(format!("final check: not proven yet ({}) — one fix round", problem.chars().take(160).collect::<String>()));
+        if fixed {
+            break;
         }
+        fixed = true;
+        looked = false;
+        note(format!("final check: not proven yet ({}) — one fix round", problem.chars().take(160).collect::<String>()));
         msg = crate::spec::retry_request(&problem);
     }
     note("final check: some items are still not proven — see the last reply".into());
@@ -4632,6 +4648,74 @@ pub async fn serve_with_token(
 mod tests {
     use super::*;
     use crate::todo::{TodoOp, TodoResult};
+
+    /// A model mock that answers request n with `replies[n]` (the last one
+    /// again after that): a `tool:<name>:<json args>` reply is a tool call,
+    /// anything else plain text. Returns the base URL and every request seen.
+    async fn scripted_llm(replies: Vec<&'static str>) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::{routing::post, Router};
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let seen2 = seen.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::extract::Json(body): axum::extract::Json<Value>| {
+                let (seen, replies) = (seen2.clone(), replies.clone());
+                async move {
+                    let n = {
+                        let mut s = seen.lock().unwrap();
+                        s.push(body);
+                        s.len() - 1
+                    };
+                    let reply = replies[n.min(replies.len() - 1)];
+                    let chunk = match reply.strip_prefix("tool:").and_then(|r| r.split_once(':')) {
+                        Some((name, args)) => json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("c{n}"),"function":{"name":name,"arguments":args}}]},"finish_reason":"tool_calls"}]}),
+                        None => json!({"choices":[{"delta":{"content":reply},"finish_reason":"stop"}]}),
+                    };
+                    let payload = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1"), seen)
+    }
+
+    /// Seen live: a mission step checked its work with tools, then wrote a
+    /// report without PASS/FAIL lines, and the whole step was redone. The
+    /// final check now asks once for the lines and keeps the evidence.
+    #[tokio::test]
+    async fn a_final_check_without_verdict_lines_is_asked_for_them() {
+        let (base, seen) = scripted_llm(vec![
+            r#"tool:list:{"path":"."}"#,
+            "I looked at everything and it all works.",
+            "PASS: index.html exists — the listing shows it",
+        ])
+        .await;
+        let dir = std::env::temp_dir().join(format!("ocrs-final-lines-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), "<p>hi</p>").unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = base;
+        cfg.provider.model = "mock".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("check", None).unwrap();
+        let spec = crate::spec::Spec {
+            goal: "a page".into(),
+            output: "index.html".into(),
+            done_when: vec!["index.html exists".into()],
+            assuming: vec![],
+        };
+        let passed = final_check(&st, &s.id, &spec, &AtomicBool::new(false)).await;
+        assert_eq!(passed, Some(true), "the lines it was asked for count, with the evidence it gathered");
+        let asked = seen.lock().unwrap().last().unwrap().to_string();
+        assert!(asked.contains("had no PASS/FAIL lines"), "the third request asks for the lines");
+        assert_eq!(seen.lock().unwrap().len(), 3, "one short extra reply, not a redo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Projects: a chat filed under another folder works there: its tools
     /// write into that folder and its AGENTS.md reaches the prompt.

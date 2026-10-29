@@ -340,23 +340,167 @@ async fn serve_harness(
         .unwrap_or_default();
     let widths = if widths.is_empty() { DEFAULT_WIDTHS.to_vec() } else { widths };
     let path = url_path(&path).replace('"', "%22");
+    let html = harness_html(&format!("/p/{token}/{path}?__probe=1"), &widths);
+    ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+}
+
+/// The page that loads `frame_src` once per width and collects the reports.
+fn harness_html(frame_src: &str, widths: &[u32]) -> String {
     let frames: String = widths
         .iter()
         .map(|w| {
             format!(
-                "<iframe src=\"/p/{token}/{path}?__probe=1\" width=\"{w}\" height=\"900\" \
+                "<iframe src=\"{frame_src}\" width=\"{w}\" height=\"900\" \
                  style=\"border:0;display:block\"></iframe>"
             )
         })
         .collect();
-    let html = format!(
+    format!(
         "<!doctype html><html><body style=\"margin:0\"><script>window.__res={{}};\
          window.__report=function(o){{__res[o.w]=o;if(Object.keys(__res).length>={n}){{\
          var s=document.createElement('script');s.type='application/json';s.id='__probe';\
          s.textContent=JSON.stringify(__res);document.body.appendChild(s);}}}};</script>{frames}</body></html>",
         n = widths.len()
-    );
+    )
+}
+
+// ---------------------------------------------------------------- app proxy
+
+/// An app with its own server (an API the page calls, server-rendered
+/// pages) cannot be checked from files: its `/api/...` requests would reach
+/// the file server. So such an app is checked through a proxy on a port of
+/// its own: every request goes on to the app unchanged, and its HTML pages
+/// get the probe. Seen live: a task board app whose API `check_page` could
+/// not reach, so the model had to check it by hand.
+struct AppProxy {
+    /// `http://localhost:3000`: scheme, host and port of the running app.
+    origin: String,
+}
+
+const PROXY_HARNESS: &str = "/__habi_check";
+
+async fn app_proxy(origin: &str) -> Result<std::net::SocketAddr> {
+    static PROXIES: std::sync::OnceLock<Mutex<HashMap<String, std::net::SocketAddr>>> = std::sync::OnceLock::new();
+    let map = PROXIES.get_or_init(Default::default);
+    if let Some(addr) = map.lock().unwrap_or_else(|e| e.into_inner()).get(origin) {
+        return Ok(*addr);
+    }
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = listener.local_addr()?;
+    let app = axum::Router::new()
+        .route(PROXY_HARNESS, axum::routing::get(proxy_harness))
+        .fallback(proxy_pass)
+        .with_state(Arc::new(AppProxy { origin: origin.to_string() }));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    map.lock().unwrap_or_else(|e| e.into_inner()).insert(origin.to_string(), addr);
+    Ok(addr)
+}
+
+/// `/__habi_check?w=375,1440&path=/board` (path last, as given).
+async fn proxy_harness(axum::extract::RawQuery(query): axum::extract::RawQuery) -> Resp {
+    use axum::response::IntoResponse;
+    let q = query.unwrap_or_default();
+    let widths: Vec<u32> = q
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("w="))
+        .map(|w| w.split(',').filter_map(|x| x.parse().ok()).filter(|x| (200..=4000).contains(x)).collect())
+        .unwrap_or_default();
+    let widths = if widths.is_empty() { DEFAULT_WIDTHS.to_vec() } else { widths };
+    let path = q.split_once("path=").map_or("/", |(_, p)| p).replace('"', "%22");
+    let sep = if path.contains('?') { '&' } else { '?' };
+    let html = harness_html(&format!("{path}{sep}__probe=1"), &widths);
     ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+}
+
+async fn proxy_pass(axum::extract::State(p): axum::extract::State<Arc<AppProxy>>, req: axum::extract::Request) -> Resp {
+    use axum::response::IntoResponse;
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(30)).build().unwrap_or_default()
+    });
+    let (parts, body) = req.into_parts();
+    let path = parts.uri.path().to_string();
+    let mut probe = false;
+    let query: Vec<&str> = parts
+        .uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .filter(|kv| {
+            let is_probe = *kv == "__probe=1";
+            probe |= is_probe;
+            !is_probe
+        })
+        .collect();
+    let url = if query.is_empty() { format!("{}{path}", p.origin) } else { format!("{}{path}?{}", p.origin, query.join("&")) };
+    let Ok(bytes) = axum::body::to_bytes(body, 32 * 1024 * 1024).await else {
+        return status(413, "request body too large");
+    };
+    let mut fwd = client.request(parts.method, &url).body(bytes);
+    for name in ["content-type", "accept", "cookie", "authorization"] {
+        if let Some(v) = parts.headers.get(name) {
+            fwd = fwd.header(name, v);
+        }
+    }
+    let resp = match fwd.send().await {
+        Ok(r) => r,
+        Err(e) => return status(502, &format!("the app at {} did not answer: {e}", p.origin)),
+    };
+    let code = resp.status();
+    let kind = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let Ok(bytes) = resp.bytes().await else {
+        return status(502, "the app's answer broke off");
+    };
+    let body = if probe && kind.starts_with("text/html") {
+        inject_probe(&String::from_utf8_lossy(&bytes)).into_bytes()
+    } else {
+        bytes.to_vec()
+    };
+    let mut out = (code, body).into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&kind) {
+        out.headers_mut().insert(axum::http::header::CONTENT_TYPE, v);
+    }
+    out.headers_mut().insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    out
+}
+
+/// `(origin, path)` of a URL on this machine, else `None`.
+fn local_app_url(raw: &str) -> Option<(String, String)> {
+    let raw = raw.trim();
+    let (scheme, rest) = raw.split_once("://")?;
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return None;
+    }
+    let (host, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let name = host.rsplit_once(':').map_or(host, |(h, _)| h).to_ascii_lowercase();
+    matches!(name.as_str(), "localhost" | "127.0.0.1" | "[::1]").then(|| (format!("{scheme}://{host}"), path.to_string()))
+}
+
+/// Is an app answering at this origin? (Any HTTP answer counts.)
+async fn app_running(origin: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(3)).build() else {
+        return false;
+    };
+    client.get(origin).send().await.is_ok()
+}
+
+/// Check the page at `path` of the app running at `origin`, through the proxy.
+pub async fn check_app(origin: &str, path: &str, widths: &[u32], expect: &[String]) -> Result<Report> {
+    let exe = find_browser().ok_or_else(|| {
+        anyhow!("no Edge or Chrome found to check the page with (set OPENCODE_RUST_BROWSER to its path)")
+    })?;
+    let addr = app_proxy(origin).await?;
+    let widths: Vec<u32> = if widths.is_empty() { DEFAULT_WIDTHS.to_vec() } else { widths.to_vec() };
+    let list = widths.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let harness = format!("http://{addr}{PROXY_HARNESS}?w={list}&path={path}");
+    let dom = dump_dom(&exe, &harness, Duration::from_secs(120)).await?;
+    read_report(&dom, &widths, expect, path.to_string(), format!("{origin}{path}"))
 }
 
 // -------------------------------------------------------------------- probe
@@ -471,13 +615,19 @@ pub async fn check(root: &Path, page: &str, widths: &[u32], expect: &[String]) -
     let list = widths.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
     let harness = format!("http://{}/c/{token}/{rel}?w={list}", p.addr);
     let dom = dump_dom(&exe, &harness, Duration::from_secs(120)).await?;
-    let json = between(&dom, "<script type=\"application/json\" id=\"__probe\">", "</script>")
+    let url = format!("http://{}/p/{token}/{rel}", p.addr);
+    read_report(&dom, &widths, expect, rel, url)
+}
+
+/// The report out of the harness DOM (one probe result per width).
+fn read_report(dom: &str, widths: &[u32], expect: &[String], page: String, url: String) -> Result<Report> {
+    let json = between(dom, "<script type=\"application/json\" id=\"__probe\">", "</script>")
         .ok_or_else(|| anyhow!("the page did not finish loading in the browser (no probe result)"))?;
     let all: HashMap<String, Value> =
         serde_json::from_str(&html_unescape(json)).context("reading the probe result")?;
-    let mut report = Report { page: rel.clone(), url: format!("http://{}/p/{token}/{rel}", p.addr), ..Default::default() };
+    let mut report = Report { page, url, ..Default::default() };
     let mut text = String::new();
-    for w in &widths {
+    for w in widths {
         let Some(r) = all.get(&w.to_string()) else { continue };
         let strings = |k: &str| -> Vec<String> {
             r.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default()
@@ -580,7 +730,6 @@ fn missing_page(root: &Path, page: &str) -> anyhow::Error {
 
 pub async fn run_tool(root: &Path, input: &Value) -> Result<(String, Report)> {
     let raw = input.get("path").and_then(Value::as_str).filter(|p| !p.trim().is_empty()).unwrap_or("index.html");
-    let page = &page_arg(root, raw)?;
     let widths: Vec<u32> = input
         .get("widths")
         .and_then(Value::as_array)
@@ -591,7 +740,12 @@ pub async fn run_tool(root: &Path, input: &Value) -> Result<(String, Report)> {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).map(String::from).take(10).collect())
         .unwrap_or_default();
-    let report = check(root, page, &widths, &expect).await?;
+    // A page of a running app (its own server and API) is checked through
+    // that server; a localhost URL with nothing answering means a file.
+    let report = match local_app_url(raw) {
+        Some((origin, path)) if app_running(&origin).await => check_app(&origin, &path, &widths, &expect).await?,
+        _ => check(root, &page_arg(root, raw)?, &widths, &expect).await?,
+    };
     Ok((report.render(), report))
 }
 
@@ -662,6 +816,42 @@ pub fn recently_modified(root: &Path, since: std::time::SystemTime) -> Vec<PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_app_urls_are_told_apart() {
+        assert_eq!(local_app_url("http://localhost:3000/board?x=1"), Some(("http://localhost:3000".into(), "/board?x=1".into())));
+        assert_eq!(local_app_url("http://127.0.0.1:8080"), Some(("http://127.0.0.1:8080".into(), "/".into())));
+        assert_eq!(local_app_url("https://example.com/"), None);
+        assert_eq!(local_app_url("index.html"), None);
+    }
+
+    /// An app whose page fills itself from its own API: the text only shows
+    /// when the page's `/api` requests reach the app (through the proxy).
+    #[tokio::test]
+    async fn an_app_with_its_own_api_is_checked_through_its_server() {
+        if find_browser().is_none() {
+            return;
+        }
+        let page = "<!doctype html><html><head><title>Board</title></head><body><main><h1 id=t>loading</h1></main>\
+                    <script>fetch('/api/name',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})\
+                    .then(r=>r.json()).then(d=>{document.getElementById('t').textContent=d.name})</script></body></html>";
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(move || async move { ([(axum::http::header::CONTENT_TYPE, "text/html")], page) }))
+            .route("/api/name", axum::routing::post(|| async { axum::Json(serde_json::json!({"name": "Flowboard from the API"})) }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let dir = std::env::temp_dir().join(format!("ocrs-appcheck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = serde_json::json!({"path": format!("http://127.0.0.1:{}/", addr.port()), "expect_text": ["Flowboard from the API"]});
+        let (text, report) = run_tool(&dir, &input).await.unwrap();
+        assert!(report.general.is_empty(), "the API text reached the page: {text}");
+        assert!(report.url.starts_with(&format!("http://127.0.0.1:{}", addr.port())), "{}", report.url);
+        assert!(text.contains("no script errors"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_page_forms_models_write_all_mean_the_file() {
