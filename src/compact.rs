@@ -102,7 +102,7 @@ pub fn transcript_lines(msgs: &[crate::db::Message]) -> Vec<String> {
 }
 
 async fn summarize(st: &Shared, transcript: &str, abort: &AtomicBool) -> Result<String> {
-    let msgs = vec![
+    let mut msgs = vec![
         ChatMsg {
             role: "system".into(),
             content: Some(
@@ -123,6 +123,9 @@ async fn summarize(st: &Shared, transcript: &str, abort: &AtomicBool) -> Result<
             tool_call_id: None,
         },
     ];
+    // A server that drops the `system` role would drop the whole instruction
+    // and summarize nothing (see `server::deliver_system_prompt`).
+    crate::server::deliver_system_prompt(&mut msgs, st);
     // B-29: copy the client out of the lock; never hold it while waiting.
     let client = st.client.lock().await.clone();
     let model = st

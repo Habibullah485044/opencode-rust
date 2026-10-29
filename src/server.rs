@@ -246,7 +246,22 @@ pub struct AppState {
     /// The model's context window as the provider reports it in `/models`
     /// (`context_window`, `context_length`…). 0 = not known.
     pub detected_context: std::sync::atomic::AtomicUsize,
+    /// Does the server pass a `system` message on to the model?
+    /// [`SYSTEM_UNKNOWN`] = not asked yet, [`SYSTEM_DELIVERS`] = yes,
+    /// [`SYSTEM_DROPS`] = no, the role is silently discarded.
+    pub system_delivery: std::sync::atomic::AtomicU8,
 }
+
+/// `system_delivery`: not probed yet — the prompt travels as a user note,
+/// which every server passes on, until the probe answers.
+pub const SYSTEM_UNKNOWN: u8 = 0;
+/// `system_delivery`: the server delivers `system` messages (the normal case).
+pub const SYSTEM_DELIVERS: u8 = 1;
+/// `system_delivery`: the server drops the role, so the prompt must be sent
+/// in a message it does deliver (seen 2026-10-26: a gateway in front of
+/// Ollama discarded the role, and with it the whole prompt — mode rules,
+/// tool guide, AGENTS.md — while answering cheerfully with none of them).
+pub const SYSTEM_DROPS: u8 = 2;
 
 pub type Shared = Arc<AppState>;
 
@@ -298,6 +313,7 @@ pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
         mcp: AsyncMutex::new(mcp),
         browser: Mutex::new(None),
         detected_context: std::sync::atomic::AtomicUsize::new(0),
+        system_delivery: std::sync::atomic::AtomicU8::new(SYSTEM_UNKNOWN),
     }))
 }
 
@@ -354,6 +370,7 @@ pub async fn build_state_ephemeral_skills(
         mcp: AsyncMutex::new(mcp),
         browser: Mutex::new(None),
         detected_context: std::sync::atomic::AtomicUsize::new(0),
+        system_delivery: std::sync::atomic::AtomicU8::new(SYSTEM_UNKNOWN),
     })
 }
 
@@ -558,29 +575,95 @@ impl AppState {
     /// (seen 2026-10-26 against a 16384-token model).
     pub fn start_context_probe(self: &Shared) {
         let st = self.clone();
-        tokio::spawn(async move {
-            let Ok(base) = st.cfg.effective_base_url() else { return };
-            let key = st.cfg.provider.api_key.clone();
-            let Ok(http) = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(4))
-                .timeout(std::time::Duration::from_secs(12))
-                .build()
-            else {
-                return;
-            };
-            let req = crate::provider::with_auth(
-                http.get(format!("{base}/models")),
-                st.cfg.provider.api,
-                &key,
-            );
-            let body = match req.send().await {
-                Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
-                _ => None,
-            };
-            if let Some(n) = st.note_context(body.as_ref(), &http, &base, &key).await {
-                eprintln!("[api] model context window: {n} tokens");
-            }
+        tokio::spawn(async move { st.run_startup_probes().await });
+    }
+
+    /// The two questions worth asking a server before using it: how big the
+    /// model's context window is, and whether it delivers `system` messages.
+    /// An interactive run asks in the background; a headless run asks first,
+    /// so its very first request is already packed for the server it has.
+    pub async fn run_startup_probes(self: &Shared) {
+        let Ok(base) = self.cfg.effective_base_url() else { return };
+        let key = self.cfg.provider.api_key.clone();
+        let Ok(http) = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(4))
+            .timeout(std::time::Duration::from_secs(12))
+            .build()
+        else {
+            return;
+        };
+        let req = crate::provider::with_auth(
+            http.get(format!("{base}/models")),
+            self.cfg.provider.api,
+            &key,
+        );
+        let body = match req.send().await {
+            Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
+            _ => None,
+        };
+        if let Some(n) = self.note_context(body.as_ref(), &http, &base, &key).await {
+            eprintln!("[api] model context window: {n} tokens");
+        }
+        self.probe_system_delivery(&base, &key).await;
+    }
+
+    /// One tiny question: does this server pass a `system` message on to the
+    /// model? The answer is stored in [`AppState::system_delivery`] and read
+    /// when the prompt is packed into a request.
+    ///
+    /// Seen 2026-10-26: a gateway in front of Ollama dropped the role without
+    /// an error — the prompt, the tool guide and AGENTS.md all stayed behind,
+    /// and the model answered cheerfully with none of them. Nothing in a
+    /// `/models` answer says so, so the only way to know is to ask.
+    ///
+    /// `None` = could not tell (offline, timeout, refused). The state then
+    /// stays [`SYSTEM_UNKNOWN`] and the prompt keeps travelling as a trailing
+    /// user note, which every server passes on.
+    async fn probe_system_delivery(&self, base: &str, key: &str) -> Option<()> {
+        // Anthropic's protocol has its own top-level `system` field, filled in
+        // by the API itself: there is no role in the message list to lose.
+        if self.cfg.provider.api != crate::config::ProviderApi::OpenAi {
+            self.system_delivery.store(SYSTEM_DELIVERS, Ordering::Relaxed);
+            return Some(());
+        }
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(4))
+            .timeout(std::time::Duration::from_secs(45))
+            .build()
+            .ok()?;
+        let body = json!({
+            "model": self.current_model().await,
+            "messages": [
+                {"role": "system", "content": "Reply to every message with exactly the word ARCHITECT."},
+                {"role": "user", "content": "Say hello."}
+            ],
+            "temperature": 0,
+            "stream": false
         });
+        let req = crate::provider::with_auth(
+            http.post(format!("{base}/chat/completions")),
+            self.cfg.provider.api,
+            key,
+        )
+        .json(&body);
+        let resp = req.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: Value = resp.json().await.ok()?;
+        let text = v.pointer("/choices/0/message/content").and_then(Value::as_str)?;
+        let delivers = text.to_ascii_uppercase().contains("ARCHITECT");
+        self.system_delivery
+            .store(if delivers { SYSTEM_DELIVERS } else { SYSTEM_DROPS }, Ordering::Relaxed);
+        eprintln!(
+            "[api] {}",
+            if delivers {
+                "system messages reach the model"
+            } else {
+                "this server drops system messages — the prompt travels as a user note"
+            }
+        );
+        Some(())
     }
 }
 
@@ -911,7 +994,7 @@ pub async fn one_shot(
     if abort.load(Ordering::SeqCst) {
         anyhow::bail!("aborted");
     }
-    let msgs = vec![
+    let mut msgs = vec![
         ChatMsg {
             role: "system".into(),
             content: Some(system.to_string()),
@@ -925,6 +1008,7 @@ pub async fn one_shot(
             tool_call_id: None,
         },
     ];
+    deliver_system_prompt(&mut msgs, st);
     // B-29: copy the client out of the lock; never hold it while waiting.
     let client = st.client.lock().await.clone();
     let model = if prefer_small {
@@ -2753,9 +2837,12 @@ pub async fn run_loop(
             return Err(anyhow::anyhow!("the provider kept answering with an error: {}", text.trim()));
         }
         // Some models (Qwen through Ollama/llama.cpp without a tool parser)
-        // write their tool calls into the reply text. Run them as calls
-        // instead of showing XML and ending the turn.
-        if calls.is_empty() && text.contains("<tool_call>") {
+        // write their tool calls into the reply text: wrapped, as the
+        // `CALL {…}` line the guide teaches, or as the bare JSON object.
+        // Run them as calls instead of showing the JSON and ending the turn.
+        // (The gate used to require the wrapped form, which every other
+        // shape failed: the run then ended with the JSON on screen.)
+        if calls.is_empty() {
             let (rest, found) = crate::provider::calls_in_text(&text);
             if !found.is_empty() {
                 text = rest;
@@ -4312,6 +4399,35 @@ async fn check_permission_preview(
 }
 
 /// Build OpenAI-format messages: system + persisted history including tool calls/results.
+/// Put the leading system message where the server will actually read it.
+///
+/// [`SYSTEM_DELIVERS`] leaves it where it is. Otherwise — the role is
+/// dropped, or we have not managed to ask yet — it moves to the END of the
+/// request as an `[app]` user note: a message every server does deliver, in
+/// a place a server that trims the head of a long request cannot take it
+/// away, and out of `keep_task_near_the_tail`'s way (that one skips `[app]`
+/// notes when it looks for the user's own request).
+pub(crate) fn deliver_system_prompt(msgs: &mut Vec<ChatMsg>, st: &Shared) {
+    if st.system_delivery.load(Ordering::Relaxed) != SYSTEM_DROPS {
+        return;
+    }
+    if !msgs.first().is_some_and(|m| m.role == "system") {
+        return;
+    }
+    let text = msgs.remove(0).content.unwrap_or_default();
+    if text.trim().is_empty() {
+        return;
+    }
+    msgs.push(ChatMsg {
+        role: "user".into(),
+        content: Some(format!(
+            "[app] Instructions for this chat, sent here because this server has no system role:\n\n{text}"
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+}
+
 fn build_chat_messages(st: &Shared, session_id: &str, system: &str) -> Result<Vec<ChatMsg>> {
     let mut out = vec![ChatMsg {
         role: "system".into(),
@@ -4409,6 +4525,9 @@ fn build_chat_messages(st: &Shared, session_id: &str, system: &str) -> Result<Ve
             tool_call_id: None,
         });
     }
+    // Last: moving the prompt to the tail must not hide that the chat has no
+    // user message of its own from the check above.
+    deliver_system_prompt(&mut out, st);
     Ok(out)
 }
 
@@ -5602,6 +5721,34 @@ mod tests {
         let msgs = build_chat_messages(&st, &s.id, "sys").unwrap();
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[1].role, "user", "inserted right after the system prompt");
+    }
+
+    /// The prompt is packed for the server it is talking to: in the `system`
+    /// role when that role is delivered, as an `[app]` note at the end when
+    /// the server drops it (seen 2026-10-26, where the whole prompt was lost).
+    #[tokio::test]
+    async fn the_prompt_follows_what_the_server_does_with_system_messages() {
+        let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let s = st.db.create_session("u", None).unwrap();
+        st.db.add_message(&s.id, "user", &[Part::Text { text: "Say hi.".into() }]).unwrap();
+
+        let msgs = build_chat_messages(&st, &s.id, "SYS PROMPT").unwrap();
+        assert_eq!(msgs[0].role, "system", "not asked yet: the normal shape");
+
+        st.system_delivery.store(SYSTEM_DROPS, Ordering::Relaxed);
+        let msgs = build_chat_messages(&st, &s.id, "SYS PROMPT").unwrap();
+        assert_eq!(msgs[0].role, "user", "the role this server keeps");
+        let last = msgs.last().unwrap();
+        assert_eq!(last.role, "user");
+        let text = last.content.as_deref().unwrap();
+        assert!(text.contains("SYS PROMPT"), "the prompt is still sent: {text}");
+        assert!(text.starts_with("[app]"), "an app note, so it is not read as the task: {text}");
+
+        st.system_delivery.store(SYSTEM_DELIVERS, Ordering::Relaxed);
+        let msgs = build_chat_messages(&st, &s.id, "SYS PROMPT").unwrap();
+        assert_eq!(msgs[0].role, "system");
+        assert!(msgs.iter().all(|m| !m.content.as_deref().is_some_and(|c| c.contains("SYS PROMPT")) || m.role == "system"),
+            "nothing appended when the role is delivered");
     }
 
     #[test]

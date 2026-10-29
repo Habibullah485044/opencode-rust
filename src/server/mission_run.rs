@@ -213,6 +213,9 @@ pub(super) async fn run_mission(
     let ws = st.workspace_for(session_id);
     // Pages changed from here on are the mission's (a resume counts from the resume).
     let mission_started = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+    // A resume carries on the same way the mission started: a `--deep`
+    // mission keeps running every step as a Deep run.
+    let mut deep = deep;
     if let Some(goal) = goal {
         st.db.add_message(session_id, "user", &[Part::Text { text: format!("[mission] {goal}") }])?;
         // The goal is kept with its spec: the plan, every step brief and the
@@ -224,7 +227,7 @@ pub(super) async fn run_mission(
         if abort.load(Ordering::SeqCst) {
             anyhow::bail!("aborted");
         }
-        st.db.mission_start(session_id, &goal, &steps)?;
+        st.db.mission_start(session_id, &goal, &steps, deep)?;
         let m = st.db.mission(session_id)?.expect("just started");
         let shown = spec.as_ref().map(|s| format!("{}\n\n", crate::spec::for_user(s))).unwrap_or_default();
         say(st, session_id, format!("{shown}**Mission plan** — I keep working until it is done:\n{}", plan_text(&m)));
@@ -235,6 +238,7 @@ pub(super) async fn run_mission(
         if m.status == "done" {
             return Ok("This mission is already complete.".into());
         }
+        deep = m.deep;
         st.db.mission_set_status(session_id, "running")?;
         note(format!("mission: resuming — {} step(s) left", m.steps.iter().filter(|s| s.status != "done" && s.status != "failed").count()));
     }
@@ -477,7 +481,14 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
 /// `/mission status`: the plan with each step's state and receipt line.
 pub fn mission_report(st: &AppState, session_id: &str) -> String {
     match st.db.mission(session_id) {
-        Ok(Some(m)) => format!("Mission ({}): {}\n{}\n\nReceipts:\n{}", m.status, m.goal, plan_text(&m), done_so_far(&m)),
+        Ok(Some(m)) => format!(
+            "Mission ({}{}): {}\n{}\n\nReceipts:\n{}",
+            m.status,
+            if m.deep { ", deep" } else { "" },
+            m.goal,
+            plan_text(&m),
+            done_so_far(&m)
+        ),
         _ => "This chat has no mission. Start one with /mission <goal>.".into(),
     }
 }

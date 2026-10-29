@@ -123,6 +123,18 @@ async fn main() {
                         )),
                         "data: [DONE]\n\n".to_string()
                     )
+                } else if first_user.contains("text-call") {
+                    // A model with no tool parser: the call written as one
+                    // line of text, with no `tool_calls` field at all — what
+                    // a gateway in front of Ollama produced on 2026-10-26.
+                    format!(
+                        "{}{}",
+                        sse_data(&chunk(
+                            json!({"content": "CALL {\"name\":\"write\",\"arguments\":{\"path\":\"text-call-marker.txt\",\"content\":\"written by a text call\"}}"}),
+                            Value::Null,
+                        )),
+                        "data: [DONE]\n\n".to_string()
+                    )
                 } else if first_user.contains("parallel-agents") {
                     // M7: two spawns in ONE turn — the agents panel shows them
                     // working in parallel.

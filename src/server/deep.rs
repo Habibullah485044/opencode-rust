@@ -122,7 +122,15 @@ pub(super) async fn run_deep(
     // MCP servers act on the real project, not on an attempt's copy (and
     // each attempt would start them again).
     cfg.mcp.servers.clear();
-    for (tool, action) in [("write", "allow"), ("edit", "allow"), ("ask_user", "deny")] {
+    // Nobody can answer approval prompts during an attempt: web reads are
+    // safe, so they stay allowed (otherwise every web lookup is denied on
+    // the spot); questions are denied so attempts decide for themselves.
+    for (tool, action) in [
+        ("write", "allow"),
+        ("edit", "allow"),
+        ("webfetch", "allow"),
+        ("ask_user", "deny"),
+    ] {
         cfg.permissions.defaults.insert(tool.into(), action.into());
     }
     if !can_run_commands {

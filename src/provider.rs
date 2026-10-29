@@ -904,17 +904,7 @@ pub fn calls_in_text(text: &str) -> (String, Vec<(String, String, Value)>) {
             None => (after, ""), // cut off: take what is there
         };
         if let Some(call) = parse_one_text_call(body) {
-            // Unique across replies: a per-reply index alone made every
-            // reply's first call `txt_0_<pid>`, so a chat full of text calls
-            // repeated the same ids and the results no longer paired with
-            // their calls (seen live in a saved session).
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let id = format!(
-                "txt_{}_{}_{}",
-                std::process::id(),
-                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                calls.len()
-            );
+            let id = text_call_id(calls.len());
             calls.push((id, call.0, call.1));
         } else {
             rest.push_str(&s[start..start + "<tool_call>".len()]);
@@ -924,9 +914,102 @@ pub fn calls_in_text(text: &str) -> (String, Vec<(String, String, Value)>) {
     }
     rest.push_str(s);
     if calls.is_empty() {
-        return (text.to_string(), calls);
+        // No wrapper anywhere: the one-line `CALL {…}` the guide teaches
+        // with its marker or the wrapper lost, or a reply that is nothing
+        // but the JSON object. Without this the turn ends with JSON on
+        // screen and no tool ran (seen 2026-10-26 with a 32B coder model,
+        // which answered with three such lines at once).
+        let mut work = rest;
+        while let Some((clean, call)) = unwrapped_call(&work) {
+            calls.push((text_call_id(calls.len()), call.0, call.1));
+            work = clean;
+        }
+        if calls.is_empty() {
+            return (text.to_string(), calls);
+        }
+        return (work.trim().to_string(), calls);
     }
     (rest.trim().to_string(), calls)
+}
+
+/// Ids for calls read out of reply text: a per-reply index alone made every
+/// reply's first call `txt_0_<pid>`, so a chat full of text calls repeated the
+/// same ids and the results no longer paired with their calls (seen live in a
+/// saved session).
+fn text_call_id(index: usize) -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "txt_{}_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        index
+    )
+}
+
+/// A call written without any `<tool_call> …` wrapper: the `CALL {…}` line
+/// the guide teaches, or a reply that is exactly one JSON object. Returns the
+/// text with the call taken out and the call (name, arguments).
+fn unwrapped_call(text: &str) -> Option<(String, (String, Value))> {
+    // 1. The taught marker, on one line.
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("CALL") {
+        let start = from + rel;
+        let at = start + "CALL".len();
+        from = at.max(from + 1);
+        let after = &text[at..];
+        let line = &after[..after.find('\n').unwrap_or(after.len())];
+        let Some(brace) = line.find('{') else { continue };
+        let Some(obj) = json_object_at(text, at + brace) else { continue };
+        let Some(call) = parse_one_text_call(obj) else { continue };
+        let mut clean = String::new();
+        clean.push_str(&text[..start]);
+        clean.push_str(&text[at + brace + obj.len()..]);
+        return Some((clean, call));
+    }
+    // 2. Nothing but the object (the model dropped the marker too).
+    let t = text.trim();
+    let obj = json_object_at(t, 0)?;
+    if obj.len() != t.len() {
+        return None;
+    }
+    parse_one_text_call(obj).map(|call| (String::new(), call))
+}
+
+/// The balanced `{…}` object starting at `start` — string- and escape-aware,
+/// so an argument containing a brace does not end it early.
+fn json_object_at(s: &str, start: usize) -> Option<&str> {
+    let b = s.as_bytes();
+    if b.get(start) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &c) in b.iter().enumerate().skip(start) {
+        let ch = c as char;
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_one_text_call(body: &str) -> Option<(String, Value)> {
@@ -1035,6 +1118,41 @@ mod text_call_tests {
         let (_, b) = calls_in_text(t);
         assert_eq!(a.len(), 1, "{a:?}");
         assert_ne!(a[0].0, b[0].0, "a second reply's call must not reuse the first reply's id");
+    }
+
+    #[test]
+    fn a_call_written_as_a_plain_line_is_read() {
+        // The form the guide teaches, and the one a 32B coder model actually
+        // copies (seen 2026-10-26): no `<tool_call> …` wrapper around it.
+        let t = "Sure.\nCALL {\"name\":\"read\",\"arguments\":{\"path\":\"a.txt\"}}\nDone.";
+        let (rest, calls) = calls_in_text(t);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].1, "read");
+        assert_eq!(calls[0].2, serde_json::json!({"path": "a.txt"}));
+        assert!(!rest.contains("CALL {"), "the call is taken out of the reply: {rest}");
+    }
+
+    #[test]
+    fn a_reply_that_is_only_the_json_object_is_read() {
+        // Same call with the marker dropped as well — a model that loses the
+        // wrapper entirely would otherwise end the turn with JSON on screen.
+        let t = "{\"name\":\"write\",\"arguments\":{\"path\":\"SUMMARY.md\",\"content\":\"# s\"}}";
+        let (rest, calls) = calls_in_text(t);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].1, "write");
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn prose_that_is_not_a_call_is_left_alone() {
+        let t = "I would CALL the read tool if I could.";
+        let (rest, calls) = calls_in_text(t);
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(rest, t);
+        let jsonish = "The config is {\"a\": 1} — nothing to run here.";
+        let (rest, calls) = calls_in_text(jsonish);
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(rest, jsonish);
     }
 
     #[test]

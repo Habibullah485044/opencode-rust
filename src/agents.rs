@@ -337,10 +337,12 @@ write(path,content) · edit(path,old_str,new_str) · bash(command; background,jo
 webfetch(url|query) · todo(op,content,id) · ask_user(question,options) · check_page(path,expect_text) · \
 spawn(subagent: explore|research|plan|worker|review, task) · browser_*(GUI panel) · \
 mcp_call(server,tool,args).\n\n\
-The argument names above are the ones that work (`path`, not `file_path`). Where the server has no \
-tool parser and you write the call as text, spell it exactly: \
-\x3ctool_call\x3e{\"name\":\"read\",\"arguments\":{\"path\":\"a.md\"}}\x3c/tool_call\x3e — \
-the name is what makes it a call; bare arguments (`{\"path\":\"a.md\"}`) call nothing.";
+The argument names above are the ones that work (`path`, not `file_path`). Some servers carry no \
+	tool parser: a call only happens written as text, on ONE line:\n\n\
+	CALL {\"name\":\"read\",\"arguments\":{\"path\":\"a.md\"}}\n\n\
+	Start with CALL, name under \"name\", arguments under \"arguments\" as JSON. The name \
+	is what makes it a call: bare arguments (`{\"path\":\"a.md\"}`) call nothing, and \
+	`read(a.md)` is only text.";
 
 /// Rules for web pages (measurable ones, from what v0, bolt and the
 /// frontend-design guidance share), added only to chats about a page.
@@ -755,9 +757,17 @@ mod tests {
     #[test]
     fn the_tool_guide_shows_how_to_spell_a_call() {
         assert!(TOOL_GUIDE.contains("`path`, not `file_path`"), "argument names are named");
-        assert!(TOOL_GUIDE.contains("\x3ctool_call\x3e"), "a call is spelled out");
+        // One form only: a model copies whichever shape it is shown, so it
+        // is shown the one it reproduces (it dropped a wrapper it was not
+        // shown and then answered with the bare JSON instead of calling).
+        assert!(!TOOL_GUIDE.contains("\x3ctool_call\x3e"), "one teaching form, not two");
         assert!(TOOL_GUIDE.contains("\"name\""), "and where the tool name goes");
         assert!(TOOL_GUIDE.contains("call nothing"), "the nameless form is called out");
+        // Seen live 2026-10-26 with a 32B coder model: what it copies is the
+        // plain line, not the wrapper — so the plain line is what the guide
+        // teaches first.
+        assert!(TOOL_GUIDE.contains("CALL {\"name\":"), "the one-line form is spelled out");
+        assert!(TOOL_GUIDE.contains("ONE line"), "and said to stay on one line");
     }
 
     #[test]

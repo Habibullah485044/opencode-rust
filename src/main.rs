@@ -161,9 +161,16 @@ fn run() -> Result<()> {
             state.start_heartbeat();
         }
         // The window the model reports drives fitting the chat to it and
-        // compacting it; a headless run has no heartbeat to learn it, so ask
-        // once here (a duplicate of the heartbeat's first check otherwise).
-        state.start_context_probe();
+        // compacting it, and whether the server keeps `system` messages decides
+        // where the prompt is packed. A headless run has no heartbeat to learn
+        // either and its FIRST request already needs both, so ask before it
+        // starts; an interactive run asks in the background (a duplicate of the
+        // heartbeat's first check otherwise).
+        if headless {
+            state.run_startup_probes().await;
+        } else {
+            state.start_context_probe();
+        }
         let boot_ms = t0.elapsed().as_millis();
         // New (S-01): say where the HTTP API token is (never the token).
         eprintln!("[api] {}", server::api_token_note(&state.state_dir));

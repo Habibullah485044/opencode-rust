@@ -204,11 +204,12 @@ pub struct PermissionsCfg {
 impl Default for PermissionsCfg {
     fn default() -> Self {
         let mut defaults = HashMap::new();
-        // Safe reads: allow. Anything that mutates the machine: ask.
-        for t in ["read", "list", "glob", "grep", "check_page", "mcp_search", "ask_user", "todo"] {
+        // Safe reads (including web reads): allow. Anything that mutates the
+        // machine or the project: ask.
+        for t in ["read", "list", "glob", "grep", "check_page", "mcp_search", "ask_user", "todo", "webfetch"] {
             defaults.insert(t.to_string(), "allow".to_string());
         }
-        for t in ["bash", "write", "edit", "webfetch"] {
+        for t in ["bash", "write", "edit"] {
             defaults.insert(t.to_string(), "ask".to_string());
         }
         // Goal B: reading the page and waiting are safe; clicking and typing
@@ -511,6 +512,9 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.permissions.defaults.get("bash").unwrap(), "ask");
         assert_eq!(c.permissions.defaults.get("read").unwrap(), "allow");
+        // Web reads are safe: allowed without asking (deep attempts and
+        // missions run with nobody around to approve).
+        assert_eq!(c.permissions.defaults.get("webfetch").unwrap(), "allow");
         // Goal B: reading the page is free, acting on it asks.
         assert_eq!(c.permissions.defaults.get("browser_snapshot").unwrap(), "allow");
         assert_eq!(c.permissions.defaults.get("browser_click").unwrap(), "ask");

@@ -117,7 +117,7 @@ grep = "allow"
 bash = "ask"
 write = "ask"
 edit = "ask"
-webfetch = "ask"
+webfetch = "allow"
 
 # Rules are checked in order; the first match wins.
 # For file tools the pattern is matched against the path relative to the

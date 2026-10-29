@@ -161,6 +161,20 @@ const APPROVALS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS approvals (
     UNIQUE (workspace, tool, pattern)
 );";
 
+/// The `deep` column on `missions` (added in place to databases from
+/// older builds, which only have goal/status).
+fn migrate_missions(conn: &Connection) -> Result<()> {
+    let cols: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(missions)")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        names.collect::<std::result::Result<_, _>>()?
+    };
+    if !cols.iter().any(|c| c == "deep") {
+        conn.execute_batch("ALTER TABLE missions ADD COLUMN deep INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    Ok(())
+}
+
 /// Provider token counts, one row per session per UTC day (`/usage`).
 /// `session_id` is "" for model calls outside a chat (planning, edits).
 /// Missions: one per chat (a new one replaces the old), and its steps in
@@ -170,6 +184,7 @@ const MISSION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS missions (
     session_id TEXT PRIMARY KEY,
     goal TEXT NOT NULL,
     status TEXT NOT NULL,
+    deep INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -191,6 +206,9 @@ pub struct Mission {
     pub goal: String,
     /// planning, running, paused, done, stopped
     pub status: String,
+    /// every step runs as a Deep run (`/mission --deep`); kept so
+    /// `/mission resume` carries on the same way the mission started.
+    pub deep: bool,
     pub steps: Vec<MissionStep>,
 }
 
@@ -338,6 +356,7 @@ impl Db {
         conn.execute_batch(USAGE_SCHEMA)?;
         conn.execute_batch(USAGE_LOG_SCHEMA)?;
         conn.execute_batch(MISSION_SCHEMA)?;
+        migrate_missions(&conn)?;
         migrate_projects(&conn)?;
         Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
     }
@@ -367,6 +386,7 @@ impl Db {
         conn.execute_batch(USAGE_SCHEMA)?;
         conn.execute_batch(USAGE_LOG_SCHEMA)?;
         conn.execute_batch(MISSION_SCHEMA)?;
+        migrate_missions(&conn)?;
         migrate_projects(&conn)?;
         Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
     }
@@ -534,15 +554,16 @@ impl Db {
 
     /// Start a mission in chat `session_id` with these steps (replaces any
     /// earlier mission of the chat).
-    pub fn mission_start(&self, session_id: &str, goal: &str, steps: &[String]) -> Result<()> {
+    pub fn mission_start(&self, session_id: &str, goal: &str, steps: &[String], deep: bool) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let now = now_ms();
+        let deep = deep as i64;
         tx.execute("DELETE FROM mission_steps WHERE session_id=?1", params![session_id])?;
         tx.execute(
-            "INSERT INTO missions (session_id, goal, status, created_at, updated_at) VALUES (?1, ?2, 'running', ?3, ?3)
-             ON CONFLICT (session_id) DO UPDATE SET goal=?2, status='running', created_at=?3, updated_at=?3",
-            params![session_id, goal, now],
+            "INSERT INTO missions (session_id, goal, status, deep, created_at, updated_at) VALUES (?1, ?2, 'running', ?4, ?3, ?3)
+             ON CONFLICT (session_id) DO UPDATE SET goal=?2, status='running', deep=?4, created_at=?3, updated_at=?3",
+            params![session_id, goal, now, deep],
         )?;
         for (i, t) in steps.iter().enumerate() {
             tx.execute(
@@ -559,12 +580,12 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let head = conn
             .query_row(
-                "SELECT goal, status FROM missions WHERE session_id=?1",
+                "SELECT goal, status, deep FROM missions WHERE session_id=?1",
                 params![session_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
             )
             .optional()?;
-        let Some((goal, status)) = head else { return Ok(None) };
+        let Some((goal, status, deep)) = head else { return Ok(None) };
         let mut stmt = conn.prepare(
             "SELECT id, title, status, attempts, result, child_id FROM mission_steps WHERE session_id=?1 ORDER BY pos, id",
         )?;
@@ -580,7 +601,7 @@ impl Db {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(Some(Mission { goal, status, steps }))
+        Ok(Some(Mission { goal, status, deep: deep != 0, steps }))
     }
 
     pub fn mission_set_status(&self, session_id: &str, status: &str) -> Result<()> {
@@ -919,9 +940,10 @@ mod mission_tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("m", None).unwrap();
         assert!(db.mission(&s.id).unwrap().is_none());
-        db.mission_start(&s.id, "ship it", &["one".into(), "two".into()]).unwrap();
+        db.mission_start(&s.id, "ship it", &["one".into(), "two".into()], false).unwrap();
         let m = db.mission(&s.id).unwrap().unwrap();
         assert_eq!((m.goal.as_str(), m.status.as_str()), ("ship it", "running"));
+        assert!(!m.deep, "a plain mission is not deep");
         let first = m.steps[0].id;
         db.mission_step_insert_after(&s.id, first, "one and a half").unwrap();
         db.mission_step_update(first, "done", 1, "did one", Some("child1")).unwrap();
@@ -936,8 +958,10 @@ mod mission_tests {
         db.mission_set_status(&s.id, "paused").unwrap();
         assert_eq!(db.mission(&s.id).unwrap().unwrap().status, "paused");
         // A new mission replaces the old one.
-        db.mission_start(&s.id, "again", &["x".into()]).unwrap();
-        assert_eq!(db.mission(&s.id).unwrap().unwrap().steps.len(), 1);
+        db.mission_start(&s.id, "again", &["x".into()], true).unwrap();
+        let m = db.mission(&s.id).unwrap().unwrap();
+        assert_eq!(m.steps.len(), 1);
+        assert!(m.deep, "the deep flag is kept so resume carries it on");
     }
 }
 
@@ -980,6 +1004,29 @@ mod tests {
         db.remove_project(&p.id).unwrap();
         assert!(db.list_projects().unwrap().is_empty());
         assert!(db.get_session(&child.id).unwrap().unwrap().project_id.is_none(), "chats stay, unfiled");
+    }
+
+    /// A database from before the mission `deep` flag gets the column in
+    /// place and keeps its missions (old missions resume as non-deep).
+    #[test]
+    fn old_database_gets_mission_deep_column() {
+        let path = std::env::temp_dir().join(format!("ocrs-old-mission-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE missions (session_id TEXT PRIMARY KEY, goal TEXT NOT NULL,
+                   status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 INSERT INTO missions VALUES ('ses_old', 'old goal', 'paused', 1, 2);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let m = db.mission("ses_old").unwrap().unwrap();
+        assert_eq!((m.goal.as_str(), m.status.as_str()), ("old goal", "paused"));
+        assert!(!m.deep, "old missions resume as non-deep");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A database from before projects gets the new columns in place and
