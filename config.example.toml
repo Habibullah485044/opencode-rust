@@ -73,6 +73,10 @@ max_steps = 40
 # context_tokens = 8192
 ponytail = true
 auto_review = true
+# Before a run: turn the request into a spec (goal, output, done-when checks).
+sharpen = true
+# After a run with a spec: the model proves each done-when item with tools.
+final_check = true
 reuse_gate = true
 
 # F-05: give each `worker` subagent and team worker its own git worktree.

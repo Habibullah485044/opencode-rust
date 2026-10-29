@@ -137,7 +137,30 @@ pub fn find_browser() -> Option<PathBuf> {
 async fn dump_dom(exe: &Path, url: &str, timeout: Duration) -> Result<String> {
     static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _turn = ONE_AT_A_TIME.lock().await;
-    let profile = std::env::temp_dir().join("opencode-rust-pagecheck-profile");
+    // The lock above is per process. Another Habi (the GUI next to a
+    // headless run) using the kept profile makes Edge print nothing, so the
+    // check failed until the other one finished: then take a fresh profile.
+    let shared = std::env::temp_dir().join("opencode-rust-pagecheck-profile");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(shared.with_extension("lock"))
+        .ok()
+        .filter(|f| f.try_lock().is_ok());
+    let profile = if lock.is_some() {
+        shared
+    } else {
+        std::env::temp_dir().join(format!("opencode-rust-pagecheck-profile-{}", std::process::id()))
+    };
+    let dom = dump_dom_with(exe, url, timeout, &profile).await;
+    if lock.is_none() {
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+    dom
+}
+
+async fn dump_dom_with(exe: &Path, url: &str, timeout: Duration, profile: &Path) -> Result<String> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args([
         "--headless=new",
@@ -429,7 +452,7 @@ fn inject_probe(html: &str) -> String {
 pub async fn check(root: &Path, page: &str, widths: &[u32], expect: &[String]) -> Result<Report> {
     let file = crate::tools::confine_path(root, page)?;
     if !file.is_file() {
-        return Err(anyhow!("{page} does not exist"));
+        return Err(missing_page(root, page));
     }
     let exe = find_browser().ok_or_else(|| {
         anyhow!("no Edge or Chrome found to check the page with (set OPENCODE_RUST_BROWSER to its path)")
@@ -512,8 +535,52 @@ pub fn expected_texts(request: &str) -> Vec<String> {
 }
 
 /// The `check_page` tool.
+/// The page a model meant. Seen live: `/index.html`, `/`,
+/// `http://localhost:8000/index.html` each failed and cost a call; they all
+/// mean a file in the project.
+pub fn page_arg(root: &Path, raw: &str) -> Result<String> {
+    let mut p = raw.trim().to_string();
+    let lower = p.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://")) {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let name = host.split(':').next().unwrap_or("");
+        if !matches!(name, "localhost" | "127.0.0.1" | "[::1]") {
+            bail!("check_page checks pages in this project: pass a file path like index.html, not {raw}");
+        }
+        let start = p.len() - rest.len() + host.len();
+        p = p[start..].split(['?', '#']).next().unwrap_or("").to_string();
+    }
+    let trimmed = p.trim_start_matches("./").trim_start_matches(['/', '\\']).to_string();
+    if trimmed != p && (trimmed.is_empty() || root.join(&trimmed).exists()) {
+        p = trimmed;
+    }
+    if p.is_empty() || root.join(&p).is_dir() {
+        p = Path::new(&p).join("index.html").to_string_lossy().replace('\\', "/");
+    }
+    Ok(p)
+}
+
+/// `page does not exist`, with the pages that do, so the next call is right.
+fn missing_page(root: &Path, page: &str) -> anyhow::Error {
+    let mut pages: Vec<String> = ignore::WalkBuilder::new(root)
+        .max_depth(Some(3))
+        .build()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("html")))
+        .filter_map(|e| e.path().strip_prefix(root).ok().map(|p| p.to_string_lossy().replace('\\', "/")))
+        .collect();
+    pages.sort();
+    pages.truncate(10);
+    if pages.is_empty() {
+        anyhow!("{page} does not exist, and this project has no .html pages yet")
+    } else {
+        anyhow!("{page} does not exist. Pages in this project: {}", pages.join(", "))
+    }
+}
+
 pub async fn run_tool(root: &Path, input: &Value) -> Result<(String, Report)> {
-    let page = input.get("path").and_then(Value::as_str).filter(|p| !p.trim().is_empty()).unwrap_or("index.html");
+    let raw = input.get("path").and_then(Value::as_str).filter(|p| !p.trim().is_empty()).unwrap_or("index.html");
+    let page = &page_arg(root, raw)?;
     let widths: Vec<u32> = input
         .get("widths")
         .and_then(Value::as_array)
@@ -595,6 +662,23 @@ pub fn recently_modified(root: &Path, since: std::time::SystemTime) -> Vec<PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_page_forms_models_write_all_mean_the_file() {
+        let dir = std::env::temp_dir().join(format!("ocrs-pagearg-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("shop")).unwrap();
+        std::fs::write(dir.join("index.html"), "<p>x</p>").unwrap();
+        std::fs::write(dir.join("shop/index.html"), "<p>x</p>").unwrap();
+        for raw in ["index.html", "/index.html", "./index.html", "/", "", "http://localhost:8000/index.html", "http://127.0.0.1:8000/?a=1"] {
+            assert_eq!(page_arg(&dir, raw).unwrap(), "index.html", "{raw:?}");
+        }
+        assert_eq!(page_arg(&dir, "shop").unwrap(), "shop/index.html");
+        assert_eq!(page_arg(&dir, "http://localhost:3000/shop/").unwrap(), "shop/index.html");
+        assert!(page_arg(&dir, "https://example.com/").unwrap_err().to_string().contains("not https://example.com/"));
+        let missing = missing_page(&dir, "about.html").to_string();
+        assert!(missing.contains("index.html") && missing.contains("shop/index.html"), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn quoted_names_become_expected_texts() {

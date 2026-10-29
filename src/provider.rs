@@ -345,11 +345,10 @@ impl Client {
         if self.stream_usage {
             body["stream_options"] = json!({ "include_usage": true });
         }
-        // GPT-6 Luna Chat Completions requires reasoning_effort="none"
-        // when function tools are supplied.
-        if !tools.is_empty() && model.eq_ignore_ascii_case("gpt-6-luna") {
-            body["reasoning_effort"] = json!("none");
-        } else if let Some(effort) = &self.reasoning_effort {
+        // (A rule here once forced reasoning_effort="none" for gpt-6-luna
+        // with tools; lumoncode answers that with 400 on every request.
+        // Checked live: no effort, or "low", works.)
+        if let Some(effort) = &self.reasoning_effort {
             // OpenAI's own API takes `reasoning_effort`; OpenRouter and most
             // routers take `reasoning.effort`.
             if self.base_url.contains("api.openai.com") {

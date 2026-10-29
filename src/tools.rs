@@ -528,6 +528,22 @@ pub mod jobs {
         kill_tree(pid).await;
         Ok(format!("stopped {id}"))
     }
+
+    /// Stop every job still running, with everything it started. Called on
+    /// exit: dropping a job only kills its shell, so a dev server it started
+    /// (`python -m http.server`) kept running after Habi closed.
+    pub async fn stop_all() {
+        let pids: Vec<Option<u32>> = {
+            let map = jobs().lock().unwrap_or_else(|e| e.into_inner());
+            map.values()
+                .filter(|j| j.exit.lock().unwrap_or_else(|e| e.into_inner()).is_none())
+                .map(|j| j.pid)
+                .collect()
+        };
+        for pid in pids {
+            kill_tree(pid).await;
+        }
+    }
 }
 
 async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
@@ -617,6 +633,43 @@ pub(crate) fn msys_to_windows(raw: &str) -> Option<String> {
 ///    symlinks). A symlink leading outside, or a broken symlink, is refused.
 /// 4. The result keeps the workspace prefix as `workspace` spells it (no
 ///    `\\?\` prefix on Windows).
+/// Like [`confine_path`], for tools that only read (`read`, `list`): also
+/// allows the user's skills folder (`~/.config/opencode-rust/skills`), so a
+/// skill installed for every project can be read with its reference files.
+/// Nothing outside the workspace can be written this way.
+pub fn confine_read_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
+    match confine_path(workspace, raw) {
+        // Seen live: models read an installed skill as `.opencode/skills/<name>/SKILL.md`
+        // (or drop the name: `.opencode/skills/references/x.md`). When the
+        // project has no such file, the user's skills folder answers.
+        Ok(p) if !p.exists() => Ok(user_skill_file(raw).unwrap_or(p)),
+        Ok(p) => Ok(p),
+        Err(e) => {
+            let Some(skills) = crate::skills::user_config_dir().map(|d| d.join("skills")) else { return Err(e) };
+            let Ok(root) = skills.canonicalize() else { return Err(e) };
+            match confine_path(&root, raw) {
+                Ok(p) if p.starts_with(&root) => Ok(p),
+                _ => Err(e),
+            }
+        }
+    }
+}
+
+/// `.opencode/skills/<rest>` in the user's skills folder: `<rest>` itself,
+/// or (a path without the skill's name) the one skill that has `<rest>`.
+fn user_skill_file(raw: &str) -> Option<PathBuf> {
+    let norm = raw.replace('\\', "/");
+    let rest = norm.trim_start_matches("./").strip_prefix(".opencode/skills/")?;
+    let root = crate::skills::user_config_dir()?.join("skills");
+    let direct = root.join(rest);
+    if direct.exists() {
+        return Some(direct);
+    }
+    let mut found = std::fs::read_dir(&root).ok()?.flatten().map(|d| d.path().join(rest)).filter(|p| p.exists());
+    let one = found.next()?;
+    found.next().is_none().then_some(one)
+}
+
 pub fn confine_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
     let outside = || {
         anyhow!(
@@ -677,7 +730,7 @@ pub fn confine_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
 
 /// `read` with `outline: true` (see `repomap::outline_text`).
 fn read_outline(workspace: &Path, path: &str) -> Result<String> {
-    let abs = confine_path(workspace, path)?;
+    let abs = confine_read_path(workspace, path)?;
     if abs.is_dir() {
         bail!("{path} is a directory — use the list tool to see its contents");
     }
@@ -690,7 +743,7 @@ fn read_outline(workspace: &Path, path: &str) -> Result<String> {
 }
 
 fn read_file(workspace: &Path, path: &str, offset: i64, limit: i64) -> Result<String> {
-    let abs = confine_path(workspace, path)?;
+    let abs = confine_read_path(workspace, path)?;
     if abs.is_dir() {
         bail!("{path} is a directory — use the list tool to see its contents");
     }
@@ -1385,7 +1438,7 @@ fn utf8_len(b: u8) -> usize {
 }
 
 fn list_dir(workspace: &Path, path: &str) -> Result<String> {
-    let abs = confine_path(workspace, path)?;
+    let abs = confine_read_path(workspace, path)?;
     let rd = std::fs::read_dir(&abs).with_context(|| format!("listing {}", abs.display()))?;
     let mut dirs = Vec::new();
     let mut files = Vec::new();
@@ -1442,6 +1495,21 @@ mod tests {
         assert!(err.to_string().contains("timed out"), "{err}");
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!dir.path().join("marker.txt").exists(), "the background child must die too");
+    }
+
+    /// A dev server the agent started in the background must not outlive
+    /// Habi: `stop_all` (run on exit) ends it and what it started.
+    #[tokio::test]
+    async fn stop_all_ends_background_jobs_and_their_children() {
+        if shell_kind() != crate::permissions::Shell::Posix {
+            return;
+        }
+        let dir = TempDir::new("jobs-stop-all");
+        jobs::start("(sleep 2; echo late > marker.txt) & sleep 30", dir.path()).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        jobs::stop_all().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!dir.path().join("marker.txt").exists(), "the job's child must die too");
     }
 
     /// B-06: nothing starts once the run is aborted.
@@ -1614,6 +1682,30 @@ mod tests {
         let out = read_outline(dir.path(), "app.py").unwrap();
         assert!(out.contains("     3  class Cart") && out.contains("     4  def add"), "{out}");
         assert!(read_outline(dir.path(), ".").unwrap_err().to_string().contains("list"));
+    }
+
+    /// Read-only tools may read the user's skills folder (a skill installed
+    /// for every project, with its reference files), nothing else outside.
+    #[test]
+    fn the_user_skills_folder_is_readable_but_nothing_else_outside() {
+        let ws = TempDir::new("skills-read");
+        let Some(skills) = crate::skills::user_config_dir().map(|d| d.join("skills")) else { return };
+        let probe = skills.join("zz-probe-skill");
+        std::fs::create_dir_all(&probe).unwrap();
+        std::fs::write(probe.join("SKILL.md"), "---\nname: zz\n---\nhello skill\n").unwrap();
+        std::fs::create_dir_all(probe.join("references")).unwrap();
+        std::fs::write(probe.join("references/zz-probe-only.md"), "probe reference\n").unwrap();
+        let path = probe.join("SKILL.md").display().to_string();
+        let out = read_file(ws.path(), &path, 0, 10);
+        // The project-relative spellings models use for an installed skill.
+        let as_project = read_file(ws.path(), ".opencode/skills/zz-probe-skill/SKILL.md", 0, 10);
+        let no_name = read_file(ws.path(), ".opencode/skills/references/zz-probe-only.md", 0, 10);
+        let _ = std::fs::remove_dir_all(&probe);
+        assert!(out.unwrap().contains("hello skill"));
+        assert!(as_project.unwrap().contains("hello skill"));
+        assert!(no_name.unwrap().contains("probe reference"));
+        assert!(read_file(ws.path(), "C:/Windows/win.ini", 0, 5).is_err() || cfg!(not(windows)));
+        assert!(write_file(ws.path(), &skills.join("x.txt").display().to_string(), "no").is_err(), "writing there stays refused");
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub mod server;
 pub mod settings;
 pub mod sessions;
 pub mod skills;
+pub mod spec;
 pub mod subagent;
 pub mod team;
 pub mod todo;

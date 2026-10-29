@@ -354,12 +354,20 @@ contrast at least 4.5:1, touch targets at least 44px.\n\
 - A phone menu is a <button aria-controls aria-expanded> with a visible three-bar icon, \
 toggled by the script.\n\
 - Use names from the request exactly as written. After building, run check_page and fix \
-everything it reports.";
+everything it reports.\n\
+- Design like a studio made it for this business, not a template: choose one visual \
+direction (palette, a display and a body font, image style) and hold it everywhere. Real, \
+specific copy for this business; never lorem ipsum, \"Welcome to our website\" or a generic \
+three-icon feature row.\n\
+- One message and one main action per section; a large display size in the type scale; \
+generous space; vary section layouts (split, grid, full-bleed) instead of stacking centred \
+blocks. Hover and focus states, consistent radius and shadow, a <title>, alt text.\n\
+- The smallest-change rule is about code, never about this finish: lean code, full design.";
 
 /// True when a request is about building or changing a web page.
 pub fn is_web_task(text: &str) -> bool {
     let t = text.to_lowercase();
-    ["website", "web site", "homepage", "home page", "landing page", "web page", "webpage", "html", "css", "frontend", "front-end"]
+    ["website", "web site", "homepage", "home page", "landing page", "web page", "webpage", "web app", "storefront", "online store", "portfolio", "dashboard", "html", "css", "frontend", "front-end"]
         .iter()
         .any(|k| t.contains(k))
 }
@@ -471,7 +479,8 @@ pub fn compose_system(p: PromptInputs<'_>) -> String {
              These are all of your skills; the list is already complete, so answer \
              questions about what you can do from it instead of running commands to \
              look for skills. Read a skill's file only when you are about to use it.\n\
-             Skill files live in `{}/.opencode/skills/`.\n\n",
+             Skill files live in `{}/.opencode/skills/`, except a skill shown with a path \
+             in brackets: read that path. Files a skill mentions sit next to its SKILL.md.\n\n",
             p.workspace.display()
         ));
         out.push_str(&skills::skill_index(p.skills));

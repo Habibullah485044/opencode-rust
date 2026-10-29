@@ -96,12 +96,27 @@ fn mark(status: &str) -> &'static str {
     }
 }
 
+/// A step line `<result> — check: <proof>` as (result, proof). Like Codebuff's
+/// reviewer and test runner: what proves a step is decided when it is
+/// planned, and proven with tools after it, not taken from the worker's word.
+fn split_check(title: &str) -> (&str, Option<&str>) {
+    let lower = title.to_ascii_lowercase();
+    match lower.find("check:") {
+        Some(i) => {
+            let result = title[..i].trim_end().trim_end_matches(['—', '-', '–', ';', ',', '(']).trim_end();
+            let proof = title[i + "check:".len()..].trim().trim_end_matches(')').trim();
+            (if result.is_empty() { title } else { result }, Some(proof).filter(|p| !p.is_empty()))
+        }
+        None => (title, None),
+    }
+}
+
 /// The plan with each step's state, for the coordinator and the brief.
 fn plan_text(m: &Mission) -> String {
     m.steps
         .iter()
         .enumerate()
-        .map(|(i, s)| format!("{} {}. {}", mark(&s.status), i + 1, s.title))
+        .map(|(i, s)| format!("{} {}. {}", mark(&s.status), i + 1, split_check(&s.title).0))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -144,8 +159,10 @@ async fn plan(st: &Shared, ws: &std::path::Path, goal: &str, abort: &AtomicBool)
     let map = crate::repomap::render(&crate::repomap::scan(ws, &st.state_dir), goal, &[], 600);
     let user = format!(
         "Mission goal:\n{goal}\n{map}\n\nSplit the mission into 2 to 8 steps, in order. Each step is one \
-         line: a concrete result one focused work session can finish and check. Make the last step \
-         \"Check that the whole result works\". Reply with only the numbered list."
+         line: a concrete result one focused work session can finish, then ` — check: ` and how a tool \
+         call proves it (a file opens as a PNG, `node tests/x.mjs` passes, check_page shows the cart). \
+         Make the last step \"Check that the whole result works — check: every done-when item of the \
+         goal\". Reply with only the numbered list."
     );
     match one_shot(st, COORDINATOR, &user, abort, false).await {
         Ok(reply) => {
@@ -159,7 +176,8 @@ async fn plan(st: &Shared, ws: &std::path::Path, goal: &str, abort: &AtomicBool)
 async fn review(st: &Shared, m: &Mission, n: usize, receipt: &str, abort: &AtomicBool) -> Verdict {
     let user = format!(
         "Mission goal:\n{}\n\nPlan ([x] done, [>] just worked on, [!] failed, [ ] to do):\n{}\n\n\
-         Report of step {n}:\n{}\n\nDecide what happens next. Reply with exactly one line:\n\
+         Report of step {n}:\n{}\n\nA step whose check is NOT proven is not done. \
+         Decide what happens next. Reply with exactly one line:\n\
          NEXT — step {n} is done, go on with the plan\n\
          REDO: <what is missing> — step {n} is not done yet\n\
          ADD: <new step> — step {n} is done, and the mission needs one more step right after it\n\
@@ -195,14 +213,19 @@ pub(super) async fn run_mission(
     let ws = st.workspace_for(session_id);
     if let Some(goal) = goal {
         st.db.add_message(session_id, "user", &[Part::Text { text: format!("[mission] {goal}") }])?;
+        // The goal is kept with its spec: the plan, every step brief and the
+        // coordinator see the done-when checks, and the final check proves them.
+        let spec = make_spec(st, session_id, goal, abort).await;
+        let goal = spec.as_ref().map_or_else(|| goal.to_string(), |s| crate::spec::with_goal(goal, s));
         note("mission: planning the steps…".into());
-        let steps = plan(st, &ws, goal, abort).await;
+        let steps = plan(st, &ws, &goal, abort).await;
         if abort.load(Ordering::SeqCst) {
             anyhow::bail!("aborted");
         }
-        st.db.mission_start(session_id, goal, &steps)?;
+        st.db.mission_start(session_id, &goal, &steps)?;
         let m = st.db.mission(session_id)?.expect("just started");
-        say(st, session_id, format!("**Mission plan** — I keep working until it is done:\n{}", plan_text(&m)));
+        let shown = spec.as_ref().map(|s| format!("{}\n\n", crate::spec::for_user(s))).unwrap_or_default();
+        say(st, session_id, format!("{shown}**Mission plan** — I keep working until it is done:\n{}", plan_text(&m)));
     } else {
         let Some(m) = st.db.mission(session_id)? else {
             anyhow::bail!("this chat has no mission to resume; start one with /mission <goal>");
@@ -225,6 +248,21 @@ pub(super) async fn run_mission(
         note(format!("mission: each step is a Deep run ({} attempts, the best checked one kept)", st.cfg.agent.deep_attempts));
     }
     let result = steps_loop(st, session_id, &ws, deep, abort).await;
+    // Every step said done: now prove the goal's checks on the whole result,
+    // in a chat of its own (still with automatic approvals).
+    let mut checked = String::new();
+    if matches!(result, Ok(true)) && st.cfg.agent.final_check {
+        let goal = st.db.mission(session_id)?.map(|m| m.goal).unwrap_or_default();
+        if let Some(spec) = crate::spec::from_goal(&goal) {
+            let child = st.db.create_session("mission final check", Some(session_id))?;
+            let passed = final_check(st, &child.id, &spec, abort).await;
+            checked = match passed {
+                Some(true) => "\nFinal check: every done-when item proven.".into(),
+                Some(false) => "\nFinal check: not every done-when item could be proven — see the final check chat.".into(),
+                None => "\nFinal check: could not run (provider unreachable) — check the result yourself.".into(),
+            };
+        }
+    }
     if before != PermissionMode::Turbo {
         st.set_perm_mode(before);
     }
@@ -239,7 +277,7 @@ pub(super) async fn run_mission(
     let counts = |s: &str| m.steps.iter().filter(|x| x.status == s).count();
     let summary = match status {
         "done" => format!(
-            "**Mission complete** — {} step(s) done{}.\n{}",
+            "**Mission complete** — {} step(s) done{}.\n{}{checked}",
             counts("done"),
             if counts("failed") > 0 { format!(", {} failed", counts("failed")) } else { String::new() },
             plan_text(&m)
@@ -338,19 +376,48 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
             agent_status(st, &info, "working", "checking the result…".into());
             check_after_run(st, &child.id, &brief, since, true, abort).await
         };
+        // The step's own check, proven with tools in the step's chat. The
+        // last step's whole-goal check is the mission's final check instead.
+        let proof = match split_check(&step.title).1 {
+            Some(check) if st.cfg.agent.final_check && !check.to_ascii_lowercase().contains("every done-when") => {
+                agent_status(st, &info, "working", "proving the step's check…".into());
+                let spec = crate::spec::Spec {
+                    goal: split_check(&step.title).0.to_string(),
+                    output: "the work of this step".into(),
+                    done_when: vec![check.to_string()],
+                    assuming: vec![],
+                };
+                Some(final_check(st, &child.id, &spec, abort).await)
+            }
+            _ => None,
+        };
+        if abort.load(Ordering::SeqCst) {
+            st.db.mission_step_update(step.id, "pending", attempts - 1, &step.result, None)?;
+            agent_status(st, &info, "failed", "stopped".into());
+            anyhow::bail!("aborted");
+        }
         let shown: Vec<String> = files
             .iter()
             .take(12)
             .map(|f| f.strip_prefix(ws).unwrap_or(f).to_string_lossy().replace('\\', "/"))
             .collect();
         let receipt = format!(
-            "{}\nFiles changed: {}\nChecks: {}",
+            "{}\nFiles changed: {}\nChecks: {}{}",
             report.trim(),
             if shown.is_empty() { "none".to_string() } else { shown.join(", ") },
             match &checks {
                 Some((true, s)) => format!("passed ({s})"),
                 Some((false, s)) => format!("still failing ({s})"),
                 None => "none ran".into(),
+            },
+            match proof {
+                Some(Some(true)) => "\nStep check: proven with tools".to_string(),
+                Some(None) => "\nStep check: could not run (provider unreachable); judge from the report".to_string(),
+                Some(Some(false)) => format!(
+                    "\nStep check: NOT proven ({}) — see the end of the step chat",
+                    split_check(&step.title).1.unwrap_or("")
+                ),
+                None => String::new(),
             }
         );
         // The coordinator sees this step as the one just worked on.
@@ -375,19 +442,19 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
                 st.db.mission_step_update(step.id, "done", attempts, &receipt, None)?;
                 st.db.mission_step_insert_after(session_id, step.id, &new_step)?;
                 agent_status(st, &info, "done", first_line.clone());
-                say(st, session_id, format!("✓ Step {n}: {} — {first_line}\n➕ Added next: {new_step}", step.title));
+                say(st, session_id, format!("✓ Step {n}: {} — {first_line}\n➕ Added next: {new_step}", split_check(&step.title).0));
             }
             Verdict::Done => {
                 st.db.mission_step_update(step.id, "done", attempts, &receipt, None)?;
                 agent_status(st, &info, "done", first_line.clone());
-                say(st, session_id, format!("✓ Step {n}: {} — {first_line}", step.title));
+                say(st, session_id, format!("✓ Step {n}: {} — {first_line}", split_check(&step.title).0));
                 // The coordinator says the goal is reached: what is left is not needed.
                 return Ok(true);
             }
             Verdict::Next | Verdict::Add(_) => {
                 st.db.mission_step_update(step.id, "done", attempts, &receipt, None)?;
                 agent_status(st, &info, "done", first_line.clone());
-                say(st, session_id, format!("✓ Step {n}: {} — {first_line}", step.title));
+                say(st, session_id, format!("✓ Step {n}: {} — {first_line}", split_check(&step.title).0));
             }
         }
     }
@@ -404,6 +471,17 @@ pub fn mission_report(st: &AppState, session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_step_carries_its_own_check() {
+        assert_eq!(
+            split_check("Add the cart module — check: `node tests/cart.test.mjs` passes"),
+            ("Add the cart module", Some("`node tests/cart.test.mjs` passes"))
+        );
+        assert_eq!(split_check("Draw the heart (check: heart.png opens as a PNG)"), ("Draw the heart", Some("heart.png opens as a PNG")));
+        assert_eq!(split_check("Build the page layout"), ("Build the page layout", None));
+        assert_eq!(split_check("Build it - Check:"), ("Build it", None));
+    }
 
     #[test]
     fn plans_are_read_from_lists() {

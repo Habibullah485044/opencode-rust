@@ -219,7 +219,16 @@ pub fn resolve_command(workspace: &Path, input: &str) -> Option<(String, Doc)> {
 pub fn skill_index(skills: &[Doc]) -> String {
     skills
         .iter()
-        .map(|s| format!("- {}: {}", s.name, s.description))
+        .map(|s| {
+            // A skill from the user's folder (installed for every project) is
+            // not under the workspace: name its file so it can be read.
+            let user = user_config_dir().map(|d| d.join("skills")).is_some_and(|d| s.path.starts_with(&d));
+            if user {
+                format!("- {} ({}): {}", s.name, s.path.display(), s.description)
+            } else {
+                format!("- {}: {}", s.name, s.description)
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -535,7 +544,10 @@ mod tests {
         std::fs::create_dir_all(&skills).unwrap();
         std::fs::write(skills.join("alpha.md"), "---\ndescription: Does alpha\n---\nA").unwrap();
         let all = load_skills(&ws);
-        assert_eq!(skill_index(&all), "- alpha: Does alpha");
+        // Skills installed in the user's own folder are listed too (with
+        // their file); this test only looks at its own.
+        let index = skill_index(&all);
+        assert!(index.lines().any(|l| l == "- alpha: Does alpha"), "{index}");
         assert!(find_skill(&ws, "alpha").is_ok());
         assert!(find_skill(&ws, "beta").is_err());
         let _ = std::fs::remove_dir_all(&ws);

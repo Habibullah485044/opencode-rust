@@ -1278,6 +1278,28 @@ pub fn is_local_url(url: &str) -> bool {
 
 /// New (B-42): the newest chat, if it has no messages yet (reuse it instead of
 /// creating another empty "New chat").
+/// Where plain chats work. The start folder, unless it is no project: Habi's
+/// own source (`cargo run` there put a user's mission into this code), the
+/// folder the program sits in, the home folder, a system folder or a drive
+/// root (a double-clicked app starts in one of those). Then `~/Habi Projects`.
+pub fn chat_home(start: &std::path::Path) -> std::path::PathBuf {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(std::path::PathBuf::from);
+    let fallback = home.clone().unwrap_or_else(std::env::temp_dir).join("Habi Projects");
+    let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let start_c = canon(start);
+    let is_habi_source = std::fs::read_to_string(start.join("Cargo.toml"))
+        .is_ok_and(|t| t.contains("name = \"opencode-rust\""));
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(canon));
+    let lower = start_c.to_string_lossy().to_lowercase().replace('/', "\\");
+    let system = ["\\windows", "\\program files", "\\programdata"].iter().any(|s| lower.contains(s));
+    let unsuitable = is_habi_source
+        || start_c.parent().is_none()
+        || exe_dir.as_deref() == Some(start_c.as_path())
+        || home.as_deref().map(canon).as_deref() == Some(start_c.as_path())
+        || system;
+    if unsuitable { fallback } else { start.to_path_buf() }
+}
+
 fn newest_empty_session(st: &server::AppState) -> Option<crate::db::Session> {
     let newest = st.db.list_sessions().ok()?.into_iter().next()?;
     let empty = st.db.messages(&newest.id).map(|m| m.is_empty()).unwrap_or(false);
@@ -2065,8 +2087,29 @@ pub async fn run(
     };
     let mut gs = GuiState::new();
     gs.session = Some(session.id.clone());
-    // The folder the app started in is a project; plain new chats go there.
-    gs.default_project = state.db.upsert_project(&state.workspace).ok().map(|p| p.id);
+    // The folder the app started in is a project; plain new chats go there,
+    // unless it is no project at all (see `chat_home`).
+    let home = chat_home(&state.workspace);
+    if home != state.workspace {
+        if let Err(e) = std::fs::create_dir_all(&home) {
+            gs.push(EntryKind::Error, format!("could not make {}: {e}", home.display()));
+        }
+        gs.push(
+            EntryKind::System,
+            format!(
+                "New chats work in {} (Habi was started in {}, which is not a project). \
+                 Add your own project folder from the sidebar to work on its code.",
+                home.display(),
+                state.workspace.display()
+            ),
+        );
+    }
+    gs.default_project = state.db.upsert_project(&home).ok().map(|p| p.id);
+    if session.project_id.is_none() {
+        if let Some(p) = &gs.default_project {
+            let _ = state.db.set_session_project(&session.id, Some(p));
+        }
+    }
     gs.editors = find_editors().into_iter().map(|(n, _)| n.to_string()).collect();
     gs.commands = GUI_COMMANDS.iter().map(|(n, a, h)| (format!("{n}{}{a}", if a.is_empty() { "" } else { " " }), h.to_string())).collect();
     for doc in crate::skills::load_commands(&state.workspace) {
@@ -3273,6 +3316,22 @@ mod tests {
 
     fn delta(text: &str) -> ServerEvent {
         ServerEvent::AssistantDelta { session_id: "s".into(), text: text.into() }
+    }
+
+    #[test]
+    fn chats_never_work_in_habis_own_source_or_system_folders() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(chat_home(src).ends_with("Habi Projects"), "Habi's own source is no project");
+        let home = std::path::PathBuf::from(std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).unwrap());
+        assert!(chat_home(&home).ends_with("Habi Projects"), "the home folder is no project");
+        if cfg!(windows) {
+            assert!(chat_home(std::path::Path::new("C:\\Windows\\System32")).ends_with("Habi Projects"));
+            assert!(chat_home(std::path::Path::new("C:\\")).ends_with("Habi Projects"));
+        }
+        let project = std::env::temp_dir().join(format!("ocrs-chat-home-{}", std::process::id()));
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(chat_home(&project), project, "a normal folder is the project");
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[tokio::test]

@@ -1092,15 +1092,22 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
     let started = std::time::Instant::now();
     // Coarse file times: a second of slack so this run's first writes count.
     let started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
-    let result = agent_inner(st, session_id, user_content, &abort).await;
+    let spec = make_spec(st, session_id, user_content, &abort).await;
+    let result = agent_inner_with(st, session_id, user_content, spec.as_ref().map(crate::spec::for_model), &abort).await;
     // Laziness Meter: did this run change the workspace at all? Successful
     // write/edit calls always count. New (P-02): bash counts only when the
     // git working tree really changed (or when there is no git to ask).
     let (touched, bash_used) = {
         let after = snapshot_stats(st, session_id);
         let bash_used = after.bash_runs > before.bash_runs;
+        // Without git there is no tree to compare: look at file times
+        // instead. Assuming a change (as before) started a full review after
+        // `node --version` — 13 extra calls on a live test.
         let bash_changed = bash_used
-            && (tree_before.is_none() || st.workspace_fingerprint(session_id).await != tree_before);
+            && match tree_before {
+                Some(_) => st.workspace_fingerprint(session_id).await != tree_before,
+                None => files_changed_since(&st.workspace_for(session_id), started_at),
+            };
         // Files written by this run's subagents count too.
         let by_agents = !crate::keepbest::written_since(&st.workspace_for(session_id), started_at).is_empty();
         (after.writes > before.writes || after.edits > before.edits || bash_changed || by_agents, bash_used)
@@ -1124,6 +1131,13 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
         // before the turn is declared done. Never after an abort.
         if ok && touched && !abort.load(Ordering::SeqCst) {
             check_after_run(st, session_id, user_content, started_at, bash_used, &abort).await;
+        }
+        // The checks above run tests and pages; this one proves what the
+        // user asked for (a PNG that is a PNG, a cart that adds up).
+        if let Some(spec) = spec.as_ref().filter(|_| ok && st.cfg.agent.final_check) {
+            if !abort.load(Ordering::SeqCst) && !matches!(result.as_deref(), Ok("aborted")) {
+                final_check(st, session_id, spec, &abort).await;
+            }
         }
         // Auto ponytail review: any run that changed files gets the
         // outside-the-diff senior-dev pass BEFORE the turn is declared done.
@@ -1526,7 +1540,23 @@ async fn agent_inner(
     user_content: &str,
     abort: &AtomicBool,
 ) -> Result<String> {
+    agent_inner_with(st, session_id, user_content, None, abort).await
+}
+
+/// [`agent_inner`] with a note the model gets right after the request (the
+/// work spec). A message, not part of the system prompt: the prompt stays
+/// the same for the chat and keeps hitting the provider's cache.
+async fn agent_inner_with(
+    st: &Shared,
+    session_id: &str,
+    user_content: &str,
+    note: Option<String>,
+    abort: &AtomicBool,
+) -> Result<String> {
     st.db.add_message(session_id, "user", &[Part::Text { text: user_content.to_string() }])?;
+    if let Some(note) = note {
+        st.db.add_message(session_id, "system", &[Part::Text { text: note }])?;
+    }
     // M2: expand slash-command templates (`.opencode/commands/*.md`);
     // the raw input stays visible to the user, the expansion is a system note.
     if let Some((rendered, doc)) = skills::resolve_command(&st.workspace_for(session_id), user_content) {
@@ -2302,6 +2332,32 @@ pub fn rewind_chat(st: &AppState, session_id: &str, text: &str, skip: usize) -> 
     }
     let messages = st.db.delete_messages_from(session_id, &msgs[at].id)?;
     Ok(Rewound { messages, undone, problem })
+}
+
+/// Did any file under `ws` change at or after `since`? Ignored and build
+/// folders are skipped, and the walk stops after 20,000 entries (then it
+/// answers yes, to be safe).
+fn files_changed_since(ws: &std::path::Path, since: std::time::SystemTime) -> bool {
+    let walker = ignore::WalkBuilder::new(ws)
+        .hidden(false)
+        .require_git(false)
+        .filter_entry(|e| !matches!(e.file_name().to_str(), Some(".git" | "node_modules" | "target" | ".opencode")))
+        .build();
+    for (n, entry) in walker.flatten().enumerate() {
+        if n > 20_000 {
+            return true;
+        }
+        let changed = entry
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+            .is_some_and(|t| t >= since);
+        if changed {
+            return true;
+        }
+    }
+    false
 }
 
 /// Most "do it now" nudges per run.
@@ -3319,6 +3375,78 @@ pub const VERIFY_PREFIX: &str = "[verify]";
 /// fewer problems; otherwise the files it wrote are put back (the model
 /// cannot judge its own work without a signal, and later rounds often make
 /// things worse). Each step shows up as a `Note`.
+/// The work spec for a request (see [`crate::spec`]), shown to the user as
+/// a note. `None` when it is off, the message is chatter or a question, or
+/// the model's reply is not a spec: the run goes on without one.
+pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abort: &AtomicBool) -> Option<crate::spec::Spec> {
+    if !st.cfg.agent.sharpen || !crate::spec::needs_spec(request) {
+        return None;
+    }
+    let ws = st.workspace_for(session_id);
+    let mut files: Vec<String> = std::fs::read_dir(&ws)
+        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !n.starts_with('.')).collect())
+        .unwrap_or_default();
+    files.sort();
+    files.truncate(30);
+    let context = last_assistant_text(st, session_id);
+    let user = crate::spec::prompt(request, context.as_deref(), &files);
+    let reply = match one_shot(st, crate::spec::SYSTEM, &user, abort, false).await {
+        Ok(r) => r,
+        Err(e) => {
+            core_log(&format!("[spec] {e:#}"));
+            return None;
+        }
+    };
+    let spec = crate::spec::parse(&reply)?;
+    let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text: crate::spec::for_user(&spec) });
+    Some(spec)
+}
+
+/// The final check: the model proves each done-when item of the spec with
+/// tool calls, in this chat, and fixes what fails (one more round at most).
+/// A "PASS" given without a tool call proves nothing and counts as a fail.
+/// `Some(true)` when every item passed, `None` when the check could not run
+/// (provider down, aborted): that says nothing about the work.
+pub(crate) async fn final_check(st: &Shared, session_id: &str, spec: &crate::spec::Spec, abort: &AtomicBool) -> Option<bool> {
+    let note = |text: String| {
+        let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
+    };
+    let tool_results = || {
+        st.db.messages(session_id).map(|m| m.iter().filter(|m| m.role == "tool").count()).unwrap_or(0)
+    };
+    note(format!("final check — proving {} item(s) with tools…", spec.done_when.len()));
+    let mut msg = crate::spec::check_request(spec);
+    for round in 1..=2 {
+        if abort.load(Ordering::SeqCst) {
+            return None;
+        }
+        let before = tool_results();
+        if let Err(e) = agent_inner(st, session_id, &msg, abort).await {
+            note(format!("final check could not run: {e}"));
+            return None;
+        }
+        let looked = tool_results() > before;
+        let (pass, fails) = crate::spec::verdicts(&last_assistant_text(st, session_id).unwrap_or_default());
+        let problem = if !looked {
+            "you answered without calling a tool, so nothing was proven".to_string()
+        } else if fails.is_empty() && pass > 0 {
+            note(format!("final check passed — {pass} item(s) proven{}", if round > 1 { " after a fix round" } else { "" }));
+            return Some(true);
+        } else if fails.is_empty() {
+            note("final check: the reply had no PASS/FAIL lines".into());
+            return Some(false);
+        } else {
+            fails.join("; ")
+        };
+        if round == 1 {
+            note(format!("final check: not proven yet ({}) — one fix round", problem.chars().take(160).collect::<String>()));
+        }
+        msg = crate::spec::retry_request(&problem);
+    }
+    note("final check: some items are still not proven — see the last reply".into());
+    Some(false)
+}
+
 async fn check_after_run(
     st: &Shared,
     session_id: &str,
@@ -5154,6 +5282,21 @@ mod tests {
         let mut small = vec![m("user", "hi".into()), m("tool", "ok".into())];
         assert_eq!(fit_tool_results(&mut small, 16_384), 0, "a small request is left alone");
         assert_eq!(fit_tool_results(&mut msgs.clone(), 0), 0, "no known limit, nothing cut");
+    }
+
+    #[test]
+    fn file_changes_are_seen_without_git() {
+        let dir = std::env::temp_dir().join(format!("ocrs-nogit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.txt"), "x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let since = std::time::SystemTime::now();
+        assert!(!files_changed_since(&dir, since), "nothing changed (node --version)");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("new.txt"), "y").unwrap();
+        assert!(files_changed_since(&dir, since), "a command wrote a file");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -7824,6 +7967,14 @@ mod prompt_budget_tests {
         let st = super::build_state_ephemeral(crate::config::Config::default(), dir.clone()).await;
         let s = st.db.create_session("m", None).unwrap();
         let (system, tools, count) = st.request_overhead(&s.id);
+        // Skills installed in the user's own folder (this temp workspace has
+        // none) are the user's choice, not the fixed part: leave them out.
+        let composed = st.composed_system(&s.id);
+        let skills = composed.find("\n\n## Skills").map_or(0, |at| {
+            let rest = &composed[at + 2..];
+            rest.find("\n\n## ").unwrap_or(rest.len()) + 2
+        });
+        let system = system - skills / 4;
         // 900 → 1000 for the all-tools calling guide (the tool names and
         // arguments a weak model needs spelled out; the user asked for it
         // after the model kept calling tools wrong).

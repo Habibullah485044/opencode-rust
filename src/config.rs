@@ -308,6 +308,12 @@ pub struct AgentCfg {
     pub ponytail: bool,
     /// Automatically run a ponytail review after runs that changed files.
     pub auto_review: bool,
+    /// Before a run, turn the request into a spec (goal, output, done-when
+    /// checks) with one plain model call, shown to the user and the worker.
+    pub sharpen: bool,
+    /// After a run with a spec, make the model prove each done-when item
+    /// with tool calls and fix what fails (one fix round at most).
+    pub final_check: bool,
     /// F-05: give each `worker` subagent and team worker its own git
     /// worktree. Their changes come back as a patch file instead of landing
     /// in the workspace. Off by default.
@@ -363,6 +369,8 @@ impl Default for AgentCfg {
             verify_max_rounds: 2,
             verify_timeout_secs: 600,
             auto_review: true,
+            sharpen: true,
+            final_check: true,
             reuse_gate: true,
             context_tokens: 0,
         }

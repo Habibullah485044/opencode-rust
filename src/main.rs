@@ -168,20 +168,22 @@ fn run() -> Result<()> {
         // New (S-01): say where the HTTP API token is (never the token).
         eprintln!("[api] {}", server::api_token_note(&state.state_dir));
 
-        if headless {
-            return headless_run(state, addr, prompt, boot_ms).await;
-        }
-        if gui {
+        let result = if headless {
+            headless_run(state, addr, prompt, boot_ms).await
+        } else if gui {
             #[cfg(feature = "gui")]
             {
-                return opencode_rust::gui::run(state, addr, prompt, boot_ms).await;
+                opencode_rust::gui::run(state, addr, prompt, boot_ms).await
             }
             #[cfg(not(feature = "gui"))]
             {
-                anyhow::bail!("this build has no GUI support; rebuild with: cargo build --features gui");
+                Err(anyhow::anyhow!("this build has no GUI support; rebuild with: cargo build --features gui"))
             }
-        }
-        tui_run(state, addr, prompt, boot_ms).await
+        } else {
+            tui_run(state, addr, prompt, boot_ms).await
+        };
+        opencode_rust::tools::jobs::stop_all().await;
+        result
     })
 }
 
@@ -675,6 +677,7 @@ async fn headless_run(
                     "\n[error] headless run timed out after {}s (raise it with --timeout N; 0 = no limit)",
                     limit.as_secs()
                 );
+                opencode_rust::tools::jobs::stop_all().await;
                 std::process::exit(124);
             }
         }
@@ -734,6 +737,7 @@ async fn headless_run(
                 println!();
                 if !ok {
                     eprintln!("[error] {}", message.unwrap_or_default());
+                    opencode_rust::tools::jobs::stop_all().await;
                     std::process::exit(1);
                 }
                 break;
