@@ -150,6 +150,19 @@ pub struct ProviderCfg {
     /// (`stream_options.include_usage`), so `/usage` can show cache hits.
     /// Turn off for a server that rejects the field.
     pub stream_usage: bool,
+    /// Model router: a step that follows only reading (read, list, glob,
+    /// grep) goes to `small_model`. When the small model then wants to
+    /// change something (write, edit, bash…), its reply is dropped unseen and
+    /// the step is asked again of `model`. Off by default.
+    pub router: bool,
+    /// Prices in US dollars per million tokens, for the cost shown in
+    /// `/usage` and the desktop app. OpenRouter reports the real cost itself
+    /// and these are not used there. 0 = unknown (no cost shown).
+    pub price_input: f64,
+    pub price_output: f64,
+    /// Price of prompt tokens read from the provider's cache. 0 = same as
+    /// `price_input`.
+    pub price_cached: f64,
 }
 
 /// `provider.prompt_cache`: when to send prompt-caching markers.
@@ -181,6 +194,10 @@ impl Default for ProviderCfg {
             images: "auto".into(),
             prompt_cache: PromptCache::Auto,
             stream_usage: true,
+            router: false,
+            price_input: 0.0,
+            price_output: 0.0,
+            price_cached: 0.0,
         }
     }
 }
@@ -340,6 +357,10 @@ pub struct AgentCfg {
     /// Laziness Meter: hint the model when a write duplicates something the
     /// repo already has, and flag overbuilt writes.
     pub reuse_gate: bool,
+    /// After each step that wrote or edited files, check those files with
+    /// the language's own checker (cargo check, tsc, python, node, JSON and
+    /// TOML parsing) and hand the errors back to the model before it goes on.
+    pub check_edits: bool,
     /// F-07: the model's context window in tokens. When the next request
     /// would use about 80% of it, older messages are compacted first.
     /// 0 = off (default).
@@ -364,6 +385,7 @@ impl Default for AgentCfg {
             verify_timeout_secs: 600,
             auto_review: true,
             reuse_gate: true,
+            check_edits: true,
             context_tokens: 0,
         }
     }

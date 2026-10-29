@@ -173,9 +173,38 @@ fn user_config_dir_inner() -> Option<PathBuf> {
     Some(base.join("opencode-rust"))
 }
 
+/// Skills that ship inside the app, after the folders: a project or user
+/// skill with the same name replaces one of these.
+const BUNDLED: [(&str, &str); 4] = [
+    ("website-builder", include_str!("bundled_skills/website-builder.md")),
+    ("fix-tests", include_str!("bundled_skills/fix-tests.md")),
+    ("git-commit", include_str!("bundled_skills/git-commit.md")),
+    ("security-check", include_str!("bundled_skills/security-check.md")),
+];
+
+/// Where the model reads a built-in skill: `read builtin-skills/<name>.md`
+/// (there is no such file; the read tool answers from `BUNDLED`).
+pub const BUILTIN_DIR: &str = "builtin-skills";
+
+pub fn bundled_skills() -> impl Iterator<Item = Doc> {
+    BUNDLED
+        .iter()
+        .map(|(name, text)| parse_md(&Path::new(BUILTIN_DIR).join(name).join("SKILL.md"), text))
+}
+
+/// The text of a built-in skill for a read of `builtin-skills/<name>.md`
+/// (or `…/<name>/SKILL.md`), unless the project has a real file there.
+pub fn builtin_skill_text(workspace: &Path, path: &str) -> Option<&'static str> {
+    let p = path.trim().replace('\\', "/");
+    let rest = p.trim_start_matches("./").strip_prefix(BUILTIN_DIR)?.strip_prefix('/')?;
+    let name = rest.strip_suffix("/SKILL.md").or_else(|| rest.strip_suffix(".md")).unwrap_or(rest);
+    let (_, text) = BUNDLED.iter().find(|(n, _)| *n == name)?;
+    (!workspace.join(&p).exists()).then_some(*text)
+}
+
 /// All skills visible to the workspace (workspace wins on duplicate names).
 pub fn load_skills(workspace: &Path) -> Vec<Doc> {
-    dedup(skill_dirs(workspace).iter().flat_map(|d| load_dir(d)))
+    dedup(skill_dirs(workspace).iter().flat_map(|d| load_dir(d)).chain(bundled_skills()))
 }
 
 /// All slash-command templates visible to the workspace.
@@ -535,7 +564,7 @@ mod tests {
         std::fs::create_dir_all(&skills).unwrap();
         std::fs::write(skills.join("alpha.md"), "---\ndescription: Does alpha\n---\nA").unwrap();
         let all = load_skills(&ws);
-        assert_eq!(skill_index(&all), "- alpha: Does alpha");
+        assert!(skill_index(&all).starts_with("- alpha: Does alpha\n"), "{}", skill_index(&all));
         assert!(find_skill(&ws, "alpha").is_ok());
         assert!(find_skill(&ws, "beta").is_err());
         let _ = std::fs::remove_dir_all(&ws);
@@ -671,5 +700,29 @@ mod tests {
         assert!(err.to_string().contains("already holds"), "{err}");
         install_skill(&base, &a).expect("re-installing the same skill is fine");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn built_in_skills_load_and_a_project_skill_replaces_one() {
+        let ws = tmp("bundled");
+        let names: Vec<String> = load_skills(&ws).into_iter().map(|d| d.name).collect();
+        for want in ["website-builder", "fix-tests", "git-commit", "security-check"] {
+            assert!(names.iter().any(|n| n == want), "{names:?}");
+        }
+        for d in bundled_skills() {
+            assert!(!d.description.is_empty() && d.body.len() > 400, "{}", d.name);
+        }
+        assert!(builtin_skill_text(&ws, "builtin-skills/git-commit.md").unwrap().contains("# Writing a commit"));
+        assert!(builtin_skill_text(&ws, ".\\builtin-skills\\security-check\\SKILL.md").is_some());
+        assert_eq!(builtin_skill_text(&ws, "builtin-skills/nope.md"), None);
+        assert_eq!(builtin_skill_text(&ws, "src/git-commit.md"), None);
+        let dir = ws.join(".opencode").join("skills").join("fix-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\ndescription: Ours\n---\nOur own way").unwrap();
+        let all = load_skills(&ws);
+        let ours: Vec<_> = all.iter().filter(|d| d.name == "fix-tests").collect();
+        assert_eq!(ours.len(), 1);
+        assert_eq!(ours[0].description, "Ours");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

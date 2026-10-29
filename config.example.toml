@@ -66,6 +66,18 @@ rate_limit_wait_secs = 300
 # /usage can show cache hits. Set false if a server rejects the request.
 # stream_usage = true
 
+# Model router: steps that follow only reading (read/list/glob/grep) go to
+# small_model; if the small model then wants to change anything, its reply
+# is dropped and the step goes to `model`. Needs small_model. Off by default.
+# router = true
+
+# Prices in US dollars per million tokens, for the cost in /usage and the
+# desktop app. OpenRouter reports the real cost itself; these are only for
+# other providers. 0 = unknown. price_cached 0 = same as price_input.
+# price_input = 3.0
+# price_output = 15.0
+# price_cached = 0.3
+
 [agent]
 max_steps = 40
 # Context window of your model in tokens; at ~80% the agent compacts older
@@ -74,6 +86,9 @@ max_steps = 40
 ponytail = true
 auto_review = true
 reuse_gate = true
+# Check the files each step wrote or edited (cargo check, tsc, python,
+# node --check, JSON/TOML parsing) and show the model the errors at once.
+check_edits = true
 
 # F-05: give each `worker` subagent and team worker its own git worktree.
 # Their changes come back as patch files; nothing lands in your files until

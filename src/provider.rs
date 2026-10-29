@@ -66,6 +66,11 @@ pub struct Usage {
     pub cached: u64,
     pub cache_write: u64,
     pub output: u64,
+    /// What the reply cost, in millionths of a US dollar: as the provider
+    /// reported it (OpenRouter's `usage.cost`), else from the configured
+    /// prices (`Usage::priced`). 0 = unknown.
+    #[serde(default)]
+    pub cost_micros: u64,
 }
 
 impl Usage {
@@ -82,7 +87,21 @@ impl Usage {
         // DeepSeek reports `prompt_cache_hit_tokens` instead of the details.
         let cached = n(&details["cached_tokens"]).max(n(&u["prompt_cache_hit_tokens"]));
         let cache_write = n(&details["cache_write_tokens"]);
-        Some(Self { input, cached, cache_write, output })
+        let cost_micros = u["cost"].as_f64().map(|c| (c * 1e6).round().max(0.0) as u64).unwrap_or(0);
+        Some(Self { input, cached, cache_write, output, cost_micros })
+    }
+
+    /// The cost from the configured prices (US dollars per million tokens,
+    /// so tokens × price is millionths of a dollar), unless the provider
+    /// already reported one. Unchanged when no price is set.
+    pub fn priced(mut self, p: &crate::config::ProviderCfg) -> Self {
+        if self.cost_micros == 0 && (p.price_input > 0.0 || p.price_output > 0.0) {
+            let cached_price = if p.price_cached > 0.0 { p.price_cached } else { p.price_input };
+            let fresh = self.input.saturating_sub(self.cached) as f64;
+            let c = fresh * p.price_input + self.cached as f64 * cached_price + self.output as f64 * p.price_output;
+            self.cost_micros = c.round().max(0.0) as u64;
+        }
+        self
     }
 }
 
@@ -344,6 +363,10 @@ impl Client {
         }
         if self.stream_usage {
             body["stream_options"] = json!({ "include_usage": true });
+            // OpenRouter adds what the request cost (`usage.cost`, dollars).
+            if self.base_url.contains("openrouter.ai") {
+                body["usage"] = json!({ "include": true });
+            }
         }
         // GPT-6 Luna Chat Completions requires reasoning_effort="none"
         // when function tools are supplied.
@@ -1589,7 +1612,7 @@ mod cache_tests {
         ])
         .await;
         assert!(matches!(out[0], StreamEvent::Text(_)));
-        let want = Usage { input: 1000, cached: 900, cache_write: 0, output: 20 };
+        let want = Usage { input: 1000, cached: 900, cache_write: 0, output: 20, cost_micros: 0 };
         assert!(matches!(&out[1], StreamEvent::Usage(u) if *u == want), "{out:?}");
         assert!(matches!(out[2], StreamEvent::Done { .. }));
         assert_eq!(out.len(), 3);
@@ -1626,7 +1649,7 @@ mod cache_tests {
     fn usage_reads_openai_and_deepseek_shapes() {
         let o = Usage::from_openai(&json!({"prompt_tokens": 50, "completion_tokens": 5,
             "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 3}})).unwrap();
-        assert_eq!(o, Usage { input: 50, cached: 40, cache_write: 3, output: 5 });
+        assert_eq!(o, Usage { input: 50, cached: 40, cache_write: 3, output: 5, cost_micros: 0 });
         let d = Usage::from_openai(&json!({"prompt_tokens": 50, "completion_tokens": 5,
             "prompt_cache_hit_tokens": 30})).unwrap();
         assert_eq!(d.cached, 30);

@@ -208,6 +208,7 @@ const USAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS usage (
     cached INTEGER NOT NULL DEFAULT 0,
     cache_write INTEGER NOT NULL DEFAULT 0,
     output INTEGER NOT NULL DEFAULT 0,
+    cost_micros INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, day)
 );";
 
@@ -219,6 +220,23 @@ pub struct UsageTotals {
     pub cached: u64,
     pub cache_write: u64,
     pub output: u64,
+    /// Summed cost in millionths of a US dollar (0 = unknown).
+    #[serde(default)]
+    pub cost_micros: u64,
+}
+
+/// A usage table from a build before costs were kept has no `cost_micros`.
+fn migrate_usage(conn: &Connection) -> Result<()> {
+    conn.execute_batch(USAGE_SCHEMA)?;
+    let has_cost = {
+        let mut stmt = conn.prepare("PRAGMA table_info(usage)")?;
+        let names: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1))?.flatten().collect();
+        names.iter().any(|c| c == "cost_micros")
+    };
+    if !has_cost {
+        conn.execute_batch("ALTER TABLE usage ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    Ok(())
 }
 
 /// Bring the approvals table to the S-07 layout. A table from an older
@@ -286,7 +304,7 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);",
         )?;
         migrate_approvals(&conn)?;
-        conn.execute_batch(USAGE_SCHEMA)?;
+        migrate_usage(&conn)?;
         conn.execute_batch(MISSION_SCHEMA)?;
         migrate_projects(&conn)?;
         Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
@@ -314,7 +332,7 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);",
         )?;
         migrate_approvals(&conn)?;
-        conn.execute_batch(USAGE_SCHEMA)?;
+        migrate_usage(&conn)?;
         conn.execute_batch(MISSION_SCHEMA)?;
         migrate_projects(&conn)?;
         Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
@@ -573,12 +591,20 @@ impl Db {
     pub fn add_usage(&self, session_id: &str, u: &crate::provider::Usage) -> Result<()> {
         let day = now_ms() / 86_400_000;
         self.conn.lock().unwrap().execute(
-            "INSERT INTO usage (session_id, day, requests, input, cached, cache_write, output)
-             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6)
+            "INSERT INTO usage (session_id, day, requests, input, cached, cache_write, output, cost_micros)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (session_id, day) DO UPDATE SET
                requests = requests + 1, input = input + ?3, cached = cached + ?4,
-               cache_write = cache_write + ?5, output = output + ?6",
-            params![session_id, day, u.input as i64, u.cached as i64, u.cache_write as i64, u.output as i64],
+               cache_write = cache_write + ?5, output = output + ?6, cost_micros = cost_micros + ?7",
+            params![
+                session_id,
+                day,
+                u.input as i64,
+                u.cached as i64,
+                u.cache_write as i64,
+                u.output as i64,
+                u.cost_micros as i64
+            ],
         )?;
         Ok(())
     }
@@ -590,7 +616,7 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let t = conn.query_row(
             "SELECT COALESCE(SUM(requests),0), COALESCE(SUM(input),0), COALESCE(SUM(cached),0),
-                    COALESCE(SUM(cache_write),0), COALESCE(SUM(output),0)
+                    COALESCE(SUM(cache_write),0), COALESCE(SUM(output),0), COALESCE(SUM(cost_micros),0)
              FROM usage WHERE day >= ?1 AND (?2 IS NULL OR session_id = ?2)",
             params![from, session],
             |r| {
@@ -600,6 +626,7 @@ impl Db {
                     cached: r.get::<_, i64>(2)? as u64,
                     cache_write: r.get::<_, i64>(3)? as u64,
                     output: r.get::<_, i64>(4)? as u64,
+                    cost_micros: r.get::<_, i64>(5)? as u64,
                 })
             },
         )?;

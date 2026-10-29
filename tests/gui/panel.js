@@ -350,6 +350,10 @@
   ok("the sidebar shows the chat's cache share",
     !usageEl.hidden && /Cache 75%/.test(usageEl.textContent) && /1\.2M in/.test(usageEl.textContent),
     usageEl.textContent);
+  ok("no cost is shown when the provider gives none", !/\$/.test(usageEl.textContent), usageEl.textContent);
+  withUsage.usage.cost_micros = 12345;
+  window.render(withUsage);
+  ok("the sidebar shows the chat's cost", /\$0\.0123/.test(usageEl.textContent), usageEl.textContent);
   window.render(payload(basePage0()));
   ok("no usage line before the first reply", usageEl.hidden);
   var replay = payload(basePage0());
