@@ -1260,7 +1260,7 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
         // A `review` agent already checked this run's work: a second review
         // would only repeat it at the cost of another full agent loop.
         let reviewed = crate::subagent::reviewed_since(session_id, started);
-        if ok && touched && !aborted && !reviewed && st.cfg.agent.auto_review {
+        if ok && touched && !aborted && !reviewed && st.cfg.agent.auto_review && !st.own_prompt_only() {
             let _ = st.events.send(ServerEvent::Note {
                 session_id: session_id.to_string(),
                 text: "ponytail review — checking the change and what it may have \
@@ -3542,7 +3542,9 @@ pub const VERIFY_PREFIX: &str = "[verify]";
 /// a note. `None` when it is off, the message is chatter or a question, or
 /// the model's reply is not a spec: the run goes on without one.
 pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abort: &AtomicBool) -> Option<crate::spec::Spec> {
-    if !st.cfg.agent.sharpen || !crate::spec::needs_spec(request) {
+    // The user's own main prompt: no planning call of Habi's (and so no final
+    // check, which proves the spec). They asked for their prompt alone.
+    if !st.cfg.agent.sharpen || st.own_prompt_only() || !crate::spec::needs_spec(request) {
         return None;
     }
     // A turbo continuation is the app talking, not a new request: its spec
@@ -3559,12 +3561,10 @@ pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abor
     let context = last_assistant_text(st, session_id);
     // The spec step also picks the skills that fit the task: it sees every
     // skill's description, which the prompt no longer lists when there are many.
-    // With the user's own main prompt there are no skills: none are picked.
-    let skills: Vec<skills::Doc> = if st.own_prompt_only() {
-        Vec::new()
-    } else {
-        skills::load_skills(&ws).into_iter().filter(|s| !skills::NOT_AUTO_PICKED.contains(&s.name.as_str())).collect()
-    };
+    let skills: Vec<skills::Doc> = skills::load_skills(&ws)
+        .into_iter()
+        .filter(|s| !skills::NOT_AUTO_PICKED.contains(&s.name.as_str()))
+        .collect();
     let user = crate::spec::prompt(request, context.as_deref(), &files, &skills::skill_menu(&skills));
     let reply = match tagged("spec", session_id, one_shot(st, crate::spec::SYSTEM, &user, abort, false)).await {
         Ok(r) => r,
@@ -3655,7 +3655,7 @@ pub(crate) async fn design_review(
     bash_used: bool,
     abort: &AtomicBool,
 ) -> Option<()> {
-    if !st.cfg.agent.design_review {
+    if !st.cfg.agent.design_review || st.own_prompt_only() {
         return None;
     }
     let ws = st.workspace_for(session_id);
@@ -5020,6 +5020,33 @@ mod tests {
         let added = st.composed_system(&s.id);
         assert!(added.starts_with(&habi[..60]), "Habi's own instructions first");
         assert!(added.ends_with("## The user's own instructions\n\nAlways answer in Urdu."), "yours last");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the user's own main prompt, Habi makes no extra model calls of
+    /// its own around their request: no spec (so no final check) and no
+    /// design review. Seen: the user pasted their prompt and still saw a
+    /// "Spec" being worked out first.
+    #[tokio::test]
+    async fn the_users_own_prompt_turns_off_habis_extra_steps() {
+        let (base, seen) = scripted_llm(vec!["KIND: task\nGOAL: x\nOUTPUT: y\nDONE WHEN:\n- z"]).await;
+        let dir = std::env::temp_dir().join(format!("ocrs-own-prompt-steps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        std::fs::write(dir.join("index.html"), "<h1>Hi</h1>").unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.provider.base_url = base;
+        cfg.provider.model = "mock".into();
+        cfg.provider.images = "on".into();
+        let st = build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("p", None).unwrap();
+        *st.user_prompt.write().unwrap() = (Some("You are my assistant.".into()), None);
+        let none = AtomicBool::new(false);
+        assert!(make_spec(&st, &s.id, "build a website for my bakery please", &none).await.is_none());
+        assert!(design_review(&st, &s.id, "build a website", None, since, true, &none).await.is_none());
+        assert!(seen.lock().unwrap().is_empty(), "no model call of Habi's own");
+        *st.user_prompt.write().unwrap() = (None, None);
+        assert!(make_spec(&st, &s.id, "build a website for my bakery please", &none).await.is_some(), "Habi's own mode plans as before");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
