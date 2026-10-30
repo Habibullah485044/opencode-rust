@@ -80,6 +80,45 @@ fn save_provider_to(path: &std::path::Path, base_url: &str, model: &str, reasoni
     Ok(())
 }
 
+/// Write the user's own prompt into the config file (`[agent]`): `main`
+/// as `system_prompt` (replaces Habi's base instructions), `extra` as
+/// `extra_prompt` (added after them). `None` removes the setting.
+pub fn save_user_prompt(main: Option<&str>, extra: Option<&str>) -> Result<PathBuf> {
+    let path = crate::config::default_config_path();
+    save_user_prompt_to(&path, main, extra)?;
+    Ok(path)
+}
+
+fn save_user_prompt_to(path: &std::path::Path, main: Option<&str>, extra: Option<&str>) -> Result<()> {
+    let mut table: toml::Table = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let _ = std::fs::write(path.with_extension("toml.bak"), &text);
+            text.parse().with_context(|| format!("{} is not valid TOML; fix it or delete it first", path.display()))?
+        }
+        Err(_) => toml::Table::new(),
+    };
+    let agent = table
+        .entry("agent")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("[agent] in {} is not a table", path.display()))?;
+    for (key, value) in [("system_prompt", main), ("extra_prompt", extra)] {
+        match value {
+            Some(v) => {
+                agent.insert(key.into(), toml::Value::String(v.to_string()));
+            }
+            None => {
+                agent.remove(key);
+            }
+        }
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(&table)?).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(all(windows, feature = "gui"))]
 fn protect(data: &[u8]) -> Result<Vec<u8>> {
     dpapi(data, true)
@@ -128,6 +167,29 @@ fn unprotect(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_users_prompt_is_saved_in_one_place_and_keeps_other_settings() {
+        let dir = std::env::temp_dir().join(format!("ocrs-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[provider]\nmodel = \"m\"\n[agent]\nmax_steps = 7\n").unwrap();
+        let read = || std::fs::read_to_string(&path).unwrap().parse::<toml::Table>().unwrap();
+        save_user_prompt_to(&path, Some("You are Habi.\nAnswer briefly."), None).unwrap();
+        let t = read();
+        assert_eq!(t["agent"]["system_prompt"].as_str(), Some("You are Habi.\nAnswer briefly."), "multi-line text survives");
+        assert!(t["agent"].get("extra_prompt").is_none());
+        assert_eq!(t["agent"]["max_steps"].as_integer(), Some(7), "other settings stay");
+        assert_eq!(t["provider"]["model"].as_str(), Some("m"));
+        save_user_prompt_to(&path, None, Some("Always reply in Urdu.")).unwrap();
+        let t = read();
+        assert!(t["agent"].get("system_prompt").is_none(), "switching mode moves it");
+        assert_eq!(t["agent"]["extra_prompt"].as_str(), Some("Always reply in Urdu."));
+        save_user_prompt_to(&path, None, None).unwrap();
+        assert!(read()["agent"].get("extra_prompt").is_none(), "empty clears it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn saving_the_provider_keeps_other_settings_and_drops_a_plain_key() {

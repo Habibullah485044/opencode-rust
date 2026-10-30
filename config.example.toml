@@ -68,6 +68,11 @@ rate_limit_wait_secs = 300
 
 [agent]
 max_steps = 40
+# Your own prompt (also in the desktop app: Settings -> System prompt).
+# system_prompt replaces Habi's base instructions; extra_prompt is added after
+# them. Habi's tool, approval and safety rules stay either way.
+# system_prompt = "You are ..."
+# extra_prompt = "Always answer in Urdu."
 # Context window of your model in tokens; at ~80% the agent compacts older
 # messages automatically. 0 = off. The Kaggle/Ollama setup uses 8192.
 # context_tokens = 8192

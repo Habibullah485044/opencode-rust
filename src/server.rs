@@ -250,6 +250,10 @@ pub struct AppState {
     /// [`SYSTEM_UNKNOWN`] = not asked yet, [`SYSTEM_DELIVERS`] = yes,
     /// [`SYSTEM_DROPS`] = no, the role is silently discarded.
     pub system_delivery: std::sync::atomic::AtomicU8,
+    /// The user's own prompt from Settings: (replaces Habi's base
+    /// instructions, added after them). Starts from the config
+    /// (`agent.system_prompt`, `agent.extra_prompt`) and changes live.
+    pub user_prompt: std::sync::RwLock<(Option<String>, Option<String>)>,
 }
 
 /// `system_delivery`: not probed yet — the prompt travels as a user note,
@@ -294,6 +298,7 @@ pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
     let mut mcp = crate::mcp::Registry::default();
     mcp.start_all(&cfg.mcp.servers).await;
     let skill_base = skills::skill_base(&state_dir);
+    let cfg_prompt = (cfg.agent.system_prompt.clone(), cfg.agent.extra_prompt.clone());
     Ok(Arc::new(AppState {
         engine,
         events,
@@ -314,6 +319,7 @@ pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
         browser: Mutex::new(None),
         detected_context: std::sync::atomic::AtomicUsize::new(0),
         system_delivery: std::sync::atomic::AtomicU8::new(SYSTEM_UNKNOWN),
+        user_prompt: std::sync::RwLock::new((cfg_prompt.0, cfg_prompt.1)),
     }))
 }
 
@@ -339,6 +345,7 @@ pub async fn build_state_ephemeral_skills(
         .unwrap_or_else(|_| Client::new("http://127.0.0.1:9", "", "stub", 5).expect("stub"));
     let mut mcp = crate::mcp::Registry::default();
     mcp.start_all(&cfg.mcp.servers).await;
+    let cfg_prompt = (cfg.agent.system_prompt.clone(), cfg.agent.extra_prompt.clone());
     Arc::new(AppState {
         engine,
         events,
@@ -371,6 +378,7 @@ pub async fn build_state_ephemeral_skills(
         browser: Mutex::new(None),
         detected_context: std::sync::atomic::AtomicUsize::new(0),
         system_delivery: std::sync::atomic::AtomicU8::new(SYSTEM_UNKNOWN),
+        user_prompt: std::sync::RwLock::new((cfg_prompt.0, cfg_prompt.1)),
     })
 }
 
@@ -1789,10 +1797,11 @@ impl AppState {
         };
         let request = self.first_request(session_id).unwrap_or_default();
         let map = crate::repomap::for_chat(session_id, &workspace, &self.state_dir, &request, self.cfg.agent.repo_map_tokens);
-        agents::compose_system(PromptInputs {
+        let (main, extra) = self.user_prompt.read().map(|p| p.clone()).unwrap_or_default();
+        let mut system = agents::compose_system(PromptInputs {
             workspace: &workspace,
             mode,
-            configured: self.cfg.agent.system_prompt.as_deref(),
+            configured: main.as_deref().filter(|p| !p.trim().is_empty()),
             agents_md: agents_md.as_deref(),
             skills: &skills_list,
             ponytail: self.ponytail_level(session_id),
@@ -1800,7 +1809,31 @@ impl AppState {
             lessons: lessons.as_deref(),
             web: agents::is_web_task(&request),
             map: Some(&map),
-        })
+        });
+        // Last, so the user's word on how to work is what the model reads
+        // after everything Habi says.
+        if let Some(extra) = extra.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            system.push_str("\n\n## The user's own instructions\n\n");
+            system.push_str(extra);
+        }
+        system
+    }
+
+    /// Settings → System prompt: `text` replaces Habi's base instructions
+    /// (`replace`) or is added after them. Empty clears it. Saved to the
+    /// config file, and used from the next request on.
+    pub fn set_user_prompt(&self, text: &str, replace: bool) -> Result<PathBuf> {
+        let text = text.trim();
+        let (main, extra) = match (text.is_empty(), replace) {
+            (true, _) => (None, None),
+            (false, true) => (Some(text.to_string()), None),
+            (false, false) => (None, Some(text.to_string())),
+        };
+        let path = crate::settings::save_user_prompt(main.as_deref(), extra.as_deref())?;
+        if let Ok(mut p) = self.user_prompt.write() {
+            *p = (main, extra);
+        }
+        Ok(path)
     }
 
     /// The chat's first user message (what the chat is about). Fixed for
@@ -4951,6 +4984,28 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/v1"), seen)
+    }
+
+    /// Settings → System prompt: as the main prompt it replaces Habi's base
+    /// instructions (the tool rules stay); added, it comes last. Applied
+    /// from the next request, no restart.
+    #[tokio::test]
+    async fn the_users_own_prompt_is_the_main_one_or_comes_last() {
+        let dir = std::env::temp_dir().join(format!("ocrs-user-prompt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = build_state_ephemeral(crate::config::Config::default(), dir.clone()).await;
+        let s = st.db.create_session("p", None).unwrap();
+        let habi = st.composed_system(&s.id);
+        *st.user_prompt.write().unwrap() = (Some("You are Crumb's own coding assistant.".into()), None);
+        let main = st.composed_system(&s.id);
+        assert!(main.starts_with("You are Crumb's own coding assistant."), "{}", &main[..80]);
+        assert!(main.contains("## Tools"), "Habi's tool rules stay");
+        assert!(main.len() < habi.len(), "Habi's base instructions are replaced");
+        *st.user_prompt.write().unwrap() = (None, Some("Always answer in Urdu.".into()));
+        let added = st.composed_system(&s.id);
+        assert!(added.starts_with(&habi[..60]), "Habi's own instructions first");
+        assert!(added.ends_with("## The user's own instructions\n\nAlways answer in Urdu."), "yours last");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A skill file stays in full while the model works from it, then

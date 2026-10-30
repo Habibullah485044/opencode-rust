@@ -658,7 +658,12 @@
   .use-t input { width: 80px; text-align: right; font: inherit; background: var(--code-bg); color: var(--text); border: 1px solid var(--line-strong); border-radius: var(--radius-s); padding: 3px 6px; }
   .use-note { font-size: 12px; color: var(--text-muted); margin: 8px 0 0; }
   .use-empty { color: var(--text-muted); font-size: 13px; padding: 18px 0; text-align: center; }
-  .set-usage { width: 100%; text-align: left; margin-top: 4px; }
+  .set-body .set-usage {
+    width: 100%; text-align: left; margin-top: 4px; padding: 8px 10px; cursor: pointer;
+    font: inherit; font-size: 13px; color: var(--text-soft); background: transparent;
+    border: 1px solid var(--line-strong); border-radius: var(--radius-s);
+  }
+  .set-body .set-usage:hover { background: var(--hover); color: var(--text-strong); border-color: var(--accent-line); }
   .chg-card { width: min(1100px, 100%); height: min(780px, 100%); display: flex; flex-direction: column; }
   .chg-sub { color: var(--text-muted); font-size: 12px; }
   .chg-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px 1fr; }
@@ -691,7 +696,21 @@
     font: inherit; font-size: 12px; border-radius: var(--radius-s); padding: 4px 10px; cursor: pointer;
   }
   #chg-send { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 600; }
-  .set-card { width: min(520px, 100%); }
+  .set-card { width: min(560px, 100%); max-height: 100%; display: flex; flex-direction: column; }
+  .set-card .set-body { overflow-y: auto; min-height: 0; }
+  .set-body textarea {
+    font: 12.5px/1.5 var(--mono, ui-monospace, monospace); padding: 8px 10px; border-radius: var(--radius-s);
+    border: 1px solid var(--line-strong); background: var(--surface); color: var(--text);
+    width: 100%; min-height: 150px; resize: vertical;
+  }
+  .set-body textarea:focus { outline: none; border-color: var(--accent-line); }
+  .set-modes { display: grid; gap: 4px; }
+  .set-body .set-modes label {
+    display: flex; gap: 8px; align-items: flex-start; margin: 0; font-family: inherit; font-size: 12.5px;
+    font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--text-soft); cursor: pointer;
+  }
+  .set-body .set-modes input { width: auto; margin-top: 3px; }
+  .set-hint { margin: 0; font-size: 11.5px; color: var(--text-muted); line-height: 1.45; }
   .set-note { color: var(--warn); font-size: 12px; }
   .set-body { display: grid; gap: 6px; padding: 14px 16px 16px; }
   .set-body label { font-size: 12px; font-weight: 600; color: var(--text-soft); margin-top: 8px; }
@@ -2615,6 +2634,15 @@
         <option value="black">Pure black</option>
         <option value="light">Paper terminal (light)</option>
       </select>
+      <label for="set-prompt">System prompt</label>
+      <div class="set-modes" role="radiogroup" aria-label="How your prompt is used">
+        <label><input type="radio" name="set-prompt-mode" id="set-prompt-replace" value="replace" checked />
+          <span><b>Main prompt</b>: replaces Habi's own instructions</span></label>
+        <label><input type="radio" name="set-prompt-mode" id="set-prompt-add" value="add" />
+          <span><b>Add to Habi's</b>: your text comes after Habi's instructions</span></label>
+      </div>
+      <textarea id="set-prompt" spellcheck="false" placeholder="Your own instructions for every chat: who the assistant is, how it works, how it answers. Empty = Habi's own."></textarea>
+      <p class="set-hint">Habi's tool, approval and safety rules always stay, so tools keep working. A provider's own hidden instructions are added on its servers and can't be removed from here.</p>
       <label>Token usage</label>
       <button type="button" id="set-usage" class="set-usage" title="Tokens and costs by day, model, purpose and chat">Token usage &amp; costs &rarr;</button>
       <p class="set-path" id="set-path"></p>
@@ -4286,6 +4314,8 @@
     document.getElementById("set-effort").value = s.reasoning_effort || "";
     document.getElementById("set-theme").value = savedTheme();
     document.getElementById("set-path").textContent = s.config_path ? "Saved to " + s.config_path : "";
+    document.getElementById("set-prompt").value = s.system_prompt || "";
+    document.getElementById(s.prompt_replaces === false ? "set-prompt-add" : "set-prompt-replace").checked = true;
     document.getElementById("set-setup").hidden = !s.needs_setup;
     box.hidden = false;
     overlayHooks.open();
@@ -5138,6 +5168,13 @@
         try { localStorage.setItem("habi.theme", theme); } catch (e) {}
         applyTheme(theme);
         postToRust(msg);
+        // The prompt only when it changed (each save writes the config file).
+        var s = settingsData || {};
+        var promptText = document.getElementById("set-prompt").value;
+        var replace = document.getElementById("set-prompt-replace").checked;
+        if (promptText.trim() !== (s.system_prompt || "").trim() || replace !== (s.prompt_replaces !== false)) {
+          postToRust({ type: "save_prompt", text: promptText, replace: replace });
+        }
         document.getElementById("set-key").value = "";
         closeSettings();
       });

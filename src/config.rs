@@ -304,6 +304,9 @@ impl Default for ServerCfg {
 pub struct AgentCfg {
     pub max_steps: usize,
     pub system_prompt: Option<String>,
+    /// The user's own instructions added after Habi's (Settings → System
+    /// prompt, "add to Habi's"). `system_prompt` replaces Habi's base instead.
+    pub extra_prompt: Option<String>,
     /// Vendor the Ponytail (lazy senior dev) discipline into every system
     /// prompt: smallest complete change, reuse over rewrite, never cut safety.
     pub ponytail: bool,
@@ -362,6 +365,7 @@ impl Default for AgentCfg {
         Self {
             max_steps: 40,
             system_prompt: None,
+            extra_prompt: None,
             ponytail: true,
             isolate_workers: false,
             max_subagents: 4,

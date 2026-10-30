@@ -125,6 +125,10 @@ pub struct GuiSettings {
     /// Models the provider lists (after "Load models").
     pub models: Vec<String>,
     pub config_path: String,
+    /// The user's own prompt, and whether it replaces Habi's base
+    /// instructions (else it is added after them).
+    pub system_prompt: String,
+    pub prompt_replaces: bool,
 }
 
 /// A4: one spawned agent in the agents panel.
@@ -837,6 +841,8 @@ impl GuiState {
                 "needs_setup": self.settings.needs_setup,
                 "models": self.settings.models,
                 "config_path": self.settings.config_path,
+                "system_prompt": self.settings.system_prompt,
+                "prompt_replaces": self.settings.prompt_replaces,
             },
             "projects": projects,
             "current_project": self.current_project(),
@@ -949,6 +955,9 @@ pub enum IpcMsg {
     AgentStop(String),
     /// Settings page: save the provider; `api_key` None keeps the saved one.
     SaveSettings { base_url: String, model: String, api_key: Option<String>, effort: String },
+    /// Settings → System prompt: the text (empty = none) and whether it
+    /// replaces Habi's base instructions.
+    SavePrompt { text: String, replace: bool },
     /// Settings page: ask the provider which models it has.
     ListModels,
     /// Write the open chat as Markdown into its project.
@@ -1062,6 +1071,10 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
             model: v.get("model")?.as_str()?.trim().to_string(),
             api_key: v.get("api_key").and_then(|k| k.as_str()).map(str::to_string),
             effort: v.get("reasoning_effort").and_then(|e| e.as_str()).unwrap_or("").to_string(),
+        }),
+        "save_prompt" => Some(IpcMsg::SavePrompt {
+            text: v.get("text")?.as_str()?.to_string(),
+            replace: v.get("replace").and_then(|r| r.as_bool()).unwrap_or(true),
         }),
         "list_models" => Some(IpcMsg::ListModels),
         "export" => Some(IpcMsg::Export),
@@ -2162,7 +2175,12 @@ pub async fn run(
             needs_setup: placeholder || p.model.trim().is_empty(),
             models: Vec::new(),
             config_path: crate::config::default_config_path().display().to_string(),
+            system_prompt: String::new(),
+            prompt_replaces: true,
         };
+        let (main, extra) = state.user_prompt.read().map(|p| p.clone()).unwrap_or_default();
+        gs.settings.prompt_replaces = extra.is_none();
+        gs.settings.system_prompt = main.or(extra).unwrap_or_default();
     }
     gs.approval_timeout_secs = state.cfg.permissions.approval_timeout_secs;
     gs.perm_mode = state.perm_mode();
@@ -2610,6 +2628,22 @@ pub async fn run(
                                 Err(e) => format!("Settings not saved: {e:#}"),
                             };
                             gs.push(EntryKind::System, text);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::SavePrompt { text, replace }) => {
+                            let note = match st.set_user_prompt(&text, replace) {
+                                Ok(_) => {
+                                    gs.settings.system_prompt = text.trim().to_string();
+                                    gs.settings.prompt_replaces = replace;
+                                    match (text.trim().is_empty(), replace) {
+                                        (true, _) => "System prompt cleared: Habi's own instructions are used.".to_string(),
+                                        (false, true) => "Your system prompt is now the main one (Habi's tool and safety rules stay). It applies from the next message.".to_string(),
+                                        (false, false) => "Your instructions are added after Habi's. They apply from the next message.".to_string(),
+                                    }
+                                }
+                                Err(e) => format!("System prompt not saved: {e:#}"),
+                            };
+                            gs.push(EntryKind::System, note);
                             changed = true;
                         }
                         UiMsg::Ipc(IpcMsg::FindFiles(query)) => {
@@ -3655,6 +3689,10 @@ mod tests {
         assert_eq!(parse_ipc(r#"{"type":"add_project"}"#), Some(IpcMsg::AddProject(None)));
         // Usage dashboard: a range in days (none = all time) and prices.
         assert_eq!(parse_ipc(r#"{"type":"load_usage","days":7}"#), Some(IpcMsg::LoadUsage(Some(7))));
+        assert_eq!(
+            parse_ipc(r#"{"type":"save_prompt","text":"Be brief.","replace":false}"#),
+            Some(IpcMsg::SavePrompt { text: "Be brief.".into(), replace: false })
+        );
         assert_eq!(parse_ipc(r#"{"type":"load_usage","days":null}"#), Some(IpcMsg::LoadUsage(None)));
         assert_eq!(
             parse_ipc(r#"{"type":"set_price","model":"gpt-6-sol","input":2,"cached":0.5,"output":8}"#),
