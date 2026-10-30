@@ -87,7 +87,7 @@ pub fn prompt(request: &str, context: Option<&str>, files: &[String], skill_menu
     if !skill_menu.trim().is_empty() {
         p.push_str(&format!(
             "The agent's skills (a SKILL.md each, with the method for that kind of work):\n{skill_menu}\n\n\
-             After DONE WHEN and ASSUMING, add one line: SKILLS: <1 to 3 skill names from this list \
+             After DONE WHEN and ASSUMING, add one line: SKILLS: <1 or 2 skill names from this list \
              that fit the task, best first, comma separated, or none>\n\n"
         ));
     }
@@ -142,7 +142,7 @@ pub fn parse(reply: &str) -> Option<Spec> {
                 .split(',')
                 .map(|n| n.trim().trim_matches(['`', '*', '"', '.']).to_string())
                 .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("none") && !n.starts_with('<'))
-                .take(3)
+                .take(2)
                 .collect();
             list = None;
         } else if upper.starts_with("DESIGN") {
@@ -357,7 +357,7 @@ mod tests {
         let reply = "KIND: task\nGOAL: A bakery site\nOUTPUT: index.html\nDONE WHEN:\n- check_page passes\n\
                      ASSUMING:\n- one page\nSKILLS: `frontend-design`, build-anything, test-driven-development, extra";
         let s = parse(reply).unwrap();
-        assert_eq!(s.skills, ["frontend-design", "build-anything", "test-driven-development"], "three at most");
+        assert_eq!(s.skills, ["frontend-design", "build-anything"], "two at most: each one read rides along");
         let note = for_model(&s);
         assert!(note.contains("First read these skills") && note.contains(".opencode/skills/frontend-design/SKILL.md"), "{note}");
         assert!(for_user(&s).contains("Skills: frontend-design, build-anything"));

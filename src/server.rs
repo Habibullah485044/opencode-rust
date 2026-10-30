@@ -3513,7 +3513,10 @@ pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abor
     let context = last_assistant_text(st, session_id);
     // The spec step also picks the skills that fit the task: it sees every
     // skill's description, which the prompt no longer lists when there are many.
-    let skills = skills::load_skills(&ws);
+    let skills: Vec<skills::Doc> = skills::load_skills(&ws)
+        .into_iter()
+        .filter(|s| !skills::NOT_AUTO_PICKED.contains(&s.name.as_str()))
+        .collect();
     let user = crate::spec::prompt(request, context.as_deref(), &files, &skills::skill_menu(&skills));
     let reply = match tagged("spec", session_id, one_shot(st, crate::spec::SYSTEM, &user, abort, false)).await {
         Ok(r) => r,
@@ -4512,6 +4515,7 @@ fn build_chat_messages(st: &Shared, session_id: &str, system: &str) -> Result<Ve
     // New (B-04): repair what a crash, an abort or a compaction can leave
     // behind before the provider sees it (see `repair_history`).
     let mut out = repair_history(out);
+    retire_skill_reads(&mut out);
     fit_tool_results(&mut out, context_limit(st));
     keep_task_near_the_tail(&mut out);
     // Chat templates (Qwen's among them) refuse a request with no user
@@ -4529,6 +4533,55 @@ fn build_chat_messages(st: &Shared, session_id: &str, system: &str) -> Result<Ve
     // user message of its own from the check above.
     deliver_system_prompt(&mut out, st);
     Ok(out)
+}
+
+/// Model steps a skill file read stays in the chat in full; after that it is
+/// a one-line note.
+const SKILL_READ_KEPT_FOR: usize = 3;
+
+/// A skill file the model read (`read` of a SKILL.md or of a file in a
+/// skills folder) rides along with every later request: a run that read
+/// brainstorming, frontend-design and build-anything (~7K tokens) resent
+/// them on each of its steps, ~200K tokens over 30 steps. Once the model has
+/// had it for a few steps, it becomes a note naming the file; reading it
+/// again is one call. A retired read stays retired, so the cached start of
+/// the request changes once per skill, not on every step.
+fn retire_skill_reads(msgs: &mut [ChatMsg]) {
+    let mut reads: HashMap<String, String> = HashMap::new();
+    for m in msgs.iter() {
+        for c in m.tool_calls.iter().flatten().filter(|c| c.function.name == "read") {
+            let args: Value = serde_json::from_str(&c.function.arguments).unwrap_or_default();
+            let path = args["path"].as_str().unwrap_or("").to_string();
+            let p = path.replace('\\', "/").to_ascii_lowercase();
+            if p.ends_with("/skill.md") || p == "skill.md" || (p.contains("/skills/") && p.ends_with(".md")) {
+                reads.insert(c.id.clone(), path);
+            }
+        }
+    }
+    if reads.is_empty() {
+        return;
+    }
+    let assistant_after: Vec<usize> = {
+        let mut after = vec![0; msgs.len()];
+        let mut n = 0;
+        for i in (0..msgs.len()).rev() {
+            after[i] = n;
+            if msgs[i].role == "assistant" {
+                n += 1;
+            }
+        }
+        after
+    };
+    for (i, m) in msgs.iter_mut().enumerate() {
+        let Some(path) = m.tool_call_id.as_ref().and_then(|id| reads.get(id)) else { continue };
+        let failed = m.content.as_deref().is_some_and(|c| c.starts_with("[error]"));
+        if m.role == "tool" && !failed && assistant_after[i] >= SKILL_READ_KEPT_FOR {
+            m.content = Some(format!(
+                "[app] The skill file {path} was read here and followed in the steps after it. Its text \
+                 is left out now to save tokens: read it again if you need its details."
+            ));
+        }
+    }
 }
 
 /// Keep the user's request near the END of a long chat as well as at its
@@ -4898,6 +4951,51 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/v1"), seen)
+    }
+
+    /// A skill file stays in full while the model works from it, then
+    /// becomes a note naming it; other reads and failed reads are untouched.
+    #[test]
+    fn skill_files_read_earlier_are_not_resent_forever() {
+        let call = |id: &str, name: &str, path: &str| ChatMsg {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![crate::provider::ToolCallReq {
+                id: id.into(),
+                kind: "function".into(),
+                function: crate::provider::FunctionCall { name: name.into(), arguments: json!({"path": path}).to_string() },
+            }]),
+            tool_call_id: None,
+        };
+        let result = |id: &str, text: &str| ChatMsg {
+            role: "tool".into(),
+            content: Some(text.into()),
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+        };
+        let skill_text = "# Frontend design\n".repeat(400);
+        let mut msgs = vec![
+            ChatMsg { role: "user".into(), content: Some("build a page".into()), tool_calls: None, tool_call_id: None },
+            call("s1", "read", r"C:\Users\x\.config\opencode-rust\skills\frontend-design\SKILL.md"),
+            result("s1", &skill_text),
+            call("r1", "read", "index.html"),
+            result("r1", "<html>"),
+            call("s2", "read", ".opencode/skills/missing/SKILL.md"),
+            result("s2", "[error]\nnot found"),
+            call("w1", "write", "index.html"),
+            result("w1", "ok"),
+        ];
+        // One step after the read (reading index.html): still in full.
+        let mut early = msgs[..5].to_vec();
+        retire_skill_reads(&mut early);
+        assert_eq!(early[2].content.as_deref(), Some(skill_text.as_str()), "kept while the model works from it");
+        msgs.push(call("w2", "write", "style.css"));
+        msgs.push(result("w2", "ok"));
+        retire_skill_reads(&mut msgs);
+        let note = msgs[2].content.as_deref().unwrap();
+        assert!(note.contains("frontend-design") && note.contains("read it again") && note.len() < 300, "{note}");
+        assert_eq!(msgs[4].content.as_deref(), Some("<html>"), "a project file stays");
+        assert!(msgs[6].content.as_deref().unwrap().starts_with("[error]"), "a failed read stays");
     }
 
     /// Seen live: a mission step checked its work with tools, then wrote a

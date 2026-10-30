@@ -25,4 +25,7 @@ MIT License, Copyright (c) Jesse Vincent (LICENSE-superpowers.txt):
 These skills were written for Claude Code. Habi maps their tool names in
 its system prompt: Skill tool = read that SKILL.md, TodoWrite = todo,
 Task/subagent = spawn, Bash/Read/Write/Edit/Grep/Glob = Habi's tools.
-Habi's spec step picks the 1-3 skills that fit each task.
+Habi's spec step picks the 1-2 skills that fit each task (not brainstorming,
+using-superpowers or diagnosing-superpowers, which are about chatting with
+a person); a skill file the model read is left out of later requests after
+a few steps (it can read it again).

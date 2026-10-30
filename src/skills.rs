@@ -261,6 +261,12 @@ pub fn skill_index(skills: &[Doc]) -> String {
 /// Up to this many skills are listed with their descriptions in the prompt.
 pub const SKILLS_LISTED_IN_FULL: usize = 12;
 
+/// Skills the spec step does not pick by itself: they are about how to work
+/// with a person in a chat (brainstorming stops to ask questions, which a
+/// mission cannot answer) and cost thousands of tokens on every later step.
+/// They stay installed and readable when a task really calls for one.
+pub const NOT_AUTO_PICKED: &[&str] = &["brainstorming", "using-superpowers", "diagnosing-superpowers"];
+
 /// Every skill with its description, one line each: what the spec step
 /// chooses from (sent once per task, not with every request).
 pub fn skill_menu(skills: &[Doc]) -> String {
