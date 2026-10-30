@@ -2637,7 +2637,7 @@ pub async fn run(
                                     gs.settings.prompt_replaces = replace;
                                     match (text.trim().is_empty(), replace) {
                                         (true, _) => "System prompt cleared: Habi's own instructions are used.".to_string(),
-                                        (false, true) => "Your system prompt is now the main one (Habi's tool and safety rules stay). It applies from the next message.".to_string(),
+                                        (false, true) => "Your system prompt is now the only one, with the tool guide after it. It applies from the next message.".to_string(),
                                         (false, false) => "Your instructions are added after Habi's. They apply from the next message.".to_string(),
                                     }
                                 }

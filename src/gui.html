@@ -2637,12 +2637,12 @@
       <label for="set-prompt">System prompt</label>
       <div class="set-modes" role="radiogroup" aria-label="How your prompt is used">
         <label><input type="radio" name="set-prompt-mode" id="set-prompt-replace" value="replace" checked />
-          <span><b>Main prompt</b>: replaces Habi's own instructions</span></label>
+          <span><b>Main prompt</b>: your text plus the tool guide, nothing else of Habi's</span></label>
         <label><input type="radio" name="set-prompt-mode" id="set-prompt-add" value="add" />
           <span><b>Add to Habi's</b>: your text comes after Habi's instructions</span></label>
       </div>
       <textarea id="set-prompt" spellcheck="false" placeholder="Your own instructions for every chat: who the assistant is, how it works, how it answers. Empty = Habi's own."></textarea>
-      <p class="set-hint">Habi's tool, approval and safety rules always stay, so tools keep working. A provider's own hidden instructions are added on its servers and can't be removed from here.</p>
+      <p class="set-hint">Main prompt: Habi's base instructions, ponytail rules, skills and web guide are left out; the tool guide stays so tools keep working. Approvals and file safety are enforced by the app either way. A provider's own hidden instructions are added on its servers and can't be removed from here.</p>
       <label>Token usage</label>
       <button type="button" id="set-usage" class="set-usage" title="Tokens and costs by day, model, purpose and chat">Token usage &amp; costs &rarr;</button>
       <p class="set-path" id="set-path"></p>

@@ -329,7 +329,7 @@ pub struct PromptInputs<'a> {
 /// Qwen 27B) described calls instead of making them, used other agents'
 /// tool names, or claimed they could not see the files. Every tool with
 /// its arguments — kept short, because this is in every request.
-const TOOL_GUIDE: &str = "\n\n## Tools\n\n\
+pub const TOOL_GUIDE: &str = "\n\n## Tools\n\n\
 Call tools for real — never write \"I'll use X\" without calling it, never ask the user to paste \
 files (you can read them). One call per step; read the result. \
 list(path) · read(path,offset,limit,outline) · glob(pattern) · grep(pattern,path) · \

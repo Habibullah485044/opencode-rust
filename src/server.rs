@@ -1798,10 +1798,17 @@ impl AppState {
         let request = self.first_request(session_id).unwrap_or_default();
         let map = crate::repomap::for_chat(session_id, &workspace, &self.state_dir, &request, self.cfg.agent.repo_map_tokens);
         let (main, extra) = self.user_prompt.read().map(|p| p.clone()).unwrap_or_default();
+        // The user's main prompt (Settings -> System prompt) is the system
+        // prompt, with only the tool guide after it: no base instructions,
+        // ponytail rules, skills, web guide, map or lessons (the user's call).
+        // Approvals and plan mode are enforced in code, not by the prompt.
+        if let Some(main) = main.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            return format!("{main}{}", agents::TOOL_GUIDE);
+        }
         let mut system = agents::compose_system(PromptInputs {
             workspace: &workspace,
             mode,
-            configured: main.as_deref().filter(|p| !p.trim().is_empty()),
+            configured: None,
             agents_md: agents_md.as_deref(),
             skills: &skills_list,
             ponytail: self.ponytail_level(session_id),
@@ -1817,6 +1824,12 @@ impl AppState {
             system.push_str(extra);
         }
         system
+    }
+
+    /// Is the user's own main prompt set (then it and the tool guide are the
+    /// whole system prompt)?
+    pub fn own_prompt_only(&self) -> bool {
+        self.user_prompt.read().is_ok_and(|p| p.0.as_deref().is_some_and(|m| !m.trim().is_empty()))
     }
 
     /// Settings → System prompt: `text` replaces Habi's base instructions
@@ -3546,10 +3559,12 @@ pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abor
     let context = last_assistant_text(st, session_id);
     // The spec step also picks the skills that fit the task: it sees every
     // skill's description, which the prompt no longer lists when there are many.
-    let skills: Vec<skills::Doc> = skills::load_skills(&ws)
-        .into_iter()
-        .filter(|s| !skills::NOT_AUTO_PICKED.contains(&s.name.as_str()))
-        .collect();
+    // With the user's own main prompt there are no skills: none are picked.
+    let skills: Vec<skills::Doc> = if st.own_prompt_only() {
+        Vec::new()
+    } else {
+        skills::load_skills(&ws).into_iter().filter(|s| !skills::NOT_AUTO_PICKED.contains(&s.name.as_str())).collect()
+    };
     let user = crate::spec::prompt(request, context.as_deref(), &files, &skills::skill_menu(&skills));
     let reply = match tagged("spec", session_id, one_shot(st, crate::spec::SYSTEM, &user, abort, false)).await {
         Ok(r) => r,
@@ -4998,9 +5013,9 @@ mod tests {
         let habi = st.composed_system(&s.id);
         *st.user_prompt.write().unwrap() = (Some("You are Crumb's own coding assistant.".into()), None);
         let main = st.composed_system(&s.id);
-        assert!(main.starts_with("You are Crumb's own coding assistant."), "{}", &main[..80]);
-        assert!(main.contains("## Tools"), "Habi's tool rules stay");
-        assert!(main.len() < habi.len(), "Habi's base instructions are replaced");
+        assert_eq!(main, format!("You are Crumb's own coding assistant.{}", crate::agents::TOOL_GUIDE), "only the user's text and the tool guide");
+        assert!(!main.contains("## Skills") && !main.contains("Ponytail") && !main.contains("lazy senior"), "no skills, no ponytail");
+        assert!(st.own_prompt_only());
         *st.user_prompt.write().unwrap() = (None, Some("Always answer in Urdu.".into()));
         let added = st.composed_system(&s.id);
         assert!(added.starts_with(&habi[..60]), "Habi's own instructions first");
