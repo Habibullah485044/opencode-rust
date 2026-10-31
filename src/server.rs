@@ -1291,6 +1291,12 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
         if st.busy.read().await.len() <= 1 {
             clear_scratch(&scratch);
         }
+        // What the run left, so a later undo can tell its changes from work
+        // done outside Habi afterwards (and refuse to overwrite that).
+        let (ws, sd) = (st.workspace_for(session_id), st.state_dir.clone());
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || crate::gitsnap::record_after_run(&ws, &sd)).await {
+            core_log(&format!("[snapshot] after run: {e:#}"));
+        }
         let _ = st.events.send(ServerEvent::RunFinished {
             session_id: session_id.to_string(),
             ok,

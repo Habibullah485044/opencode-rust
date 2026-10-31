@@ -1580,7 +1580,9 @@ fn gui_command(gs: &mut GuiState, st: &Arc<server::AppState>, rt: &tokio::runtim
             _ => say(gs, "Usage: /deep [n] <task>, with n from 1 to 5 (default 3).".into()),
         },
         "undo" | "redo" => {
-            let res = if name == "undo" {
+            let res = if name == "undo" && arg == "force" {
+                crate::gitsnap::undo_anyway(&root, &st.state_dir)
+            } else if name == "undo" {
                 crate::gitsnap::undo(&root, &st.state_dir)
             } else {
                 crate::gitsnap::redo(&root, &st.state_dir)

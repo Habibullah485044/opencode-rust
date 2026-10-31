@@ -15,6 +15,8 @@ pub enum Command {
     Build,
     Compact,
     Undo,
+    /// `/undo force`: undo even over work done outside Habi since the run.
+    UndoForce,
     Redo,
     Fork,
     Resume(String),
@@ -182,6 +184,7 @@ pub fn classify(input: &str) -> Option<Command> {
         "build" if arg.is_empty() => Some(Command::Build),
         "compact" if arg.is_empty() => Some(Command::Compact),
         "undo" if arg.is_empty() => Some(Command::Undo),
+        "undo" if arg == "force" => Some(Command::UndoForce),
         "redo" if arg.is_empty() => Some(Command::Redo),
         "fork" if arg.is_empty() => Some(Command::Fork),
         "resume" if !arg.is_empty() => Some(Command::Resume(arg.to_string())),
@@ -263,6 +266,7 @@ mod tests {
         assert_eq!(classify("  /build  "), Some(Command::Build));
         assert_eq!(classify("/compact"), Some(Command::Compact));
         assert_eq!(classify("/undo"), Some(Command::Undo));
+        assert_eq!(classify("/undo force"), Some(Command::UndoForce));
         assert_eq!(classify("/redo"), Some(Command::Redo));
         assert_eq!(classify("/fork"), Some(Command::Fork));
         assert_eq!(classify("/resume ses_123"), Some(Command::Resume("ses_123".into())));

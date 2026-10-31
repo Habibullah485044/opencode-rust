@@ -592,6 +592,7 @@ impl App {
                     }
                     Some(Command::Compact) => (Some(InputAction::Compact), true),
                     Some(Command::Undo) => (Some(InputAction::Undo), false),
+                    Some(Command::UndoForce) => (Some(InputAction::UndoForce), false),
                     Some(Command::Redo) => (Some(InputAction::Redo), false),
                     Some(Command::Fork) => (Some(InputAction::Fork), false),
                     Some(Command::Resume(arg)) => (Some(InputAction::Resume(arg)), false),
@@ -1239,6 +1240,8 @@ pub enum InputAction {
     SetMode(AgentMode),
     Compact,
     Undo,
+    /// `/undo force`: undo even over work done outside Habi since the run.
+    UndoForce,
     Redo,
     Fork,
     Resume(String),

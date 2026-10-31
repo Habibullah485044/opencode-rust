@@ -232,12 +232,16 @@ fn positional_prompt(args: &[String]) -> Result<Option<String>, String> {
 }
 
 /// `/undo` / `/redo`: git snapshot restore off the async runtime (subprocess).
-async fn snapshot_command(st: std::sync::Arc<server::AppState>, sid: String, redo: bool) {
-    let ws = st.workspace.clone();
+/// `force`: undo even over work done outside Habi since the run.
+async fn snapshot_command(st: std::sync::Arc<server::AppState>, sid: String, redo: bool, force: bool) {
+    // The chat's own folder: that is where its runs took their undo points.
+    let ws = st.workspace_for(&sid);
     let sd = st.state_dir.clone();
     let res = tokio::task::spawn_blocking(move || {
         if redo {
             opencode_rust::gitsnap::redo(&ws, &sd)
+        } else if force {
+            opencode_rust::gitsnap::undo_anyway(&ws, &sd)
         } else {
             opencode_rust::gitsnap::undo(&ws, &sd)
         }
@@ -384,13 +388,15 @@ async fn headless_run(
                 }
                 return Ok(());
             }
-            Cmd::Undo | Cmd::Redo => {
+            Cmd::Undo | Cmd::UndoForce | Cmd::Redo => {
                 let ws = state.workspace.clone();
                 let sd = state.state_dir.clone();
                 let redo = matches!(cmd, Cmd::Redo);
+                let force = matches!(cmd, Cmd::UndoForce);
                 let verb = if redo { "redo" } else { "undo" };
                 let res = tokio::task::spawn_blocking(move || {
                     if redo { opencode_rust::gitsnap::redo(&ws, &sd) }
+                    else if force { opencode_rust::gitsnap::undo_anyway(&ws, &sd) }
                     else { opencode_rust::gitsnap::undo(&ws, &sd) }
                 })
                 .await;
@@ -992,12 +998,17 @@ async fn tui_run(
                     tui::InputAction::Undo => {
                         let st2 = st.clone();
                         let sid2 = sid.clone();
-                        tokio::spawn(snapshot_command(st2, sid2, false));
+                        tokio::spawn(snapshot_command(st2, sid2, false, false));
+                    }
+                    tui::InputAction::UndoForce => {
+                        let st2 = st.clone();
+                        let sid2 = sid.clone();
+                        tokio::spawn(snapshot_command(st2, sid2, false, true));
                     }
                     tui::InputAction::Redo => {
                         let st2 = st.clone();
                         let sid2 = sid.clone();
-                        tokio::spawn(snapshot_command(st2, sid2, true));
+                        tokio::spawn(snapshot_command(st2, sid2, true, false));
                     }
                     tui::InputAction::Fork => {
                         let forked = st

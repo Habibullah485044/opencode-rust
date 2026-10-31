@@ -493,6 +493,107 @@ fn step(
     restored.map(|_| Some(m))
 }
 
+/// What a run left behind, written next to its undo point when it ends:
+/// the commit it ended on and a hash of every changed file. Undo compares
+/// the workspace with it, so it never overwrites work done outside Habi
+/// after the run (seen: an undo days after a run put five files back to
+/// their old copies, over newer committed work).
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+struct AfterRun {
+    head: Option<String>,
+    /// Workspace-relative path -> content hash, for files dirty at run end.
+    files: std::collections::BTreeMap<String, String>,
+}
+
+/// FNV-1a of a file's bytes, or "absent".
+fn content_hash(path: &Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in &bytes {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            format!("{h:016x}")
+        }
+        Err(_) => "absent".into(),
+    }
+}
+
+fn current_head(workspace: &Path) -> Option<String> {
+    git(workspace, &["rev-parse", "HEAD"]).ok().map(|s| s.trim().to_string())
+}
+
+/// When a run ends: record what it left (see [`AfterRun`]) with the newest
+/// undo point. Nothing to do outside a git repo or without an undo point.
+pub fn record_after_run(workspace: &Path, state_dir: &Path) -> Result<()> {
+    if !is_repo(workspace) {
+        return Ok(());
+    }
+    let root = snap_root(state_dir, workspace);
+    let (undo_path, _) = stack_paths(&root);
+    let Some(id) = read_stack(&undo_path).last().cloned() else { return Ok(()) };
+    let mut after = AfterRun { head: current_head(workspace), ..Default::default() };
+    for e in dirty_entries(workspace, state_dir)? {
+        if checked_rel(&e.rel).is_some() && !under_symlinked_dir(workspace, &e.rel) {
+            after.files.insert(e.rel.clone(), content_hash(&e.abs));
+        }
+    }
+    std::fs::write(root.join(&id).join("after.json"), serde_json::to_string_pretty(&after)?)?;
+    Ok(())
+}
+
+/// What changed outside Habi after the run the next undo would roll back,
+/// and that undo would overwrite: new commits, and each such file. Empty =
+/// safe to undo. A run without a record (older undo points, or one still
+/// going) is judged by its commit alone.
+pub fn changed_since_run(workspace: &Path, state_dir: &Path) -> Vec<String> {
+    if !is_repo(workspace) {
+        return Vec::new();
+    }
+    let root = snap_root(state_dir, workspace);
+    let (undo_path, _) = stack_paths(&root);
+    let Some(id) = read_stack(&undo_path).last().cloned() else { return Vec::new() };
+    let Ok(m) = load_manifest(&root, &id) else { return Vec::new() };
+    let after: Option<AfterRun> = std::fs::read_to_string(root.join(&id).join("after.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let mut out = Vec::new();
+    let head_then = after.as_ref().map_or(m.base_sha.clone(), |a| a.head.clone());
+    let head_now = current_head(workspace);
+    if head_then.is_some() && head_now != head_then {
+        let short = |s: &Option<String>| s.as_deref().map_or("none".to_string(), |s| s.chars().take(7).collect());
+        out.push(format!("new commits since the run ({} -> {})", short(&head_then), short(&head_now)));
+    }
+    let Some(after) = after else { return out };
+    // Every file undo would rewrite, remove or check out.
+    let mut touched: std::collections::BTreeSet<String> = m.present.iter().chain(&m.absent).cloned().collect();
+    if let Ok(dirty) = dirty_entries(workspace, state_dir) {
+        touched.extend(dirty.into_iter().map(|e| e.rel));
+    }
+    for rel in touched {
+        if checked_rel(&rel).is_none() || under_symlinked_dir(workspace, &rel) {
+            continue;
+        }
+        let now = content_hash(&workspace.join(&rel));
+        let then = after.files.get(&rel).cloned();
+        let changed = match then {
+            Some(h) => h != now,
+            // Clean when the run ended: changed since if it differs from
+            // the commit's copy (it is dirty now) or is gone.
+            None => dirty_now(workspace, state_dir, &rel),
+        };
+        if changed {
+            out.push(rel);
+        }
+    }
+    out
+}
+
+fn dirty_now(workspace: &Path, state_dir: &Path, rel: &str) -> bool {
+    dirty_entries(workspace, state_dir).is_ok_and(|d| d.iter().any(|e| e.rel == rel))
+}
+
 /// When the newest undo point was taken (ms), if there is one.
 pub fn newest_undo_time(workspace: &Path, state_dir: &Path) -> Option<i64> {
     let root = snap_root(state_dir, workspace);
@@ -502,7 +603,23 @@ pub fn newest_undo_time(workspace: &Path, state_dir: &Path) -> Option<i64> {
 }
 
 /// Restore the most recent snapshot (undo). `Ok(None)` = nothing to undo.
+/// Refuses, changing nothing, when work was done outside Habi after the
+/// run (see [`changed_since_run`]); [`undo_anyway`] skips that check.
 pub fn undo(workspace: &Path, state_dir: &Path) -> Result<Option<Manifest>> {
+    let outside = changed_since_run(workspace, state_dir);
+    if !outside.is_empty() {
+        return Err(anyhow!(
+            "undo stopped, nothing was changed: since the last run, {} changed outside Habi and undo \
+             would overwrite it:\n  {}\nCommit or copy that work first, or use `/undo force` to undo anyway.",
+            if outside.len() == 1 { "this" } else { "these" },
+            outside.join("\n  ")
+        ));
+    }
+    undo_anyway(workspace, state_dir)
+}
+
+/// [`undo`] without the check for work done outside Habi (`/undo force`).
+pub fn undo_anyway(workspace: &Path, state_dir: &Path) -> Result<Option<Manifest>> {
     let root = snap_root(state_dir, workspace);
     let (undo_path, redo_path) = stack_paths(&root);
     step(workspace, state_dir, &undo_path, &redo_path, "pre-undo")
@@ -569,6 +686,52 @@ mod tests {
         assert!(undo(&dir, &dir).unwrap().is_none());
         assert!(redo(&dir, &dir).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seen live: an undo days after a run wrote the run's old copies over
+    /// newer work. Now work done outside Habi after the run stops undo,
+    /// changing nothing; `undo_anyway` (`/undo force`) still restores.
+    #[test]
+    fn undo_will_not_overwrite_work_done_after_the_run() {
+        let r = test_repo();
+        std::fs::write(r.dir.join("a.txt"), "before the run\n").unwrap();
+        record_before_run(&r.dir, &r.state, "pre-run").unwrap().unwrap();
+        std::fs::write(r.dir.join("a.txt"), "the run's edit\n").unwrap();
+        record_after_run(&r.dir, &r.state).unwrap();
+        assert!(changed_since_run(&r.dir, &r.state).is_empty(), "nothing changed since the run");
+
+        // Work outside Habi after the run: an edit and a new file in git.
+        std::fs::write(r.dir.join("a.txt"), "the user's later work\n").unwrap();
+        std::fs::write(r.dir.join("b.txt"), "also edited later\n").unwrap();
+        let err = undo(&r.dir, &r.state).unwrap_err().to_string();
+        assert!(err.contains("undo stopped") && err.contains("a.txt") && err.contains("b.txt") && err.contains("/undo force"), "{err}");
+        assert_eq!(read(&r.dir.join("a.txt")), "the user's later work\n", "nothing was changed");
+        assert_eq!(read(&r.dir.join("b.txt")), "also edited later\n");
+
+        let restored = undo_anyway(&r.dir, &r.state).unwrap();
+        assert!(restored.is_some());
+        assert_eq!(read(&r.dir.join("a.txt")), "before the run\n", "forced undo still works");
+    }
+
+    /// Commits made after the run (the case seen live) also stop undo, and
+    /// an undo right after a run, with nothing changed since, still works.
+    #[test]
+    fn undo_stops_after_new_commits_and_works_right_after_a_run() {
+        let r = test_repo();
+        record_before_run(&r.dir, &r.state, "pre-run").unwrap().unwrap();
+        std::fs::write(r.dir.join("a.txt"), "run edit\n").unwrap();
+        record_after_run(&r.dir, &r.state).unwrap();
+        assert!(undo(&r.dir, &r.state).unwrap().is_some(), "plain undo right after the run");
+        assert_eq!(read(&r.dir.join("a.txt")), "original a\n");
+
+        record_before_run(&r.dir, &r.state, "pre-run").unwrap().unwrap();
+        std::fs::write(r.dir.join("a.txt"), "run edit 2\n").unwrap();
+        record_after_run(&r.dir, &r.state).unwrap();
+        git(&r.dir, &["commit", "-am", "work committed after the run"]).unwrap();
+        let reasons = changed_since_run(&r.dir, &r.state);
+        assert!(reasons.iter().any(|r| r.contains("new commits")), "{reasons:?}");
+        assert!(undo(&r.dir, &r.state).is_err());
+        assert_eq!(read(&r.dir.join("a.txt")), "run edit 2\n", "the committed work stays");
     }
 
     #[test]
