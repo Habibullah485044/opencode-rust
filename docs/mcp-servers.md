@@ -1,11 +1,26 @@
 # MCP servers
 
 opencode-rust starts each server in `[[mcp.servers]]` (see `config.example.toml`)
-as a separate program and talks to it over stdin/stdout. A server's tools reach
+as a separate program and talks to it over stdin/stdout, or, for an entry with a
+`url`, over Streamable HTTP (see below). A server's tools reach
 the model as `mcp__<name>__<tool>`. Calls to MCP tools go through the normal
 permission prompt, because they are unknown tools ("ask" by default). To allow
 one without asking, add for example `"mcp__context7__query-docs" = "allow"`
 under `[permissions.defaults]`.
+
+## Streamable HTTP servers
+
+A server that runs elsewhere is reached over Streamable HTTP instead: give it a
+`url` (then `command` and `args` are ignored and nothing is started) and, if it
+needs them, `headers` that are sent with every request:
+
+```toml
+[[mcp.servers]]
+name = "remote"
+url = "https://example.com/mcp"
+[mcp.servers.headers]
+Authorization = "Bearer your-token"
+```
 
 ## Context7 (library documentation)
 
