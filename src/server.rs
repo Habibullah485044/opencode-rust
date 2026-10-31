@@ -84,6 +84,10 @@ impl PermissionMode {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
     AssistantDelta { session_id: String, text: String },
+    /// The last `chars` characters of streamed reply text belong to a reply
+    /// that broke off and is being asked again: clients drop them, or the
+    /// retry would show after the half reply (partial + full on screen).
+    ReplyRetracted { session_id: String, chars: usize },
     /// Token counts of one provider reply (`last`) and the session's running
     /// totals (`session`); `cached` is the part read from the prompt cache.
     Usage { session_id: String, last: crate::provider::Usage, session: crate::db::UsageTotals },
@@ -254,6 +258,10 @@ pub struct AppState {
     /// instructions, added after them). Starts from the config
     /// (`agent.system_prompt`, `agent.extra_prompt`) and changes live.
     pub user_prompt: std::sync::RwLock<(Option<String>, Option<String>)>,
+    /// Chats whose approvals are automatic (a running mission), with how
+    /// many grants hold each. Their child chats count too. Per chat, unlike
+    /// `perm_mode`: a mission must not auto-approve the user's other chats.
+    pub auto_approve: Mutex<HashMap<String, u32>>,
 }
 
 /// `system_delivery`: not probed yet — the prompt travels as a user note,
@@ -320,6 +328,7 @@ pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
         detected_context: std::sync::atomic::AtomicUsize::new(0),
         system_delivery: std::sync::atomic::AtomicU8::new(SYSTEM_UNKNOWN),
         user_prompt: std::sync::RwLock::new((cfg_prompt.0, cfg_prompt.1)),
+        auto_approve: Mutex::new(HashMap::new()),
     }))
 }
 
@@ -379,6 +388,7 @@ pub async fn build_state_ephemeral_skills(
         detected_context: std::sync::atomic::AtomicUsize::new(0),
         system_delivery: std::sync::atomic::AtomicU8::new(SYSTEM_UNKNOWN),
         user_prompt: std::sync::RwLock::new((cfg_prompt.0, cfg_prompt.1)),
+        auto_approve: Mutex::new(HashMap::new()),
     })
 }
 
@@ -473,6 +483,98 @@ impl AppState {
         self.set_perm_mode(if on { PermissionMode::Turbo } else { PermissionMode::Default });
         on
     }
+
+    /// The mode chat `session_id` runs in: the user's mode, or Turbo while
+    /// the chat (or a chat it was started from) holds an [`AutoApprove`]
+    /// grant. Deny rules still apply in every mode.
+    pub fn perm_mode_for(&self, session_id: &str) -> PermissionMode {
+        let mode = self.perm_mode();
+        if mode != PermissionMode::Turbo && self.auto_approved(session_id) {
+            return PermissionMode::Turbo;
+        }
+        mode
+    }
+
+    /// Does `session_id` or one of its parent chats hold an auto-approval?
+    fn auto_approved(&self, session_id: &str) -> bool {
+        let granted: Vec<String> = match self.auto_approve.lock() {
+            Ok(m) if !m.is_empty() => m.keys().cloned().collect(),
+            _ => return false,
+        };
+        let mut id = session_id.to_string();
+        // Missions nest a few levels (step → subagent); a cycle cannot loop.
+        for _ in 0..16 {
+            if granted.contains(&id) {
+                return true;
+            }
+            match self.db.get_session(&id).ok().flatten().and_then(|s| s.parent_id) {
+                Some(parent) => id = parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Automatic approvals for chat `session_id` and its child chats until
+    /// the returned guard is dropped (also on an early return or a panic).
+    /// Other chats and their waiting approvals are not touched.
+    pub fn auto_approve_session(self: &Shared, session_id: &str) -> AutoApprove {
+        if let Ok(mut m) = self.auto_approve.lock() {
+            *m.entry(session_id.to_string()).or_insert(0) += 1;
+        }
+        AutoApprove { st: self.clone(), session_id: session_id.to_string() }
+    }
+
+    /// A deleted chat's in-memory state: stats, mode, ponytail level, grants
+    /// and the per-chat caches, so long-running servers do not keep them.
+    pub fn forget_session(&self, session_id: &str) {
+        if let Ok(mut m) = self.stats.lock() {
+            m.remove(session_id);
+        }
+        if let Ok(mut m) = self.modes.lock() {
+            m.remove(session_id);
+        }
+        if let Ok(mut m) = self.ponytail_levels.lock() {
+            m.remove(session_id);
+        }
+        if let Ok(mut m) = self.auto_approve.lock() {
+            m.remove(session_id);
+        }
+        if let Some(Ok(mut m)) = FROZEN_LESSONS.get().map(|c| c.lock()) {
+            m.remove(session_id);
+        }
+        if let Some(Ok(mut m)) = COMPACT_FAILED_AT.get().map(|c| c.lock()) {
+            m.remove(session_id);
+        }
+    }
+}
+
+/// Lessons per chat, read once (see `composed_system`).
+static FROZEN_LESSONS: std::sync::OnceLock<Mutex<HashMap<String, Option<String>>>> = std::sync::OnceLock::new();
+/// Message count of the chat's last failed automatic compaction.
+static COMPACT_FAILED_AT: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
+
+/// A mission's automatic approvals ([`AppState::auto_approve_session`]),
+/// taken back when dropped.
+pub struct AutoApprove {
+    st: Shared,
+    session_id: String,
+}
+
+impl Drop for AutoApprove {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.st.auto_approve.lock() {
+            if let Some(n) = m.get_mut(&self.session_id) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&self.session_id);
+                }
+            }
+        }
+    }
+}
+
+impl AppState {
 
     /// M5: probe `{base}/models` every 15s and emit `Heartbeat`. Only a 2xx
     /// answer counts as up: Cloudflare error pages (530/1033) and auth
@@ -770,7 +872,7 @@ async fn abort_session(
 ) -> Result<StatusCode, StatusCode> {
     let busy = st.busy.read().await;
     if let Some(flag) = busy.get(&id) {
-        flag.store(true, Ordering::SeqCst);
+        signal_abort(flag);
         Ok(StatusCode::ACCEPTED)
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -910,6 +1012,7 @@ async fn delete_session_route(
         }
     }
     if st.db.delete_session(&id).map_err(internal)? {
+        st.forget_session(&id);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -961,16 +1064,26 @@ fn internal<E: std::fmt::Display>(e: E) -> StatusCode {
 /// of `eprintln!` in code that can run while the TUI owns the terminal.
 pub fn core_log(msg: &str) {
     use std::io::Write;
-    let path = crate::config::default_state_dir().join("core.log");
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    // Opened once and kept: this runs on async threads, and reopening the
+    // file (plus create_dir_all) on every line was a blocking call each time.
+    static LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if log.is_none() {
+        let path = crate::config::default_state_dir().join("core.log");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        *log = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
     }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "[{stamp}] {msg}");
+    if let Some(f) = log.as_mut() {
+        // A failed write (file deleted, disk full) reopens next time.
+        if writeln!(f, "[{stamp}] {msg}").is_err() {
+            *log = None;
+        }
     }
 }
 
@@ -1059,10 +1172,36 @@ pub const TURBO_MAX_CONTINUATIONS: u32 = 8;
 /// message. It is not the user talking, so `turbo_streak` skips it.
 const AUTO_REVIEW_PROMPT_START: &str = "Review the current uncommitted changes";
 
+/// How the app's own "user" messages start. They are told apart from the
+/// user's words by these starts (`first_request`, `turbo_streak`…).
+const APP_MARKERS: [&str; 4] = ["[app]", VERIFY_PREFIX, TURBO_CONTINUE_PREFIX, AUTO_REVIEW_PROMPT_START];
+
+/// Put in front of a user message that starts like one of the app's own
+/// (U+2060 WORD JOINER: invisible, and not whitespace, so no `trim` drops it).
+const USER_TEXT_GUARD: char = '\u{2060}';
+
+/// The user's message as stored: one that starts like an app message
+/// (`[app] …`, `[verify] …`, `TURBO-CONTINUE: …`) gets [`USER_TEXT_GUARD`]
+/// in front, so typing a marker cannot make it count as the app's (skip the
+/// turbo cap, hide the real request). Old rows keep matching as before.
+pub fn neutralize_user_text(text: &str) -> String {
+    let t = text.trim_start();
+    if APP_MARKERS.iter().any(|m| t.starts_with(m)) {
+        format!("{USER_TEXT_GUARD}{text}")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Trailing run of `[TURBO-CONTINUE]` user messages (non-user messages in
 /// between don't break the streak; a real user message does).
+#[cfg(test)]
 fn turbo_streak(st: &Shared, session_id: &str) -> u32 {
-    let Ok(msgs) = st.db.messages(session_id) else { return 0 };
+    st.db.messages(session_id).map(|m| turbo_streak_in(&m)).unwrap_or(0)
+}
+
+/// [`turbo_streak`] over messages already loaded.
+fn turbo_streak_in(msgs: &[Message]) -> u32 {
     let mut streak = 0;
     for m in msgs.iter().rev() {
         if m.role != "user" {
@@ -1097,10 +1236,8 @@ fn turbo_streak(st: &Shared, session_id: &str) -> u32 {
     streak
 }
 
-/// True when the session's todo list still has open work.
 /// Was the last turbo continuation answered without a single tool call?
-fn continuation_answered_without_tools(st: &Shared, session_id: &str) -> bool {
-    let Ok(msgs) = st.db.messages(session_id) else { return false };
+fn continuation_answered_without_tools(msgs: &[Message]) -> bool {
     let Some(cont) = msgs.iter().rposition(|m| {
         m.role == "user"
             && m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.starts_with(TURBO_CONTINUE_PREFIX)))
@@ -1114,6 +1251,7 @@ fn continuation_answered_without_tools(st: &Shared, session_id: &str) -> bool {
         && !after.iter().any(|m| m.parts.iter().any(|p| matches!(p, Part::ToolCall { .. })))
 }
 
+/// True when the session's todo list still has open work.
 fn todos_open(st: &Shared, session_id: &str) -> bool {
     matches!(
         st.todo_store.exec(session_id, crate::todo::TodoOp::List),
@@ -1121,14 +1259,22 @@ fn todos_open(st: &Shared, session_id: &str) -> bool {
     )
 }
 
+/// What a turbo continuation takes over from the run that started it: the
+/// prompt's pass budget and its hold on the scratch folder.
+struct Chain {
+    budget: PassBudget,
+    scratch: ScratchGuard,
+}
+
 /// Fire-and-forget start of a run whose `busy` slot is already claimed
 /// (`flag`). Deliberately NOT async: `run_agent` → spawn → `run_agent` would
 /// otherwise make their future types recursive (E0391). A sync call keeps
 /// the cycle broken. New (B-24): replaces `spawn_kick_run`.
-fn spawn_claimed_run(st: Shared, session_id: String, user_content: String, flag: Arc<AtomicBool>) {
+fn spawn_claimed_run(st: Shared, session_id: String, user_content: String, flag: Arc<AtomicBool>, chain: Chain) {
+    let slot = RunSlot::new(st.clone(), session_id.clone(), flag.clone());
     tokio::spawn(async move {
-        run_agent(&st, &session_id, &user_content, flag.clone()).await;
-        st.release_run(&session_id, &flag).await;
+        run_agent_in(&st, &session_id, &user_content, flag, Some(chain)).await;
+        slot.release().await;
     });
 }
 
@@ -1137,19 +1283,23 @@ fn spawn_claimed_run(st: Shared, session_id: String, user_content: String, flag:
 /// the cap), else None. A trailing "?" in the answer does NOT count as more
 /// work: asking is the one thing turbo must respect. The model is blocked
 /// on the user, and pushing it to "decide for yourself" produces guesses.
-fn turbo_continuation(st: &Shared, session_id: &str, result: &Result<String>) -> Option<String> {
-    let aborted = matches!(result.as_deref(), Ok("aborted"));
-    if !st.turbo() || result.is_err() || aborted {
+fn turbo_continuation(st: &Shared, session_id: &str, result: &Result<LoopEnd>) -> Option<String> {
+    if st.perm_mode_for(session_id) != PermissionMode::Turbo || !matches!(result, Ok(LoopEnd::Done(_))) {
         return None;
     }
-    if !todos_open(st, session_id) || turbo_streak(st, session_id) >= TURBO_MAX_CONTINUATIONS {
+    if !todos_open(st, session_id) {
+        return None;
+    }
+    // One read of the chat for both checks below.
+    let msgs = st.db.messages(session_id).unwrap_or_default();
+    if turbo_streak_in(&msgs) >= TURBO_MAX_CONTINUATIONS {
         return None;
     }
     // A continuation answered with words only ("the job is complete"): the
     // model is done and the open todo is a leftover. Another round would
     // resend the whole chat for the same answer (seen: 8 rounds, ~360K
     // tokens, for nothing).
-    if continuation_answered_without_tools(st, session_id) {
+    if continuation_answered_without_tools(&msgs) {
         let _ = st.events.send(ServerEvent::Note {
             session_id: session_id.to_string(),
             text: "turbo: stopping — the model says it is done, though a todo is still open".into(),
@@ -1173,10 +1323,61 @@ fn turbo_continuation(st: &Shared, session_id: &str, result: &Result<String>) ->
     ))
 }
 
+/// Most extra model passes one user prompt may start on top of its own run:
+/// fix rounds, final-check rounds, the design and ponytail reviews, and turbo
+/// continuations (each of which runs the whole pipeline again). Without a
+/// cap one message could fan out into dozens of full agent loops.
+pub const MAX_EXTRA_PASSES: u32 = 12;
+
+/// The extra passes one prompt has left (shared with its continuations).
+#[derive(Clone)]
+pub(crate) struct PassBudget(Arc<(std::sync::atomic::AtomicU32, AtomicBool)>);
+
+impl PassBudget {
+    fn new() -> Self {
+        Self(Arc::new((std::sync::atomic::AtomicU32::new(MAX_EXTRA_PASSES), AtomicBool::new(false))))
+    }
+
+    /// Spend one pass on `what`. False when none are left; the user is told
+    /// once per prompt what was skipped.
+    fn take(&self, st: &AppState, session_id: &str, what: &str) -> bool {
+        let (left, told) = &*self.0;
+        let mut n = left.load(Ordering::SeqCst);
+        while n > 0 {
+            match left.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+        if !told.swap(true, Ordering::SeqCst) {
+            let _ = st.events.send(ServerEvent::Note {
+                session_id: session_id.to_string(),
+                text: format!(
+                    "skipping {what}: this message already used its {MAX_EXTRA_PASSES} extra passes \
+                     (checks, fix rounds, reviews, turbo rounds). Send a message to go on."
+                ),
+            });
+        }
+        false
+    }
+}
+
+/// Spend a pass from `budget`, when there is one (missions and deep mode
+/// have their own limits and pass `None`).
+fn spend(budget: Option<&PassBudget>, st: &AppState, session_id: &str, what: &str) -> bool {
+    budget.is_none_or(|b| b.take(st, session_id, what))
+}
+
 /// The agent loop entry for a user prompt: records a git snapshot first
 /// (so `/undo` can roll the run back), stores the message, expands slash
 /// command templates, composes the system prompt, and runs [`run_loop`].
 pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort: Arc<AtomicBool>) {
+    run_agent_in(st, session_id, user_content, abort, None).await
+}
+
+/// [`run_agent`], as a turbo continuation of an earlier run (`chain`) or as
+/// a new prompt (`None`).
+async fn run_agent_in(st: &Shared, session_id: &str, user_content: &str, abort: Arc<AtomicBool>, chain: Option<Chain>) {
     // Safety net before anything mutates the workspace. Failure is not
     // fatal — snapshotting is a convenience, the run must still work.
     // New (B-48): git runs off the async threads; errors go to core.log.
@@ -1188,7 +1389,10 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
     if let Ok(Err(e)) = snap {
         core_log(&format!("[snapshot] {e:#}"));
     }
-    let scratch = prepare_scratch(&st.workspace_for(session_id));
+    let (budget, scratch) = match chain {
+        Some(c) => (c.budget, c.scratch),
+        None => (PassBudget::new(), ScratchGuard::acquire(st.workspace_for(session_id)).await),
+    };
     let before = snapshot_stats(st, session_id);
     // New (P-02): fingerprint the git working tree first, so a run that only
     // ran read-only commands (ls, cargo test, git log) gets no review.
@@ -1214,7 +1418,11 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
         let bash_changed = bash_used
             && match tree_before {
                 Some(_) => st.workspace_fingerprint(session_id).await != tree_before,
-                None => files_changed_since(&st.workspace_for(session_id), started_at),
+                None => {
+                    // A walk of the whole project: off the async threads.
+                    let ws = st.workspace_for(session_id);
+                    tokio::task::spawn_blocking(move || files_changed_since(&ws, started_at)).await.unwrap_or(true)
+                }
             };
         // Files written by this run's subagents count too.
         let by_agents = !crate::keepbest::written_since(&st.workspace_for(session_id), started_at).is_empty();
@@ -1228,81 +1436,79 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
     };
     // If a newer run replaced us, stay silent: our completion must not flip
     // the TUI's busy state or inject a stale answer into its transcript.
-    let superseded = {
-        let busy = st.busy.read().await;
-        busy.get(session_id)
-            .map(|f| !Arc::ptr_eq(f, &abort))
-            .unwrap_or(false)
-    };
-    if !superseded {
-        // F-08 verification loop: check the work before the review and
-        // before the turn is declared done. Never after an abort.
-        if ok && touched && !abort.load(Ordering::SeqCst) {
-            check_after_run(st, session_id, user_content, started_at, bash_used, &abort).await;
-        }
-        // The checks above run tests and pages; this one proves what the
-        // user asked for (a PNG that is a PNG, a cart that adds up).
-        if let Some(spec) = spec.as_ref().filter(|_| ok && st.cfg.agent.final_check) {
-            if !abort.load(Ordering::SeqCst) && !matches!(result.as_deref(), Ok("aborted")) {
-                final_check(st, session_id, spec, &abort).await;
-            }
-        }
-        // Working is not the same as looking right: the model judges the
-        // pages it changed by eye (it built five near-identical "AI" heroes
-        // on four models while every check passed).
-        if ok && touched && !abort.load(Ordering::SeqCst) && !matches!(result.as_deref(), Ok("aborted")) {
-            design_review(st, session_id, user_content, spec.as_ref(), started_at, bash_used, &abort).await;
-        }
-        // Auto ponytail review: any run that changed files gets the
-        // outside-the-diff senior-dev pass BEFORE the turn is declared done.
-        // New (P-03): never after an abort; the user asked us to stop.
-        let aborted = matches!(result.as_deref(), Ok("aborted"));
-        // A `review` agent already checked this run's work: a second review
-        // would only repeat it at the cost of another full agent loop.
-        let reviewed = crate::subagent::reviewed_since(session_id, started);
-        if ok && touched && !aborted && !reviewed && st.cfg.agent.auto_review && !st.own_prompt_only() {
-            let _ = st.events.send(ServerEvent::Note {
-                session_id: session_id.to_string(),
-                text: "ponytail review — checking the change and what it may have \
-                       broken outside the diff…"
-                    .to_string(),
-            });
-            if let Err(e) = run_review(st, session_id, Some(started_at), &abort).await {
-                let _ = st.events.send(ServerEvent::Note {
-                    session_id: session_id.to_string(),
-                    text: format!("ponytail review failed: {e}"),
-                });
-            }
-        }
-        // New (B-24): a turbo continuation is part of the same run. Register
-        // it BEFORE this run returns and announce no RunFinished in between:
-        // every client (headless, TUI, GUI) sees one run that ends when the
-        // last continuation ends.
-        if let Some(next) = turbo_continuation(st, session_id, &result) {
-            let _ = st.events.send(ServerEvent::Note {
-                session_id: session_id.to_string(),
-                text: "turbo: continuing on my own — no questions, no waiting".into(),
-            });
-            let flag = st.claim_run(session_id).await;
-            spawn_claimed_run(st.clone(), session_id.to_string(), next, flag);
-            return;
-        }
-        // Another run in the same project may still use the scratch folder.
-        if st.busy.read().await.len() <= 1 {
-            clear_scratch(&scratch);
-        }
-        // What the run left, so a later undo can tell its changes from work
-        // done outside Habi afterwards (and refuse to overwrite that).
-        let (ws, sd) = (st.workspace_for(session_id), st.state_dir.clone());
-        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || crate::gitsnap::record_after_run(&ws, &sd)).await {
-            core_log(&format!("[snapshot] after run: {e:#}"));
-        }
-        let _ = st.events.send(ServerEvent::RunFinished {
-            session_id: session_id.to_string(),
-            ok,
-            message,
-        });
+    if st.is_superseded(session_id, &abort).await {
+        scratch.release().await;
+        return;
     }
+    let aborted = || abort.load(Ordering::SeqCst) || matches!(result, Ok(LoopEnd::Aborted));
+    // F-08 verification loop: check the work before the review and
+    // before the turn is declared done. Never after an abort.
+    if ok && touched && !aborted() {
+        check_after_run(st, session_id, user_content, started_at, bash_used, &abort, Some(&budget)).await;
+    }
+    // The checks above run tests and pages; this one proves what the
+    // user asked for (a PNG that is a PNG, a cart that adds up).
+    if let Some(spec) = spec.as_ref().filter(|_| ok && st.cfg.agent.final_check) {
+        if !aborted() {
+            final_check(st, session_id, spec, &abort, Some(&budget)).await;
+        }
+    }
+    // Working is not the same as looking right: the model judges the
+    // pages it changed by eye (it built five near-identical "AI" heroes
+    // on four models while every check passed).
+    if ok && touched && !aborted() {
+        design_review(st, session_id, user_content, spec.as_ref(), started_at, bash_used, &abort, Some(&budget)).await;
+    }
+    // Auto ponytail review: any run that changed files gets the
+    // outside-the-diff senior-dev pass BEFORE the turn is declared done.
+    // New (P-03): never after an abort; the user asked us to stop.
+    // A `review` agent already checked this run's work: a second review
+    // would only repeat it at the cost of another full agent loop.
+    let reviewed = crate::subagent::reviewed_since(session_id, started);
+    if ok && touched && !aborted() && !reviewed && st.cfg.agent.auto_review && !st.own_prompt_only()
+        && budget.take(st, session_id, "the ponytail review")
+    {
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: "ponytail review — checking the change and what it may have \
+                   broken outside the diff…"
+                .to_string(),
+        });
+        if let Err(e) = run_review(st, session_id, Some(started_at), &abort).await {
+            let _ = st.events.send(ServerEvent::Note {
+                session_id: session_id.to_string(),
+                text: format!("ponytail review failed: {e}"),
+            });
+        }
+    }
+    // New (B-24): a turbo continuation is part of the same run. Register
+    // it BEFORE this run returns and announce no RunFinished in between:
+    // every client (headless, TUI, GUI) sees one run that ends when the
+    // last continuation ends.
+    if let Some(next) = turbo_continuation(st, session_id, &result).filter(|_| budget.take(st, session_id, "another turbo round")) {
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: "turbo: continuing on my own — no questions, no waiting".into(),
+        });
+        let flag = st.claim_run(session_id).await;
+        // The continuation holds the scratch folder before this run lets go.
+        let chain = Chain { budget: budget.clone(), scratch: scratch.share() };
+        spawn_claimed_run(st.clone(), session_id.to_string(), next, flag, chain);
+        scratch.release().await;
+        return;
+    }
+    scratch.release().await;
+    // What the run left, so a later undo can tell its changes from work
+    // done outside Habi afterwards (and refuse to overwrite that).
+    let (ws, sd) = (st.workspace_for(session_id), st.state_dir.clone());
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || crate::gitsnap::record_after_run(&ws, &sd)).await {
+        core_log(&format!("[snapshot] after run: {e:#}"));
+    }
+    st.finish_run(session_id, &abort, match message {
+        None => Ok(None),
+        Some(m) => Err(m),
+    })
+    .await;
 }
 
 /// A run's temporary files live in `<project>/.opencode/scratch/`: git
@@ -1327,6 +1533,78 @@ fn clear_scratch((dir, made_parent): &(PathBuf, bool)) {
     if *made_parent {
         if let Some(parent) = dir.parent() {
             let _ = std::fs::remove_dir(parent); // only when empty
+        }
+    }
+}
+
+/// Runs holding each project's scratch folder, and whether `.opencode` was
+/// made for it. Per project: a run in another project never keeps this one's
+/// folder alive (the old check counted every busy chat of every project).
+fn scratch_users() -> &'static Mutex<HashMap<PathBuf, (usize, bool)>> {
+    static USERS: std::sync::OnceLock<Mutex<HashMap<PathBuf, (usize, bool)>>> = std::sync::OnceLock::new();
+    USERS.get_or_init(Default::default)
+}
+
+/// One more holder of `ws`'s scratch folder; the first one creates it. The
+/// folder work happens under the lock, so a create and a remove never cross.
+fn scratch_hold(ws: &std::path::Path) {
+    let mut users = scratch_users().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = users.entry(ws.to_path_buf()).or_insert((0, false));
+    if entry.0 == 0 {
+        entry.1 = prepare_scratch(ws).1;
+    }
+    entry.0 += 1;
+}
+
+/// One holder fewer; the last one removes the folder.
+fn scratch_let_go(ws: &std::path::Path) {
+    let mut users = scratch_users().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(entry) = users.get_mut(ws) else { return };
+    entry.0 = entry.0.saturating_sub(1);
+    if entry.0 == 0 {
+        let made_parent = entry.1;
+        users.remove(ws);
+        clear_scratch(&(scratch_dir(ws), made_parent));
+    }
+}
+
+/// A run's hold on its project's scratch folder. Let go on every way out of
+/// the run: `release` on the normal paths, `Drop` on a panic.
+pub(crate) struct ScratchGuard {
+    ws: Option<PathBuf>,
+}
+
+impl ScratchGuard {
+    async fn acquire(ws: PathBuf) -> Self {
+        let key = ws.clone();
+        let _ = tokio::task::spawn_blocking(move || scratch_hold(&key)).await;
+        Self { ws: Some(ws) }
+    }
+
+    /// A second hold on the same folder (for a turbo continuation). The
+    /// folder exists already, so this touches no files.
+    fn share(&self) -> Self {
+        if let Some(ws) = &self.ws {
+            scratch_hold(ws);
+        }
+        Self { ws: self.ws.clone() }
+    }
+
+    async fn release(mut self) {
+        if let Some(ws) = self.ws.take() {
+            let _ = tokio::task::spawn_blocking(move || scratch_let_go(&ws)).await;
+        }
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let Some(ws) = self.ws.take() else { return };
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn_blocking(move || scratch_let_go(&ws));
+            }
+            Err(_) => scratch_let_go(&ws),
         }
     }
 }
@@ -1478,44 +1756,11 @@ impl AppState {
 
     /// `/review` — ponytail review run as the session's current turn.
     pub async fn kick_review(self: &Shared, session_id: String) {
-        let flag = {
-            let mut busy = self.busy.write().await;
-            if let Some(old) = busy.remove(&session_id) {
-                old.store(true, Ordering::SeqCst);
-            }
-            let flag = Arc::new(AtomicBool::new(false));
-            busy.insert(session_id.clone(), flag.clone());
-            flag
-        };
-        let st2 = self.clone();
-        tokio::spawn(async move {
-            let res = run_review(&st2, &session_id, None, &flag).await;
-            let superseded = {
-                let busy = st2.busy.read().await;
-                busy.get(&session_id)
-                    .map(|f| !Arc::ptr_eq(f, &flag))
-                    .unwrap_or(false)
-            };
-            if !superseded {
-                let (ok, message) = match res {
-                    Ok(_) => (true, None),
-                    Err(e) => (false, Some(format!("error: {e}"))),
-                };
-                let _ = st2.events.send(ServerEvent::RunFinished {
-                    session_id: session_id.clone(),
-                    ok,
-                    message,
-                });
-            }
-            let mut busy = st2.busy.write().await;
-            if busy
-                .get(&session_id)
-                .map(|f| Arc::ptr_eq(f, &flag))
-                .unwrap_or(false)
-            {
-                busy.remove(&session_id);
-            }
-        });
+        self.kick_task(session_id, |st, sid, flag| async move {
+            let res = run_review(&st, &sid, None, &flag).await;
+            st.finish_run(&sid, &flag, res.map(|_| None).map_err(|e| format!("error: {e}"))).await;
+        })
+        .await;
     }
 
     /// `/mission <goal>` (or `/mission resume` with `goal: None`): work on
@@ -1532,18 +1777,7 @@ impl AppState {
         };
         self.kick_task(session_id, move |st, sid, flag| async move {
             let res = mission_run::run_mission(&st, &sid, goal.as_deref(), deep, &flag).await;
-            if st.is_superseded(&sid, &flag).await {
-                return;
-            }
-            let (ok, message) = match res {
-                Ok(text) => {
-                    let _ = st.db.add_message(&sid, "assistant", &[Part::Text { text: text.clone() }]);
-                    let _ = st.events.send(ServerEvent::AssistantDelta { session_id: sid.clone(), text });
-                    (true, None)
-                }
-                Err(e) => (false, Some(format!("mission: {e:#}"))),
-            };
-            let _ = st.events.send(ServerEvent::RunFinished { session_id: sid, ok, message });
+            st.finish_run(&sid, &flag, res.map(Some).map_err(|e| format!("mission: {e:#}"))).await;
         })
         .await;
     }
@@ -1555,21 +1789,12 @@ impl AppState {
         let n = attempts.unwrap_or(self.cfg.agent.deep_attempts);
         self.kick_task(session_id, move |st, sid, flag| async move {
             let res = deep::run_deep(&st, &sid, &task, n, &flag).await;
-            if st.is_superseded(&sid, &flag).await {
-                return;
-            }
-            let (ok, message) = match res {
-                Ok(text) => {
-                    if !text.is_empty() {
-                        let _ = st.db.add_message(&sid, "assistant", &[Part::Text { text: text.clone() }]);
-                        let _ = st.events.send(ServerEvent::AssistantDelta { session_id: sid.clone(), text });
-                    }
-                    (true, None)
-                }
-                Err(e) if flag.load(Ordering::SeqCst) => (false, Some(format!("deep mode stopped: {e}"))),
-                Err(e) => (false, Some(format!("deep mode failed: {e:#}"))),
+            let outcome = match res {
+                Ok(text) => Ok((!text.is_empty()).then_some(text)),
+                Err(e) if flag.load(Ordering::SeqCst) => Err(format!("deep mode stopped: {e}")),
+                Err(e) => Err(format!("deep mode failed: {e:#}")),
             };
-            let _ = st.events.send(ServerEvent::RunFinished { session_id: sid, ok, message });
+            st.finish_run(&sid, &flag, outcome).await;
         })
         .await;
     }
@@ -1579,13 +1804,12 @@ impl AppState {
     /// the TUI action bridge, the CLI pre-prompt) goes through here so a
     /// stuck run can always be replaced by the next message.
     pub async fn kick_run(self: &Shared, session_id: String, user_content: String) {
-        let flag = self.claim_run(&session_id).await;
-        let st2 = self.clone();
-        tokio::spawn(async move {
-            let _ = run_agent(&st2, &session_id, &user_content, flag.clone()).await;
-            // Remove only OUR flag — a newer run may own the slot already.
-            st2.release_run(&session_id, &flag).await;
-        });
+        // The user's own words: they never pass for one of the app's notes.
+        let user_content = neutralize_user_text(&user_content);
+        self.kick_task(session_id, move |st, sid, flag| async move {
+            run_agent(&st, &sid, &user_content, flag).await;
+        })
+        .await;
     }
 }
 
@@ -1597,7 +1821,7 @@ impl AppState {
     pub async fn claim_run(&self, session_id: &str) -> Arc<AtomicBool> {
         let mut busy = self.busy.write().await;
         if let Some(old) = busy.remove(session_id) {
-            old.store(true, Ordering::SeqCst);
+            signal_abort(&old);
         }
         let flag = Arc::new(AtomicBool::new(false));
         busy.insert(session_id.to_string(), flag.clone());
@@ -1618,6 +1842,28 @@ impl AppState {
         busy.get(session_id).map(|f| !Arc::ptr_eq(f, flag)).unwrap_or(false)
     }
 
+    /// The end of a run, for the clients: on `Ok(Some(text))` the text is
+    /// saved and streamed as the last reply, then one `RunFinished` (an
+    /// `Err` carries its message). Nothing at all when a newer run took the
+    /// slot: that run reports for itself. False then.
+    pub async fn finish_run(&self, session_id: &str, flag: &Arc<AtomicBool>, outcome: std::result::Result<Option<String>, String>) -> bool {
+        if self.is_superseded(session_id, flag).await {
+            return false;
+        }
+        let (ok, message) = match outcome {
+            Ok(text) => {
+                if let Some(text) = text {
+                    let _ = self.db.add_message(session_id, "assistant", &[Part::Text { text: text.clone() }]);
+                    let _ = self.events.send(ServerEvent::AssistantDelta { session_id: session_id.to_string(), text });
+                }
+                (true, None)
+            }
+            Err(m) => (false, Some(m)),
+        };
+        let _ = self.events.send(ServerEvent::RunFinished { session_id: session_id.to_string(), ok, message });
+        true
+    }
+
     /// Ask the session's active run to stop. False when nothing runs.
     pub async fn abort_run(&self, session_id: &str) -> bool {
         // Its spawned agents stop with it.
@@ -1625,7 +1871,7 @@ impl AppState {
         let busy = self.busy.read().await;
         match busy.get(session_id) {
             Some(flag) => {
-                flag.store(true, Ordering::SeqCst);
+                signal_abort(flag);
                 true
             }
             None => false,
@@ -1638,19 +1884,122 @@ impl AppState {
     }
 
     /// Run `work` as the session's current run: registered in `busy`,
-    /// replacing any active run, released when it ends. `work` gets the
-    /// state, the session id and the run's abort flag.
+    /// replacing any active run, released when it ends — also when it
+    /// panics (see [`RunSlot`]). `work` gets the state, the session id and
+    /// the run's abort flag.
     pub async fn kick_task<F, Fut>(self: &Shared, session_id: String, work: F)
     where
         F: FnOnce(Shared, String, Arc<AtomicBool>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let flag = self.claim_run(&session_id).await;
+        let slot = RunSlot::new(self.clone(), session_id.clone(), flag.clone());
         let st = self.clone();
         tokio::spawn(async move {
-            work(st.clone(), session_id.clone(), flag.clone()).await;
-            st.release_run(&session_id, &flag).await;
+            work(st, session_id, flag).await;
+            slot.release().await;
         });
+    }
+}
+
+/// A claimed busy slot, freed when the run ends. Normally by `release`; on
+/// a panic the task's future is dropped and `Drop` frees it, so a crashed
+/// run cannot leave its chat "busy" for good (DELETE then answered 409).
+pub(crate) struct RunSlot {
+    st: Shared,
+    session_id: String,
+    flag: Option<Arc<AtomicBool>>,
+}
+
+impl RunSlot {
+    fn new(st: Shared, session_id: String, flag: Arc<AtomicBool>) -> Self {
+        Self { st, session_id, flag: Some(flag) }
+    }
+
+    async fn release(mut self) {
+        if let Some(flag) = self.flag.take() {
+            self.st.release_run(&self.session_id, &flag).await;
+        }
+    }
+}
+
+impl Drop for RunSlot {
+    fn drop(&mut self) {
+        let Some(flag) = self.flag.take() else { return };
+        if let Ok(mut busy) = self.st.busy.try_write() {
+            if busy.get(&self.session_id).is_some_and(|f| Arc::ptr_eq(f, &flag)) {
+                busy.remove(&self.session_id);
+            }
+            return;
+        }
+        // The lock is taken right now: free the slot from a task instead.
+        if let Ok(h) = tokio::runtime::Handle::try_current() {
+            let (st, session_id) = (self.st.clone(), std::mem::take(&mut self.session_id));
+            h.spawn(async move { st.release_run(&session_id, &flag).await });
+        }
+    }
+}
+
+/// Wakers for everything waiting on an abort flag, by the flag's address
+/// (the flags are plain `AtomicBool`s shared with the other modules).
+fn abort_wakers() -> &'static Mutex<HashMap<usize, Arc<tokio::sync::Notify>>> {
+    static W: std::sync::OnceLock<Mutex<HashMap<usize, Arc<tokio::sync::Notify>>>> = std::sync::OnceLock::new();
+    W.get_or_init(Default::default)
+}
+
+/// Stop a run: set its abort flag and wake whatever waits on it at once.
+pub fn signal_abort(flag: &AtomicBool) {
+    flag.store(true, Ordering::SeqCst);
+    let key = flag as *const AtomicBool as usize;
+    let waker = abort_wakers().lock().ok().and_then(|m| m.get(&key).cloned());
+    if let Some(n) = waker {
+        n.notify_waiters();
+    }
+}
+
+/// Resolves once `flag` is set. [`signal_abort`] wakes it at once (this
+/// replaced 100 ms sleep loops); a flag set some other way (a plain `store`
+/// in another module) is still seen within `RECHECK`.
+pub async fn aborted(flag: &AtomicBool) {
+    const RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
+    let key = flag as *const AtomicBool as usize;
+    let waiter = AbortWaiter::new(key);
+    loop {
+        let notified = waiter.notify.notified();
+        tokio::pin!(notified);
+        // Registered before the check, so a signal in between is not lost.
+        notified.as_mut().enable();
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(RECHECK) => {}
+        }
+    }
+}
+
+/// One waiter's share of a flag's `Notify`; the last one out removes it.
+struct AbortWaiter {
+    key: usize,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl AbortWaiter {
+    fn new(key: usize) -> Self {
+        let mut map = abort_wakers().lock().unwrap_or_else(|e| e.into_inner());
+        let notify = map.entry(key).or_default().clone();
+        Self { key, notify }
+    }
+}
+
+impl Drop for AbortWaiter {
+    fn drop(&mut self) {
+        let mut map = abort_wakers().lock().unwrap_or_else(|e| e.into_inner());
+        // The map's copy and ours: nobody else waits on this flag.
+        if map.get(&self.key).is_some_and(|n| Arc::ptr_eq(n, &self.notify)) && Arc::strong_count(&self.notify) <= 2 {
+            map.remove(&self.key);
+        }
     }
 }
 
@@ -1659,7 +2008,7 @@ async fn agent_inner(
     session_id: &str,
     user_content: &str,
     abort: &AtomicBool,
-) -> Result<String> {
+) -> Result<LoopEnd> {
     agent_inner_with(st, session_id, user_content, None, abort).await
 }
 
@@ -1672,7 +2021,7 @@ async fn agent_inner_with(
     user_content: &str,
     note: Option<String>,
     abort: &AtomicBool,
-) -> Result<String> {
+) -> Result<LoopEnd> {
     st.db.add_message(session_id, "user", &[Part::Text { text: user_content.to_string() }])?;
     if let Some(note) = note {
         st.db.add_message(session_id, "system", &[Part::Text { text: note }])?;
@@ -1688,7 +2037,12 @@ async fn agent_inner_with(
             }],
         )?;
     }
-    let system = st.composed_system(session_id);
+    // Reads AGENTS.md, skills and lessons and builds the project map: file
+    // work, so off the async threads.
+    let system = {
+        let (st, sid) = (st.clone(), session_id.to_string());
+        tokio::task::spawn_blocking(move || st.composed_system(&sid)).await.context("composing the system prompt")?
+    };
     let opts = LoopOpts {
         model: None,
         max_steps: None,
@@ -1699,7 +2053,7 @@ async fn agent_inner_with(
         workspace: st.run_workspace(session_id),
         agent: None,
     };
-    run_loop(st, session_id, &opts, abort).await
+    run_loop_inner(st, session_id, &opts, abort).await
 }
 
 /// M7: identity of a spawned subagent run — its tool activity is attributed
@@ -1796,9 +2150,9 @@ impl AppState {
         // Read once per chat: a lesson saved by this chat's fix round would
         // otherwise change the system prompt, and every later request would
         // miss the prompt cache. New lessons apply from the next chat.
+        // Kept until the chat is deleted (`forget_session`).
         let lessons = {
-            static FROZEN: std::sync::OnceLock<Mutex<HashMap<String, Option<String>>>> = std::sync::OnceLock::new();
-            let mut frozen = FROZEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+            let mut frozen = FROZEN_LESSONS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
             frozen.entry(session_id.to_string()).or_insert_with(|| load_lessons(self, &workspace)).clone()
         };
         let request = self.first_request(session_id).unwrap_or_default();
@@ -1957,7 +2311,11 @@ impl AppState {
         } else {
             raw.to_string()
         };
-        let path = Self::export_path(&self.workspace_for(session_id), &name)?;
+        let workspace = self.workspace_for(session_id);
+        let path = Self::export_path(&workspace, &name)?;
+        // The text check above cannot see links: a symlinked folder (or
+        // file) inside the workspace would carry the write outside it.
+        Self::export_stays_inside(&workspace, &path)?;
         if path.exists() && !force {
             let existing = std::fs::read_to_string(&path).unwrap_or_default();
             if !existing.starts_with(Self::EXPORT_MARKER) {
@@ -1970,6 +2328,8 @@ impl AppState {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
+        // Again with the folders made: one could have been swapped for a link.
+        Self::export_stays_inside(&workspace, &path)?;
         let md = format!("{}\n{}", Self::EXPORT_MARKER, self.transcript_markdown(session_id));
         std::fs::write(&path, md).with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
@@ -2004,6 +2364,28 @@ impl AppState {
             anyhow::bail!("export path is empty");
         }
         Ok(workspace.join(clean))
+    }
+
+    /// `path` (from [`Self::export_path`]) on disk: its deepest existing
+    /// folder, links resolved, must still be inside the workspace, and the
+    /// file itself must not be a link.
+    fn export_stays_inside(workspace: &std::path::Path, path: &std::path::Path) -> Result<()> {
+        let root = std::fs::canonicalize(workspace).with_context(|| format!("reading {}", workspace.display()))?;
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if d.exists() {
+                let real = std::fs::canonicalize(d).with_context(|| format!("reading {}", d.display()))?;
+                if !real.starts_with(&root) {
+                    anyhow::bail!("export path leaves the workspace through a link: {}", path.display());
+                }
+                break;
+            }
+            dir = d.parent();
+        }
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            anyhow::bail!("export path is a link; pick another name: {}", path.display());
+        }
+        Ok(())
     }
 
     /// M6: `/todos` — the session's todo list as a transcript block.
@@ -2225,50 +2607,54 @@ fn fit_tool_results(msgs: &mut [ChatMsg], limit: usize) -> usize {
 
 /// F-07: compact the session when the next request would use 80% or more
 /// of `agent.context_tokens`. A failed attempt is remembered per session
-/// (by message count), so it is not retried on every step.
+/// (by message count), so it is not retried on every step. `msgs` is the
+/// request about to be sent (built once per step); true when the chat was
+/// compacted and the request must be built again.
 async fn auto_compact_if_needed(
     st: &Shared,
     session_id: &str,
-    system: &str,
+    msgs: &[ChatMsg],
     specs: &[crate::provider::ToolSpec],
     abort: &AtomicBool,
-) {
-    static FAILED_AT: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
+) -> bool {
     let limit = context_limit(st);
     if limit == 0 {
-        return;
+        return false;
     }
-    let Ok(msgs) = build_chat_messages(st, session_id, system) else { return };
-    let used = estimate_tokens(&msgs, specs);
+    let used = estimate_tokens(msgs, specs);
     if used.saturating_mul(5) < limit.saturating_mul(4) {
-        return;
+        return false;
     }
-    let failed = FAILED_AT.get_or_init(|| Mutex::new(HashMap::new()));
+    let failed = COMPACT_FAILED_AT.get_or_init(|| Mutex::new(HashMap::new()));
     let tried_here = failed
         .lock()
         .map(|m| m.get(session_id) == Some(&msgs.len()))
         .unwrap_or(false);
     if tried_here {
-        return;
+        return false;
     }
-    let text = match crate::compact::compact(st, session_id, abort).await {
+    let (text, compacted) = match crate::compact::compact(st, session_id, abort).await {
         Ok(o) => {
             if let Ok(mut m) = failed.lock() {
                 m.remove(session_id);
             }
-            format!(
-                "context is ~{used} of {limit} tokens: compacted {} older message(s) into a summary",
-                o.removed
+            (
+                format!(
+                    "context is ~{used} of {limit} tokens: compacted {} older message(s) into a summary",
+                    o.removed
+                ),
+                true,
             )
         }
         Err(e) => {
             if let Ok(mut m) = failed.lock() {
                 m.insert(session_id.to_string(), msgs.len());
             }
-            format!("context is ~{used} of {limit} tokens: automatic compaction skipped ({e})")
+            (format!("context is ~{used} of {limit} tokens: automatic compaction skipped ({e})"), false)
         }
     };
     let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
+    compacted
 }
 
 /// F-09 loop guard: the third identical call in a row (same tool, same
@@ -2434,7 +2820,7 @@ fn short_id(id: &str) -> &str {
 /// shows (`/mission x`, `/deep 3 x`) and what is stored (`[mission] x`,
 /// `[deep mode, 3 attempts] x`) come out the same.
 fn rewind_key(text: &str) -> String {
-    let t = text.trim().trim_start_matches('\u{203a}').trim();
+    let t = text.trim().trim_start_matches('\u{203a}').trim().trim_start_matches(USER_TEXT_GUARD);
     let t = t
         .strip_prefix("[mission] ")
         .or_else(|| t.strip_prefix("/mission "))
@@ -2660,14 +3046,47 @@ pub fn denies_file_access(text: &str) -> bool {
     cannot.iter().any(|c| t.contains(c)) && files.iter().any(|f| t.contains(f)) && ask.iter().any(|a| t.contains(a))
 }
 
+/// How a run loop ended. An abort used to come back as the answer text
+/// "aborted", which a model reply of that one word could pass for.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LoopEnd {
+    /// The final answer (or the step-limit note).
+    Done(String),
+    /// Stopped by the abort flag.
+    Aborted,
+}
+
+impl LoopEnd {
+    /// The old text form, for [`run_loop`]'s callers in other modules.
+    pub(crate) fn into_legacy(self) -> String {
+        match self {
+            LoopEnd::Done(text) => text,
+            LoopEnd::Aborted => "aborted".into(),
+        }
+    }
+}
+
 /// The agent loop: load history, call model, execute tools, repeat until done.
+/// An aborted run returns the text "aborted" (see [`LoopEnd`]).
 pub async fn run_loop(
     st: &Shared,
     session_id: &str,
     opts: &LoopOpts,
     abort: &AtomicBool,
 ) -> Result<String> {
+    run_loop_inner(st, session_id, opts, abort).await.map(LoopEnd::into_legacy)
+}
+
+/// [`run_loop`] with the ending as a [`LoopEnd`].
+pub(crate) async fn run_loop_inner(
+    st: &Shared,
+    session_id: &str,
+    opts: &LoopOpts,
+    abort: &AtomicBool,
+) -> Result<LoopEnd> {
     let mode = st.mode_for(session_id);
+    // A mission's chats run like turbo without the user's mode being turbo.
+    let turbo = st.perm_mode_for(session_id) == PermissionMode::Turbo;
     // F-09: one loop guard per run (a spawned subagent has its own).
     let mut loop_guard = LoopGuard::default();
     // Replies that only said what the model would do next (see `announces_work`).
@@ -2695,7 +3114,7 @@ pub async fn run_loop(
         specs.retain(|s| s.function.name != "todo" && s.function.name != "ask_user");
     }
     // Turbo means "decide yourself": no questions.
-    if st.turbo() {
+    if turbo {
         specs.retain(|s| s.function.name != "ask_user");
     }
     let specs: Vec<_> = match &opts.allow {
@@ -2715,16 +3134,19 @@ pub async fn run_loop(
     let mut stream_drops = 0u32;
     for _step in 0..max_steps {
         if abort.load(Ordering::SeqCst) {
-            return Ok("aborted".into());
+            return Ok(LoopEnd::Aborted);
         }
         // A3: messages for a subagent from its parent, or finished
         // background reports for a parent, arrive before the next step.
         if let Some(text) = crate::subagent::take_mail(session_id) {
             st.db.add_message(session_id, "user", &[Part::Text { text }])?;
         }
-        // F-07: compact first when the context is nearly full.
-        auto_compact_if_needed(st, session_id, &opts.system, &specs, abort).await;
-        let msgs = build_chat_messages(st, session_id, &opts.system)?;
+        // F-07: compact first when the context is nearly full. The request
+        // is built once per step, and again only when compaction changed it.
+        let mut msgs = build_chat_messages(st, session_id, &opts.system)?;
+        if auto_compact_if_needed(st, session_id, &msgs, &specs, abort).await {
+            msgs = build_chat_messages(st, session_id, &opts.system)?;
+        }
         let prefix_note = prefix_change(session_id, &msgs, &specs);
         let mut request_usage: Option<crate::provider::Usage> = None;
         // B-29: copy the client out of the lock; never hold it while waiting.
@@ -2749,11 +3171,7 @@ pub async fn run_loop(
                 }
                 Err(e) => return Err(e),
             },
-            _ = async {
-                while !abort.load(Ordering::SeqCst) {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            } => return Ok("aborted".into()),
+            _ = aborted(abort) => return Ok(LoopEnd::Aborted),
         };
 
         let mut text = String::new();
@@ -2764,25 +3182,19 @@ pub async fn run_loop(
         let mut finish_reason: Option<String> = None;
         // Poll the stream in racing with the abort flag: a replaced run must
         // exit promptly even when the transport yields nothing at all.
-        let mut abort_tick =
-            tokio::time::interval(std::time::Duration::from_millis(200));
-        abort_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let stop = aborted(abort);
+        tokio::pin!(stop);
         let mut dropped = false;
         // The stream broke off for good: the part that arrived is kept.
         let mut broke_off = false;
         loop {
             let ev = tokio::select! {
                 ev = stream.next() => ev,
-                _ = abort_tick.tick() => {
-                    if abort.load(Ordering::SeqCst) {
-                        return Ok("aborted".into());
-                    }
-                    continue;
-                }
+                _ = &mut stop => return Ok(LoopEnd::Aborted),
             };
             let Some(ev) = ev else { break };
             if abort.load(Ordering::SeqCst) {
-                return Ok("aborted".into());
+                return Ok(LoopEnd::Aborted);
             }
             // Nothing of a cut-off reply is saved yet: ask the same step again
             // instead of ending the run (a free provider drops streams often).
@@ -2790,6 +3202,9 @@ pub async fn run_loop(
                 Ok(ev) => ev,
                 Err(e) if stream_drops < MAX_STREAM_DROPS => {
                     stream_drops += 1;
+                    // The part already on screen is asked again from the
+                    // start: take it back, or partial + full reply show.
+                    retract_shown(st, session_id, &text[..shown]);
                     let _ = st.events.send(ServerEvent::Note {
                         session_id: session_id.to_string(),
                         text: format!(
@@ -2857,6 +3272,12 @@ pub async fn run_loop(
         log_cache(st, session_id, request_usage.as_ref(), &prefix_note);
         let mut calls = acc.finish();
         if text.contains(['\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}']) {
+            // `shown` counts bytes of the text as it streamed: the shown part
+            // shrinks by the characters taken out of it, not to `min(len)`
+            // (that dropped or doubled the end of the reply).
+            if text.is_char_boundary(shown) {
+                shown = strip_invisible(&text[..shown]).len();
+            }
             text = strip_invisible(&text);
             shown = shown.min(text.len());
         }
@@ -2865,6 +3286,8 @@ pub async fn run_loop(
         // chat when it says the request was too long, ask again, and fail
         // with the message when it keeps coming back.
         if calls.is_empty() && is_wrapped_error(&text) {
+            // It streamed in as reply text: take it off the screen.
+            retract_shown(st, session_id, &text[..shown.min(text.len())]);
             if !compacted && is_context_overflow(&text) {
                 compacted = true;
                 let _ = st.events.send(ServerEvent::Note {
@@ -3081,13 +3504,13 @@ pub async fn run_loop(
                     ),
                     None => "tool blocked: not allowed in this mode/role".to_string(),
                 })
-            } else if crate::tools::is_job_control(&name, &input) {
+            } else if crate::tools::is_job_control(&name, &input) && agent_job(&input) {
                 None // reading or stopping a job it was allowed to start
             } else if !check_permission_preview(
                 st,
                 session_id,
                 &name,
-                &detail,
+                &job_detail(&name, &input).unwrap_or_else(|| detail.clone()),
                 &approval_preview(&name, &input),
                 abort,
             )
@@ -3123,7 +3546,7 @@ pub async fn run_loop(
             finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
         }
         // The user was asked: stop until they answer.
-        if let Some(question) = asked.filter(|_| opts.agent.is_none() && !st.turbo()) {
+        if let Some(question) = asked.filter(|_| opts.agent.is_none() && !turbo) {
             final_text = if text.trim().is_empty() { question } else { text };
             finished = true;
             break;
@@ -3145,9 +3568,40 @@ pub async fn run_loop(
             session_id: session_id.to_string(),
             text: msg.clone(),
         });
-        return Ok(msg);
+        return Ok(LoopEnd::Done(msg));
     }
-    Ok(final_text)
+    Ok(LoopEnd::Done(final_text))
+}
+
+/// Take back reply text already streamed (`shown`) when its step is asked
+/// again ([`ServerEvent::ReplyRetracted`]).
+fn retract_shown(st: &Shared, session_id: &str, shown: &str) {
+    let chars = shown.chars().count();
+    if chars > 0 {
+        let _ = st.events.send(ServerEvent::ReplyRetracted { session_id: session_id.to_string(), chars });
+    }
+}
+
+/// Is the `bash {job}` call about a job the agent started (`job<n>`)? The
+/// user's own terminal commands (`term<n>`) are not the agent's to read or
+/// stop without asking.
+fn agent_job(input: &Value) -> bool {
+    input
+        .get("job")
+        .and_then(Value::as_str)
+        .and_then(|id| id.strip_prefix("job"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// What the approval prompt names for a `bash {job}` call (it has no
+/// command, so the usual detail is empty).
+fn job_detail(name: &str, input: &Value) -> Option<String> {
+    if name != "bash" || input.get("command").is_some() {
+        return None;
+    }
+    let id = input.get("job").and_then(Value::as_str)?;
+    let stop = input.get("stop").and_then(Value::as_bool).unwrap_or(false);
+    Some(if stop { format!("stop job {id}") } else { format!("read job {id}") })
 }
 
 /// Tool-started event: transcript for a top-level run, agents-panel status
@@ -3490,7 +3944,11 @@ pub async fn run_review(
     // git, no shell), and a model told to "find the changes" without them
     // spent its steps saying tools were blocked.
     let ws = st.workspace_for(session_id);
-    let changes = review_targets(&ws, since);
+    // git diff and file reads: off the async threads.
+    let changes = {
+        let ws = ws.clone();
+        tokio::task::spawn_blocking(move || review_targets(&ws, since)).await.unwrap_or(None)
+    };
     let prompt = match &changes {
         Some(c) => format!(
             "Review the current uncommitted changes in this workspace \
@@ -3591,7 +4049,13 @@ pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abor
 /// A "PASS" given without a tool call proves nothing and counts as a fail.
 /// `Some(true)` when every item passed, `None` when the check could not run
 /// (provider down, aborted): that says nothing about the work.
-pub(crate) async fn final_check(st: &Shared, session_id: &str, spec: &crate::spec::Spec, abort: &AtomicBool) -> Option<bool> {
+pub(crate) async fn final_check(
+    st: &Shared,
+    session_id: &str,
+    spec: &crate::spec::Spec,
+    abort: &AtomicBool,
+    budget: Option<&PassBudget>,
+) -> Option<bool> {
     let note = |text: String| {
         let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
     };
@@ -3606,7 +4070,7 @@ pub(crate) async fn final_check(st: &Shared, session_id: &str, spec: &crate::spe
     // PASS/FAIL lines are asked for (the looking was done); reset for a fix.
     let mut looked = false;
     loop {
-        if abort.load(Ordering::SeqCst) {
+        if abort.load(Ordering::SeqCst) || !spend(budget, st, session_id, "the final check") {
             return None;
         }
         let before = tool_results();
@@ -3660,6 +4124,7 @@ pub(crate) async fn design_review(
     since: std::time::SystemTime,
     bash_used: bool,
     abort: &AtomicBool,
+    budget: Option<&PassBudget>,
 ) -> Option<()> {
     if !st.cfg.agent.design_review || st.own_prompt_only() {
         return None;
@@ -3692,7 +4157,7 @@ pub(crate) async fn design_review(
             Err(e) => note(format!("design review: no screenshots of {page}: {e:#}")),
         }
     }
-    if shots.is_empty() || abort.load(Ordering::SeqCst) {
+    if shots.is_empty() || abort.load(Ordering::SeqCst) || !spend(budget, st, session_id, "the design review") {
         return None;
     }
     let goal = spec.map_or(request, |s| s.goal.as_str());
@@ -3711,12 +4176,16 @@ async fn check_after_run(
     since: std::time::SystemTime,
     bash_used: bool,
     abort: &Arc<AtomicBool>,
+    budget: Option<&PassBudget>,
 ) -> Option<(bool, String)> {
     let note = |text: String| {
         let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
     };
     let ws = st.workspace_for(session_id);
-    let cmd = verify_command_for(st, &ws, &note);
+    let cmd = match verify_command_for(st, &ws, &note) {
+        Some(c) if verify_permitted(st, session_id, &c, &note, abort).await => Some(c),
+        _ => None,
+    };
     let pages = |since| changed_web_pages(&ws, since, bash_used, st.cfg.agent.check_pages);
     let mut gate = Gate { cmd, pages: pages(since), expect: crate::pagecheck::expected_texts(request) };
     if gate.cmd.is_none() && gate.pages.is_empty() {
@@ -3736,6 +4205,9 @@ async fn check_after_run(
     for round in 1..=max_rounds {
         if abort.load(Ordering::SeqCst) {
             return None;
+        }
+        if !spend(budget, st, session_id, "the next fix round") {
+            return Some((false, best.summary));
         }
         note(format!("{VERIFY_PREFIX} {} failed — fix round {round} of {max_rounds}", best.summary));
         let mut msg = format!("{VERIFY_PREFIX} {}\n", best.report);
@@ -3759,7 +4231,8 @@ async fn check_after_run(
             note(format!("{VERIFY_PREFIX} {} passed after {round} fix round(s)", gate.label()));
             // A failure the checks proved fixed is worth remembering here.
             let fix = last_assistant_text(st, session_id).unwrap_or_default();
-            record_lesson(st, &ws, &first_report, &fix);
+            let (path, report) = (lessons_path(st, &ws), first_report.clone());
+            let _ = tokio::task::spawn_blocking(move || record_lesson_at(&path, &report, &fix)).await;
             return Some((true, format!("{} (after {round} fix round(s))", now.summary)));
         }
         if now.problems < best.problems {
@@ -3783,8 +4256,8 @@ async fn check_after_run(
 }
 
 /// The check command for `ws`: the configured one, else (with
-/// `agent.auto_verify`) the project's own. Deny rules still apply. There is
-/// no "ask" prompt: the user set this command, or it is the project's check.
+/// `agent.auto_verify`) the project's own. Deny rules still apply. Whether
+/// it may run without asking is [`verify_permitted`]'s call.
 fn verify_command_for(st: &AppState, ws: &std::path::Path, note: &impl Fn(String)) -> Option<String> {
     let configured = st.cfg.agent.verify_command.as_deref().map(str::trim).filter(|c| !c.is_empty());
     let cmd = match configured {
@@ -3797,6 +4270,22 @@ fn verify_command_for(st: &AppState, ws: &std::path::Path, note: &impl Fn(String
         return None;
     }
     Some(cmd)
+}
+
+/// May the check command `cmd` run in this chat? The command the user set
+/// in their own config (`agent.verify_command`; there is no project-level
+/// config) runs without asking: they wrote it. A command found in the
+/// project (`cargo check`, `npm test`, `pytest`…) runs the project's code —
+/// in an untrusted repository that is code execution — so it goes through
+/// the same check as any `bash` call: allow rules, "always allow", turbo and
+/// a mission's approvals pass, otherwise the user is asked.
+async fn verify_permitted(st: &Shared, session_id: &str, cmd: &str, note: &impl Fn(String), abort: &AtomicBool) -> bool {
+    let configured = st.cfg.agent.verify_command.as_deref().map(str::trim).is_some_and(|c| c == cmd);
+    if configured || check_permission(st, session_id, "bash", cmd, abort).await {
+        return true;
+    }
+    note(format!("{VERIFY_PREFIX} skipped `{cmd}`: running it was not approved"));
+    false
 }
 
 /// Most lessons kept per project (each is sent with every request).
@@ -3822,7 +4311,14 @@ pub fn load_lessons(st: &AppState, ws: &std::path::Path) -> Option<String> {
 /// harness2's evidence-backed lessons, with the checks as the evidence).
 /// One line each; newest last; a repeat of the same problem replaces the
 /// older line.
+#[cfg(test)]
 fn record_lesson(st: &AppState, ws: &std::path::Path, report: &str, fix: &str) {
+    record_lesson_at(&lessons_path(st, ws), report, fix)
+}
+
+/// [`record_lesson`] into the lessons file `path` (file work only, so it can
+/// run off the async threads).
+fn record_lesson_at(path: &std::path::Path, report: &str, fix: &str) {
     let problem = report
         .lines()
         .map(str::trim)
@@ -3849,8 +4345,7 @@ fn record_lesson(st: &AppState, ws: &std::path::Path, report: &str, fix: &str) {
     } else {
         format!("- {} → fixed by: {fix}", short(&problem, 180))
     };
-    let path = lessons_path(st, ws);
-    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+    let mut lines: Vec<String> = std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .filter(|l| l.starts_with("- ") && !l.contains(&key))
@@ -3861,7 +4356,7 @@ fn record_lesson(st: &AppState, ws: &std::path::Path, report: &str, fix: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, lines[skip..].join("\n") + "\n");
+    let _ = std::fs::write(path, lines[skip..].join("\n") + "\n");
 }
 
 /// The last thing the assistant said in a session (its fix summary).
@@ -4046,38 +4541,59 @@ fn failure_count(out: &str) -> usize {
 
 /// F-08: run the check in the workspace with a timeout. Returns the exit code
 /// (`None` = timed out or killed) and stdout + stderr. Stops early on abort.
+/// Timeout and abort end the whole process tree, like `bash` does: killing
+/// only the shell left `npm test`'s node or `cargo check`'s rustc running.
 async fn run_verify_command(
     cmd: &str,
     workspace: &std::path::Path,
     timeout: std::time::Duration,
     abort: &AtomicBool,
 ) -> Result<(Option<i32>, String)> {
+    async fn read_all<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut p, &mut buf).await;
+        }
+        buf
+    }
     let mut command = crate::tools::shell_command(cmd);
     command
         .current_dir(workspace)
-        // S-05 spirit: child processes never get the provider API key.
-        .env_remove("OPENCODE_RUST_API_KEY")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let child = command.spawn().context("starting the verify command")?;
-    let out = tokio::select! {
-        r = tokio::time::timeout(timeout, child.wait_with_output()) => match r {
-            Ok(r) => r.context("waiting for the verify command")?,
-            Err(_) => {
-                return Ok((None, format!("(stopped: no result after {}s)", timeout.as_secs())));
-            }
-        },
-        _ = async {
-            while !abort.load(Ordering::SeqCst) {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        } => anyhow::bail!("aborted"),
+    // S-05: child processes never get the provider API key or our token.
+    crate::tools::scrub_secrets(&mut command);
+    // Its own process group (Unix) / Job Object (Windows), so a kill
+    // reaches everything it started.
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().context("starting the verify command")?;
+    crate::tools::adopt_into_job(&child);
+    let pid = child.id();
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let work = async move {
+        let (out, err) = tokio::join!(read_all(stdout), read_all(stderr));
+        (child.wait().await, out, err)
     };
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    Ok((out.status.code(), text))
+    tokio::pin!(work);
+    let stopped = tokio::select! {
+        (status, out, err) = &mut work => {
+            let status = status.context("waiting for the verify command")?;
+            let mut text = String::from_utf8_lossy(&out).into_owned();
+            text.push_str(&String::from_utf8_lossy(&err));
+            return Ok((status.code(), text));
+        }
+        _ = tokio::time::sleep(timeout) => None,
+        _ = aborted(abort) => Some(()),
+    };
+    // The shell still exists (`work` keeps it until we return): end the tree.
+    crate::tools::kill_tree(pid).await;
+    match stopped {
+        None => Ok((None, format!("(stopped: no result after {}s)", timeout.as_secs()))),
+        Some(()) => anyhow::bail!("aborted"),
+    }
 }
 
 /// The last `max` characters of `s` (never splits a character).
@@ -4106,11 +4622,7 @@ async fn execute_routed(
         let result = match route {
             Ok(route) => tokio::select! {
                 r = route.call(input) => r,
-                _ = async {
-                    while !abort.load(Ordering::SeqCst) {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                } => Err(anyhow::anyhow!("aborted")),
+                _ = aborted(abort) => Err(anyhow::anyhow!("aborted")),
             },
             Err(e) => Err(e),
         };
@@ -4379,7 +4891,8 @@ async fn check_permission_preview(
         return false;
     }
     let allow = decision.action == Action::Allow;
-    let permitted = match st.perm_mode() {
+    // Per chat: a running mission approves its own chats, never the others.
+    let permitted = match st.perm_mode_for(session_id) {
         // Turbo = the user granted full access: never prompt.
         PermissionMode::Turbo => true,
         PermissionMode::Default => allow,
@@ -4434,11 +4947,7 @@ async fn check_permission_preview(
             Err(_) => (false, "abort"),
         },
         _ = tokio::time::sleep(timeout) => (false, "timeout"),
-        _ = async {
-            while !abort.load(Ordering::SeqCst) {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        } => (false, "abort"),
+        _ = aborted(abort) => (false, "abort"),
     };
     // Always clean up the pending entry.
     if let Ok(mut map) = st.approvals.lock() {
@@ -4843,7 +5352,7 @@ fn resolve_api_token(state_dir: &std::path::Path) -> Result<String> {
             return Ok(v);
         }
     }
-    let token = random_token();
+    let token = random_token()?;
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
     let path = api_token_path(state_dir);
@@ -4860,30 +5369,74 @@ fn resolve_api_token(state_dir: &std::path::Path) -> Result<String> {
     let mut file = opts
         .open(&path)
         .with_context(|| format!("writing {}", path.display()))?;
+    // Windows has no mode bits: the file inherits the folder's ACL. Give it
+    // its own, with the current user only, before the token goes in.
+    #[cfg(windows)]
+    if let Err(e) = owner_only_acl(&path) {
+        // Best effort, like the mode on a filesystem without permissions
+        // (FAT); $OPENCODE_RUST_API_TOKEN avoids the file altogether.
+        core_log(&format!("[core] could not restrict {}: {e:#}", path.display()));
+    }
     std::io::Write::write_all(&mut file, token.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(token)
 }
 
-/// New (S-01): a 256-bit random token as 64 hex characters. `RandomState`
-/// is seeded from the operating system's random source once per process;
-/// hashing it with the time, the process id and a counter is good enough
-/// for a local-only secret (it is not a general-purpose crypto RNG).
-fn random_token() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut out = String::with_capacity(64);
-    for i in 0..4u64 {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u64(i);
-        h.write_u128(nanos);
-        h.write_u32(std::process::id());
-        out.push_str(&format!("{:016x}", h.finish()));
+/// New (S-01): a 256-bit random token as 64 hex characters, straight from
+/// the operating system's CSPRNG (it was SipHash over the time and the
+/// process id, which is guessable).
+fn random_token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("no random source for the API token: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Replace `path`'s ACL with one entry: full access for the current user,
+/// nothing inherited from the folder.
+#[cfg(windows)]
+fn owner_only_acl(path: &std::path::Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
+        SetFileSecurityW, SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    /// FILE_ALL_ACCESS (the Storage feature that names it is not enabled).
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    // SAFETY: plain Win32 calls. Every buffer is sized as the call asks
+    // (TOKEN_USER through the returned length, the ACL from the SID's
+    // length) and outlives the calls that use it; the token handle is
+    // closed once.
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).context("opening the process token")?;
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        // u64 cells: TOKEN_USER holds pointers, so the buffer must be aligned.
+        let mut user = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        let got = GetTokenInformation(token, TokenUser, Some(user.as_mut_ptr().cast()), len, &mut len);
+        let _ = CloseHandle(token);
+        got.context("reading the current user")?;
+        let sid = (*(user.as_ptr() as *const TOKEN_USER)).User.Sid;
+        let acl_len = std::mem::size_of::<ACL>() + 16 + GetLengthSid(sid) as usize;
+        let mut acl = vec![0u64; acl_len.div_ceil(8)];
+        let acl_ptr = acl.as_mut_ptr() as *mut ACL;
+        InitializeAcl(acl_ptr, acl_len as u32, ACL_REVISION).context("building the ACL")?;
+        AddAccessAllowedAce(acl_ptr, ACL_REVISION, FILE_ALL_ACCESS, sid).context("building the ACL")?;
+        let mut sd = SECURITY_DESCRIPTOR::default();
+        let psd = PSECURITY_DESCRIPTOR(&mut sd as *mut _ as *mut std::ffi::c_void);
+        InitializeSecurityDescriptor(psd, 1).context("building the security descriptor")?;
+        SetSecurityDescriptorDacl(psd, true, Some(acl_ptr), false).context("building the security descriptor")?;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let info = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+        if !SetFileSecurityW(PCWSTR(wide.as_ptr()), info, psd).as_bool() {
+            return Err(std::io::Error::last_os_error()).context("setting the file's ACL");
+        }
     }
-    out
+    Ok(())
 }
 
 /// New (S-01): the `Host` header must be `127.0.0.1:<port>` or
@@ -5049,7 +5602,7 @@ mod tests {
         *st.user_prompt.write().unwrap() = (Some("You are my assistant.".into()), None);
         let none = AtomicBool::new(false);
         assert!(make_spec(&st, &s.id, "build a website for my bakery please", &none).await.is_none());
-        assert!(design_review(&st, &s.id, "build a website", None, since, true, &none).await.is_none());
+        assert!(design_review(&st, &s.id, "build a website", None, since, true, &none, None).await.is_none());
         assert!(seen.lock().unwrap().is_empty(), "no model call of Habi's own");
         *st.user_prompt.write().unwrap() = (None, None);
         assert!(make_spec(&st, &s.id, "build a website for my bakery please", &none).await.is_some(), "Habi's own mode plans as before");
@@ -5128,7 +5681,7 @@ mod tests {
             design: None,
             skills: vec![],
         };
-        let passed = final_check(&st, &s.id, &spec, &AtomicBool::new(false)).await;
+        let passed = final_check(&st, &s.id, &spec, &AtomicBool::new(false), None).await;
         assert_eq!(passed, Some(true), "the lines it was asked for count, with the evidence it gathered");
         let asked = seen.lock().unwrap().last().unwrap().to_string();
         assert!(asked.contains("had no PASS/FAIL lines"), "the third request asks for the lines");
@@ -5155,13 +5708,13 @@ mod tests {
         cfg.provider.images = "off".into();
         let st = build_state_ephemeral(cfg.clone(), dir.clone()).await;
         let s = st.db.create_session("site", None).unwrap();
-        let none = design_review(&st, &s.id, "a bakery site", None, since, true, &AtomicBool::new(false)).await;
+        let none = design_review(&st, &s.id, "a bakery site", None, since, true, &AtomicBool::new(false), None).await;
         assert!(none.is_none() && seen.lock().unwrap().is_empty(), "no images, no review");
 
         cfg.provider.images = "on".into();
         let st = build_state_ephemeral(cfg, dir.clone()).await;
         let s = st.db.create_session("site", None).unwrap();
-        let done = design_review(&st, &s.id, "a bakery site", None, since, true, &AtomicBool::new(false)).await;
+        let done = design_review(&st, &s.id, "a bakery site", None, since, true, &AtomicBool::new(false), None).await;
         assert!(done.is_some());
         let req = seen.lock().unwrap().last().unwrap().to_string();
         assert!(req.contains("[design review]") && req.contains("coloured italics"), "the brief and the AI look");
@@ -6945,7 +7498,7 @@ data: [DONE]
         assert!(!host_allowed(&h, 4000));
         assert!(!host_allowed(&axum::http::HeaderMap::new(), 4000), "no Host header");
 
-        let (a, b) = (random_token(), random_token());
+        let (a, b) = (random_token().unwrap(), random_token().unwrap());
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "every token is new");
@@ -7255,10 +7808,23 @@ data: [DONE]
         cfg.provider.model = "mock".into();
         let st = build_state_ephemeral(cfg, dir.clone()).await;
         let s = st.db.create_session("drop", None).unwrap();
+        let mut rx = st.events.subscribe();
 
         run_agent(&st, &s.id, "say hi", Arc::new(AtomicBool::new(false))).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 4, "three retries, then the kept partial");
+        // Each retried reply's streamed part is taken back, so a client shows
+        // the kept reply once, not "Hello worldHello world…".
+        let (mut shown, mut retracted) = (0usize, Vec::new());
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ServerEvent::AssistantDelta { text, .. } => shown += text.chars().count(),
+                ServerEvent::ReplyRetracted { chars, .. } => retracted.push(chars),
+                _ => {}
+            }
+        }
+        assert_eq!(retracted, vec![11, 11, 11], "one take-back per retried attempt");
+        assert_eq!(shown - retracted.iter().sum::<usize>(), "Hello world".len(), "what stays on screen");
         let msgs = st.db.messages(&s.id).unwrap();
         let all: String = msgs
             .iter()
@@ -8316,7 +8882,8 @@ data: [DONE]
         }
         let mut events = st.events.subscribe();
         let abort = AtomicBool::new(false);
-        auto_compact_if_needed(&st, &s.id, "system prompt", &[], &abort).await;
+        let msgs = build_chat_messages(&st, &s.id, "system prompt").unwrap();
+        assert!(auto_compact_if_needed(&st, &s.id, &msgs, &[], &abort).await, "compacted");
         assert_eq!(st.db.messages(&s.id).unwrap().len(), 7, "6 kept + 1 summary");
         let mut noted = false;
         while let Ok(ev) = events.try_recv() {

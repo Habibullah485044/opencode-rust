@@ -456,6 +456,7 @@ impl GuiState {
     fn transcript_session(ev: &ServerEvent) -> Option<String> {
         match ev {
             ServerEvent::AssistantDelta { session_id, .. }
+            | ServerEvent::ReplyRetracted { session_id, .. }
             | ServerEvent::ReasoningDelta { session_id, .. }
             | ServerEvent::ToolStarted { session_id, .. }
             | ServerEvent::ToolFinished { session_id, .. }
@@ -589,6 +590,27 @@ impl GuiState {
     fn apply_event(&mut self, ev: ServerEvent) {
         match ev {
             ServerEvent::AssistantDelta { text, .. } => self.push(EntryKind::Assistant, text),
+            // A reply broke off and is asked again: drop the part of it that
+            // streamed in (back over its text and thinking, never past
+            // anything else), or the retry shows after the half reply.
+            ServerEvent::ReplyRetracted { chars, .. } => {
+                let mut left = chars;
+                while left > 0 {
+                    let Some(i) = self.entries.iter().rposition(|(k, _)| *k != EntryKind::Thinking) else { break };
+                    if self.entries[i].0 != EntryKind::Assistant {
+                        break;
+                    }
+                    let text = &mut self.entries[i].1;
+                    let count = text.chars().count();
+                    let keep = count.saturating_sub(left);
+                    let cut = text.char_indices().nth(keep).map_or(text.len(), |(b, _)| b);
+                    text.truncate(cut);
+                    left -= count - keep;
+                    if text.is_empty() {
+                        self.entries.remove(i);
+                    }
+                }
+            }
             ServerEvent::ReasoningDelta { text, .. } => {
                 // First reasoning chunk carries the marker; appends merge bare.
                 let last_is_thinking = self
@@ -3581,6 +3603,20 @@ mod tests {
             .collect();
         assert_eq!(assistant.len(), 1);
         assert_eq!(assistant[0].1, "Hello!");
+    }
+
+    /// A reply that broke off and is asked again is taken back.
+    #[test]
+    fn a_retracted_reply_leaves_the_bubble() {
+        let mut g = GuiState::new();
+        g.session = Some("s".into());
+        g.on_event(delta("Hel"));
+        g.on_event(delta("lo wor"));
+        g.on_event(ServerEvent::ReplyRetracted { session_id: "s".into(), chars: 9 });
+        g.on_event(delta("Hello world"));
+        let assistant: Vec<_> = g.entries.iter().filter(|(k, _)| *k == EntryKind::Assistant).collect();
+        assert_eq!(assistant.len(), 1);
+        assert_eq!(assistant[0].1, "Hello world");
     }
 
     #[test]

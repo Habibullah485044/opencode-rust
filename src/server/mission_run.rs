@@ -10,8 +10,10 @@
 //! (summary, files, checks), and the coordinator decides what comes next:
 //! go on, redo the step, add a step, or finish.
 //!
-//! While a mission runs, approvals are handled as in turbo (nobody is there
-//! to click them) and the worker may not ask questions. The mission, its
+//! While a mission runs, its own chats (the mission chat and the step chats
+//! under it) get their approvals as in turbo (nobody is there to click
+//! them) and the worker may not ask questions. The user's other chats keep
+//! their mode. The mission, its
 //! steps and their receipts are kept in the database, so `/mission resume`
 //! carries on after a stop, a pause or a restart.
 
@@ -192,6 +194,11 @@ async fn review(st: &Shared, m: &Mission, n: usize, receipt: &str, abort: &Atomi
     }
 }
 
+/// The chat's mission, which must exist by now.
+fn current(st: &Shared, session_id: &str) -> Result<Mission> {
+    st.db.mission(session_id)?.ok_or_else(|| anyhow::anyhow!("the mission of this chat is gone (was the chat deleted?)"))
+}
+
 /// Tell the chat: a line in the transcript and a live event.
 fn say(st: &Shared, session_id: &str, text: String) {
     let _ = st.db.add_message(session_id, "assistant", &[Part::Text { text: text.clone() }]);
@@ -228,7 +235,7 @@ pub(super) async fn run_mission(
             anyhow::bail!("aborted");
         }
         st.db.mission_start(session_id, &goal, &steps, deep)?;
-        let m = st.db.mission(session_id)?.expect("just started");
+        let m = current(st, session_id)?;
         let shown = spec.as_ref().map(|s| format!("{}\n\n", crate::spec::for_user(s))).unwrap_or_default();
         say(st, session_id, format!("{shown}**Mission plan** — I keep working until it is done:\n{}", plan_text(&m)));
     } else {
@@ -243,12 +250,13 @@ pub(super) async fn run_mission(
         note(format!("mission: resuming — {} step(s) left", m.steps.iter().filter(|s| s.status != "done" && s.status != "failed").count()));
     }
 
-    // Nobody is there to approve: run like turbo, and put the user's mode
-    // back afterwards.
-    let before = st.perm_mode();
-    if before != PermissionMode::Turbo {
-        st.set_perm_mode(PermissionMode::Turbo);
-        note("mission: approvals are automatic until the mission ends (deny rules still apply)".into());
+    // Nobody is there to approve: this chat and its step chats run like
+    // turbo until the guard goes — on every way out, `?` and panics too.
+    // The user's mode and their other chats (and what those wait on) are
+    // left alone.
+    let _approvals = st.auto_approve_session(session_id);
+    if st.perm_mode() != PermissionMode::Turbo {
+        note("mission: approvals in this mission's chats are automatic until it ends (deny rules still apply)".into());
     }
     if deep {
         note(format!("mission: each step is a Deep run ({} attempts, the best checked one kept)", st.cfg.agent.deep_attempts));
@@ -261,7 +269,7 @@ pub(super) async fn run_mission(
         let goal = st.db.mission(session_id)?.map(|m| m.goal).unwrap_or_default();
         if let Some(spec) = crate::spec::from_goal(&goal) {
             let child = st.db.create_session("mission final check", Some(session_id))?;
-            let passed = final_check(st, &child.id, &spec, abort).await;
+            let passed = final_check(st, &child.id, &spec, abort, None).await;
             checked = match passed {
                 Some(true) => "\nFinal check: every done-when item proven.".into(),
                 Some(false) => "\nFinal check: not every done-when item could be proven — see the final check chat.".into(),
@@ -275,12 +283,9 @@ pub(super) async fn run_mission(
         let goal = st.db.mission(session_id)?.map(|m| m.goal).unwrap_or_default();
         let spec = crate::spec::from_goal(&goal);
         let child = st.db.create_session("mission design review", Some(session_id))?;
-        if design_review(st, &child.id, &goal, spec.as_ref(), mission_started, true, abort).await.is_some() {
+        if design_review(st, &child.id, &goal, spec.as_ref(), mission_started, true, abort, None).await.is_some() {
             checked.push_str("\nDesign review: done — see the design review chat.");
         }
-    }
-    if before != PermissionMode::Turbo {
-        st.set_perm_mode(before);
     }
     let status = match &result {
         Ok(true) => "done",
@@ -289,7 +294,7 @@ pub(super) async fn run_mission(
         Err(_) => "paused",
     };
     st.db.mission_set_status(session_id, status)?;
-    let m = st.db.mission(session_id)?.expect("mission exists");
+    let m = current(st, session_id)?;
     let counts = |s: &str| m.steps.iter().filter(|x| x.status == s).count();
     let summary = match status {
         "done" => format!(
@@ -322,7 +327,7 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
         if abort.load(Ordering::SeqCst) {
             anyhow::bail!("aborted");
         }
-        let m = st.db.mission(session_id)?.expect("mission exists");
+        let m = current(st, session_id)?;
         let Some((i, step)) = m.steps.iter().enumerate().find(|(_, s)| s.status == "pending" || s.status == "working") else {
             return Ok(true);
         };
@@ -342,7 +347,7 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
             task: step.title.clone(),
         };
         agent_status(st, &info, "working", if attempts > 1 { format!("try {attempts}") } else { "starting…".into() });
-        let m_now = st.db.mission(session_id)?.expect("mission exists");
+        let m_now = current(st, session_id)?;
         let brief = step_brief(&m_now, n, &step, redo_reason.as_deref());
         // No slack: files the previous step wrote a moment ago must not
         // count as this step's (they would show up in its receipt).
@@ -357,11 +362,11 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
                     }
                     Ok(summary)
                 }
-                Err(e) if format!("{e:#}").contains("needs a git repository") => agent_inner(st, &child.id, &brief, abort).await,
+                Err(e) if format!("{e:#}").contains("needs a git repository") => agent_inner(st, &child.id, &brief, abort).await.map(LoopEnd::into_legacy),
                 Err(e) => Err(e),
             }
         } else {
-            agent_inner(st, &child.id, &brief, abort).await
+            agent_inner(st, &child.id, &brief, abort).await.map(LoopEnd::into_legacy)
         } }).await;
         if abort.load(Ordering::SeqCst) {
             st.db.mission_step_update(step.id, "pending", attempts - 1, &step.result, None)?;
@@ -390,7 +395,7 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
             None
         } else {
             agent_status(st, &info, "working", "checking the result…".into());
-            check_after_run(st, &child.id, &brief, since, true, abort).await
+            check_after_run(st, &child.id, &brief, since, true, abort, None).await
         };
         // The step's own check, proven with tools in the step's chat. The
         // last step's whole-goal check is the mission's final check instead.
@@ -405,7 +410,7 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
                     design: None,
                     skills: vec![],
                 };
-                Some(final_check(st, &child.id, &spec, abort).await)
+                Some(final_check(st, &child.id, &spec, abort, None).await)
             }
             _ => None,
         };
@@ -440,7 +445,7 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
         );
         // The coordinator sees this step as the one just worked on.
         st.db.mission_step_update(step.id, "working", attempts, &receipt, None)?;
-        let m = st.db.mission(session_id)?.expect("mission exists");
+        let m = current(st, session_id)?;
         let verdict = tagged("mission planning", session_id, review(st, &m, n, &receipt, abort)).await;
         let first_line: String = report.trim().lines().next().unwrap_or("").chars().take(200).collect();
         redo_reason = None;
@@ -666,6 +671,55 @@ mod tests {
         let s = st.db.create_session("m", None).unwrap();
         let err = run_mission(&st, &s.id, None, false, &Arc::new(AtomicBool::new(false))).await.unwrap_err();
         assert!(format!("{err}").contains("/mission <goal>"));
+    }
+
+    /// A mission's automatic approvals cover its own chats only, end with
+    /// the guard (an early `?` or a panic too), and never answer what
+    /// another chat waits on.
+    #[tokio::test]
+    async fn mission_approvals_stay_in_the_mission() {
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.approval_timeout_secs = 5;
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        let mission = st.db.create_session("mission", None).unwrap();
+        let step = st.db.create_session("mission step 1", Some(&mission.id)).unwrap();
+        let other = st.db.create_session("other chat", None).unwrap();
+        // The other chat is already waiting on an approval.
+        let mut rx = st.events.subscribe();
+        let (st2, oid) = (st.clone(), other.id.clone());
+        let waiting = tokio::spawn(async move {
+            check_permission(&st2, &oid, "bash", "rm -rf build", &AtomicBool::new(false)).await
+        });
+        loop {
+            if let Ok(ServerEvent::ApprovalNeeded { .. }) = rx.recv().await {
+                break;
+            }
+        }
+        {
+            let _grant = st.auto_approve_session(&mission.id);
+            assert_eq!(st.perm_mode_for(&mission.id), PermissionMode::Turbo);
+            assert_eq!(st.perm_mode_for(&step.id), PermissionMode::Turbo, "a step chat is the mission's");
+            assert_eq!(st.perm_mode_for(&other.id), PermissionMode::Default);
+            assert_eq!(st.perm_mode(), PermissionMode::Default, "the user's mode is not changed");
+            assert!(check_permission(&st, &step.id, "bash", "cargo build", &AtomicBool::new(false)).await);
+            assert_eq!(st.pending_approvals().len(), 1, "the other chat's approval still waits");
+        }
+        assert_eq!(st.perm_mode_for(&step.id), PermissionMode::Default, "the grant ends with the guard");
+        // A mission that fails half way (here: a panic) still gives it back.
+        let st3 = st.clone();
+        let mid = mission.id.clone();
+        let _ = tokio::spawn(async move {
+            let _grant = st3.auto_approve_session(&mid);
+            panic!("mission blew up");
+        })
+        .await;
+        assert_eq!(st.perm_mode_for(&mission.id), PermissionMode::Default);
+        let id = match st.pending_approvals().pop() {
+            Some(ServerEvent::ApprovalNeeded { approval_id, .. }) => approval_id,
+            other => panic!("still pending: {other:?}"),
+        };
+        assert!(st.decide(&id, false, false));
+        assert!(!waiting.await.unwrap(), "only the user answered it");
     }
 
     #[test]

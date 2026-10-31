@@ -83,6 +83,41 @@ fn forward_activity(st: &Shared, worker: &Shared, info: &AgentInfo) -> tokio::ta
     })
 }
 
+/// The attempts' worktrees. Their git work (changes, patch, apply, and the
+/// removal on drop) runs on blocking threads, not on the async ones.
+struct Trees(Option<Arc<Vec<Worktree>>>);
+
+impl Trees {
+    fn get(&self) -> Arc<Vec<Worktree>> {
+        self.0.clone().unwrap_or_default()
+    }
+
+    /// `f` on the worktrees, off the async threads.
+    async fn with<T: Send + 'static>(&self, f: impl FnOnce(&[Worktree]) -> T + Send + 'static) -> Result<T> {
+        let wts = self.get();
+        tokio::task::spawn_blocking(move || f(&wts)).await.map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Remove the worktrees now and wait for it.
+    async fn remove(mut self) {
+        if let Some(w) = self.0.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(w)).await;
+        }
+    }
+}
+
+impl Drop for Trees {
+    fn drop(&mut self) {
+        let Some(w) = self.0.take() else { return };
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn_blocking(move || drop(w));
+            }
+            Err(_) => drop(w),
+        }
+    }
+}
+
 /// Run Deep mode in chat `session_id`. Returns the text for the chat.
 pub(super) async fn run_deep(
     st: &Shared,
@@ -108,12 +143,15 @@ pub(super) async fn run_deep(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         wts.push(made.map_err(|e| anyhow::anyhow!("Deep mode needs a git repository with at least one commit: {e:#}"))?);
     }
+    let trees = Trees(Some(Arc::new(wts)));
+    let wts = trees.get();
 
     // Attempt settings: no reviews inside an attempt, the model the chat
     // uses now, and no approval waits (nobody can answer them). Writes stay
     // inside the attempt's own copy, so they need no approval; commands do,
     // so outside turbo they are off and the app runs the checks instead.
-    let mode = st.perm_mode();
+    // The chat's mode: a mission's step runs as turbo.
+    let mode = st.perm_mode_for(session_id);
     let can_run_commands = mode == PermissionMode::Turbo;
     let mut cfg = st.cfg.clone();
     cfg.agent.auto_review = false;
@@ -187,14 +225,17 @@ pub(super) async fn run_deep(
     // Check the attempts one after the other.
     let timeout = std::time::Duration::from_secs(st.cfg.agent.verify_timeout_secs.max(1));
     let expect = crate::pagecheck::expected_texts(task);
+    let changes = trees.with(|wts| wts.iter().map(|wt| wt.changes().unwrap_or_default()).collect::<Vec<_>>()).await?;
+    // Asked once per command, not once per attempt: the attempts are copies
+    // of one project, and a prompt per attempt would ask the same thing n times.
+    let mut verify_ok: HashMap<String, bool> = HashMap::new();
     let mut scored = Vec::new();
-    for (i, (wt, (res, tokens))) in wts.iter().zip(runs).enumerate() {
+    for (i, ((wt, (res, tokens)), (files, lines))) in wts.iter().zip(runs).zip(changes).enumerate() {
         let info = &infos[i];
         let attempt_ws = wt.workspace();
-        let (files, lines) = wt.changes().unwrap_or_default();
         let (failed, answer) = match res {
-            Ok(a) if a.trim() == "aborted" => (Some("stopped".to_string()), String::new()),
-            Ok(a) => (None, a),
+            Ok(LoopEnd::Aborted) => (Some("stopped".to_string()), String::new()),
+            Ok(LoopEnd::Done(a)) => (None, a),
             Err(e) => (Some(e), String::new()),
         };
         let mut s = Scored { n: i + 1, failed, files, lines, problems: 0, checks: String::new(), answer, tokens };
@@ -210,7 +251,23 @@ pub(super) async fn run_deep(
             } else {
                 Vec::new()
             };
-            let mut gate = Gate { cmd: verify_command_for(st, &attempt_ws, &prefixed), pages, expect: expect.clone() };
+            // The check runs the attempt's code: only with the same
+            // permission any `bash` call needs (skipped when it is denied).
+            let cmd = match verify_command_for(st, &attempt_ws, &prefixed) {
+                Some(c) => {
+                    let ok = match verify_ok.get(&c) {
+                        Some(ok) => *ok,
+                        None => {
+                            let ok = verify_permitted(st, session_id, &c, &prefixed, abort).await;
+                            verify_ok.insert(c.clone(), ok);
+                            ok
+                        }
+                    };
+                    ok.then_some(c)
+                }
+                None => None,
+            };
+            let mut gate = Gate { cmd, pages, expect: expect.clone() };
             match run_gate(st, &attempt_ws, &mut gate, timeout, &prefixed, abort).await {
                 Some(r) => {
                     s.problems = r.problems;
@@ -252,8 +309,8 @@ pub(super) async fn run_deep(
         return Ok(out);
     };
     let winner = &scored[best - 1];
-    let wt = &wts[best - 1];
-    let patch = wt.write_patch(&st.state_dir.join("deep-patches"))?;
+    let patch_dir = st.state_dir.join("deep-patches");
+    let patch = trees.with(move |wts| wts[best - 1].write_patch(&patch_dir)).await??;
     let Some(patch) = patch else {
         out.push_str("\nThe kept attempt has no changes after all; nothing was applied.");
         return Ok(out);
@@ -261,7 +318,8 @@ pub(super) async fn run_deep(
     // A snapshot first, so `/undo` takes the applied attempt back.
     let (w, sd) = (ws.clone(), st.state_dir.clone());
     let _ = tokio::task::spawn_blocking(move || crate::gitsnap::record_before_run(&w, &sd, "pre-deep")).await;
-    match wt.apply_to_repo(&patch) {
+    let to_apply = patch.clone();
+    match trees.with(move |wts| wts[best - 1].apply_to_repo(&to_apply)).await? {
         Ok(()) => out.push_str(&format!(
             "\nApplied attempt {best} to the project (`/undo` takes it back).\n"
         )),
@@ -278,13 +336,14 @@ pub(super) async fn run_deep(
         let said: String = winner.answer.trim().chars().take(1500).collect();
         out.push_str(&format!("\nAttempt {best} said:\n\n{said}"));
     }
-    // The other attempts' worktrees go when `wts` is dropped. The kept
-    // attempt still had problems: the normal fix rounds take over.
+    // The worktrees go now (other exit paths: when `trees` is dropped). The
+    // kept attempt still had problems: the normal fix rounds take over.
+    drop(wts);
+    trees.remove().await;
     if winner.problems > 0 {
         st.db.add_message(session_id, "assistant", &[Part::Text { text: out.clone() }])?;
         let _ = st.events.send(ServerEvent::AssistantDelta { session_id: session_id.to_string(), text: out.clone() });
-        drop(wts);
-        check_after_run(st, session_id, task, started_at, true, abort).await;
+        check_after_run(st, session_id, task, started_at, true, abort, None).await;
         return Ok(String::new());
     }
     Ok(out)
