@@ -63,32 +63,61 @@ pub(super) fn edit_many(workspace: &Path, path: &str, edits: &[(String, String)]
 /// places changed, and whether the loose match was used. On a miss the
 /// error shows the closest lines, so the next try can copy them.
 pub(super) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<(String, usize, bool)> {
-    // CRLF files: the model writes \n.
+    let (old, new) = match_line_endings(text, old, new);
+    if let Some(done) = apply_exact(text, &old, &new, replace_all)? {
+        return Ok(done);
+    }
+    apply_loose(text, &old, &new, replace_all)
+}
+
+/// CRLF files: the model writes \n.
+fn match_line_endings(text: &str, old: &str, new: &str) -> (String, String) {
     let crlf = text.contains("\r\n");
-    let (old, new) = if crlf && !old.contains("\r\n") {
+    if crlf && !old.contains("\r\n") {
         (old.replace('\n', "\r\n"), new.replace('\n', "\r\n"))
     } else {
         (old.to_string(), new.to_string())
-    };
-    let matches = text.matches(old.as_str()).count();
+    }
+}
+
+/// The exact match. `None` when `old` does not occur in `text`.
+fn apply_exact(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Option<(String, usize, bool)>> {
+    let matches = text.matches(old).count();
     if matches > 1 && !replace_all {
         bail!("old_str matches {matches} times; make it unique (add a nearby line) or set replace_all");
     }
     if matches >= 1 {
-        let out = if replace_all { text.replace(old.as_str(), &new) } else { text.replacen(old.as_str(), &new, 1) };
-        return Ok((out, matches, false));
+        let out = if replace_all { text.replace(old, new) } else { text.replacen(old, new, 1) };
+        return Ok(Some((out, matches, false)));
     }
-    // Loose: compare trimmed lines. Each line keeps its own ending (a file
-    // with mixed endings is not rewritten to one kind).
+    Ok(None)
+}
+
+/// The lines of `s` split at `\n`, each without its `\r`.
+fn split_lines(s: &str) -> Vec<&str> {
+    s.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect()
+}
+
+/// Leading and trailing blank lines carry no information.
+fn trim_blank_edges<'a>(want: &[&'a str]) -> Vec<&'a str> {
+    let start = want.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
+    let end = want.iter().rposition(|l| !l.trim().is_empty()).map_or(start, |e| e + 1);
+    want[start..end].to_vec()
+}
+
+/// Indentation is spaces and tabs only: `trim_start` also takes NBSP and
+/// other multi-byte spaces, and cutting by its byte count could split a
+/// character (a panic, and release builds abort).
+fn indent(l: &str) -> usize {
+    l.len() - l.trim_start_matches([' ', '\t']).len()
+}
+
+/// The loose match: compare trimmed lines. Each line keeps its own ending
+/// (a file with mixed endings is not rewritten to one kind).
+fn apply_loose(text: &str, old: &str, new: &str, replace_all: bool) -> Result<(String, usize, bool)> {
     let has_cr: Vec<bool> = text.split('\n').map(|l| l.ends_with('\r')).collect();
-    let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
-    let want: Vec<&str> = old.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
-    let want: Vec<&str> = {
-        // Leading and trailing blank lines carry no information.
-        let start = want.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
-        let end = want.iter().rposition(|l| !l.trim().is_empty()).map_or(start, |e| e + 1);
-        want[start..end].to_vec()
-    };
+    let lines = split_lines(text);
+    let want = trim_blank_edges(&split_lines(old));
     if want.is_empty() {
         bail!("old_str not found");
     }
@@ -101,45 +130,50 @@ pub(super) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) ->
     if hits.is_empty() {
         return Err(anyhow!("old_str not found{}", closest_region(&lines, &want)));
     }
-    // Indentation is spaces and tabs only: `trim_start` also takes NBSP and
-    // other multi-byte spaces, and cutting by its byte count could split a
-    // character (a panic, and release builds abort).
-    let indent = |l: &str| l.len() - l.trim_start_matches([' ', '\t']).len();
     let first = want.iter().find(|l| !l.trim().is_empty()).copied().unwrap_or("");
-    let new_lines: Vec<&str> = new.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let new_lines = split_lines(new);
     let mut out: Vec<String> =
         lines.iter().zip(&has_cr).map(|(l, cr)| if *cr { format!("{l}\r") } else { l.to_string() }).collect();
     // Replace from the last hit back, so earlier indexes stay valid.
     for &i in hits.iter().rev() {
-        let file_first = lines[i..i + want.len()].iter().find(|l| !l.trim().is_empty()).copied().unwrap_or("");
-        let file_pad = &file_first[..indent(file_first)];
-        let delta = indent(file_first) as i64 - indent(first) as i64;
-        let fixed: Vec<String> = new_lines
-            .iter()
-            .map(|l| {
-                if l.trim().is_empty() {
-                    String::new()
-                } else if delta >= 0 {
-                    // Same indent character as the file uses.
-                    let unit = file_pad.chars().next().unwrap_or(' ');
-                    format!("{}{l}", unit.to_string().repeat(delta as usize))
-                } else {
-                    let cut = (-delta as usize).min(indent(l));
-                    l[cut..].to_string()
-                }
-            })
-            .collect();
-        // New lines end like the replaced block: its first line's ending
-        // inside, its last line's ending at the end (no CR at a final line
-        // that had none).
-        let (inner_cr, last_cr) = (has_cr[i], has_cr[i + want.len() - 1]);
-        let n = fixed.len();
-        let fixed = fixed.into_iter().enumerate().map(|(k, l)| {
-            if (k + 1 < n && inner_cr) || (k + 1 == n && last_cr) { format!("{l}\r") } else { l }
-        });
+        let fixed = reindent(&new_lines, &lines[i..i + want.len()], first);
+        let fixed = end_like_block(fixed, has_cr[i], has_cr[i + want.len() - 1]);
         out.splice(i..i + want.len(), fixed);
     }
     Ok((out.join("\n"), hits.len(), true))
+}
+
+/// `new_lines` shifted by how much deeper the matched `block` sits in the
+/// file than `first` (the first non-blank line of old_str).
+fn reindent(new_lines: &[&str], block: &[&str], first: &str) -> Vec<String> {
+    let file_first = block.iter().find(|l| !l.trim().is_empty()).copied().unwrap_or("");
+    let file_pad = &file_first[..indent(file_first)];
+    let delta = indent(file_first) as i64 - indent(first) as i64;
+    new_lines
+        .iter()
+        .map(|l| {
+            if l.trim().is_empty() {
+                String::new()
+            } else if delta >= 0 {
+                // Same indent character as the file uses.
+                let unit = file_pad.chars().next().unwrap_or(' ');
+                format!("{}{l}", unit.to_string().repeat(delta as usize))
+            } else {
+                let cut = (-delta as usize).min(indent(l));
+                l[cut..].to_string()
+            }
+        })
+        .collect()
+}
+
+/// New lines end like the replaced block: its first line's ending
+/// inside, its last line's ending at the end (no CR at a final line
+/// that had none).
+fn end_like_block(fixed: Vec<String>, inner_cr: bool, last_cr: bool) -> impl Iterator<Item = String> {
+    let n = fixed.len();
+    fixed.into_iter().enumerate().map(move |(k, l)| {
+        if (k + 1 < n && inner_cr) || (k + 1 == n && last_cr) { format!("{l}\r") } else { l }
+    })
 }
 
 /// " — closest match at lines N-M: ..." for a failed edit, or "" when
