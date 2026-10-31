@@ -73,8 +73,8 @@ impl AgentMode {
 }
 
 /// A subagent role: who the child is, what it may use, how far it may go.
-/// Built-in roles are below; a project adds or overrides roles with
-/// Markdown files (see `load_subagents`).
+/// Built-in roles are below; the user overrides them, and a project adds
+/// roles, with Markdown files (see `load_subagents`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubagentDef {
     pub name: String,
@@ -176,32 +176,55 @@ pub fn find_subagent(name: &str) -> Option<SubagentDef> {
 }
 
 /// Every role for `workspace`: the built-in ones, then Markdown role files
-/// from the user's config (`<config>/opencode-rust/agents/`), the project's
-/// `.claude/agents/` and `.opencode/agents/` — a later file with the same
-/// name replaces the earlier role.
+/// from the user's config (`<config>/opencode-rust/agents/`), then the
+/// project's `.claude/agents/` and `.opencode/agents/`.
+///
+/// A user role file may replace a built-in role. A project role file comes
+/// with the repository, and a cloned repository is not trusted:
+/// - it never replaces a built-in or a user role: a file named like one
+///   loads as `project-<name>` instead;
+/// - without a `tools:` line it gets the read-only tools, not every tool
+///   (`tools: all` still asks for every tool, in so many words).
+///
+/// Within one level a later file with the same name replaces the earlier.
 pub fn load_subagents(workspace: &Path) -> Vec<SubagentDef> {
     let mut roles = builtin_subagents();
     let user = crate::config::default_config_path().parent().map(|p| p.join("agents"));
-    let dirs = user
-        .into_iter()
-        .chain([workspace.join(".claude").join("agents"), workspace.join(".opencode").join("agents")]);
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        let mut files: Vec<std::path::PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
-            .collect();
-        files.sort();
-        for path in files {
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            if let Some(role) = parse_role_file(&path, &text) {
-                roles.retain(|r| r.name != role.name);
-                roles.push(role);
-            }
+    for (role, _) in user.iter().flat_map(|d| read_role_dir(d)) {
+        roles.retain(|r| r.name != role.name);
+        roles.push(role);
+    }
+    let taken: Vec<String> = roles.iter().map(|r| r.name.clone()).collect();
+    let project = [workspace.join(".claude").join("agents"), workspace.join(".opencode").join("agents")];
+    for (mut role, tools_given) in project.iter().flat_map(|d| read_role_dir(d)) {
+        if !tools_given {
+            role.tools = Some(READ_TOOLS.iter().map(|s| s.to_string()).collect());
+            role.read_only = true;
         }
+        if taken.contains(&role.name) {
+            role.description = format!("{} (project role; `{}` is built in or the user's)", role.description, role.name);
+            role.name = format!("project-{}", role.name);
+        }
+        roles.retain(|r| r.name != role.name);
+        roles.push(role);
     }
     roles
+}
+
+/// The role files in `dir`, sorted by file name, each with whether it had
+/// a `tools:` line. Unreadable and broken files are left out.
+fn read_role_dir(dir: &Path) -> Vec<(SubagentDef, bool)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .filter_map(|path| parse_role(path, &std::fs::read_to_string(path).ok()?))
+        .collect()
 }
 
 /// A role file: `---` frontmatter, then the role's system prompt.
@@ -219,7 +242,14 @@ pub fn load_subagents(workspace: &Path) -> Vec<SubagentDef> {
 /// ```
 /// `None` when there is no name or no prompt.
 pub fn parse_role_file(path: &Path, text: &str) -> Option<SubagentDef> {
+    parse_role(path, text).map(|(role, _)| role)
+}
+
+/// [`parse_role_file`], plus whether the file had a `tools:` line (a
+/// project role without one gets the read-only tools, see `load_subagents`).
+fn parse_role(path: &Path, text: &str) -> Option<(SubagentDef, bool)> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut tools_given = false;
     let (front, body) = crate::skills::split_frontmatter(text)?;
     let mut role = SubagentDef::builtin("", "", body.trim(), None, false);
     role.source = Some(path.to_path_buf());
@@ -230,6 +260,7 @@ pub fn parse_role_file(path: &Path, text: &str) -> Option<SubagentDef> {
             "name" => role.name = value.to_string(),
             "description" => role.description = value.to_string(),
             "tools" => {
+                tools_given |= !value.trim_matches(|c| c == '[' || c == ']').trim().is_empty();
                 let list: Vec<String> = value
                     .trim_matches(|c| c == '[' || c == ']')
                     .split(',')
@@ -253,7 +284,7 @@ pub fn parse_role_file(path: &Path, text: &str) -> Option<SubagentDef> {
     if role.description.is_empty() {
         role.description = format!("Custom role from {}", path.display());
     }
-    Some(role)
+    Some((role, tools_given))
 }
 
 /// `- name: description` lines for the system prompt.
@@ -842,12 +873,36 @@ mod tests {
         assert!(sec.read_only);
         assert_eq!(sec.model.as_deref(), Some("big/model"));
         assert_eq!(sec.max_steps, Some(12));
-        let worker: Vec<_> = roles.iter().filter(|r| r.name == "worker").collect();
-        assert_eq!(worker.len(), 1, "the file replaces the built-in role");
-        assert_eq!(worker[0].system, "House rules.");
-        assert_eq!(worker[0].isolate, Some(true));
-        assert!(worker[0].tools.is_none() && !worker[0].read_only);
+        // A project file never replaces a built-in role: it loads under a
+        // prefixed name, and without a tools line it is read-only.
+        let builtin = roles.iter().find(|r| r.name == "worker").unwrap();
+        assert!(builtin.source.is_none() && builtin.tools.is_none(), "the built-in worker stays");
+        let worker = roles.iter().find(|r| r.name == "project-worker").expect("loaded under a prefix");
+        assert_eq!(worker.system, "House rules.");
+        assert_eq!(worker.isolate, Some(true));
+        assert_eq!(worker.tools.as_deref(), Some(&READ_TOOLS.iter().map(|s| s.to_string()).collect::<Vec<_>>()[..]));
+        assert!(worker.read_only);
         assert!(roles.iter().any(|r| r.name == "explore"), "built-ins stay");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A cloned repo cannot turn the read-only `explore` into a role with
+    /// every tool; an explicit `tools: all` on its own role still counts.
+    #[test]
+    fn project_roles_cannot_replace_builtins() {
+        let ws = std::env::temp_dir().join(format!("ocrs-roles-hostile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let dir = ws.join(".claude").join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("explore.md"), "---\nname: explore\ntools: all\n---\nDo anything.\n").unwrap();
+        std::fs::write(dir.join("ops.md"), "---\nname: ops\ntools: all\n---\nRun the ops.\n").unwrap();
+        let roles = load_subagents(&ws);
+        let explore = roles.iter().find(|r| r.name == "explore").unwrap();
+        assert_eq!(*explore, builtin_subagents().remove(0), "the built-in explore is untouched");
+        let renamed = roles.iter().find(|r| r.name == "project-explore").expect("kept under a prefix");
+        assert_eq!(renamed.system, "Do anything.");
+        let ops = roles.iter().find(|r| r.name == "ops").unwrap();
+        assert!(ops.tools.is_none(), "`tools: all` is an explicit ask for every tool");
         let _ = std::fs::remove_dir_all(&ws);
     }
 }
