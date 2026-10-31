@@ -221,15 +221,7 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
 pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &str, abort: Arc<AtomicBool>, chain: Option<Chain>) {
     // Safety net before anything mutates the workspace. Failure is not
     // fatal — snapshotting is a convenience, the run must still work.
-    // New (B-48): git runs off the async threads; errors go to core.log.
-    let (ws, sd) = (st.workspace_for(session_id), st.state_dir.clone());
-    let snap = tokio::task::spawn_blocking(move || {
-        crate::gitsnap::record_before_run(&ws, &sd, "pre-run")
-    })
-    .await;
-    if let Ok(Err(e)) = snap {
-        core_log(&format!("[snapshot] {e:#}"));
-    }
+    record_snapshot_before_run(st, session_id).await;
     let (budget, scratch) = match chain {
         Some(c) => (c.budget, c.scratch),
         None => (PassBudget::new(), ScratchGuard::acquire(st.workspace_for(session_id)).await),
@@ -247,28 +239,7 @@ pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &s
     let started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
     let spec = make_spec(st, session_id, user_content, &abort).await;
     let result = agent_inner_with(st, session_id, user_content, spec.as_ref().map(crate::spec::for_model), &abort).await;
-    // Laziness Meter: did this run change the workspace at all? Successful
-    // write/edit calls always count. New (P-02): bash counts only when the
-    // git working tree really changed (or when there is no git to ask).
-    let (touched, bash_used) = {
-        let after = snapshot_stats(st, session_id);
-        let bash_used = after.bash_runs > before.bash_runs;
-        // Without git there is no tree to compare: look at file times
-        // instead. Assuming a change (as before) started a full review after
-        // `node --version` — 13 extra calls on a live test.
-        let bash_changed = bash_used
-            && match tree_before {
-                Some(_) => st.workspace_fingerprint(session_id).await != tree_before,
-                None => {
-                    // A walk of the whole project: off the async threads.
-                    let ws = st.workspace_for(session_id);
-                    tokio::task::spawn_blocking(move || files_changed_since(&ws, started_at)).await.unwrap_or(true)
-                }
-            };
-        // Files written by this run's subagents count too.
-        let by_agents = !crate::keepbest::written_since(&st.workspace_for(session_id), started_at).is_empty();
-        (after.writes > before.writes || after.edits > before.edits || bash_changed || by_agents, bash_used)
-    };
+    let (touched, bash_used) = workspace_touched(st, session_id, &before, tree_before, started_at).await;
     // The reply already streamed to clients as AssistantDelta — resending it
     // as `message` made the TUI print the whole answer a second time.
     let (ok, message) = match &result {
@@ -281,47 +252,8 @@ pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &s
         scratch.release().await;
         return;
     }
-    let aborted = || abort.load(Ordering::SeqCst) || matches!(result, Ok(LoopEnd::Aborted));
-    // F-08 verification loop: check the work before the review and
-    // before the turn is declared done. Never after an abort.
-    if ok && touched && !aborted() {
-        check_after_run(st, session_id, user_content, started_at, bash_used, &abort, Some(&budget)).await;
-    }
-    // The checks above run tests and pages; this one proves what the
-    // user asked for (a PNG that is a PNG, a cart that adds up).
-    if let Some(spec) = spec.as_ref().filter(|_| ok && st.cfg.agent.final_check) {
-        if !aborted() {
-            final_check(st, session_id, spec, &abort, Some(&budget)).await;
-        }
-    }
-    // Working is not the same as looking right: the model judges the
-    // pages it changed by eye (it built five near-identical "AI" heroes
-    // on four models while every check passed).
-    if ok && touched && !aborted() {
-        design_review(st, session_id, user_content, spec.as_ref(), started_at, bash_used, &abort, Some(&budget)).await;
-    }
-    // Auto ponytail review: any run that changed files gets the
-    // outside-the-diff senior-dev pass BEFORE the turn is declared done.
-    // New (P-03): never after an abort; the user asked us to stop.
-    // A `review` agent already checked this run's work: a second review
-    // would only repeat it at the cost of another full agent loop.
-    let reviewed = crate::subagent::reviewed_since(session_id, started);
-    if ok && touched && !aborted() && !reviewed && st.cfg.agent.auto_review && !st.own_prompt_only()
-        && budget.take(st, session_id, "the ponytail review")
-    {
-        let _ = st.events.send(ServerEvent::Note {
-            session_id: session_id.to_string(),
-            text: "ponytail review — checking the change and what it may have \
-                   broken outside the diff…"
-                .to_string(),
-        });
-        if let Err(e) = run_review(st, session_id, Some(started_at), &abort).await {
-            let _ = st.events.send(ServerEvent::Note {
-                session_id: session_id.to_string(),
-                text: format!("ponytail review failed: {e}"),
-            });
-        }
-    }
+    let run = RunFacts { ok, touched, bash_used, started, started_at };
+    checks_after_run(st, session_id, user_content, spec.as_ref(), &result, &run, &abort, &budget).await;
     // New (B-24): a turbo continuation is part of the same run. Register
     // it BEFORE this run returns and announce no RunFinished in between:
     // every client (headless, TUI, GUI) sees one run that ends when the
@@ -350,6 +282,115 @@ pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &s
         Some(m) => Err(m),
     })
     .await;
+}
+
+/// The git snapshot `/undo` rolls a run back to.
+/// New (B-48): git runs off the async threads; errors go to core.log.
+async fn record_snapshot_before_run(st: &Shared, session_id: &str) {
+    let (ws, sd) = (st.workspace_for(session_id), st.state_dir.clone());
+    let snap = tokio::task::spawn_blocking(move || {
+        crate::gitsnap::record_before_run(&ws, &sd, "pre-run")
+    })
+    .await;
+    if let Ok(Err(e)) = snap {
+        core_log(&format!("[snapshot] {e:#}"));
+    }
+}
+
+/// Laziness Meter: did this run change the workspace at all, and did it
+/// run bash? Successful write/edit calls always count. New (P-02): bash
+/// counts only when the git working tree really changed (or when there is
+/// no git to ask).
+async fn workspace_touched(
+    st: &Shared,
+    session_id: &str,
+    before: &RunStats,
+    tree_before: Option<u64>,
+    started_at: std::time::SystemTime,
+) -> (bool, bool) {
+    let after = snapshot_stats(st, session_id);
+    let bash_used = after.bash_runs > before.bash_runs;
+    // Without git there is no tree to compare: look at file times
+    // instead. Assuming a change (as before) started a full review after
+    // `node --version` — 13 extra calls on a live test.
+    let bash_changed = bash_used
+        && match tree_before {
+            Some(_) => st.workspace_fingerprint(session_id).await != tree_before,
+            None => {
+                // A walk of the whole project: off the async threads.
+                let ws = st.workspace_for(session_id);
+                tokio::task::spawn_blocking(move || files_changed_since(&ws, started_at)).await.unwrap_or(true)
+            }
+        };
+    // Files written by this run's subagents count too.
+    let by_agents = !crate::keepbest::written_since(&st.workspace_for(session_id), started_at).is_empty();
+    (after.writes > before.writes || after.edits > before.edits || bash_changed || by_agents, bash_used)
+}
+
+/// What [`checks_after_run`] needs to know about the run that just ended.
+struct RunFacts {
+    ok: bool,
+    touched: bool,
+    bash_used: bool,
+    started: std::time::Instant,
+    started_at: std::time::SystemTime,
+}
+
+/// The checks after a run: verification, the final check against the
+/// spec, the design review and the ponytail review. None after an abort.
+#[allow(clippy::too_many_arguments)]
+async fn checks_after_run(
+    st: &Shared,
+    session_id: &str,
+    user_content: &str,
+    spec: Option<&crate::spec::Spec>,
+    result: &Result<LoopEnd>,
+    run: &RunFacts,
+    abort: &Arc<AtomicBool>,
+    budget: &PassBudget,
+) {
+    let RunFacts { ok, touched, bash_used, started, started_at } = *run;
+    let aborted = || abort.load(Ordering::SeqCst) || matches!(result, Ok(LoopEnd::Aborted));
+    // F-08 verification loop: check the work before the review and
+    // before the turn is declared done. Never after an abort.
+    if ok && touched && !aborted() {
+        check_after_run(st, session_id, user_content, started_at, bash_used, abort, Some(budget)).await;
+    }
+    // The checks above run tests and pages; this one proves what the
+    // user asked for (a PNG that is a PNG, a cart that adds up).
+    if let Some(spec) = spec.filter(|_| ok && st.cfg.agent.final_check) {
+        if !aborted() {
+            final_check(st, session_id, spec, abort, Some(budget)).await;
+        }
+    }
+    // Working is not the same as looking right: the model judges the
+    // pages it changed by eye (it built five near-identical "AI" heroes
+    // on four models while every check passed).
+    if ok && touched && !aborted() {
+        design_review(st, session_id, user_content, spec, started_at, bash_used, abort, Some(budget)).await;
+    }
+    // Auto ponytail review: any run that changed files gets the
+    // outside-the-diff senior-dev pass BEFORE the turn is declared done.
+    // New (P-03): never after an abort; the user asked us to stop.
+    // A `review` agent already checked this run's work: a second review
+    // would only repeat it at the cost of another full agent loop.
+    let reviewed = crate::subagent::reviewed_since(session_id, started);
+    if ok && touched && !aborted() && !reviewed && st.cfg.agent.auto_review && !st.own_prompt_only()
+        && budget.take(st, session_id, "the ponytail review")
+    {
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: "ponytail review — checking the change and what it may have \
+                   broken outside the diff…"
+                .to_string(),
+        });
+        if let Err(e) = run_review(st, session_id, Some(started_at), abort).await {
+            let _ = st.events.send(ServerEvent::Note {
+                session_id: session_id.to_string(),
+                text: format!("ponytail review failed: {e}"),
+            });
+        }
+    }
 }
 
 /// A run's temporary files live in `<project>/.opencode/scratch/`: git
