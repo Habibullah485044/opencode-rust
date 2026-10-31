@@ -915,6 +915,187 @@
   ok("a command is not wrapped in /deep", (last("send") || {}).text === "/review", JSON.stringify(sent));
   click("deep-btn");
 
+  // --- Accessibility: names, live regions, focus, keyboard (T-103..T-123) ---
+  ["changes", "usage", "history", "settings"].forEach(function (id) {
+    var b = document.getElementById(id);
+    if (b && !b.hidden) key(b.querySelector("[role=dialog]") || b, "Escape");
+  });
+  function byId(id) { return document.getElementById(id); }
+  var iconBtns = ["nav-back", "nav-fwd", "nav-reload", "nav-go", "close-browser-btn", "hist-close", "chg-close", "set-close"]
+    .map(byId).concat([].slice.call(document.querySelectorAll(".tb")));
+  var unnamed = iconBtns.filter(function (b) { return !b || !(b.getAttribute("aria-label") || "").trim(); });
+  ok("icon-only buttons have an aria-label", unnamed.length === 0 && iconBtns.length === 11,
+    unnamed.map(function (b) { return b && (b.id || b.className); }).join(","));
+  var noLabel = [].filter.call(document.querySelectorAll("input, textarea"), function (e) {
+    if (e.type === "hidden" || e.closest("#settings")) return false;
+    return !e.getAttribute("aria-label") && !e.getAttribute("aria-labelledby") && !(e.labels && e.labels.length);
+  });
+  ok("every input outside Settings is labelled", noLabel.length === 0,
+    noLabel.map(function (e) { return e.id || e.className; }).join(","));
+
+  var logEl = byId("log");
+  ok("the transcript is a log live region", logEl.getAttribute("role") === "log" &&
+    logEl.getAttribute("aria-relevant") === "additions");
+  window.render(Object.assign(payload(basePage), { busy: true }));
+  var busyOn = logEl.getAttribute("aria-busy");
+  window.render(payload(basePage));
+  ok("aria-busy follows a streaming reply", busyOn === "true" && logEl.getAttribute("aria-busy") === "false",
+    busyOn + "/" + logEl.getAttribute("aria-busy"));
+  ok("the connection status is a status region", byId("api").getAttribute("role") === "status");
+  ok("the approval card is described by its detail", byId("ap-card").getAttribute("aria-describedby") === "ap-detail");
+
+  // Focus goes back to the opener, and Tab stays inside the open dialog.
+  var setBtn = byId("settings-btn");
+  setBtn.focus();
+  click("settings-btn");
+  var setBox2 = byId("settings");
+  ok("Settings opens", !setBox2.hidden);
+  var focusables = [].filter.call(setBox2.querySelectorAll("button, input, textarea, select, a[href], [tabindex]"), function (e) {
+    return !e.disabled && e.type !== "hidden" && !(e.type === "radio" && !e.checked) && e.tabIndex >= 0 && e.getClientRects().length;
+  });
+  var firstF = focusables[0], lastF = focusables[focusables.length - 1];
+  lastF.focus();
+  key(lastF, "Tab");
+  ok("Tab from the last control wraps to the first", document.activeElement === firstF,
+    document.activeElement && (document.activeElement.id || document.activeElement.textContent));
+  firstF.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true }));
+  ok("Shift+Tab from the first wraps to the last", document.activeElement === lastF);
+
+  // Settings tabs: arrows move and show the matching pane.
+  var tabModels = byId("set-tab-models");
+  tabModels.focus();
+  key(tabModels, "ArrowRight");
+  ok("ArrowRight moves to the next Settings tab", document.activeElement === byId("set-tab-prompt") &&
+    byId("set-tab-prompt").getAttribute("aria-selected") === "true" && !byId("set-pane-prompt").hidden &&
+    byId("set-pane-models").hidden && byId("set-tab-prompt").tabIndex === 0 && tabModels.tabIndex === -1);
+  key(document.activeElement, "End");
+  ok("End jumps to the last tab", document.activeElement === byId("set-tab-usage") && !byId("set-pane-usage").hidden);
+  key(document.activeElement, "ArrowRight");
+  ok("ArrowRight wraps to the first tab", document.activeElement === tabModels && !byId("set-pane-models").hidden);
+  ok("tabs control their panes", tabModels.getAttribute("aria-controls") === "set-pane-models");
+  key(document.activeElement, "Escape");
+  ok("Esc closes Settings and focus returns to its button", setBox2.hidden && document.activeElement === setBtn,
+    document.activeElement && (document.activeElement.id || document.activeElement.tagName));
+
+  // Usage opens at once with a loading line.
+  sent = [];
+  click("set-usage");
+  ok("Usage is visible right after the click", !byId("usage").hidden && /Loading/.test(byId("use-sub").textContent) &&
+    count("load_usage") === 1, byId("use-sub").textContent);
+  key(byId("usage"), "Escape");
+
+  // Changes: loading text until Rust answers, Refresh disabled meanwhile.
+  sent = [];
+  click("changes-btn");
+  ok("Changes says it is loading", !byId("changes").hidden && byId("chg-sub").textContent === "Loading changes\u2026" &&
+    byId("chg-refresh").disabled && count("load_changes") === 1, byId("chg-sub").textContent);
+  window.showChanges({ files: [
+    { path: "a.txt", status: "new", diff: "" }, { path: "b.txt", status: "added", diff: "" },
+    { path: "c.txt", status: "deleted", diff: "" }, { path: "d.txt", status: "renamed", diff: "" },
+    { path: "e.txt", status: "modified", diff: "" }
+  ] });
+  ok("the answer replaces the loading text and enables Refresh", !byId("chg-refresh").disabled &&
+    byId("chg-sub").textContent === "5 files changed", byId("chg-sub").textContent);
+  var words = [].map.call(document.querySelectorAll("#chg-files .st"), function (s) { return s.getAttribute("aria-label"); });
+  ok("file status letters carry the full word", words.join(",") === "new,added,deleted,renamed,modified", words.join(","));
+  key(byId("changes"), "Escape");
+
+  // Git menu: aria-expanded, menu items, keyboard only.
+  window.render(withNext);
+  var chip = byId("git-chip"), gmenu = byId("git-menu");
+  chip.focus();
+  click("git-chip");
+  var gItems = gmenu.querySelectorAll(".git-item");
+  ok("opening the git menu sets aria-expanded and focuses the first item", chip.getAttribute("aria-expanded") === "true" &&
+    document.activeElement === gItems[0] && gItems[0].getAttribute("role") === "menuitem");
+  key(document.activeElement, "ArrowDown");
+  ok("ArrowDown moves to the next item", document.activeElement === gItems[1]);
+  key(document.activeElement, "ArrowUp");
+  key(document.activeElement, "ArrowUp");
+  ok("ArrowUp wraps to the last item", document.activeElement === gItems[gItems.length - 1]);
+  key(document.activeElement, "Escape");
+  ok("Escape closes the menu and focuses the chip", gmenu.hidden && chip.getAttribute("aria-expanded") === "false" &&
+    document.activeElement === chip);
+  window.render(payload(basePage));
+
+  // Sidebar rows: Space opens, the active one is aria-current, the dot is named.
+  var sb2 = payload(basePage0());
+  sb2.sessions = [chatOf("c1", null, { active: true }), chatOf("c2", null, { needs: true }), chatOf("c3", null, { running: true })];
+  window.render(sb2);
+  var r1 = side.querySelector('.sess[data-id="c1"]'), r2 = side.querySelector('.sess[data-id="c2"]'),
+    r3 = side.querySelector('.sess[data-id="c3"]');
+  ok("the active chat row has aria-current", !!r1 && r1.getAttribute("aria-current") === "page" && !r2.hasAttribute("aria-current"));
+  ok("a row's name includes its state", /waiting for approval/.test(r2.getAttribute("aria-label")) &&
+    /working/.test(r3.getAttribute("aria-label")), r2.getAttribute("aria-label") + "|" + r3.getAttribute("aria-label"));
+  sent = [];
+  key(r2, " ");
+  ok("Space opens a chat", (last("load") || {}).id === "c2", JSON.stringify(sent));
+  window.render(payload(basePage));
+
+  // Terminal tabs mark the current one.
+  window.showTerm({ cwd: "C:\\proj", shell: "Git Bash", text: "", running: null,
+    jobs: [{ id: "job3", title: "serve", running: true, exit: null, text: "" }] });
+  var sel = document.querySelectorAll('#term-tabs .term-tab[aria-selected="true"]');
+  ok("exactly one terminal tab is aria-selected", sel.length === 1 && sel[0].getAttribute("data-id") === "me");
+
+  // Autocomplete is linked to the composer.
+  var acta2 = byId("input");
+  var acPage2 = payload(basePage);
+  acPage2.commands = [["help", "List these commands"], ["export [path]", "Save this chat"], ["undo", "Put the files back"]];
+  window.render(acPage2);
+  acta2.value = "/";
+  acta2.setSelectionRange(1, 1);
+  acta2.dispatchEvent(new Event("input"));
+  var acOn = function () { return byId("ac-menu").querySelector(".ac-item.on"); };
+  ok("the open menu sets aria-expanded and the active option", acta2.getAttribute("aria-controls") === "ac-menu" &&
+    acta2.getAttribute("aria-expanded") === "true" && !!acOn() && acta2.getAttribute("aria-activedescendant") === acOn().id,
+    acta2.getAttribute("aria-activedescendant"));
+  var before = acta2.getAttribute("aria-activedescendant");
+  key(acta2, "ArrowDown");
+  ok("aria-activedescendant follows the pick", acta2.getAttribute("aria-activedescendant") !== before &&
+    acta2.getAttribute("aria-activedescendant") === acOn().id, before + " -> " + acta2.getAttribute("aria-activedescendant"));
+  key(acta2, "Escape");
+  ok("closing the menu clears them", acta2.getAttribute("aria-expanded") === "false" && !acta2.hasAttribute("aria-activedescendant"));
+  acta2.value = "";
+  acta2.dispatchEvent(new Event("input"));
+
+  // Contrast of --text-dim in both themes (WCAG AA 4.5:1).
+  function lum(hex) {
+    var c = [1, 3, 5].map(function (i) {
+      var v = parseInt(hex.substr(i, 2), 16) / 255;
+      return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  }
+  function ratio(a, b) { var x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); }
+  function tok(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  var html = document.documentElement, oldTheme = html.getAttribute("data-theme");
+  html.removeAttribute("data-theme");
+  var darkR = [ratio(tok("--text-dim"), tok("--bg")), ratio(tok("--text-dim"), tok("--surface"))];
+  html.setAttribute("data-theme", "light");
+  var lightR = [ratio(tok("--text-dim"), tok("--bg")), ratio(tok("--text-dim"), tok("--surface"))];
+  if (oldTheme) html.setAttribute("data-theme", oldTheme); else html.removeAttribute("data-theme");
+  ok("dark --text-dim is at least 4.5:1", darkR[0] >= 4.5 && darkR[1] >= 4.5, darkR.map(function (r) { return r.toFixed(2); }).join(","));
+  ok("light --text-dim is at least 4.5:1", lightR[0] >= 4.5 && lightR[1] >= 4.5, lightR.map(function (r) { return r.toFixed(2); }).join(","));
+
+  // The sidebar search shows a focus ring.
+  var ss = byId("side-search");
+  ss.focus();
+  var ring = getComputedStyle(ss.closest(".side-search")).boxShadow;
+  ok("the focused sidebar search shows a ring", document.activeElement === ss && !!ring && ring !== "none", ring);
+  ss.blur();
+
+  // Only one 900px rule for the starter chips.
+  var chipRules = 0;
+  [].forEach.call(document.styleSheets, function (sh) {
+    [].forEach.call(sh.cssRules, function (r) {
+      if (r.media && /max-width: 900px/.test(r.media.mediaText)) {
+        [].forEach.call(r.cssRules, function (c) { if (c.selectorText === "#empty .chips") chipRules++; });
+      }
+    });
+  });
+  ok("one 900px rule for the starter chips", chipRules === 1, chipRules);
+
   } catch (e) {
     ok("harness ran to completion", false, "threw: " + (e && e.message));
   }

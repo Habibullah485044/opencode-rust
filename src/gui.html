@@ -26,7 +26,7 @@
     --text-strong: #ffffff;
     --text-soft: #b4d4d8;
     --text-muted: #79999e;
-    --text-dim: #5b7b81;
+    --text-dim: #6a8a90;
     --code-text: #cfe9ec;
     --code-ink: #8ff0fb;
 
@@ -81,7 +81,7 @@
     --text-strong: #02090b;
     --text-soft: #23434a;
     --text-muted: #4e6c72;
-    --text-dim: #67858a;
+    --text-dim: #536f75;
     --code-text: #cfe9ec;
     --code-ink: #0e7490;
     --accent: #0e7490;
@@ -137,7 +137,7 @@
     --text-strong: #ffffff;
     --text-soft: #b4d4d8;
     --text-muted: #7f9fa4;
-    --text-dim: #5f7f85;
+    --text-dim: #6a8a90;
     --accent: #5ee7f7;
     --accent-strong: #a5f3fc;
     --accent-soft: rgba(94, 231, 247, 0.12);
@@ -2198,7 +2198,6 @@
     #log { padding: 22px 18px; }
     #compwrap { padding: 8px 18px 14px; }
     #agents { padding: 0 18px; }
-    #empty .chips { grid-template-columns: 1fr; width: min(360px, 100%); }
     .comp-hints #send-hint, .comp-hints > span:nth-child(2) { display: none; }
   }
 
@@ -2246,6 +2245,8 @@
   .side-sec::before { content: "//"; color: var(--pink); letter-spacing: 0; opacity: 0.85; }
   .side-search { border-radius: var(--radius-s); border: 1px solid var(--line); background: var(--surface); }
   .side-search kbd { font-family: var(--mono); }
+  /* The input itself has no outline, so the box carries the focus ring. */
+  .side-search:focus-within { border-color: var(--accent-line); box-shadow: 0 0 0 2px var(--accent-soft); }
   .sess, .proj-head { border-radius: var(--radius-s); }
   .sess.active::before {
     top: 50%;
@@ -2495,9 +2496,9 @@
     </div>
     <div id="tb-title">New chat</div>
     <div class="tb-btns">
-      <button class="tb" data-a="min" title="Minimize">&#x2500;</button>
-      <button class="tb" data-a="max" title="Maximize">&#x25A1;</button>
-      <button class="tb close" data-a="close" title="Close">&#x2715;</button>
+      <button class="tb" data-a="min" title="Minimize" aria-label="Minimize">&#x2500;</button>
+      <button class="tb" data-a="max" title="Maximize" aria-label="Maximize">&#x25A1;</button>
+      <button class="tb close" data-a="close" title="Close" aria-label="Close">&#x2715;</button>
     </div>
   </div>
 
@@ -2511,7 +2512,7 @@
 
       <label class="side-search">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <input id="side-search" type="text" placeholder="Search chats" spellcheck="false" autocomplete="off" />
+        <input id="side-search" type="text" aria-label="Search chats" placeholder="Search chats" spellcheck="false" autocomplete="off" />
         <kbd>Ctrl K</kbd>
       </label>
 
@@ -2526,7 +2527,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
           History
         </button>
-        <div class="api" id="api">
+        <div class="api" id="api" role="status">
           <span class="dot"></span>
           <span id="apitxt">connecting…</span>
         </div>
@@ -2557,7 +2558,7 @@
       </div>
 
       <div id="entries">
-        <div id="log"></div>
+        <div id="log" role="log" aria-live="polite" aria-relevant="additions" aria-busy="false"></div>
         
         <!-- Empty State Screen -->
         <div id="empty">
@@ -2646,7 +2647,7 @@
           <pre id="term-out"></pre>
           <div class="term-row" id="term-row">
             <span id="term-cwd"></span><span>$</span>
-            <input id="term-input" placeholder="Run a command in this folder (no interactive programs)" spellcheck="false" autocomplete="off" />
+            <input id="term-input" aria-label="Terminal command" placeholder="Run a command in this folder (no interactive programs)" spellcheck="false" autocomplete="off" />
             <button type="button" class="term-act" id="term-stop" hidden title="Stop the running command (Ctrl+C)">Stop</button>
           </div>
         </div>
@@ -2679,22 +2680,22 @@
           <div id="queue-more"></div>
         </div>
         <div id="comp">
-          <textarea id="input" rows="1" placeholder="Message Habi or ask a question…" autocomplete="off" spellcheck="false"></textarea>
+          <textarea id="input" rows="1" aria-label="Message" aria-controls="ac-menu" aria-expanded="false" aria-autocomplete="list" placeholder="Message Habi or ask a question…" autocomplete="off" spellcheck="false"></textarea>
           <div class="comp-bottom-row">
             <button type="button" id="attach-btn" title="Attach files (you can also paste or drop screenshots)" aria-label="Attach files">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21.4 11.1l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8l8.5-8.5a3.7 3.7 0 0 1 5.2 5.2l-8.5 8.5a1.8 1.8 0 0 1-2.6-2.6l7.8-7.8"/></svg>
             </button>
             <div id="git-wrap" hidden>
-              <button type="button" id="git-chip" title="Git branch: new branch, commit, pull request" aria-haspopup="menu">
+              <button type="button" id="git-chip" title="Git branch: new branch, commit, pull request" aria-haspopup="menu" aria-expanded="false" aria-controls="git-menu">
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 7v10M18 10c0 4-6 3-11 7"/></svg>
                 <span id="git-branch"></span><span id="git-count"></span>
               </button>
               <div id="git-menu" role="menu" hidden>
-                <button type="button" class="git-item" data-git="new">New branch…</button>
-                <div id="git-new" hidden><input id="git-new-name" placeholder="branch-name" spellcheck="false"><button type="button" class="next-opt" id="git-new-ok">Make</button></div>
-                <button type="button" class="git-item" data-git="changes">Show changes</button>
-                <button type="button" class="git-item" data-git="commit">Commit the changes</button>
-                <button type="button" class="git-item" data-git="pr">Push and open a pull request</button>
+                <button type="button" class="git-item" role="menuitem" data-git="new">New branch…</button>
+                <div id="git-new" hidden><input id="git-new-name" aria-label="New branch name" placeholder="branch-name" spellcheck="false"><button type="button" class="next-opt" id="git-new-ok">Make</button></div>
+                <button type="button" class="git-item" role="menuitem" data-git="changes">Show changes</button>
+                <button type="button" class="git-item" role="menuitem" data-git="commit">Commit the changes</button>
+                <button type="button" class="git-item" role="menuitem" data-git="pr">Push and open a pull request</button>
               </div>
             </div>
             <button type="button" id="mission-btn" class="mode-toggle" aria-pressed="false"
@@ -2732,14 +2733,14 @@
           <span class="tabx" id="b-tab-close" title="Close preview">&times;</span>
         </span>
         <span class="spacer"></span>
-        <button class="b-close-btn" id="close-browser-btn" title="Close Preview Panel">&times;</button>
+        <button class="b-close-btn" id="close-browser-btn" title="Close Preview Panel" aria-label="Close preview panel">&times;</button>
       </div>
       <div id="urlrow">
-        <button class="nb" id="nav-back" title="Back" disabled>&#x2190;</button>
-        <button class="nb" id="nav-fwd" title="Forward" disabled>&#x2192;</button>
-        <button class="nb" id="nav-reload" title="Reload">&#x27F3;</button>
-        <input id="url" type="text" spellcheck="false" autocomplete="off" placeholder="Paste a link or localhost:3000" />
-        <button class="nb" id="nav-go" title="Go">&#x27A4;</button>
+        <button class="nb" id="nav-back" title="Back" aria-label="Back" disabled>&#x2190;</button>
+        <button class="nb" id="nav-fwd" title="Forward" aria-label="Forward" disabled>&#x2192;</button>
+        <button class="nb" id="nav-reload" title="Reload" aria-label="Reload">&#x27F3;</button>
+        <input id="url" type="text" aria-label="Address" spellcheck="false" autocomplete="off" placeholder="Paste a link or localhost:3000" />
+        <button class="nb" id="nav-go" title="Go" aria-label="Go">&#x27A4;</button>
       </div>
       <div id="bcontent">
         <div class="b-empty" id="b-empty">
@@ -2762,8 +2763,8 @@
   <div class="hist-card" role="dialog" aria-modal="true" aria-label="History">
     <div class="hist-head">
       <b>History</b>
-      <input id="hist-search" type="text" placeholder="Search all chats" spellcheck="false" autocomplete="off" />
-      <button class="hist-close" id="hist-close" title="Close (Esc)">&times;</button>
+      <input id="hist-search" type="text" aria-label="Search all chats" placeholder="Search all chats" spellcheck="false" autocomplete="off" />
+      <button class="hist-close" id="hist-close" title="Close (Esc)" aria-label="Close history">&times;</button>
     </div>
     <div id="hist-list"></div>
   </div>
@@ -2778,7 +2779,7 @@
       <span style="flex:1"></span>
       <button type="button" id="chg-send" hidden>Send comments</button>
       <button type="button" id="chg-refresh" title="Load again">Refresh</button>
-      <button class="hist-close" id="chg-close" title="Close (Esc)">&times;</button>
+      <button class="hist-close" id="chg-close" title="Close (Esc)" aria-label="Close changes">&times;</button>
     </div>
     <div class="chg-body">
       <div id="chg-files"></div>
@@ -2794,17 +2795,17 @@
       <b>Settings</b>
       <span class="set-note" id="set-setup" hidden>Choose a model provider to start.</span>
       <span style="flex:1"></span>
-      <button class="hist-close" id="set-close" title="Close (Esc)">&times;</button>
+      <button class="hist-close" id="set-close" title="Close (Esc)" aria-label="Close settings">&times;</button>
     </div>
     <div class="set-layout">
       <nav class="set-nav" role="tablist" aria-label="Settings pages">
-        <button type="button" role="tab" data-pane="models" aria-selected="true">Models</button>
-        <button type="button" role="tab" data-pane="prompt" aria-selected="false">Prompt &amp; Temperature</button>
-        <button type="button" role="tab" data-pane="appearance" aria-selected="false">Appearance</button>
-        <button type="button" role="tab" data-pane="usage" aria-selected="false">Usage</button>
+        <button type="button" role="tab" id="set-tab-models" data-pane="models" aria-selected="true" aria-controls="set-pane-models" tabindex="0">Models</button>
+        <button type="button" role="tab" id="set-tab-prompt" data-pane="prompt" aria-selected="false" aria-controls="set-pane-prompt" tabindex="-1">Prompt &amp; Temperature</button>
+        <button type="button" role="tab" id="set-tab-appearance" data-pane="appearance" aria-selected="false" aria-controls="set-pane-appearance" tabindex="-1">Appearance</button>
+        <button type="button" role="tab" id="set-tab-usage" data-pane="usage" aria-selected="false" aria-controls="set-pane-usage" tabindex="-1">Usage</button>
       </nav>
       <form id="set-form" class="set-body" novalidate>
-        <section class="set-pane" data-pane="models" role="tabpanel" aria-label="Models">
+        <section class="set-pane" id="set-pane-models" data-pane="models" role="tabpanel" aria-label="Models">
 <!-- settings:models (Models page: provider, model, API key, thinking effort) -->
       <h2 class="set-title">Models</h2>
       <p class="set-hint mdl-lead">Where Habi sends requests, which model answers, and how hard it thinks.</p>
@@ -2864,7 +2865,7 @@
       </div>
 <!-- /settings:models -->
         </section>
-        <section class="set-pane" data-pane="prompt" role="tabpanel" aria-label="Prompt and temperature" hidden>
+        <section class="set-pane" id="set-pane-prompt" data-pane="prompt" role="tabpanel" aria-label="Prompt and temperature" hidden>
 <!-- settings:prompt (Prompt & Temperature page: system prompt, temperature) -->
       <h2 class="set-title">Prompt &amp; Temperature</h2>
       <div class="pt-group">
@@ -2899,7 +2900,7 @@
       </div>
 <!-- /settings:prompt -->
         </section>
-        <section class="set-pane" data-pane="appearance" role="tabpanel" aria-label="Appearance" hidden>
+        <section class="set-pane" id="set-pane-appearance" data-pane="appearance" role="tabpanel" aria-label="Appearance" hidden>
 <!-- settings:appearance (Appearance page: theme) -->
       <h2 class="set-title">Appearance</h2>
       <p class="thm-label" id="thm-label">Theme</p>
@@ -2935,7 +2936,7 @@
       <p class="set-hint" id="thm-hint">Pick a theme to try it right away. Save keeps it; closing Settings without saving puts the old one back.</p>
 <!-- /settings:appearance -->
         </section>
-        <section class="set-pane" data-pane="usage" role="tabpanel" aria-label="Usage" hidden>
+        <section class="set-pane" id="set-pane-usage" data-pane="usage" role="tabpanel" aria-label="Usage" hidden>
       <h2 class="set-title">Usage</h2>
       <p class="set-hint">Tokens and costs of every model request, by day, purpose, model and chat, with the prices you set per model.</p>
       <button type="button" id="set-usage" class="set-usage" title="Tokens and costs by day, model, purpose and chat">Token usage &amp; costs &rarr;</button>
@@ -2963,7 +2964,7 @@
         <button type="button" data-days="0">All time</button>
       </div>
       <button type="button" id="use-refresh" title="Load again">Refresh</button>
-      <button class="hist-close" id="use-close" title="Close (Esc)">&times;</button>
+      <button class="hist-close" id="use-close" title="Close (Esc)" aria-label="Close usage">&times;</button>
     </div>
     <div class="use-body" id="use-body"></div>
   </div>
@@ -2974,7 +2975,7 @@
 
 <!-- D1: tool-approval modal. Not part of #app so it can sit above everything. -->
 <div id="approval" hidden>
-  <div class="ap-card" id="ap-card" role="dialog" aria-modal="true" aria-labelledby="ap-title" tabindex="-1">
+  <div class="ap-card" id="ap-card" role="dialog" aria-modal="true" aria-labelledby="ap-title" aria-describedby="ap-detail" tabindex="-1">
     <div class="ap-head">
       <span class="ap-badge" id="ap-tool">tool</span>
       <span class="ap-chat" id="ap-chat" hidden></span>
@@ -3063,7 +3064,7 @@
   function runFollowup(text) {
     var nb = document.getElementById("next-box");
     if (nb) nb.hidden = true;
-    if (text === "@changes") { postToRust({ type: "load_changes" }); return; }
+    if (text === "@changes") { loadChanges(); return; }
     postToRust({ type: "send", text: text });
     rememberPrompt(text);
   }
@@ -3119,6 +3120,7 @@
       b.type = "button";
       b.className = "term-tab" + (termTab === id ? " on" : "");
       b.setAttribute("role", "tab");
+      b.setAttribute("aria-selected", termTab === id ? "true" : "false");
       b.setAttribute("data-id", id);
       b.title = title;
       if (live) {
@@ -3695,6 +3697,17 @@
   var ROWS_PER_PROJECT = 5;
   // Set by initApp: hide / restore the native preview while an overlay is up.
   var overlayHooks = { open: function () {}, close: function () {} };
+  // Dialogs hand focus back to whatever opened them; otherwise closing one
+  // leaves focus on <body> and the keyboard user starts again from the top.
+  var overlayFocus = {};
+  function rememberFocus(id) {
+    if (!(id in overlayFocus)) overlayFocus[id] = document.activeElement;
+  }
+  function restoreFocus(id) {
+    var el = overlayFocus[id];
+    delete overlayFocus[id];
+    if (el && el !== document.body && el.focus && document.contains(el)) el.focus();
+  }
 
   var ICONS = {
     chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
@@ -3728,6 +3741,7 @@
     var row = document.createElement("div");
     row.className = "sess" + (s.active ? " active" : "");
     row.setAttribute("role", "button");
+    if (s.active) row.setAttribute("aria-current", "page");
     row.tabIndex = 0;
     row.dataset.id = s.id;
     var state = s.needs ? "needs" : s.running ? "run" : "";
@@ -3738,6 +3752,7 @@
     if (renamingId === s.id) {
       var inp = document.createElement("input");
       inp.className = "rename";
+      inp.setAttribute("aria-label", "Chat name");
       inp.value = s.title || "New chat";
       inp.addEventListener("keydown", function (ev) {
         ev.stopPropagation();
@@ -3765,6 +3780,9 @@
     var title = document.createElement("span");
     title.textContent = s.title || "New chat";
     row.title = s.title || "New chat";
+    // The status dot is colour only; put its meaning in the row's name.
+    row.setAttribute("aria-label", (s.title || "New chat") +
+      (s.needs ? ", waiting for approval" : s.running ? ", working" : ""));
     row.appendChild(title);
     if (s.pinned) row.insertAdjacentHTML("beforeend", svg(ICONS.pin, "pin-mark"));
     var acts = document.createElement("span");
@@ -3784,7 +3802,10 @@
       postToRust({ type: "load", id: s.id });
     });
     row.addEventListener("keydown", function (ev) {
-      if (ev.key === "Enter" && ev.target === row) postToRust({ type: "load", id: s.id });
+      if ((ev.key === "Enter" || ev.key === " ") && ev.target === row) {
+        ev.preventDefault(); // Space would scroll the sidebar
+        postToRust({ type: "load", id: s.id });
+      }
       if (ev.key === "F2") { renamingId = s.id; renderSidebar(); }
     });
     row.addEventListener("contextmenu", function (ev) {
@@ -4153,6 +4174,7 @@
   function openHistory() {
     var h = document.getElementById("history");
     if (!h) return;
+    if (h.hidden) rememberFocus("history");
     historyOpen = true;
     h.hidden = false;
     overlayHooks.open();
@@ -4166,6 +4188,7 @@
     historyOpen = false;
     h.hidden = true;
     overlayHooks.close();
+    restoreFocus("history");
   }
 
   // ---- Autocomplete: "/" commands at the start, "@" project files ----
@@ -4186,10 +4209,20 @@
     if (!menu) return;
     menu.hidden = !ac.kind || !ac.items.length;
     menu.textContent = "";
+    // The composer owns the listbox: a screen reader follows the pick
+    // through aria-activedescendant while focus stays in the textarea.
+    var ta = document.getElementById("input");
+    if (ta) {
+      ta.setAttribute("aria-expanded", menu.hidden ? "false" : "true");
+      if (menu.hidden) ta.removeAttribute("aria-activedescendant");
+      else ta.setAttribute("aria-activedescendant", "ac-opt-" + ac.pick);
+    }
     ac.items.forEach(function (it, i) {
       var row = document.createElement("div");
       row.className = "ac-item" + (i === ac.pick ? " on" : "");
+      row.id = "ac-opt-" + i;
       row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", i === ac.pick ? "true" : "false");
       var k = document.createElement("span");
       k.className = "k";
       k.textContent = ac.kind === "cmd" ? "/" + it[0] : "@" + it[0];
@@ -4244,9 +4277,25 @@
     chgData = data || { files: [] };
     if (chgPick >= (chgData.files || []).length) chgPick = 0;
     var box = document.getElementById("changes");
-    if (box.hidden) { box.hidden = false; overlayHooks.open(); }
+    if (box.hidden) { rememberFocus("changes"); box.hidden = false; overlayHooks.open(); }
     renderChanges();
   };
+  // git diff can take seconds: open the dialog at once and say so, and keep
+  // Refresh disabled until showChanges answers so it is not clicked twice.
+  function loadChanges() {
+    var box = document.getElementById("changes");
+    if (box.hidden) {
+      rememberFocus("changes");
+      document.getElementById("chg-files").textContent = "";
+      document.getElementById("chg-diff").textContent = "";
+      box.hidden = false;
+      overlayHooks.open();
+      document.getElementById("chg-close").focus();
+    }
+    document.getElementById("chg-sub").textContent = "Loading changes…";
+    document.getElementById("chg-refresh").disabled = true;
+    postToRust({ type: "load_changes" });
+  }
   // ---- Token usage dashboard (Settings → Token usage) ----
   var useData = null;
   var useDays = 7;
@@ -4452,11 +4501,21 @@
     useData = data || {};
     useDays = useData.days || 0;
     var box = document.getElementById("usage");
-    if (box.hidden) { box.hidden = false; overlayHooks.open(); }
+    if (box.hidden) { rememberFocus("usage"); box.hidden = false; overlayHooks.open(); }
     renderUsage();
   };
+  // Open at once with a loading line: the numbers come back from Rust, and
+  // until then a click looked like it did nothing.
   function openUsage(days) {
     if (days != null) useDays = days;
+    var box = document.getElementById("usage");
+    if (box.hidden) {
+      rememberFocus("usage");
+      box.hidden = false;
+      overlayHooks.open();
+      document.getElementById("use-close").focus();
+    }
+    document.getElementById("use-sub").textContent = "Loading…";
     postToRust({ type: "load_usage", days: useDays || null });
   }
   function closeUsage() {
@@ -4464,16 +4523,19 @@
     if (!box || box.hidden) return;
     box.hidden = true;
     overlayHooks.close();
+    restoreFocus("usage");
   }
   function closeChanges() {
     var box = document.getElementById("changes");
     if (!box || box.hidden) return;
     box.hidden = true;
     overlayHooks.close();
+    restoreFocus("changes");
   }
   function renderChanges() {
     var files = chgData.files || [];
     var sub = document.getElementById("chg-sub");
+    document.getElementById("chg-refresh").disabled = false;
     sub.textContent = chgData.error ? "" : files.length + " file" + (files.length === 1 ? "" : "s") + " changed";
     var send = document.getElementById("chg-send");
     send.hidden = !chgComments.length;
@@ -4487,6 +4549,9 @@
       var st = document.createElement("span");
       st.className = "st " + f.status;
       st.textContent = { "new": "N", added: "A", deleted: "D", renamed: "R" }[f.status] || "M";
+      var word = { "new": "new", added: "added", deleted: "deleted", renamed: "renamed" }[f.status] || "modified";
+      st.title = word;
+      st.setAttribute("aria-label", word);
       var nm = document.createElement("span");
       nm.className = "nm";
       nm.textContent = f.path;
@@ -4551,6 +4616,7 @@
     box.className = "dcomment";
     var input = document.createElement("input");
     input.placeholder = "Comment on " + path + ":" + line + " — Enter to add, Esc to cancel";
+    input.setAttribute("aria-label", "Comment on " + path + " line " + line);
     box.appendChild(input);
     row.parentNode.insertBefore(box, row.nextSibling);
     input.focus();
@@ -4980,8 +5046,10 @@
   })();
   // /settings:appearance
   function showSettingsPane(name) {
+    // Roving tabindex: only the current tab is in the Tab order; arrows move.
     [].forEach.call(document.querySelectorAll("#settings .set-nav button"), function (b) {
       b.setAttribute("aria-selected", String(b.dataset.pane === name));
+      b.tabIndex = b.dataset.pane === name ? 0 : -1;
     });
     [].forEach.call(document.querySelectorAll("#settings .set-pane"), function (p) {
       p.hidden = p.dataset.pane !== name;
@@ -4995,6 +5063,7 @@
     document.getElementById("set-path").textContent = s.config_path ? "Saved to " + s.config_path : "";
     document.getElementById("set-setup").hidden = !s.needs_setup;
     showSettingsPane(typeof pane === "string" ? pane : s.needs_setup ? "models" : (box.dataset.pane || "models"));
+    if (box.hidden) rememberFocus("settings");
     box.hidden = false;
     overlayHooks.open();
     var first = box.querySelector(".set-pane:not([hidden]) input, .set-pane:not([hidden]) textarea, .set-pane:not([hidden]) select");
@@ -5005,6 +5074,7 @@
     if (!box || box.hidden) return;
     box.hidden = true;
     overlayHooks.close();
+    restoreFocus("settings");
   }
   function renderSettings(s) {
     settingsData = s || {};
@@ -5198,6 +5268,9 @@
     busyNow = !!d.busy;
     var compBox = document.getElementById("comp");
     if (compBox) compBox.classList.toggle("busy", busyNow);
+    // A screen reader waits for the reply to finish streaming, then reads it.
+    var logBox = document.getElementById("log");
+    if (logBox) logBox.setAttribute("aria-busy", busyNow ? "true" : "false");
     // Switching chats: keep what was typed in the old one, bring back the new one's.
     var nextSession = d.session || "";
     if (nextSession !== currentSession) {
@@ -5692,6 +5765,33 @@
         sendVisible(true);
       }
     };
+    // Focus trap for the open modal: Tab and Shift+Tab wrap inside it instead
+    // of walking into the page behind. The last open one in DOM order is on
+    // top (the approval card sits above everything else).
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Tab") return;
+      var cards = document.querySelectorAll('[role="dialog"][aria-modal="true"]');
+      var card = null;
+      for (var i = cards.length - 1; i >= 0; i--) {
+        if (cards[i].getClientRects().length) { card = cards[i]; break; }
+      }
+      if (!card) return;
+      var all = card.querySelectorAll('button, input, textarea, select, a[href], [tabindex]:not([tabindex="-1"])');
+      var f = [].filter.call(all, function (e) {
+        return !e.disabled && e.type !== "hidden" && !(e.type === "radio" && !e.checked) &&
+          e.tabIndex >= 0 && e.getClientRects().length;
+      });
+      if (!f.length) return;
+      var first = f[0], lastEl = f[f.length - 1], at = document.activeElement;
+      var inside = card.contains(at);
+      if (ev.shiftKey && (at === first || !inside || at === card)) {
+        ev.preventDefault();
+        lastEl.focus();
+      } else if (!ev.shiftKey && (at === lastEl || !inside)) {
+        ev.preventDefault();
+        first.focus();
+      }
+    }, true);
     var sideSearch = document.getElementById("side-search");
     if (sideSearch) {
       sideSearch.addEventListener("input", function () {
@@ -5779,8 +5879,8 @@
       });
     }
     var changesBtn = document.getElementById("changes-btn");
-    if (changesBtn) changesBtn.addEventListener("click", function () { postToRust({ type: "load_changes" }); });
-    document.getElementById("chg-refresh").addEventListener("click", function () { postToRust({ type: "load_changes" }); });
+    if (changesBtn) changesBtn.addEventListener("click", loadChanges);
+    document.getElementById("chg-refresh").addEventListener("click", loadChanges);
     document.getElementById("chg-close").addEventListener("click", closeChanges);
     document.getElementById("set-usage").addEventListener("click", function () { closeSettings(); openUsage(); });
     document.getElementById("use-close").addEventListener("click", closeUsage);
@@ -5844,6 +5944,26 @@
           showSettingsPane(b.dataset.pane);
         });
       });
+      // Tablist keys (same as the effort radio group): arrows wrap, Home/End
+      // jump, and the matching pane shows at once.
+      var setNav = setBox.querySelector(".set-nav");
+      if (setNav) {
+        setNav.addEventListener("keydown", function (ev) {
+          var tabs = [].slice.call(setNav.querySelectorAll('[role="tab"]'));
+          var at = tabs.indexOf(document.activeElement);
+          if (at < 0) return;
+          var to = -1;
+          if (ev.key === "ArrowRight" || ev.key === "ArrowDown") to = (at + 1) % tabs.length;
+          else if (ev.key === "ArrowLeft" || ev.key === "ArrowUp") to = (at + tabs.length - 1) % tabs.length;
+          else if (ev.key === "Home") to = 0;
+          else if (ev.key === "End") to = tabs.length - 1;
+          if (to < 0) return;
+          ev.preventDefault();
+          setBox.dataset.pane = tabs[to].dataset.pane;
+          showSettingsPane(tabs[to].dataset.pane);
+          tabs[to].focus();
+        });
+      }
     }
     document.addEventListener("keydown", function (ev) {
       if ((ev.ctrlKey || ev.metaKey) && ev.key === ",") { ev.preventDefault(); openSettings(); }
@@ -6010,13 +6130,45 @@
     var gitChip = document.getElementById("git-chip");
     var gitMenu = document.getElementById("git-menu");
     if (gitChip && gitMenu) {
+      // One place opens and closes the menu so aria-expanded always matches.
+      var setGitMenu = function (open, refocus) {
+        gitMenu.hidden = !open;
+        gitChip.setAttribute("aria-expanded", open ? "true" : "false");
+        if (open) {
+          document.getElementById("git-new").hidden = true;
+          var firstItem = gitMenu.querySelector(".git-item");
+          if (firstItem) firstItem.focus();
+        } else if (refocus) {
+          gitChip.focus();
+        }
+      };
       gitChip.addEventListener("click", function (ev) {
         ev.stopPropagation();
-        gitMenu.hidden = !gitMenu.hidden;
-        document.getElementById("git-new").hidden = true;
+        setGitMenu(gitMenu.hidden, false);
       });
       document.addEventListener("click", function (ev) {
-        if (!gitMenu.hidden && !(ev.target && ev.target.closest && ev.target.closest("#git-wrap"))) gitMenu.hidden = true;
+        if (!gitMenu.hidden && !(ev.target && ev.target.closest && ev.target.closest("#git-wrap"))) setGitMenu(false, false);
+      });
+      // Keyboard: arrows move between items, Home/End jump, Escape closes
+      // and gives focus back to the chip.
+      gitMenu.addEventListener("keydown", function (ev) {
+        if (ev.key === "Escape") {
+          ev.preventDefault();
+          ev.stopPropagation();
+          setGitMenu(false, true);
+          return;
+        }
+        if (ev.target && ev.target.id === "git-new-name") return;
+        var its = [].slice.call(gitMenu.querySelectorAll(".git-item"));
+        var at = its.indexOf(document.activeElement);
+        var to = -1;
+        if (ev.key === "ArrowDown") to = (at + 1) % its.length;
+        else if (ev.key === "ArrowUp") to = at <= 0 ? its.length - 1 : at - 1;
+        else if (ev.key === "Home") to = 0;
+        else if (ev.key === "End") to = its.length - 1;
+        if (to < 0) return;
+        ev.preventDefault();
+        its[to].focus();
       });
       var makeBranch = function () {
         var nameEl = document.getElementById("git-new-name");
@@ -6024,12 +6176,11 @@
         if (!name) return;
         postToRust({ type: "new_branch", name: name });
         nameEl.value = "";
-        gitMenu.hidden = true;
+        setGitMenu(false, true);
       };
       document.getElementById("git-new-ok").addEventListener("click", makeBranch);
       document.getElementById("git-new-name").addEventListener("keydown", function (ev) {
         if (ev.key === "Enter") { ev.preventDefault(); makeBranch(); }
-        if (ev.key === "Escape") gitMenu.hidden = true;
       });
       var items = gitMenu.querySelectorAll(".git-item");
       for (var gi = 0; gi < items.length; gi++) {
@@ -6041,8 +6192,8 @@
             document.getElementById("git-new-name").focus();
             return;
           }
-          gitMenu.hidden = true;
-          if (what === "changes") postToRust({ type: "load_changes" });
+          setGitMenu(false, false);
+          if (what === "changes") loadChanges();
           else runFollowup(GIT_PROMPTS[what]);
         });
       }
