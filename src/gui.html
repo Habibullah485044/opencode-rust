@@ -3063,7 +3063,7 @@
   function runFollowup(text) {
     var nb = document.getElementById("next-box");
     if (nb) nb.hidden = true;
-    if (text === "@changes") { postToRust({ type: "load_changes" }); return; }
+    if (text === "@changes") { loadChanges(); return; }
     postToRust({ type: "send", text: text });
     rememberPrompt(text);
   }
@@ -3696,6 +3696,17 @@
   var ROWS_PER_PROJECT = 5;
   // Set by initApp: hide / restore the native preview while an overlay is up.
   var overlayHooks = { open: function () {}, close: function () {} };
+  // Dialogs hand focus back to whatever opened them; otherwise closing one
+  // leaves focus on <body> and the keyboard user starts again from the top.
+  var overlayFocus = {};
+  function rememberFocus(id) {
+    if (!(id in overlayFocus)) overlayFocus[id] = document.activeElement;
+  }
+  function restoreFocus(id) {
+    var el = overlayFocus[id];
+    delete overlayFocus[id];
+    if (el && el !== document.body && el.focus && document.contains(el)) el.focus();
+  }
 
   var ICONS = {
     chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
@@ -4158,6 +4169,7 @@
   function openHistory() {
     var h = document.getElementById("history");
     if (!h) return;
+    if (h.hidden) rememberFocus("history");
     historyOpen = true;
     h.hidden = false;
     overlayHooks.open();
@@ -4171,6 +4183,7 @@
     historyOpen = false;
     h.hidden = true;
     overlayHooks.close();
+    restoreFocus("history");
   }
 
   // ---- Autocomplete: "/" commands at the start, "@" project files ----
@@ -4259,9 +4272,25 @@
     chgData = data || { files: [] };
     if (chgPick >= (chgData.files || []).length) chgPick = 0;
     var box = document.getElementById("changes");
-    if (box.hidden) { box.hidden = false; overlayHooks.open(); }
+    if (box.hidden) { rememberFocus("changes"); box.hidden = false; overlayHooks.open(); }
     renderChanges();
   };
+  // git diff can take seconds: open the dialog at once and say so, and keep
+  // Refresh disabled until showChanges answers so it is not clicked twice.
+  function loadChanges() {
+    var box = document.getElementById("changes");
+    if (box.hidden) {
+      rememberFocus("changes");
+      document.getElementById("chg-files").textContent = "";
+      document.getElementById("chg-diff").textContent = "";
+      box.hidden = false;
+      overlayHooks.open();
+      document.getElementById("chg-close").focus();
+    }
+    document.getElementById("chg-sub").textContent = "Loading changes…";
+    document.getElementById("chg-refresh").disabled = true;
+    postToRust({ type: "load_changes" });
+  }
   // ---- Token usage dashboard (Settings → Token usage) ----
   var useData = null;
   var useDays = 7;
@@ -4467,11 +4496,21 @@
     useData = data || {};
     useDays = useData.days || 0;
     var box = document.getElementById("usage");
-    if (box.hidden) { box.hidden = false; overlayHooks.open(); }
+    if (box.hidden) { rememberFocus("usage"); box.hidden = false; overlayHooks.open(); }
     renderUsage();
   };
+  // Open at once with a loading line: the numbers come back from Rust, and
+  // until then a click looked like it did nothing.
   function openUsage(days) {
     if (days != null) useDays = days;
+    var box = document.getElementById("usage");
+    if (box.hidden) {
+      rememberFocus("usage");
+      box.hidden = false;
+      overlayHooks.open();
+      document.getElementById("use-close").focus();
+    }
+    document.getElementById("use-sub").textContent = "Loading…";
     postToRust({ type: "load_usage", days: useDays || null });
   }
   function closeUsage() {
@@ -4479,16 +4518,19 @@
     if (!box || box.hidden) return;
     box.hidden = true;
     overlayHooks.close();
+    restoreFocus("usage");
   }
   function closeChanges() {
     var box = document.getElementById("changes");
     if (!box || box.hidden) return;
     box.hidden = true;
     overlayHooks.close();
+    restoreFocus("changes");
   }
   function renderChanges() {
     var files = chgData.files || [];
     var sub = document.getElementById("chg-sub");
+    document.getElementById("chg-refresh").disabled = false;
     sub.textContent = chgData.error ? "" : files.length + " file" + (files.length === 1 ? "" : "s") + " changed";
     var send = document.getElementById("chg-send");
     send.hidden = !chgComments.length;
@@ -5014,6 +5056,7 @@
     document.getElementById("set-path").textContent = s.config_path ? "Saved to " + s.config_path : "";
     document.getElementById("set-setup").hidden = !s.needs_setup;
     showSettingsPane(typeof pane === "string" ? pane : s.needs_setup ? "models" : (box.dataset.pane || "models"));
+    if (box.hidden) rememberFocus("settings");
     box.hidden = false;
     overlayHooks.open();
     var first = box.querySelector(".set-pane:not([hidden]) input, .set-pane:not([hidden]) textarea, .set-pane:not([hidden]) select");
@@ -5024,6 +5067,7 @@
     if (!box || box.hidden) return;
     box.hidden = true;
     overlayHooks.close();
+    restoreFocus("settings");
   }
   function renderSettings(s) {
     settingsData = s || {};
@@ -5714,6 +5758,33 @@
         sendVisible(true);
       }
     };
+    // Focus trap for the open modal: Tab and Shift+Tab wrap inside it instead
+    // of walking into the page behind. The last open one in DOM order is on
+    // top (the approval card sits above everything else).
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Tab") return;
+      var cards = document.querySelectorAll('[role="dialog"][aria-modal="true"]');
+      var card = null;
+      for (var i = cards.length - 1; i >= 0; i--) {
+        if (cards[i].getClientRects().length) { card = cards[i]; break; }
+      }
+      if (!card) return;
+      var all = card.querySelectorAll('button, input, textarea, select, a[href], [tabindex]:not([tabindex="-1"])');
+      var f = [].filter.call(all, function (e) {
+        return !e.disabled && e.type !== "hidden" && !(e.type === "radio" && !e.checked) &&
+          e.tabIndex >= 0 && e.getClientRects().length;
+      });
+      if (!f.length) return;
+      var first = f[0], lastEl = f[f.length - 1], at = document.activeElement;
+      var inside = card.contains(at);
+      if (ev.shiftKey && (at === first || !inside || at === card)) {
+        ev.preventDefault();
+        lastEl.focus();
+      } else if (!ev.shiftKey && (at === lastEl || !inside)) {
+        ev.preventDefault();
+        first.focus();
+      }
+    }, true);
     var sideSearch = document.getElementById("side-search");
     if (sideSearch) {
       sideSearch.addEventListener("input", function () {
@@ -5801,8 +5872,8 @@
       });
     }
     var changesBtn = document.getElementById("changes-btn");
-    if (changesBtn) changesBtn.addEventListener("click", function () { postToRust({ type: "load_changes" }); });
-    document.getElementById("chg-refresh").addEventListener("click", function () { postToRust({ type: "load_changes" }); });
+    if (changesBtn) changesBtn.addEventListener("click", loadChanges);
+    document.getElementById("chg-refresh").addEventListener("click", loadChanges);
     document.getElementById("chg-close").addEventListener("click", closeChanges);
     document.getElementById("set-usage").addEventListener("click", function () { closeSettings(); openUsage(); });
     document.getElementById("use-close").addEventListener("click", closeUsage);
