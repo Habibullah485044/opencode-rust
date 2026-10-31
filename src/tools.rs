@@ -2579,8 +2579,10 @@ mod review_fix_tests {
         let (out, _, loose) = apply_edit("a\r\nb\nc\n", "  b", "B", false).unwrap();
         assert!(loose);
         assert_eq!(out, "a\r\nB\nc\n", "only the edited line changes");
-        let (out, _, _) = apply_edit("a\r\n  b\r\nc", "b\nc", "B\nC\nD", false).unwrap();
-        assert_eq!(out, "a\r\n  B\r\n  C\r\n  D", "no CR added at a last line that had none");
+        // (Not an exact substring, so the loose path runs.)
+        let (out, _, loose) = apply_edit("a\r\n\tb\r\nc", " b\nc", "B\nC\nD", false).unwrap();
+        assert!(loose);
+        assert_eq!(out, "a\r\nB\r\nC\r\nD", "no CR added at a last line that had none");
     }
 
     /// Exponential backtracking: `*a*a*…b` against a long run of `a`.
