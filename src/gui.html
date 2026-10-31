@@ -2495,9 +2495,9 @@
     </div>
     <div id="tb-title">New chat</div>
     <div class="tb-btns">
-      <button class="tb" data-a="min" title="Minimize">&#x2500;</button>
-      <button class="tb" data-a="max" title="Maximize">&#x25A1;</button>
-      <button class="tb close" data-a="close" title="Close">&#x2715;</button>
+      <button class="tb" data-a="min" title="Minimize" aria-label="Minimize">&#x2500;</button>
+      <button class="tb" data-a="max" title="Maximize" aria-label="Maximize">&#x25A1;</button>
+      <button class="tb close" data-a="close" title="Close" aria-label="Close">&#x2715;</button>
     </div>
   </div>
 
@@ -2511,7 +2511,7 @@
 
       <label class="side-search">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <input id="side-search" type="text" placeholder="Search chats" spellcheck="false" autocomplete="off" />
+        <input id="side-search" type="text" aria-label="Search chats" placeholder="Search chats" spellcheck="false" autocomplete="off" />
         <kbd>Ctrl K</kbd>
       </label>
 
@@ -2526,7 +2526,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
           History
         </button>
-        <div class="api" id="api">
+        <div class="api" id="api" role="status">
           <span class="dot"></span>
           <span id="apitxt">connecting…</span>
         </div>
@@ -2557,7 +2557,7 @@
       </div>
 
       <div id="entries">
-        <div id="log"></div>
+        <div id="log" role="log" aria-live="polite" aria-relevant="additions" aria-busy="false"></div>
         
         <!-- Empty State Screen -->
         <div id="empty">
@@ -2646,7 +2646,7 @@
           <pre id="term-out"></pre>
           <div class="term-row" id="term-row">
             <span id="term-cwd"></span><span>$</span>
-            <input id="term-input" placeholder="Run a command in this folder (no interactive programs)" spellcheck="false" autocomplete="off" />
+            <input id="term-input" aria-label="Terminal command" placeholder="Run a command in this folder (no interactive programs)" spellcheck="false" autocomplete="off" />
             <button type="button" class="term-act" id="term-stop" hidden title="Stop the running command (Ctrl+C)">Stop</button>
           </div>
         </div>
@@ -2679,7 +2679,7 @@
           <div id="queue-more"></div>
         </div>
         <div id="comp">
-          <textarea id="input" rows="1" placeholder="Message Habi or ask a question…" autocomplete="off" spellcheck="false"></textarea>
+          <textarea id="input" rows="1" aria-label="Message" aria-controls="ac-menu" aria-expanded="false" aria-autocomplete="list" placeholder="Message Habi or ask a question…" autocomplete="off" spellcheck="false"></textarea>
           <div class="comp-bottom-row">
             <button type="button" id="attach-btn" title="Attach files (you can also paste or drop screenshots)" aria-label="Attach files">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21.4 11.1l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8l8.5-8.5a3.7 3.7 0 0 1 5.2 5.2l-8.5 8.5a1.8 1.8 0 0 1-2.6-2.6l7.8-7.8"/></svg>
@@ -2732,14 +2732,14 @@
           <span class="tabx" id="b-tab-close" title="Close preview">&times;</span>
         </span>
         <span class="spacer"></span>
-        <button class="b-close-btn" id="close-browser-btn" title="Close Preview Panel">&times;</button>
+        <button class="b-close-btn" id="close-browser-btn" title="Close Preview Panel" aria-label="Close preview panel">&times;</button>
       </div>
       <div id="urlrow">
-        <button class="nb" id="nav-back" title="Back" disabled>&#x2190;</button>
-        <button class="nb" id="nav-fwd" title="Forward" disabled>&#x2192;</button>
-        <button class="nb" id="nav-reload" title="Reload">&#x27F3;</button>
-        <input id="url" type="text" spellcheck="false" autocomplete="off" placeholder="Paste a link or localhost:3000" />
-        <button class="nb" id="nav-go" title="Go">&#x27A4;</button>
+        <button class="nb" id="nav-back" title="Back" aria-label="Back" disabled>&#x2190;</button>
+        <button class="nb" id="nav-fwd" title="Forward" aria-label="Forward" disabled>&#x2192;</button>
+        <button class="nb" id="nav-reload" title="Reload" aria-label="Reload">&#x27F3;</button>
+        <input id="url" type="text" aria-label="Address" spellcheck="false" autocomplete="off" placeholder="Paste a link or localhost:3000" />
+        <button class="nb" id="nav-go" title="Go" aria-label="Go">&#x27A4;</button>
       </div>
       <div id="bcontent">
         <div class="b-empty" id="b-empty">
@@ -2762,8 +2762,8 @@
   <div class="hist-card" role="dialog" aria-modal="true" aria-label="History">
     <div class="hist-head">
       <b>History</b>
-      <input id="hist-search" type="text" placeholder="Search all chats" spellcheck="false" autocomplete="off" />
-      <button class="hist-close" id="hist-close" title="Close (Esc)">&times;</button>
+      <input id="hist-search" type="text" aria-label="Search all chats" placeholder="Search all chats" spellcheck="false" autocomplete="off" />
+      <button class="hist-close" id="hist-close" title="Close (Esc)" aria-label="Close history">&times;</button>
     </div>
     <div id="hist-list"></div>
   </div>
@@ -2778,7 +2778,7 @@
       <span style="flex:1"></span>
       <button type="button" id="chg-send" hidden>Send comments</button>
       <button type="button" id="chg-refresh" title="Load again">Refresh</button>
-      <button class="hist-close" id="chg-close" title="Close (Esc)">&times;</button>
+      <button class="hist-close" id="chg-close" title="Close (Esc)" aria-label="Close changes">&times;</button>
     </div>
     <div class="chg-body">
       <div id="chg-files"></div>
@@ -2794,7 +2794,7 @@
       <b>Settings</b>
       <span class="set-note" id="set-setup" hidden>Choose a model provider to start.</span>
       <span style="flex:1"></span>
-      <button class="hist-close" id="set-close" title="Close (Esc)">&times;</button>
+      <button class="hist-close" id="set-close" title="Close (Esc)" aria-label="Close settings">&times;</button>
     </div>
     <div class="set-layout">
       <nav class="set-nav" role="tablist" aria-label="Settings pages">
@@ -2963,7 +2963,7 @@
         <button type="button" data-days="0">All time</button>
       </div>
       <button type="button" id="use-refresh" title="Load again">Refresh</button>
-      <button class="hist-close" id="use-close" title="Close (Esc)">&times;</button>
+      <button class="hist-close" id="use-close" title="Close (Esc)" aria-label="Close usage">&times;</button>
     </div>
     <div class="use-body" id="use-body"></div>
   </div>
@@ -2974,7 +2974,7 @@
 
 <!-- D1: tool-approval modal. Not part of #app so it can sit above everything. -->
 <div id="approval" hidden>
-  <div class="ap-card" id="ap-card" role="dialog" aria-modal="true" aria-labelledby="ap-title" tabindex="-1">
+  <div class="ap-card" id="ap-card" role="dialog" aria-modal="true" aria-labelledby="ap-title" aria-describedby="ap-detail" tabindex="-1">
     <div class="ap-head">
       <span class="ap-badge" id="ap-tool">tool</span>
       <span class="ap-chat" id="ap-chat" hidden></span>
@@ -3119,6 +3119,7 @@
       b.type = "button";
       b.className = "term-tab" + (termTab === id ? " on" : "");
       b.setAttribute("role", "tab");
+      b.setAttribute("aria-selected", termTab === id ? "true" : "false");
       b.setAttribute("data-id", id);
       b.title = title;
       if (live) {
@@ -3738,6 +3739,7 @@
     if (renamingId === s.id) {
       var inp = document.createElement("input");
       inp.className = "rename";
+      inp.setAttribute("aria-label", "Chat name");
       inp.value = s.title || "New chat";
       inp.addEventListener("keydown", function (ev) {
         ev.stopPropagation();
@@ -3765,6 +3767,9 @@
     var title = document.createElement("span");
     title.textContent = s.title || "New chat";
     row.title = s.title || "New chat";
+    // The status dot is colour only; put its meaning in the row's name.
+    row.setAttribute("aria-label", (s.title || "New chat") +
+      (s.needs ? ", waiting for approval" : s.running ? ", working" : ""));
     row.appendChild(title);
     if (s.pinned) row.insertAdjacentHTML("beforeend", svg(ICONS.pin, "pin-mark"));
     var acts = document.createElement("span");
@@ -4186,10 +4191,20 @@
     if (!menu) return;
     menu.hidden = !ac.kind || !ac.items.length;
     menu.textContent = "";
+    // The composer owns the listbox: a screen reader follows the pick
+    // through aria-activedescendant while focus stays in the textarea.
+    var ta = document.getElementById("input");
+    if (ta) {
+      ta.setAttribute("aria-expanded", menu.hidden ? "false" : "true");
+      if (menu.hidden) ta.removeAttribute("aria-activedescendant");
+      else ta.setAttribute("aria-activedescendant", "ac-opt-" + ac.pick);
+    }
     ac.items.forEach(function (it, i) {
       var row = document.createElement("div");
       row.className = "ac-item" + (i === ac.pick ? " on" : "");
+      row.id = "ac-opt-" + i;
       row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", i === ac.pick ? "true" : "false");
       var k = document.createElement("span");
       k.className = "k";
       k.textContent = ac.kind === "cmd" ? "/" + it[0] : "@" + it[0];
@@ -4487,6 +4502,9 @@
       var st = document.createElement("span");
       st.className = "st " + f.status;
       st.textContent = { "new": "N", added: "A", deleted: "D", renamed: "R" }[f.status] || "M";
+      var word = { "new": "new", added: "added", deleted: "deleted", renamed: "renamed" }[f.status] || "modified";
+      st.title = word;
+      st.setAttribute("aria-label", word);
       var nm = document.createElement("span");
       nm.className = "nm";
       nm.textContent = f.path;
@@ -4551,6 +4569,7 @@
     box.className = "dcomment";
     var input = document.createElement("input");
     input.placeholder = "Comment on " + path + ":" + line + " — Enter to add, Esc to cancel";
+    input.setAttribute("aria-label", "Comment on " + path + " line " + line);
     box.appendChild(input);
     row.parentNode.insertBefore(box, row.nextSibling);
     input.focus();
@@ -5198,6 +5217,9 @@
     busyNow = !!d.busy;
     var compBox = document.getElementById("comp");
     if (compBox) compBox.classList.toggle("busy", busyNow);
+    // A screen reader waits for the reply to finish streaming, then reads it.
+    var logBox = document.getElementById("log");
+    if (logBox) logBox.setAttribute("aria-busy", busyNow ? "true" : "false");
     // Switching chats: keep what was typed in the old one, bring back the new one's.
     var nextSession = d.session || "";
     if (nextSession !== currentSession) {
