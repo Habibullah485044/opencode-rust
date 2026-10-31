@@ -228,7 +228,7 @@ pub async fn spawn_subagent(
         .cloned()
         .ok_or_else(|| anyhow!("unknown subagent `{name}` (available: {})", names()))?;
     let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
-    let id = start(st, parent_session_id, role, task, background)?;
+    let id = start(st, parent_session_id, role, task, background).await?;
     if background {
         return Ok(format!(
             "[subagent `{name}` → session {id} · started in the background]\n\
@@ -256,10 +256,16 @@ pub async fn spawn_subagent(
 
 /// Create the child session, register the run and start it. Returns the
 /// child's id (its session id).
-fn start(st: &Shared, parent: &str, role: SubagentDef, task: &str, background: bool) -> Result<String> {
-    let session = st.db.create_session(&format!("sub:{}", role.name), Some(parent))?;
-    st.db
-        .add_message(&session.id, "user", &[Part::Text { text: task.to_string() }])?;
+async fn start(st: &Shared, parent: &str, role: SubagentDef, task: &str, background: bool) -> Result<String> {
+    let (title, parent_id, text) = (format!("sub:{}", role.name), parent.to_string(), task.to_string());
+    let session = st
+        .db
+        .run(move |db| {
+            let session = db.create_session(&title, Some(&parent_id))?;
+            db.add_message(&session.id, "user", &[Part::Text { text }])?;
+            Ok(session)
+        })
+        .await?;
     let run = Run {
         parent: parent.to_string(),
         role,
@@ -307,6 +313,7 @@ fn finish(st: &Shared, id: &str, state: RunState, report: String) {
     }) else {
         return;
     };
+    run_ended().notify_waiters();
     let first = report.lines().nth(1).or(report.lines().next()).unwrap_or("");
     let panel = if state == RunState::Stopped { "failed" } else { state.as_str() };
     agent_status(st, &info(id, &run), panel, first.to_string());
@@ -328,11 +335,11 @@ async fn run_child(st: &Shared, id: &str) -> Result<(RunState, String)> {
     let sem = slots(&run.parent, st.cfg.agent.max_subagents);
     let _permit = tokio::select! {
         p = sem.acquire_owned() => p.ok(),
-        _ = wait_flag(&abort) => None,
+        _ = crate::server::aborted(&abort) => None,
     };
     if abort.load(Ordering::SeqCst) {
         let stopped = RunState::Stopped;
-        return Ok((stopped, report(st, id, &run, stopped.as_str(), "stopped before it started")));
+        return Ok((stopped, report(st, id, &run, stopped.as_str(), "stopped before it started").await));
     }
     with_runs(|m| m.get_mut(id).map(|r| r.state = RunState::Working));
     agent_status(st, &agent, "working", "starting…".into());
@@ -385,7 +392,7 @@ async fn run_child(st: &Shared, id: &str) -> Result<(RunState, String)> {
         }
         None => {}
     }
-    Ok((state, report(st, id, &run, state.as_str(), &summary)))
+    Ok((state, report(st, id, &run, state.as_str(), &summary).await))
 }
 
 /// The child's system prompt: the shared prompt for its parent chat's
@@ -419,7 +426,8 @@ async fn run_rounds(st: &Shared, id: &str, opts: &LoopOpts, abort: &AtomicBool) 
     let mut out = run_loop(st, id, opts, abort).await;
     while out.is_ok() && !abort.load(Ordering::SeqCst) {
         let Some(text) = take_inbox(id) else { break };
-        st.db.add_message(id, "user", &[Part::Text { text }])?;
+        let sid = id.to_string();
+        st.db.run(move |db| db.add_message(&sid, "user", &[Part::Text { text }])).await?;
         out = run_loop(st, id, opts, abort).await;
     }
     out
@@ -441,21 +449,20 @@ fn end_state(out: Result<String>, aborted: bool) -> (RunState, String) {
     (state, summary)
 }
 
-/// Resolves once `flag` is set.
-async fn wait_flag(flag: &AtomicBool) {
-    while !flag.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 /// The report the parent reads: one header line with the facts, the files
 /// the child wrote, then its own summary.
-fn report(st: &Shared, id: &str, run: &Run, state: &str, summary: &str) -> String {
+async fn report(st: &Shared, id: &str, run: &Run, state: &str, summary: &str) -> String {
+    let sid = id.to_string();
+    let (messages, usage) = st
+        .db
+        .run(move |db| Ok((db.messages(&sid).unwrap_or_default(), db.usage_totals(Some(&sid), None).ok())))
+        .await
+        .unwrap_or_default();
     let mut calls = 0;
     let mut files: Vec<String> = Vec::new();
     // Paths of write/edit calls by call id; listed once their result is ok.
     let mut writes: HashMap<String, String> = HashMap::new();
-    for m in st.db.messages(id).unwrap_or_default() {
+    for m in messages {
         for p in m.parts {
             match p {
                 Part::ToolCall { id, name, input } => {
@@ -483,7 +490,7 @@ fn report(st: &Shared, id: &str, run: &Run, state: &str, summary: &str) -> Strin
         run.elapsed().as_secs_f64(),
         if calls == 1 { "" } else { "s" },
     );
-    if let Ok(u) = st.db.usage_totals(Some(id), None) {
+    if let Some(u) = usage {
         if u.input + u.output > 0 {
             head.push_str(&format!(" · {} tokens", u.input + u.output));
         }
@@ -506,16 +513,37 @@ fn report(st: &Shared, id: &str, run: &Run, state: &str, summary: &str) -> Strin
     format!("{head}\n{summary}{next}")
 }
 
+/// Woken each time a run ends (see `finish`), so `wait_for` needs no polling.
+fn run_ended() -> &'static tokio::sync::Notify {
+    static ENDED: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    ENDED.get_or_init(tokio::sync::Notify::new)
+}
+
 /// Wait until none of `ids` is queued or working, `timeout` passes, or
 /// `abort` is set.
 async fn wait_for(ids: &[String], timeout: Option<Duration>, abort: &AtomicBool) {
-    let until = timeout.map(|t| Instant::now() + t);
-    loop {
-        let busy = with_runs(|m| ids.iter().any(|id| m.get(id).is_some_and(Run::running)));
-        if !busy || abort.load(Ordering::SeqCst) || until.is_some_and(|u| Instant::now() >= u) {
-            return;
+    let ended = async {
+        loop {
+            let notified = run_ended().notified();
+            tokio::pin!(notified);
+            // Registered before the check, so a run ending in between is not lost.
+            notified.as_mut().enable();
+            if !with_runs(|m| ids.iter().any(|id| m.get(id).is_some_and(Run::running))) {
+                return;
+            }
+            notified.await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let deadline = async {
+        match timeout {
+            Some(t) => tokio::time::sleep(t).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        _ = ended => {}
+        _ = crate::server::aborted(abort) => {}
+        _ = deadline => {}
     }
 }
 
@@ -523,7 +551,7 @@ async fn wait_for(ids: &[String], timeout: Option<Duration>, abort: &AtomicBool)
 pub fn stop(id: &str) -> bool {
     with_runs(|m| match m.get(id) {
         Some(run) if run.running() => {
-            run.abort.store(true, Ordering::SeqCst);
+            crate::server::signal_abort(&run.abort);
             true
         }
         _ => false,
@@ -543,7 +571,7 @@ pub fn reviewed_since(parent: &str, since: Instant) -> bool {
 pub fn stop_children(parent: &str) {
     with_runs(|m| {
         for run in m.values().filter(|r| r.parent == parent && r.running()) {
-            run.abort.store(true, Ordering::SeqCst);
+            crate::server::signal_abort(&run.abort);
         }
     });
 }
@@ -629,7 +657,8 @@ async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, 
                 with_runs(|m| m.get_mut(&id).map(|r| r.inbox.push(message.to_string())));
                 return Ok(format!("sent; {id} reads it before its next step"));
             }
-            st.db.add_message(&id, "user", &[Part::Text { text: message.to_string() }])?;
+            let (sid, text) = (id.clone(), message.to_string());
+            st.db.run(move |db| db.add_message(&sid, "user", &[Part::Text { text }])).await?;
             with_runs(|m| {
                 m.get_mut(&id).map(|r| {
                     r.state = RunState::Queued;
