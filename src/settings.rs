@@ -119,6 +119,44 @@ fn save_user_prompt_to(path: &std::path::Path, main: Option<&str>, extra: Option
     Ok(())
 }
 
+/// Write `provider.temperature` into the config file, keeping every other
+/// setting (old file kept as `config.toml.bak`). `None` removes the key:
+/// the model's default, nothing sent.
+pub fn save_temperature(t: Option<f32>) -> Result<PathBuf> {
+    let path = crate::config::default_config_path();
+    save_temperature_to(&path, t)?;
+    Ok(path)
+}
+
+fn save_temperature_to(path: &std::path::Path, t: Option<f32>) -> Result<()> {
+    let mut table: toml::Table = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let _ = std::fs::write(path.with_extension("toml.bak"), &text);
+            text.parse().with_context(|| format!("{} is not valid TOML; fix it or delete it first", path.display()))?
+        }
+        Err(_) => toml::Table::new(),
+    };
+    let provider = table
+        .entry("provider")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("[provider] in {} is not a table", path.display()))?;
+    match t {
+        // Rounded so 0.2 is written as 0.2, not 0.20000000298023224.
+        Some(t) => {
+            provider.insert("temperature".into(), toml::Value::Float((t as f64 * 100.0).round() / 100.0));
+        }
+        None => {
+            provider.remove("temperature");
+        }
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(&table)?).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(all(windows, feature = "gui"))]
 fn protect(data: &[u8]) -> Result<Vec<u8>> {
     dpapi(data, true)
@@ -188,6 +226,26 @@ mod tests {
         assert_eq!(t["agent"]["extra_prompt"].as_str(), Some("Always reply in Urdu."));
         save_user_prompt_to(&path, None, None).unwrap();
         assert!(read()["agent"].get("extra_prompt").is_none(), "empty clears it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temperature_is_saved_and_removed_keeping_other_settings() {
+        let dir = std::env::temp_dir().join(format!("ocrs-temp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[provider]\nmodel = \"m\"\n[agent]\nmax_steps = 7\n").unwrap();
+        let load = || toml::from_str::<crate::config::Config>(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        save_temperature_to(&path, Some(0.2)).unwrap();
+        let cfg = load();
+        assert_eq!(cfg.provider.temperature, Some(0.2));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("temperature = 0.2\n"), "written rounded");
+        assert_eq!(cfg.provider.model, "m", "other settings stay");
+        assert_eq!(cfg.agent.max_steps, 7);
+        assert!(path.with_extension("toml.bak").is_file());
+        save_temperature_to(&path, None).unwrap();
+        assert_eq!(load().provider.temperature, None, "None removes the key");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

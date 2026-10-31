@@ -47,6 +47,12 @@ pub struct Client {
     stream_usage: bool,
     /// `provider.reasoning_effort`, sent when set.
     reasoning_effort: Option<String>,
+    /// `provider.temperature`, sent when set (Anthropic: clamped to 0..1).
+    temperature: Option<f32>,
+    /// The model answered 400 naming "temperature" (many reasoning models
+    /// reject it): stop sending it. Shared by all clones; cleared when the
+    /// temperature or the model changes.
+    temperature_rejected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// `provider.images`: auto / on / off.
     images: String,
     /// The model's context window in tokens as the server reported it
@@ -215,9 +221,64 @@ impl Client {
             prompt_cache: crate::config::PromptCache::Auto,
             stream_usage: true,
             reasoning_effort: None,
+            temperature: None,
+            temperature_rejected: Default::default(),
             images: "auto".into(),
             context: Default::default(),
         })
+    }
+
+    /// Change the sampling temperature in place (Settings > Prompt &
+    /// Temperature). `None` = the model's default: nothing is sent.
+    pub fn set_temperature(&mut self, t: Option<f32>) {
+        self.temperature = t;
+        self.temperature_rejected.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The temperature this client is set to (`None` = the model's default).
+    pub fn temperature(&self) -> Option<f32> {
+        self.temperature
+    }
+
+    /// Put `temperature` into a request body when one is set and the model
+    /// has not rejected it. Anthropic takes 0..1, OpenAI-style APIs 0..2.
+    /// Rounded to 2 places so 0.2 goes out as 0.2, not 0.20000000298.
+    fn add_temperature(&self, body: &mut Value) {
+        if self.temperature_rejected.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let Some(t) = self.temperature.filter(|t| t.is_finite()) else { return };
+        let max = if self.api == ProviderApi::Anthropic { 1.0 } else { 2.0 };
+        let t = (t.clamp(0.0, max) as f64 * 100.0).round() / 100.0;
+        body["temperature"] = json!(t);
+    }
+
+    /// `send_with_retry` for a JSON body. When the body carries a
+    /// temperature and the provider answers 400 about it, the request is
+    /// sent once more without it, and this client stops sending it.
+    async fn send_body(
+        &self,
+        url: &str,
+        mut body: Value,
+        build: impl Fn(&Value) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        let first = self.send_with_retry(url, || build(&body)).await;
+        match first {
+            Err(e) if body.get("temperature").is_some() && rejects_temperature(&e.to_string()) => {
+                self.temperature_rejected.store(true, std::sync::atomic::Ordering::Relaxed);
+                if !cfg!(test) {
+                    crate::server::core_log(&format!(
+                        "[provider] {} rejected `temperature`; sending requests without it from now on",
+                        self.model
+                    ));
+                }
+                if let Some(o) = body.as_object_mut() {
+                    o.remove("temperature");
+                }
+                self.send_with_retry(url, || build(&body)).await
+            }
+            r => r,
+        }
     }
 
     /// Record the model's context window (from `/models` or Ollama's
@@ -236,6 +297,7 @@ impl Client {
         c.prompt_cache = p.prompt_cache;
         c.stream_usage = p.stream_usage;
         c.reasoning_effort = p.reasoning_effort.clone().filter(|e| !e.trim().is_empty());
+        c.temperature = p.temperature;
         c.images = p.images.clone();
         Ok(c)
     }
@@ -357,6 +419,7 @@ impl Client {
                 body["reasoning"] = json!({ "effort": effort });
             }
         }
+        self.add_temperature(&mut body);
         if crate::attachments::model_sees_images(&self.images, model) {
             crate::attachments::attach_images(&mut body);
         }
@@ -379,8 +442,8 @@ impl Client {
         }
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self
-            .send_with_retry(&url, || {
-                let req = self.http.post(&url).json(&body);
+            .send_body(&url, body, |body| {
+                let req = self.http.post(&url).json(body);
                 if self.api_key.is_empty() {
                     req
                 } else {
@@ -413,6 +476,8 @@ impl Client {
     /// helpers, team workers — picks up the new model.
     pub fn set_model(&mut self, model: &str) {
         self.model = model.to_string();
+        // The new model may take the temperature the old one rejected.
+        self.temperature_rejected.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `GET {base}/models` — the ids the endpoint advertises. Best-effort:
@@ -824,6 +889,14 @@ const MAX_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Anything else (400, 401, 404 …) means the request itself is wrong.
 fn is_retryable_status(code: u16) -> bool {
     matches!(code, 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+/// Is this request error the provider refusing the `temperature` field?
+/// (HTTP 400 whose body names it, e.g. "Unsupported parameter:
+/// 'temperature' is not supported with this model.")
+fn rejects_temperature(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("provider returned 400") && e.contains("temperature")
 }
 
 /// The connection failed or broke before the response headers. Not
@@ -1648,6 +1721,71 @@ mod f01_tests {
         let seen = seen.lock().unwrap();
         assert!(seen[0].get("reasoning").is_none(), "unset: nothing extra is sent");
         assert_eq!(seen[1]["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn temperature_rejection_is_recognised() {
+        assert!(rejects_temperature(
+            "provider returned 400 Bad Request: {\"error\":{\"message\":\"Unsupported parameter: 'temperature' is not supported with this model.\"}}"
+        ));
+        assert!(!rejects_temperature("provider returned 400 Bad Request: invalid tools"));
+        assert!(!rejects_temperature("provider returned 500 Internal Server Error: temperature sensor"));
+    }
+
+    #[test]
+    fn temperature_body_is_set_clamped_or_left_out() {
+        let mut c = Client::new("http://x/v1", "", "stub", 30).unwrap();
+        let mut body = json!({});
+        c.add_temperature(&mut body);
+        assert!(body.get("temperature").is_none(), "unset: the model's default");
+        c.set_temperature(Some(0.2));
+        c.add_temperature(&mut body);
+        assert_eq!(body["temperature"], json!(0.2));
+        c.set_temperature(Some(1.7));
+        c.api = ProviderApi::Anthropic;
+        let mut body = json!({});
+        c.add_temperature(&mut body);
+        assert_eq!(body["temperature"], json!(1.0), "Anthropic takes 0..1");
+        c.temperature_rejected.store(true, Ordering::Relaxed);
+        let mut body = json!({});
+        c.add_temperature(&mut body);
+        assert!(body.get("temperature").is_none(), "rejected once: never sent again");
+    }
+
+    #[tokio::test]
+    async fn rejected_temperature_is_dropped_and_retried_once() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let log = seen.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<Value>| {
+                let log = log.clone();
+                async move {
+                    let has = body.0.get("temperature").is_some();
+                    log.lock().unwrap().push(body.0);
+                    if has {
+                        (StatusCode::BAD_REQUEST, "Unsupported parameter: 'temperature'").into_response()
+                    } else {
+                        "data: [DONE]\n\n".into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut c = fast_client(&format!("http://{addr}/v1"), 0);
+        c.set_temperature(Some(0.7));
+        assert!(c.stream("stub", &[], &[]).await.is_ok(), "the retry without it succeeds");
+        assert!(c.stream("stub", &[], &[]).await.is_ok());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "one rejected try, one retry, then never sent again");
+        assert_eq!(seen[0]["temperature"], json!(0.7));
+        assert!(seen[1].get("temperature").is_none());
+        assert!(seen[2].get("temperature").is_none());
     }
 
     #[tokio::test]

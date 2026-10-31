@@ -657,9 +657,10 @@ impl super::Client {
         if self.cache_markers(model) {
             add_cache_markers(&mut body);
         }
+        self.add_temperature(&mut body); // clamped to 0..1 for Anthropic
         let url = format!("{}/messages", self.base_url);
         let resp = self
-            .send_with_retry(&url, || super::with_auth(self.http.post(&url), self.api, &self.api_key).json(&body))
+            .send_body(&url, body, |body| super::with_auth(self.http.post(&url), self.api, &self.api_key).json(body))
             .await?;
         Ok(Box::pin(event_stream(resp.bytes_stream(), self.stall, self.turns.clone())))
     }

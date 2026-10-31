@@ -129,6 +129,8 @@ pub struct GuiSettings {
     /// instructions (else it is added after them).
     pub system_prompt: String,
     pub prompt_replaces: bool,
+    /// `provider.temperature`; `None` = the model's default (nothing sent).
+    pub temperature: Option<f32>,
 }
 
 /// A4: one spawned agent in the agents panel.
@@ -843,6 +845,8 @@ impl GuiState {
                 "config_path": self.settings.config_path,
                 "system_prompt": self.settings.system_prompt,
                 "prompt_replaces": self.settings.prompt_replaces,
+                // Rounded: f32 0.2 would reach the page as 0.20000000298.
+                "temperature": self.settings.temperature.map(|t| (t as f64 * 100.0).round() / 100.0),
             },
             "projects": projects,
             "current_project": self.current_project(),
@@ -958,6 +962,8 @@ pub enum IpcMsg {
     /// Settings → System prompt: the text (empty = none) and whether it
     /// replaces Habi's base instructions.
     SavePrompt { text: String, replace: bool },
+    /// Settings → Temperature: 0..=2, or `None` = the model's default.
+    SaveTemperature(Option<f32>),
     /// Settings page: ask the provider which models it has.
     ListModels,
     /// Write the open chat as Markdown into its project.
@@ -1076,6 +1082,14 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
             text: v.get("text")?.as_str()?.to_string(),
             replace: v.get("replace").and_then(|r| r.as_bool()).unwrap_or(true),
         }),
+        // `value` null (or missing) = the model's default; a number must be 0..=2.
+        "save_temperature" => match v.get("value") {
+            None | Some(serde_json::Value::Null) => Some(IpcMsg::SaveTemperature(None)),
+            Some(n) => {
+                let t = n.as_f64().filter(|t| (0.0..=2.0).contains(t))?;
+                Some(IpcMsg::SaveTemperature(Some(t as f32)))
+            }
+        },
         "list_models" => Some(IpcMsg::ListModels),
         "export" => Some(IpcMsg::Export),
         "pick_files" => Some(IpcMsg::PickFiles),
@@ -2177,6 +2191,7 @@ pub async fn run(
             config_path: crate::config::default_config_path().display().to_string(),
             system_prompt: String::new(),
             prompt_replaces: true,
+            temperature: p.temperature,
         };
         let (main, extra) = state.user_prompt.read().map(|p| p.clone()).unwrap_or_default();
         gs.settings.prompt_replaces = extra.is_none();
@@ -2609,10 +2624,14 @@ pub async fn run(
                         }
                         UiMsg::Ipc(IpcMsg::SaveSettings { base_url, model, api_key, effort }) => {
                             let text = match save_settings(&st, &base_url, &model, api_key.as_deref(), &effort) {
-                                Ok((path, client, has_key)) => {
+                                Ok((path, mut client, has_key)) => {
                                     let st2 = st.clone();
                                     rt.spawn(async move {
-                                        *st2.client.lock().await = client;
+                                        let mut live = st2.client.lock().await;
+                                        // Keep the temperature set at runtime (Settings >
+                                        // Prompt & Temperature), whichever task runs first.
+                                        client.set_temperature(live.temperature());
+                                        *live = client;
                                     });
                                     gs.settings.base_url = base_url;
                                     gs.settings.model = model;
@@ -2642,6 +2661,24 @@ pub async fn run(
                                     }
                                 }
                                 Err(e) => format!("System prompt not saved: {e:#}"),
+                            };
+                            gs.push(EntryKind::System, note);
+                            changed = true;
+                        }
+                        UiMsg::Ipc(IpcMsg::SaveTemperature(t)) => {
+                            let note = match crate::settings::save_temperature(t) {
+                                Ok(_) => {
+                                    let st2 = st.clone();
+                                    rt.spawn(async move {
+                                        st2.client.lock().await.set_temperature(t);
+                                    });
+                                    gs.settings.temperature = t;
+                                    match t {
+                                        None => "Temperature: the model's default (none sent).".to_string(),
+                                        Some(t) => format!("Temperature set to {t:.1}. It applies from the next message."),
+                                    }
+                                }
+                                Err(e) => format!("Temperature not saved: {e:#}"),
                             };
                             gs.push(EntryKind::System, note);
                             changed = true;
@@ -3729,6 +3766,24 @@ mod tests {
         assert_eq!(parse_ipc(r#"{"type":"close"}"#), Some(IpcMsg::Close));
         assert_eq!(parse_ipc(r#"{"type":"wat"}"#), None);
         assert_eq!(parse_ipc("not json"), None);
+    }
+
+    #[test]
+    fn ipc_parses_save_temperature() {
+        assert_eq!(
+            parse_ipc(r#"{"type":"save_temperature","value":0.7}"#),
+            Some(IpcMsg::SaveTemperature(Some(0.7)))
+        );
+        assert_eq!(parse_ipc(r#"{"type":"save_temperature","value":0}"#), Some(IpcMsg::SaveTemperature(Some(0.0))));
+        assert_eq!(parse_ipc(r#"{"type":"save_temperature","value":2}"#), Some(IpcMsg::SaveTemperature(Some(2.0))));
+        assert_eq!(
+            parse_ipc(r#"{"type":"save_temperature","value":null}"#),
+            Some(IpcMsg::SaveTemperature(None)),
+            "null = the model's default"
+        );
+        assert_eq!(parse_ipc(r#"{"type":"save_temperature","value":2.5}"#), None, "above 2 is refused");
+        assert_eq!(parse_ipc(r#"{"type":"save_temperature","value":-0.1}"#), None, "below 0 is refused");
+        assert_eq!(parse_ipc(r#"{"type":"save_temperature","value":"hot"}"#), None);
     }
 
     #[test]

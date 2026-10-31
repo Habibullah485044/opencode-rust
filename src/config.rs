@@ -136,6 +136,12 @@ pub struct ProviderCfg {
     /// "medium" or "high" (OpenAI-style servers; OpenRouter passes it on).
     /// Thinking is billed as output. Unset = the model's default.
     pub reasoning_effort: Option<String>,
+    /// Sampling temperature, 0.0 (focused, repeatable) to 2.0 (varied).
+    /// Unset = the model's default: nothing is sent. Anthropic accepts
+    /// 0..1, so the value is clamped there. A model that rejects it (many
+    /// reasoning models do) gets the request again without it, and the
+    /// client stops sending it.
+    pub temperature: Option<f32>,
     /// Send the images attached to a message to the model: "auto" (when
     /// the model name says it can see, e.g. -vl, gpt-4o, claude, gemini),
     /// "on" or "off".
@@ -178,6 +184,7 @@ impl Default for ProviderCfg {
             max_retries: 3,
             rate_limit_wait_secs: 300,
             reasoning_effort: None,
+            temperature: None,
             images: "auto".into(),
             prompt_cache: PromptCache::Auto,
             stream_usage: true,

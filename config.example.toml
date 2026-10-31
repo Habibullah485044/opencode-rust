@@ -51,6 +51,11 @@ rate_limit_wait_secs = 300
 # faster for routine coding. Unset = the model's default.
 # reasoning_effort = "low"
 
+# Sampling temperature, 0.0 (focused, repeatable) to 2.0 (varied). Unset =
+# the model's default (nothing is sent). Anthropic takes 0..1 (clamped). A
+# model that rejects it is asked again without it, automatically.
+# temperature = 0.2
+
 # Prompt caching. Every request repeats the system prompt, the tool list and
 # the chat so far; providers can keep that start in a cache and bill it at a
 # fraction of the input price (Anthropic ~10%, OpenAI/DeepSeek 10-50%).

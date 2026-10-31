@@ -711,6 +711,199 @@
   }
   .set-body .set-modes input { width: auto; margin-top: 3px; }
   .set-hint { margin: 0; font-size: 11.5px; color: var(--text-muted); line-height: 1.45; }
+  /* Settings frame: a page menu on the left, one page at a time. */
+  #settings .set-card { width: min(820px, 100%); height: min(640px, 100%); }
+  .set-layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 190px 1fr; }
+  .set-nav { display: flex; flex-direction: column; gap: 2px; padding: 12px 8px; border-right: 1px solid var(--line); }
+  .set-nav button {
+    text-align: left; font: inherit; font-size: 13px; padding: 8px 10px; border-radius: var(--radius-s);
+    border: 1px solid transparent; background: transparent; color: var(--text-soft); cursor: pointer;
+  }
+  .set-nav button:hover { background: var(--hover); color: var(--text-strong); }
+  .set-nav button[aria-selected="true"] { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-strong); }
+  .set-layout .set-body { display: flex; flex-direction: column; min-height: 0; overflow: hidden; padding: 0; }
+  .set-pane { flex: 1; min-height: 0; overflow-y: auto; display: grid; align-content: start; gap: 6px; padding: 14px 18px 16px; }
+  .set-pane[hidden] { display: none; }
+  .set-title { margin: 0 0 4px; font-size: 15px; font-weight: 600; color: var(--text-strong); }
+  .set-layout .set-actions { display: flex; align-items: center; gap: 12px; padding: 10px 18px; border-top: 1px solid var(--line); }
+  .set-layout .set-actions .set-path { flex: 1; margin: 0; }
+  @media (max-width: 640px) {
+    .set-layout { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    .set-nav { flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--line); }
+  }
+  /* settings:models styles */
+  #settings .mdl-lead { margin: -2px 0 4px; }
+  #settings .mdl-group {
+    display: grid; gap: 6px; min-width: 0; padding: 12px 14px; margin-bottom: 4px;
+    border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel);
+  }
+  #settings .mdl-headrow { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  #settings .mdl-h { margin: 0; font-size: 13px; font-weight: 600; color: var(--text); }
+  #settings .mdl-group label { margin-top: 4px; }
+  #settings .mdl-group .set-hint { margin: 0; }
+  #settings .mdl-group .set-row { min-width: 0; }
+  #settings .mdl-group .set-row input { flex: 1; min-width: 0; }
+  #settings .mdl-group .set-row button:disabled { opacity: 0.6; cursor: progress; }
+  #settings .mdl-presets button[aria-pressed="true"] { color: var(--accent-strong); background: var(--accent-soft); border-color: var(--accent-line); }
+  #settings .mdl-badge {
+    font-size: 11px; line-height: 1.5; padding: 0 8px; border-radius: 999px; white-space: nowrap;
+    border: 1px solid var(--accent-line); background: var(--accent-soft); color: var(--accent-strong);
+  }
+  #settings .mdl-badge.is-empty { border-color: var(--line-strong); background: transparent; color: var(--text-muted); }
+  #settings .mdl-picker {
+    display: grid; min-width: 0; overflow: hidden;
+    border: 1px solid var(--line-strong); border-radius: var(--radius-s); background: var(--surface);
+  }
+  #settings .mdl-picker[hidden] { display: none; }
+  #settings .mdl-picker:focus-within { border-color: var(--accent-line); }
+  #settings .mdl-picker input {
+    border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; box-shadow: none;
+  }
+  #settings .mdl-list { display: grid; gap: 1px; max-height: 210px; overflow-y: auto; padding: 4px; }
+  #settings .mdl-list button {
+    display: block; width: 100%; min-width: 0; text-align: left; cursor: pointer;
+    font: 12px/1.4 var(--mono, ui-monospace, monospace); padding: 5px 8px;
+    border: 1px solid transparent; border-radius: var(--radius-s); background: transparent; color: var(--text-soft);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #settings .mdl-list button:hover { background: var(--hover); color: var(--text); }
+  #settings .mdl-list button[aria-selected="true"] { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-strong); }
+  #settings .mdl-empty { padding: 10px 8px; font-size: 12px; color: var(--text-muted); }
+  #settings .mdl-seg {
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; padding: 3px;
+    border: 1px solid var(--line-strong); border-radius: var(--radius-s); background: var(--surface);
+  }
+  #settings .mdl-seg button {
+    font: inherit; font-size: 12.5px; padding: 6px 8px; cursor: pointer;
+    border: 1px solid transparent; border-radius: var(--radius-s); background: transparent; color: var(--text-muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #settings .mdl-seg button:hover { color: var(--text); background: var(--hover); }
+  #settings .mdl-seg button[aria-checked="true"] { color: var(--accent-strong); background: var(--accent-soft); border-color: var(--accent-line); font-weight: 600; }
+  #settings .mdl-seg button:focus-visible, #settings .mdl-list button:focus-visible { outline: 2px solid var(--accent-line); outline-offset: -1px; }
+  @media (max-width: 520px) {
+    #settings .mdl-group { padding: 10px; }
+    #settings .mdl-seg { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  /* /settings:models styles */
+  /* settings:prompt styles */
+  #settings .pt-group {
+    display: grid; gap: 8px; min-width: 0; padding: 12px 14px; margin-bottom: 4px;
+    border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel);
+  }
+  #settings .pt-headrow { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; }
+  #settings .pt-h { margin: 0; font-size: 13px; font-weight: 600; color: var(--text); }
+  #settings .pt-count { font: 11px/1.4 var(--mono, ui-monospace, monospace); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  #settings .pt-group textarea { min-height: 140px; }
+  #settings .pt-value {
+    font: 600 12px/1.5 var(--mono, ui-monospace, monospace); padding: 0 8px; border-radius: 999px; white-space: nowrap;
+    border: 1px solid var(--accent-line); background: var(--accent-soft); color: var(--accent-strong);
+  }
+  #settings .pt-group.is-default .pt-value { border-color: var(--line-strong); background: transparent; color: var(--text-muted); font-weight: 400; }
+  #settings .pt-toggle {
+    display: flex; align-items: center; gap: 8px; margin: 0; cursor: pointer; width: fit-content;
+    font-family: inherit; font-size: 12.5px; font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--text-soft);
+  }
+  #settings .pt-dim { color: var(--text-muted); }
+  #settings .pt-toggle input {
+    -webkit-appearance: none; appearance: none; flex: none; position: relative; cursor: pointer;
+    width: 30px; height: 17px; padding: 0; margin: 0; border-radius: 999px;
+    border: 1px solid var(--line-strong); background: var(--surface); box-shadow: none;
+  }
+  #settings .pt-toggle input::before {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%;
+    background: var(--text-muted); transition: transform 0.15s ease, background 0.15s ease;
+  }
+  #settings .pt-toggle input:checked { background: var(--accent-soft); border-color: var(--accent-line); }
+  #settings .pt-toggle input:checked::before { transform: translateX(13px); background: var(--accent); }
+  #settings .pt-toggle input:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
+  #settings .pt-range {
+    width: 100%; height: 22px; padding: 0; margin: 2px 0 0; border: 0; background: transparent; box-shadow: none;
+    accent-color: var(--accent); cursor: pointer;
+  }
+  #settings .pt-range:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
+  #settings .pt-group.is-default .pt-range, #settings .pt-group.is-default .pt-scale { opacity: 0.45; }
+  #settings .pt-scale {
+    display: flex; justify-content: space-between; margin-top: -4px;
+    font: 10.5px/1.3 var(--mono, ui-monospace, monospace); color: var(--text-muted);
+  }
+  #settings .pt-presets button[aria-pressed="true"] { color: var(--accent-strong); background: var(--accent-soft); border-color: var(--accent-line); }
+  #settings .pt-presets button:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+  @media (max-width: 520px) { #settings .pt-group { padding: 10px; } }
+  @media (prefers-reduced-motion: reduce) { #settings .pt-toggle input::before { transition: none; } }
+  /* /settings:prompt styles */
+  /* settings:appearance styles */
+  /* Theme preview colours: the one place literal theme colours live on this
+     page, copied from the tokens on :root (dark), [data-theme="black"] and
+     [data-theme="light"] (whose title bar and sidebar take the dark tokens).
+     Keep them in step when a theme's tokens change. */
+  .thm-c-dark {
+    --p-bg: #071114; --p-top: #081518; --p-side: #081518; --p-side-line: rgba(103, 232, 249, 0.08);
+    --p-side-ink: #5b7b81; --p-side-on: rgba(94, 231, 247, 0.11); --p-side-on-line: rgba(94, 231, 247, 0.38);
+    --p-bub: rgba(94, 231, 247, 0.10); --p-bub-line: rgba(94, 231, 247, 0.38);
+    --p-text: #b4d4d8; --p-muted: #5b7b81; --p-comp: #0c1c20; --p-line: rgba(103, 232, 249, 0.16);
+    --p-accent: #5ee7f7;
+  }
+  .thm-c-black {
+    --p-bg: #000000; --p-top: #000000; --p-side: #000000; --p-side-line: rgba(103, 232, 249, 0.10);
+    --p-side-ink: #5b7b81; --p-side-on: rgba(94, 231, 247, 0.11); --p-side-on-line: rgba(94, 231, 247, 0.38);
+    --p-bub: rgba(94, 231, 247, 0.10); --p-bub-line: rgba(94, 231, 247, 0.38);
+    --p-text: #b4d4d8; --p-muted: #5b7b81; --p-comp: #050b0c; --p-line: rgba(103, 232, 249, 0.19);
+    --p-accent: #5ee7f7;
+  }
+  .thm-c-light {
+    --p-bg: #f3faf9; --p-top: #081518; --p-side: #081518; --p-side-line: rgba(103, 232, 249, 0.09);
+    --p-side-ink: #5f7f85; --p-side-on: rgba(94, 231, 247, 0.12); --p-side-on-line: rgba(94, 231, 247, 0.40);
+    --p-bub: rgba(14, 116, 144, 0.12); --p-bub-line: rgba(14, 116, 144, 0.36);
+    --p-text: #23434a; --p-muted: #67858a; --p-comp: #ffffff; --p-line: rgba(14, 116, 144, 0.22);
+    --p-accent: #0e7490;
+  }
+  /* Page chrome: theme tokens only. (Prefix "thm-": "ap-" is the approval card.) */
+  .thm-label { margin-top: 8px; font-size: 12px; font-weight: 600; color: var(--text-soft); }
+  .thm-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr)); gap: 10px; padding: 2px; }
+  .thm-card {
+    display: flex; flex-direction: column; gap: 9px; padding: 8px; cursor: pointer; outline: none;
+    background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius-l);
+    transition: border-color 0.12s var(--ease), background-color 0.12s var(--ease), box-shadow 0.12s var(--ease);
+  }
+  .thm-card:hover { border-color: var(--accent-line); background: var(--hover); }
+  .thm-card[aria-checked="true"] { border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+  .thm-card:focus-visible { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); }
+  .thm-card[aria-checked="true"]:focus-visible { box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); }
+  .thm-meta { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; row-gap: 1px; align-items: start; padding: 0 2px 2px; }
+  .thm-dot {
+    grid-row: span 2; width: 14px; height: 14px; margin-top: 2px; border-radius: 50%;
+    border: 1.5px solid var(--text-dim); background: transparent;
+  }
+  .thm-card[aria-checked="true"] .thm-dot { border-color: var(--accent); background: radial-gradient(circle, var(--accent) 0 3px, transparent 3.5px); }
+  .thm-name { font-size: 13px; font-weight: 600; color: var(--text-strong); }
+  .thm-card[aria-checked="true"] .thm-name { color: var(--accent-strong); }
+  .thm-desc { font-size: 11.5px; line-height: 1.4; color: var(--text-muted); }
+  /* The mini window: title bar, sidebar with chats, a user bubble, a reply and
+     the composer with its accent send button, drawn in the preview colours. */
+  .thm-pv { position: relative; height: 88px; overflow: hidden; border-radius: var(--radius); border: 1px solid var(--line); }
+  .thm-win {
+    position: absolute; inset: 0; display: grid; grid-template-columns: 27% 1fr; grid-template-rows: 9px 1fr;
+    background: var(--p-bg);
+  }
+  .thm-top { grid-column: 1 / -1; background: var(--p-top); border-bottom: 1px solid var(--p-side-line); }
+  .thm-side { display: flex; flex-direction: column; gap: 5px; padding: 7px 5px; background: var(--p-side); border-right: 1px solid var(--p-side-line); }
+  .thm-side i { display: block; height: 4px; border-radius: 2px; background: var(--p-side-ink); opacity: 0.55; }
+  .thm-side i:first-child { height: 7px; background: var(--p-side-on); box-shadow: inset 0 0 0 1px var(--p-side-on-line); opacity: 1; }
+  .thm-side i:nth-child(3) { width: 70%; }
+  .thm-main { display: flex; flex-direction: column; gap: 5px; min-width: 0; padding: 7px 8px 6px; }
+  .thm-bub { align-self: flex-end; width: 50%; height: 13px; border-radius: 4px 4px 1px 4px; background: var(--p-bub); border: 1px solid var(--p-bub-line); }
+  .thm-ln { width: 80%; height: 4px; border-radius: 2px; background: var(--p-text); opacity: 0.55; }
+  .thm-ln-s { width: 54%; background: var(--p-muted); }
+  .thm-comp {
+    display: flex; align-items: center; justify-content: flex-end; margin-top: auto; height: 15px; padding: 0 2px;
+    border-radius: 8px; background: var(--p-comp); border: 1px solid var(--p-line);
+  }
+  .thm-send { width: 18px; height: 9px; border-radius: 5px; background: var(--p-accent); }
+  /* "Same as Windows": dark on the left, light on the right, cut on a slant. */
+  .thm-pv-system .thm-c-light { clip-path: polygon(62% 0, 100% 0, 100% 100%, 42% 100%); }
+  @media (prefers-reduced-motion: reduce) { .thm-card { transition: none; } }
+  /* /settings:appearance styles */
   .set-note { color: var(--warn); font-size: 12px; }
   .set-body { display: grid; gap: 6px; padding: 14px 16px 16px; }
   .set-body label { font-size: 12px; font-weight: 600; color: var(--text-soft); margin-top: 8px; }
@@ -2603,53 +2796,156 @@
       <span style="flex:1"></span>
       <button class="hist-close" id="set-close" title="Close (Esc)">&times;</button>
     </div>
-    <form id="set-form" class="set-body" novalidate>
-      <label for="set-url">Provider address</label>
-      <div class="set-presets">
-        <button type="button" data-url="https://openrouter.ai/api/v1">OpenRouter</button>
-        <button type="button" data-url="https://api.openai.com/v1">OpenAI</button>
-        <button type="button" data-url="https://api.groq.com/openai/v1">Groq</button>
-        <button type="button" data-url="http://127.0.0.1:11434/v1">Ollama (local)</button>
+    <div class="set-layout">
+      <nav class="set-nav" role="tablist" aria-label="Settings pages">
+        <button type="button" role="tab" data-pane="models" aria-selected="true">Models</button>
+        <button type="button" role="tab" data-pane="prompt" aria-selected="false">Prompt &amp; Temperature</button>
+        <button type="button" role="tab" data-pane="appearance" aria-selected="false">Appearance</button>
+        <button type="button" role="tab" data-pane="usage" aria-selected="false">Usage</button>
+      </nav>
+      <form id="set-form" class="set-body" novalidate>
+        <section class="set-pane" data-pane="models" role="tabpanel" aria-label="Models">
+<!-- settings:models (Models page: provider, model, API key, thinking effort) -->
+      <h2 class="set-title">Models</h2>
+      <p class="set-hint mdl-lead">Where Habi sends requests, which model answers, and how hard it thinks.</p>
+      <div class="mdl-group">
+        <h3 class="mdl-h">Provider</h3>
+        <div class="set-presets mdl-presets" role="group" aria-label="Provider presets">
+          <button type="button" data-url="https://openrouter.ai/api/v1" aria-pressed="false">OpenRouter</button>
+          <button type="button" data-url="https://api.openai.com/v1" aria-pressed="false">OpenAI</button>
+          <button type="button" data-url="https://api.groq.com/openai/v1" aria-pressed="false">Groq</button>
+          <button type="button" data-url="https://www.lumoncode.com/v1" aria-pressed="false">LumonCode</button>
+          <button type="button" data-url="http://127.0.0.1:11434/v1" aria-pressed="false">Ollama (local)</button>
+        </div>
+        <label for="set-url">Address</label>
+        <input id="set-url" type="text" spellcheck="false" autocomplete="off" placeholder="https://openrouter.ai/api/v1" />
+        <p class="set-hint">Any OpenAI-compatible endpoint, usually ending in /v1.</p>
       </div>
-      <input id="set-url" type="text" spellcheck="false" autocomplete="off" placeholder="https://openrouter.ai/api/v1" />
-      <label for="set-model">Model</label>
-      <div class="set-row">
-        <input id="set-model" type="text" list="set-models" spellcheck="false" autocomplete="off" placeholder="e.g. qwen/qwen3-coder:free" />
-        <button type="button" id="set-load-models" title="Ask the provider which models it has">Load models</button>
+      <div class="mdl-group">
+        <h3 class="mdl-h">Model</h3>
+        <label for="set-model">Model id</label>
+        <div class="set-row">
+          <input id="set-model" type="text" spellcheck="false" autocomplete="off" placeholder="e.g. qwen/qwen3-coder:free" />
+          <button type="button" id="set-load-models" title="Ask the provider which models it has">Load models</button>
+        </div>
+        <datalist id="set-models"></datalist>
+        <div class="mdl-picker" id="mdl-picker" hidden>
+          <input id="mdl-search" type="search" spellcheck="false" autocomplete="off" placeholder="Search models" aria-label="Search loaded models" />
+          <div class="mdl-list" id="mdl-list" role="listbox" aria-label="Loaded models"></div>
+        </div>
+        <p class="set-hint" id="mdl-status">Load models asks the saved provider what it offers. Changed the address or key? Save first.</p>
       </div>
-      <datalist id="set-models"></datalist>
-      <label for="set-key">API key</label>
-      <input id="set-key" type="password" autocomplete="off" placeholder="Paste a key (kept encrypted for your Windows user)" />
-      <label for="set-effort">Thinking effort</label>
-      <select id="set-effort">
-        <option value="">Model default</option>
-        <option value="low">Low — cheapest, fastest</option>
-        <option value="medium">Medium</option>
-        <option value="high">High — slowest, most output tokens</option>
-      </select>
-      <label for="set-theme">Appearance</label>
-      <select id="set-theme">
-        <option value="system">Same as Windows</option>
-        <option value="dark">Pixel night (dark)</option>
-        <option value="black">Pure black</option>
-        <option value="light">Paper terminal (light)</option>
-      </select>
-      <label for="set-prompt">System prompt</label>
-      <div class="set-modes" role="radiogroup" aria-label="How your prompt is used">
-        <label><input type="radio" name="set-prompt-mode" id="set-prompt-replace" value="replace" checked />
-          <span><b>Main prompt</b>: your text plus the tool guide, nothing else of Habi's</span></label>
-        <label><input type="radio" name="set-prompt-mode" id="set-prompt-add" value="add" />
-          <span><b>Add to Habi's</b>: your text comes after Habi's instructions</span></label>
+      <div class="mdl-group">
+        <div class="mdl-headrow">
+          <h3 class="mdl-h">API key</h3>
+          <span class="mdl-badge is-empty" id="mdl-key-state">No key saved</span>
+        </div>
+        <div class="set-row">
+          <input id="set-key" type="password" autocomplete="off" aria-label="API key" placeholder="Paste a key" />
+          <button type="button" id="mdl-key-show" aria-controls="set-key" aria-pressed="false">Show</button>
+        </div>
+        <p class="set-hint">Kept encrypted for your Windows user. Leave empty to keep the saved key. Local servers such as Ollama need none.</p>
       </div>
-      <textarea id="set-prompt" spellcheck="false" placeholder="Your own instructions for every chat: who the assistant is, how it works, how it answers. Empty = Habi's own."></textarea>
-      <p class="set-hint">Main prompt: Habi's base instructions, ponytail rules, skills and web guide are left out, and Habi's own extra steps are off (the spec before a task, the final check, design review and ponytail review); the tool guide stays so tools keep working. Approvals and file safety are enforced by the app either way. A provider's own hidden instructions are added on its servers and can't be removed from here.</p>
-      <label>Token usage</label>
+      <div class="mdl-group">
+        <h3 class="mdl-h" id="mdl-effort-h">Thinking effort</h3>
+        <div class="mdl-seg" id="mdl-effort" role="radiogroup" aria-labelledby="mdl-effort-h">
+          <button type="button" role="radio" data-effort="" aria-checked="true">Model default</button>
+          <button type="button" role="radio" data-effort="low" aria-checked="false">Low</button>
+          <button type="button" role="radio" data-effort="medium" aria-checked="false">Medium</button>
+          <button type="button" role="radio" data-effort="high" aria-checked="false">High</button>
+        </div>
+        <select id="set-effort" hidden aria-hidden="true" tabindex="-1">
+          <option value="">Model default</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+        </select>
+        <p class="set-hint" id="mdl-effort-hint"></p>
+      </div>
+<!-- /settings:models -->
+        </section>
+        <section class="set-pane" data-pane="prompt" role="tabpanel" aria-label="Prompt and temperature" hidden>
+<!-- settings:prompt (Prompt & Temperature page: system prompt, temperature) -->
+      <h2 class="set-title">Prompt &amp; Temperature</h2>
+      <div class="pt-group">
+        <div class="pt-headrow">
+          <h3 class="pt-h" id="pt-prompt-h">System prompt</h3>
+          <span class="pt-count" id="pt-prompt-count" aria-live="polite"></span>
+        </div>
+        <div class="set-modes" role="radiogroup" aria-label="How your prompt is used">
+          <label><input type="radio" name="set-prompt-mode" id="set-prompt-replace" value="replace" checked />
+            <span><b>Main prompt</b>: your text plus the tool guide, nothing else of Habi's</span></label>
+          <label><input type="radio" name="set-prompt-mode" id="set-prompt-add" value="add" />
+            <span><b>Add to Habi's</b>: your text comes after Habi's instructions</span></label>
+        </div>
+        <textarea id="set-prompt" spellcheck="false" aria-labelledby="pt-prompt-h" aria-describedby="pt-prompt-count pt-prompt-hint" placeholder="Your own instructions for every chat: who the assistant is, how it works, how it answers. Empty = Habi's own."></textarea>
+        <p class="set-hint" id="pt-prompt-hint">Main prompt leaves out Habi's own instructions and extra steps (spec, final check, reviews); the tool guide stays so tools keep working. Approvals and file safety apply either way. The prompt is sent with every request.</p>
+      </div>
+      <div class="pt-group" id="pt-temp-group">
+        <div class="pt-headrow">
+          <h3 class="pt-h" id="pt-temp-h">Temperature</h3>
+          <output class="pt-value" id="pt-temp-value" for="set-temp" aria-live="polite">Model default</output>
+        </div>
+        <label class="pt-toggle"><input type="checkbox" role="switch" id="set-temp-default" checked />
+          <span>Model default <span class="pt-dim">(send nothing)</span></span></label>
+        <input class="pt-range" type="range" id="set-temp" min="0" max="2" step="0.1" value="0.7" aria-labelledby="pt-temp-h" aria-describedby="pt-temp-hint" />
+        <div class="pt-scale" aria-hidden="true"><span>0 focused</span><span>1</span><span>2 varied</span></div>
+        <div class="set-presets pt-presets" id="pt-temp-presets" role="group" aria-label="Temperature presets">
+          <button type="button" data-temp="0.2" aria-pressed="false">Precise 0.2</button>
+          <button type="button" data-temp="0.7" aria-pressed="false">Balanced 0.7</button>
+          <button type="button" data-temp="1" aria-pressed="false">Creative 1.0</button>
+        </div>
+        <p class="set-hint" id="pt-temp-hint">Lower gives focused, repeatable answers; higher gives more varied ones. Some reasoning models ignore or reject it, and Habi then stops sending it.</p>
+      </div>
+<!-- /settings:prompt -->
+        </section>
+        <section class="set-pane" data-pane="appearance" role="tabpanel" aria-label="Appearance" hidden>
+<!-- settings:appearance (Appearance page: theme) -->
+      <h2 class="set-title">Appearance</h2>
+      <p class="thm-label" id="thm-label">Theme</p>
+      <!-- The chosen theme; Save reads it (cards below set it). -->
+      <input type="hidden" id="set-theme" value="system" />
+      <div class="thm-grid" id="thm-themes" role="radiogroup" aria-labelledby="thm-label" aria-describedby="thm-hint">
+        <div class="thm-card" role="radio" aria-checked="false" tabindex="-1" data-choice="system" aria-labelledby="thm-n-system" aria-describedby="thm-d-system">
+          <div class="thm-pv thm-pv-system" aria-hidden="true">
+            <div class="thm-win thm-c-dark"><div class="thm-top"></div><div class="thm-side"><i></i><i></i><i></i></div><div class="thm-main"><div class="thm-bub"></div><div class="thm-ln"></div><div class="thm-ln thm-ln-s"></div><div class="thm-comp"><div class="thm-send"></div></div></div></div>
+            <div class="thm-win thm-c-light"><div class="thm-top"></div><div class="thm-side"><i></i><i></i><i></i></div><div class="thm-main"><div class="thm-bub"></div><div class="thm-ln"></div><div class="thm-ln thm-ln-s"></div><div class="thm-comp"><div class="thm-send"></div></div></div></div>
+          </div>
+          <div class="thm-meta"><span class="thm-dot"></span><span class="thm-name" id="thm-n-system">Same as Windows</span><span class="thm-desc" id="thm-d-system">Paper terminal when Windows is light, Pixel night when it is dark.</span></div>
+        </div>
+        <div class="thm-card" role="radio" aria-checked="false" tabindex="-1" data-choice="dark" aria-labelledby="thm-n-dark" aria-describedby="thm-d-dark">
+          <div class="thm-pv" aria-hidden="true">
+            <div class="thm-win thm-c-dark"><div class="thm-top"></div><div class="thm-side"><i></i><i></i><i></i></div><div class="thm-main"><div class="thm-bub"></div><div class="thm-ln"></div><div class="thm-ln thm-ln-s"></div><div class="thm-comp"><div class="thm-send"></div></div></div></div>
+          </div>
+          <div class="thm-meta"><span class="thm-dot"></span><span class="thm-name" id="thm-n-dark">Pixel night</span><span class="thm-desc" id="thm-d-dark">Deep teal-black lit by terminal cyan. The default dark look.</span></div>
+        </div>
+        <div class="thm-card" role="radio" aria-checked="false" tabindex="-1" data-choice="black" aria-labelledby="thm-n-black" aria-describedby="thm-d-black">
+          <div class="thm-pv" aria-hidden="true">
+            <div class="thm-win thm-c-black"><div class="thm-top"></div><div class="thm-side"><i></i><i></i><i></i></div><div class="thm-main"><div class="thm-bub"></div><div class="thm-ln"></div><div class="thm-ln thm-ln-s"></div><div class="thm-comp"><div class="thm-send"></div></div></div></div>
+          </div>
+          <div class="thm-meta"><span class="thm-dot"></span><span class="thm-name" id="thm-n-black">Pure black</span><span class="thm-desc" id="thm-d-black">True black surfaces with the same neon accents. Deepest on OLED.</span></div>
+        </div>
+        <div class="thm-card" role="radio" aria-checked="false" tabindex="-1" data-choice="light" aria-labelledby="thm-n-light" aria-describedby="thm-d-light">
+          <div class="thm-pv" aria-hidden="true">
+            <div class="thm-win thm-c-light"><div class="thm-top"></div><div class="thm-side"><i></i><i></i><i></i></div><div class="thm-main"><div class="thm-bub"></div><div class="thm-ln"></div><div class="thm-ln thm-ln-s"></div><div class="thm-comp"><div class="thm-send"></div></div></div></div>
+          </div>
+          <div class="thm-meta"><span class="thm-dot"></span><span class="thm-name" id="thm-n-light">Paper terminal</span><span class="thm-desc" id="thm-d-light">Pale mint page with deep teal ink; the sidebar stays dark.</span></div>
+        </div>
+      </div>
+      <p class="set-hint" id="thm-hint">Pick a theme to try it right away. Save keeps it; closing Settings without saving puts the old one back.</p>
+<!-- /settings:appearance -->
+        </section>
+        <section class="set-pane" data-pane="usage" role="tabpanel" aria-label="Usage" hidden>
+      <h2 class="set-title">Usage</h2>
+      <p class="set-hint">Tokens and costs of every model request, by day, purpose, model and chat, with the prices you set per model.</p>
       <button type="button" id="set-usage" class="set-usage" title="Tokens and costs by day, model, purpose and chat">Token usage &amp; costs &rarr;</button>
-      <p class="set-path" id="set-path"></p>
-      <div class="set-actions">
-        <button type="submit" id="set-save">Save</button>
-      </div>
-    </form>
+        </section>
+        <div class="set-actions">
+          <p class="set-path" id="set-path"></p>
+          <button type="submit" id="set-save">Save</button>
+        </div>
+      </form>
+    </div>
   </div>
 </div>
 
@@ -4302,24 +4598,407 @@
   // ---- Settings: provider, model, key, thinking effort ----
   var settingsData = {};
   var setupShown = false;
-  function openSettings() {
+  // ---- Settings pages. Each page registers load(s), filling its fields from
+  // the settings the app sent, and save(send), sending its messages to the
+  // app when Save is pressed. A page touches only its own fields. ----
+  var settingsPages = [];
+  // settings:models (Models page)
+  var modelsPage = (function () {
+    var EFFORT_HINTS = {
+      "": "Uses the model's own setting. Models without thinking ignore this.",
+      low: "Cheapest and fastest: the model thinks briefly before it answers.",
+      medium: "A balance of speed, cost and depth.",
+      high: "Slowest, and uses the most output tokens. For hard problems."
+    };
+    var STATUS_IDLE = "Load models asks the saved provider what it offers. Changed the address or key? Save first.";
+    var wired = false;
+    var loading = false;
+    var loadTimer = 0;
+    function el(id) { return document.getElementById(id); }
+    function normUrl(u) { return String(u || "").trim().replace(/\/+$/, "").toLowerCase(); }
+    function markPreset() {
+      var cur = normUrl(el("set-url").value);
+      [].forEach.call(document.querySelectorAll("#settings .mdl-presets button"), function (b) {
+        b.setAttribute("aria-pressed", String(cur !== "" && normUrl(b.getAttribute("data-url")) === cur));
+      });
+    }
+    function setEffort(v, focus) {
+      var sel = el("set-effort");
+      sel.value = v || "";
+      if (sel.selectedIndex < 0) sel.value = "";
+      [].forEach.call(el("mdl-effort").querySelectorAll("button"), function (b) {
+        var on = b.getAttribute("data-effort") === sel.value;
+        b.setAttribute("aria-checked", String(on));
+        b.tabIndex = on ? 0 : -1;
+        if (on && focus) b.focus();
+      });
+      el("mdl-effort-hint").textContent = EFFORT_HINTS[sel.value] || "";
+    }
+    // The ids the app sent: renderSettings fills #set-models with them.
+    function modelIds() {
+      var out = [];
+      var list = el("set-models");
+      if (list) [].forEach.call(list.querySelectorAll("option"), function (o) { if (o.value) out.push(o.value); });
+      if (!out.length && settingsData && Array.isArray(settingsData.models)) out = settingsData.models.slice();
+      return out;
+    }
+    function markSelected() {
+      var cur = el("set-model").value.trim();
+      [].forEach.call(el("mdl-list").querySelectorAll("button"), function (b) {
+        b.setAttribute("aria-selected", String(b.getAttribute("data-model") === cur));
+      });
+    }
+    function renderModels() {
+      var ids = modelIds();
+      var box = el("mdl-list");
+      var status = el("mdl-status");
+      el("mdl-picker").hidden = ids.length === 0;
+      box.textContent = "";
+      if (!ids.length) {
+        status.textContent = loading ? "Asking the provider for its models…" : STATUS_IDLE;
+        return;
+      }
+      var q = el("mdl-search").value.trim().toLowerCase();
+      var terms = q ? q.split(/\s+/) : [];
+      var shown = ids.filter(function (m) {
+        var l = m.toLowerCase();
+        return terms.every(function (t) { return l.indexOf(t) !== -1; });
+      });
+      var cur = el("set-model").value.trim();
+      var frag = document.createDocumentFragment();
+      shown.slice(0, 500).forEach(function (m) {
+        var b = document.createElement("button");
+        b.type = "button";
+        b.setAttribute("role", "option");
+        b.setAttribute("data-model", m);
+        b.setAttribute("aria-selected", String(m === cur));
+        b.title = m;
+        b.textContent = m;
+        frag.appendChild(b);
+      });
+      if (!shown.length) {
+        var empty = document.createElement("div");
+        empty.className = "mdl-empty";
+        empty.textContent = "No model matches “" + q + "”.";
+        frag.appendChild(empty);
+      }
+      box.appendChild(frag);
+      status.textContent = loading ? "Refreshing the list…"
+        : ids.length + (ids.length === 1 ? " model" : " models")
+          + (terms.length ? ", " + shown.length + " shown" : "") + ". Click one to use it.";
+    }
+    function setLoading(on, timedOut) {
+      loading = on;
+      clearTimeout(loadTimer);
+      var btn = el("set-load-models");
+      btn.disabled = on;
+      btn.textContent = on ? "Loading…" : "Load models";
+      if (on) loadTimer = setTimeout(function () { setLoading(false, true); }, 6000);
+      renderModels();
+      if (timedOut && !modelIds().length) {
+        el("mdl-status").textContent = "No models came back. Check the saved address and key (Save first), then try again.";
+      }
+    }
+    function pick(m) {
+      el("set-model").value = m;
+      markSelected();
+    }
+    function wire() {
+      if (wired) return;
+      wired = true;
+      el("set-url").addEventListener("input", markPreset);
+      [].forEach.call(document.querySelectorAll("#settings .mdl-presets button"), function (b) {
+        b.addEventListener("click", function () { el("set-url").value = b.getAttribute("data-url"); markPreset(); });
+      });
+      // The shared init sends list_models; this only shows that it is on its way.
+      el("set-load-models").addEventListener("click", function () {
+        setTimeout(function () { setLoading(true); }, 0);
+      });
+      var list = el("set-models");
+      if (list && window.MutationObserver) {
+        new MutationObserver(function () {
+          if (loading) setLoading(false); else renderModels();
+        }).observe(list, { childList: true });
+      }
+      el("set-model").addEventListener("input", markSelected);
+      el("mdl-search").addEventListener("input", renderModels);
+      el("mdl-search").addEventListener("keydown", function (ev) {
+        var first = el("mdl-list").querySelector("button");
+        if (ev.key === "Enter") {
+          ev.preventDefault(); // not a form submit
+          if (first) pick(first.getAttribute("data-model"));
+        } else if (ev.key === "ArrowDown" && first) {
+          ev.preventDefault();
+          first.focus();
+        }
+      });
+      el("mdl-list").addEventListener("click", function (ev) {
+        var b = ev.target.closest("button[data-model]");
+        if (b) pick(b.getAttribute("data-model"));
+      });
+      el("mdl-list").addEventListener("keydown", function (ev) {
+        if (ev.key !== "ArrowDown" && ev.key !== "ArrowUp") return;
+        var items = [].slice.call(el("mdl-list").querySelectorAll("button"));
+        var i = items.indexOf(document.activeElement);
+        if (i < 0) return;
+        ev.preventDefault();
+        if (ev.key === "ArrowUp" && i === 0) { el("mdl-search").focus(); return; }
+        var next = items[Math.max(0, Math.min(items.length - 1, i + (ev.key === "ArrowDown" ? 1 : -1)))];
+        if (next) next.focus();
+      });
+      el("mdl-key-show").addEventListener("click", function () {
+        showKey(el("set-key").type === "password");
+        el("set-key").focus();
+      });
+      var seg = el("mdl-effort");
+      seg.addEventListener("click", function (ev) {
+        var b = ev.target.closest("button[data-effort]");
+        if (b) setEffort(b.getAttribute("data-effort"), true);
+      });
+      seg.addEventListener("keydown", function (ev) {
+        var keys = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+        if (!keys[ev.key]) return;
+        ev.preventDefault();
+        var btns = [].slice.call(seg.querySelectorAll("button"));
+        var i = btns.findIndex(function (b) { return b.getAttribute("aria-checked") === "true"; });
+        var n = btns[(i + keys[ev.key] + btns.length) % btns.length];
+        setEffort(n.getAttribute("data-effort"), true);
+      });
+    }
+    function showKey(on) {
+      var key = el("set-key");
+      var btn = el("mdl-key-show");
+      key.type = on ? "text" : "password";
+      btn.textContent = on ? "Hide" : "Show";
+      btn.setAttribute("aria-pressed", String(on));
+      btn.title = on ? "Hide the key" : "Show the key";
+    }
+    return {
+      load: function (s) {
+        wire();
+        el("set-url").value = s.base_url || "";
+        el("set-model").value = s.model || "";
+        markPreset();
+        var key = el("set-key");
+        key.value = "";
+        showKey(false);
+        key.placeholder = s.has_key ? "Leave empty to keep the saved key" : "Paste a key";
+        var state = el("mdl-key-state");
+        state.textContent = s.has_key ? "Key saved" : "No key saved";
+        state.classList.toggle("is-empty", !s.has_key);
+        setEffort(s.reasoning_effort || "", false);
+        el("mdl-search").value = "";
+        renderModels();
+      },
+      afterSave: function () {
+        el("set-key").value = "";
+        showKey(false);
+      }
+    };
+  })();
+  settingsPages.push({
+    load: modelsPage.load,
+    save: function (send) {
+      var key = document.getElementById("set-key").value.trim();
+      var msg = {
+        type: "save_settings",
+        base_url: document.getElementById("set-url").value.trim(),
+        model: document.getElementById("set-model").value.trim(),
+        reasoning_effort: document.getElementById("set-effort").value
+      };
+      if (key) msg.api_key = key; // empty: keep the saved key
+      send(msg);
+      modelsPage.afterSave();
+    }
+  });
+  // /settings:models
+  // settings:prompt (Prompt & Temperature page)
+  // The system prompt (with a size counter: it goes out with every request)
+  // and the sampling temperature: a 0-2 slider, presets, and "Model default"
+  // (value null: nothing is sent). Save sends only what changed.
+  (function () {
+    var wired = false;
+    var loadedTemp = null; // what the page showed on load, to see a change
+    function byId(id) { return document.getElementById(id); }
+    function round1(x) { return Math.round(x * 10) / 10; }
+    function countPrompt() {
+      var n = byId("set-prompt").value.length;
+      byId("pt-prompt-count").textContent = n
+        ? n.toLocaleString() + " chars · ~" + Math.ceil(n / 4).toLocaleString() + " tokens per request"
+        : "Empty: Habi's own instructions";
+    }
+    function currentTemp() {
+      return byId("set-temp-default").checked ? null : round1(parseFloat(byId("set-temp").value) || 0);
+    }
+    function showTemp() {
+      var t = currentTemp();
+      byId("pt-temp-value").textContent = t === null ? "Model default" : t.toFixed(1);
+      byId("pt-temp-group").classList.toggle("is-default", t === null);
+      [].forEach.call(byId("pt-temp-presets").querySelectorAll("button[data-temp]"), function (b) {
+        b.setAttribute("aria-pressed", String(t !== null && t === round1(parseFloat(b.getAttribute("data-temp")))));
+      });
+    }
+    function wire() {
+      if (wired) return;
+      wired = true;
+      byId("set-prompt").addEventListener("input", countPrompt);
+      // Moving the slider or picking a preset turns "Model default" off.
+      byId("set-temp").addEventListener("input", function () {
+        byId("set-temp-default").checked = false;
+        showTemp();
+      });
+      byId("set-temp-default").addEventListener("change", showTemp);
+      byId("pt-temp-presets").addEventListener("click", function (ev) {
+        var b = ev.target.closest("button[data-temp]");
+        if (!b) return;
+        byId("set-temp").value = b.getAttribute("data-temp");
+        byId("set-temp-default").checked = false;
+        showTemp();
+      });
+    }
+    settingsPages.push({
+      load: function (s) {
+        wire();
+        byId("set-prompt").value = s.system_prompt || "";
+        byId(s.prompt_replaces === false ? "set-prompt-add" : "set-prompt-replace").checked = true;
+        countPrompt();
+        var t = typeof s.temperature === "number" ? s.temperature : null;
+        byId("set-temp-default").checked = t === null;
+        byId("set-temp").value = String(t === null ? 0.7 : t);
+        showTemp();
+        loadedTemp = currentTemp();
+      },
+      save: function (send) {
+        // Only when it changed (each save writes the config file).
+        var s = settingsData || {};
+        var promptText = byId("set-prompt").value;
+        var replace = byId("set-prompt-replace").checked;
+        if (promptText.trim() !== (s.system_prompt || "").trim() || replace !== (s.prompt_replaces !== false)) {
+          send({ type: "save_prompt", text: promptText, replace: replace });
+        }
+        var t = currentTemp();
+        if (t !== loadedTemp) {
+          send({ type: "save_temperature", value: t });
+          loadedTemp = t;
+        }
+      }
+    });
+  })();
+  // /settings:prompt
+  // settings:appearance (Appearance page)
+  // Theme cards in a radio group: clicking (or Enter/Space) previews the theme
+  // at once; Save stores it; closing Settings any other way (the close button,
+  // Esc, a click outside) puts the saved theme back. #set-theme holds the
+  // chosen value, and Save reads it from there.
+  (function () {
+    var wired = false;
+    var previewing = false; // Settings is open and the theme on screen may be a preview
+    var box, field, group, cards = [];
+    function mark(theme) {
+      cards.forEach(function (c) {
+        var on = c.dataset.choice === theme;
+        c.setAttribute("aria-checked", String(on));
+        c.tabIndex = on ? 0 : -1;
+      });
+      if (!cards.some(function (c) { return c.tabIndex === 0; }) && cards[0]) cards[0].tabIndex = 0;
+    }
+    function choose(theme) {
+      field.value = theme;
+      mark(theme);
+      applyTheme(theme);
+    }
+    function checkedCard() {
+      return cards.filter(function (c) { return c.getAttribute("aria-checked") === "true"; })[0] || cards[0];
+    }
+    function wire() {
+      if (wired) return true;
+      box = document.getElementById("settings");
+      field = document.getElementById("set-theme");
+      group = document.getElementById("thm-themes");
+      if (!box || !field || !group) return false;
+      wired = true;
+      cards = [].slice.call(group.querySelectorAll('[role="radio"]'));
+      cards.forEach(function (c, i) {
+        c.addEventListener("click", function () { choose(c.dataset.choice); c.focus(); });
+        c.addEventListener("keydown", function (ev) {
+          var k = ev.key, j = -1, n = cards.length;
+          if (k === "Enter" || k === " " || k === "Spacebar") {
+            ev.preventDefault();
+            choose(c.dataset.choice);
+            return;
+          }
+          if (k === "ArrowRight" || k === "ArrowDown") j = (i + 1) % n;
+          else if (k === "ArrowLeft" || k === "ArrowUp") j = (i - 1 + n) % n;
+          else if (k === "Home") j = 0;
+          else if (k === "End") j = n - 1;
+          if (j < 0) return;
+          ev.preventDefault();
+          cards.forEach(function (o, m) { o.tabIndex = m === j ? 0 : -1; });
+          cards[j].focus();
+        });
+      });
+      // Tabbing back into the group lands on the selected theme.
+      group.addEventListener("focusout", function (ev) {
+        if (!group.contains(ev.relatedTarget)) mark(field.value);
+      });
+      if (window.MutationObserver) {
+        new MutationObserver(function () {
+          if (box.hidden) {
+            // Closed without Save: back to the stored theme.
+            if (previewing) { previewing = false; applyTheme(savedTheme()); }
+            return;
+          }
+          // Opened on this page with nothing focused yet: focus the selected card.
+          var pane = group.closest(".set-pane");
+          if (pane && !pane.hidden && !box.contains(document.activeElement)) {
+            var c = checkedCard();
+            if (c) c.focus();
+          }
+        }).observe(box, { attributes: true, attributeFilter: ["hidden"] });
+      }
+      return true;
+    }
+    settingsPages.push({
+      load: function () {
+        if (!wire()) return;
+        // Settings opened again while already open: keep the preview going.
+        if (previewing && !box.hidden) return;
+        var theme = savedTheme();
+        previewing = true;
+        field.value = theme;
+        mark(theme);
+        applyTheme(theme); // drops any preview left over from a close and reopen in one go
+      },
+      save: function () {
+        var theme = (field || document.getElementById("set-theme")).value || "system";
+        try { localStorage.setItem("habi.theme", theme); } catch (e) {}
+        previewing = false;
+        applyTheme(theme);
+        if (wired) mark(theme);
+      }
+    });
+  })();
+  // /settings:appearance
+  function showSettingsPane(name) {
+    [].forEach.call(document.querySelectorAll("#settings .set-nav button"), function (b) {
+      b.setAttribute("aria-selected", String(b.dataset.pane === name));
+    });
+    [].forEach.call(document.querySelectorAll("#settings .set-pane"), function (p) {
+      p.hidden = p.dataset.pane !== name;
+    });
+  }
+  function openSettings(pane) {
     var box = document.getElementById("settings");
     if (!box) return;
     var s = settingsData || {};
-    document.getElementById("set-url").value = s.base_url || "";
-    document.getElementById("set-model").value = s.model || "";
-    var key = document.getElementById("set-key");
-    key.value = "";
-    key.placeholder = s.has_key ? "A key is saved — leave empty to keep it" : "Paste a key (kept encrypted for your Windows user)";
-    document.getElementById("set-effort").value = s.reasoning_effort || "";
-    document.getElementById("set-theme").value = savedTheme();
+    settingsPages.forEach(function (p) { p.load(s); });
     document.getElementById("set-path").textContent = s.config_path ? "Saved to " + s.config_path : "";
-    document.getElementById("set-prompt").value = s.system_prompt || "";
-    document.getElementById(s.prompt_replaces === false ? "set-prompt-add" : "set-prompt-replace").checked = true;
     document.getElementById("set-setup").hidden = !s.needs_setup;
+    showSettingsPane(typeof pane === "string" ? pane : s.needs_setup ? "models" : (box.dataset.pane || "models"));
     box.hidden = false;
     overlayHooks.open();
-    (s.base_url ? document.getElementById("set-model") : document.getElementById("set-url")).focus();
+    var first = box.querySelector(".set-pane:not([hidden]) input, .set-pane:not([hidden]) textarea, .set-pane:not([hidden]) select");
+    if (first) first.focus();
   }
   function closeSettings() {
     var box = document.getElementById("settings");
@@ -5143,7 +5822,7 @@
       });
     }
     var settingsBtn = document.getElementById("settings-btn");
-    if (settingsBtn) settingsBtn.addEventListener("click", openSettings);
+    if (settingsBtn) settingsBtn.addEventListener("click", function () { openSettings(); });
     var setClose = document.getElementById("set-close");
     if (setClose) setClose.addEventListener("click", closeSettings);
     var setBox = document.getElementById("settings");
@@ -5156,27 +5835,14 @@
       document.getElementById("set-load-models").addEventListener("click", function () { postToRust({ type: "list_models" }); });
       document.getElementById("set-form").addEventListener("submit", function (ev) {
         ev.preventDefault();
-        var key = document.getElementById("set-key").value.trim();
-        var msg = {
-          type: "save_settings",
-          base_url: document.getElementById("set-url").value.trim(),
-          model: document.getElementById("set-model").value.trim(),
-          reasoning_effort: document.getElementById("set-effort").value
-        };
-        if (key) msg.api_key = key; // empty: keep the saved key
-        var theme = document.getElementById("set-theme").value;
-        try { localStorage.setItem("habi.theme", theme); } catch (e) {}
-        applyTheme(theme);
-        postToRust(msg);
-        // The prompt only when it changed (each save writes the config file).
-        var s = settingsData || {};
-        var promptText = document.getElementById("set-prompt").value;
-        var replace = document.getElementById("set-prompt-replace").checked;
-        if (promptText.trim() !== (s.system_prompt || "").trim() || replace !== (s.prompt_replaces !== false)) {
-          postToRust({ type: "save_prompt", text: promptText, replace: replace });
-        }
-        document.getElementById("set-key").value = "";
+        settingsPages.forEach(function (p) { p.save(postToRust); });
         closeSettings();
+      });
+      [].forEach.call(setBox.querySelectorAll(".set-nav button"), function (b) {
+        b.addEventListener("click", function () {
+          setBox.dataset.pane = b.dataset.pane;
+          showSettingsPane(b.dataset.pane);
+        });
       });
     }
     document.addEventListener("keydown", function (ev) {
