@@ -143,6 +143,31 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_projects,
 ];
 
+/// "database is locked"/"busy", which SQLite sometimes returns without
+/// waiting for `busy_timeout`.
+fn sql_locked(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _)
+        if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+}
+
+fn is_locked(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<rusqlite::Error>().is_some_and(sql_locked))
+}
+
+/// Run `f` again (up to ~1 s) while it fails with "database is locked".
+fn retry_locked(mut f: impl FnMut() -> rusqlite::Result<()>) -> Result<()> {
+    let mut tries = 0;
+    loop {
+        match f() {
+            Err(e) if tries < 50 && sql_locked(&e) => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            r => return Ok(r?),
+        }
+    }
+}
+
 /// Bring the schema up to date: the steps `user_version` says are missing,
 /// all in one `BEGIN IMMEDIATE` transaction, so two processes opening the
 /// same file do not both run an ALTER (the second waits, then sees the
@@ -392,11 +417,23 @@ impl Db {
         // Another process (a second window, the CLI) may hold the write
         // lock for a moment: wait for it instead of failing at once.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Switching a new file to WAL can fail at once with "database is
+        // locked" while another process does the same (SQLite skips the
+        // busy handler there to avoid a deadlock): retry for a while.
+        retry_locked(|| conn.pragma_update(None, "journal_mode", "WAL"))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // SQLite ignores REFERENCES / ON DELETE CASCADE unless this is on.
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        init_schema(&mut conn).with_context(|| format!("updating {}", path.display()))?;
+        let mut tries = 0;
+        loop {
+            match init_schema(&mut conn) {
+                Err(e) if tries < 50 && is_locked(&e) => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                r => break r.with_context(|| format!("updating {}", path.display()))?,
+            }
+        }
         Ok(Self::from_conn(conn))
     }
 
