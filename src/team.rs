@@ -71,7 +71,8 @@ pub async fn run_team(
         );
     }
     say(st, session_id, format!("[team] decomposing goal: {goal}\n"));
-    st.db.add_message(session_id, "user", &[Part::Text { text: format!("/team {goal}") }])?;
+    let (sid, text) = (session_id.to_string(), format!("/team {goal}"));
+    st.db.run(move |db| db.add_message(&sid, "user", &[Part::Text { text }])).await?;
 
     // 1. PLANNER — read-only agent proposes subtasks as JSON.
     let subtasks = crate::server::tagged("team", session_id, plan(st, goal, &abort)).await?;
@@ -95,7 +96,8 @@ pub async fn run_team(
 
     // 4. SYNTHESIS — verdict + per-report results in the parent session.
     let summary = synthesis(goal, &verdict, &reports);
-    st.db.add_message(session_id, "assistant", &[Part::Text { text: summary.clone() }])?;
+    let (sid, text) = (session_id.to_string(), summary.clone());
+    st.db.run(move |db| db.add_message(&sid, "assistant", &[Part::Text { text }])).await?;
     // B-34: stream the synthesis too. Clients see the per-worker results,
     // and the TUI team panel reaches "done" on its `[team] results for:` line.
     say(st, session_id, summary.clone());
@@ -264,7 +266,8 @@ async fn worker(
     goal: &str,
     abort: Arc<AtomicBool>,
 ) -> Result<String> {
-    let session = st.db.create_session(&task.title, Some(parent))?;
+    let (title, parent_id) = (task.title.clone(), parent.to_string());
+    let session = st.db.run(move |db| db.create_session(&title, Some(&parent_id))).await?;
     let prompt = format!(
         "Overall goal: {goal}\n\nYour subtask: {}\n{}",
         task.title, task.instructions
@@ -280,10 +283,17 @@ async fn run_worker_agent(
     prompt: &str,
     abort: &AtomicBool,
 ) -> Result<String> {
-    st.db.add_message(session_id, "user", &[Part::Text { text: prompt.to_string() }])?;
+    let (sid, text) = (session_id.to_string(), prompt.to_string());
+    let parent = st
+        .db
+        .run(move |db| {
+            db.add_message(&sid, "user", &[Part::Text { text }])?;
+            Ok(db.get_session(&sid).ok().flatten().and_then(|s| s.parent_id))
+        })
+        .await?;
     // The worker works in its parent chat's project folder.
     let project_ws = st.workspace_for(session_id);
-    let mut system = worker_system(st, session_id, &project_ws);
+    let mut system = worker_system(st, session_id, parent.as_deref(), &project_ws);
     // F-05: with `agent.isolate_workers`, each team worker runs in its own
     // git worktree. The prompt names the folder it really works in.
     let iso = match st.cfg.agent.isolate_workers {
@@ -317,7 +327,7 @@ async fn run_worker_agent(
     // with its worktree. The report goes first, so a later size cap cannot
     // cut it off, and the user sees it as a note in the parent session.
     let report = iso.finish_async().await;
-    if let Some(parent) = st.db.get_session(session_id).ok().flatten().and_then(|s| s.parent_id) {
+    if let Some(parent) = parent {
         let _ = st.events.send(ServerEvent::Note {
             session_id: parent,
             text: format!("team worker {session_id}: {report}"),
@@ -331,7 +341,12 @@ async fn run_worker_agent(
 
 /// The team worker's system prompt: its rules, the project instructions,
 /// the parent's ponytail level and the baked-in skills.
-fn worker_system(st: &Shared, session_id: &str, project_ws: &std::path::Path) -> String {
+fn worker_system(
+    st: &Shared,
+    session_id: &str,
+    parent: Option<&str>,
+    project_ws: &std::path::Path,
+) -> String {
     let mut system = format!(
         "You are a focused worker agent in team mode. Complete only your subtask.\n\n\
          Workspace: {}.\nNobody can answer questions during this run: make reasonable \
@@ -343,8 +358,7 @@ fn worker_system(st: &Shared, session_id: &str, project_ws: &std::path::Path) ->
         system.push_str(md.trim());
     }
     // P-05: a team worker follows its parent session's ponytail level.
-    let parent = st.db.get_session(session_id).ok().flatten().and_then(|s| s.parent_id);
-    let level = st.ponytail_level(parent.as_deref().unwrap_or(session_id));
+    let level = st.ponytail_level(parent.unwrap_or(session_id));
     system.push_str(&crate::agents::ponytail_section(level));
     for s in crate::skills::load_baked(&st.skill_base) {
         system.push_str(&format!("\n\n## Skill: {} — always active\n\n", s.name));
