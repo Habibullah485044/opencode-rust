@@ -26,7 +26,7 @@
     --text-strong: #ffffff;
     --text-soft: #b4d4d8;
     --text-muted: #79999e;
-    --text-dim: #5b7b81;
+    --text-dim: #6a8a90;
     --code-text: #cfe9ec;
     --code-ink: #8ff0fb;
 
@@ -81,7 +81,7 @@
     --text-strong: #02090b;
     --text-soft: #23434a;
     --text-muted: #4e6c72;
-    --text-dim: #67858a;
+    --text-dim: #536f75;
     --code-text: #cfe9ec;
     --code-ink: #0e7490;
     --accent: #0e7490;
@@ -137,7 +137,7 @@
     --text-strong: #ffffff;
     --text-soft: #b4d4d8;
     --text-muted: #7f9fa4;
-    --text-dim: #5f7f85;
+    --text-dim: #6a8a90;
     --accent: #5ee7f7;
     --accent-strong: #a5f3fc;
     --accent-soft: rgba(94, 231, 247, 0.12);
@@ -2198,7 +2198,6 @@
     #log { padding: 22px 18px; }
     #compwrap { padding: 8px 18px 14px; }
     #agents { padding: 0 18px; }
-    #empty .chips { grid-template-columns: 1fr; width: min(360px, 100%); }
     .comp-hints #send-hint, .comp-hints > span:nth-child(2) { display: none; }
   }
 
@@ -2246,6 +2245,8 @@
   .side-sec::before { content: "//"; color: var(--pink); letter-spacing: 0; opacity: 0.85; }
   .side-search { border-radius: var(--radius-s); border: 1px solid var(--line); background: var(--surface); }
   .side-search kbd { font-family: var(--mono); }
+  /* The input itself has no outline, so the box carries the focus ring. */
+  .side-search:focus-within { border-color: var(--accent-line); box-shadow: 0 0 0 2px var(--accent-soft); }
   .sess, .proj-head { border-radius: var(--radius-s); }
   .sess.active::before {
     top: 50%;
