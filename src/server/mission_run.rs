@@ -224,20 +224,7 @@ pub(super) async fn run_mission(
     // mission keeps running every step as a Deep run.
     let mut deep = deep;
     if let Some(goal) = goal {
-        st.db.add_message(session_id, "user", &[Part::Text { text: format!("[mission] {goal}") }])?;
-        // The goal is kept with its spec: the plan, every step brief and the
-        // coordinator see the done-when checks, and the final check proves them.
-        let spec = make_spec(st, session_id, goal, abort).await;
-        let goal = spec.as_ref().map_or_else(|| goal.to_string(), |s| crate::spec::with_goal(goal, s));
-        note("mission: planning the steps…".into());
-        let steps = tagged("mission planning", session_id, plan(st, &ws, &goal, abort)).await;
-        if abort.load(Ordering::SeqCst) {
-            anyhow::bail!("aborted");
-        }
-        st.db.mission_start(session_id, &goal, &steps, deep)?;
-        let m = current(st, session_id)?;
-        let shown = spec.as_ref().map(|s| format!("{}\n\n", crate::spec::for_user(s))).unwrap_or_default();
-        say(st, session_id, format!("{shown}**Mission plan** — I keep working until it is done:\n{}", plan_text(&m)));
+        start_mission(st, session_id, goal, deep, &ws, abort, &note).await?;
     } else {
         let Some(m) = st.db.mission(session_id)? else {
             anyhow::bail!("this chat has no mission to resume; start one with /mission <goal>");
@@ -262,10 +249,60 @@ pub(super) async fn run_mission(
         note(format!("mission: each step is a Deep run ({} attempts, the best checked one kept)", st.cfg.agent.deep_attempts));
     }
     let result = steps_loop(st, session_id, &ws, deep, abort).await;
-    // Every step said done: now prove the goal's checks on the whole result,
-    // in a chat of its own (still with automatic approvals).
+    let checked = if matches!(result, Ok(true)) {
+        checks_after_mission(st, session_id, mission_started, abort).await?
+    } else {
+        String::new()
+    };
+    let status = match &result {
+        Ok(true) => "done",
+        Ok(false) => "paused",
+        Err(_) if abort.load(Ordering::SeqCst) => "stopped",
+        Err(_) => "paused",
+    };
+    st.db.mission_set_status(session_id, status)?;
+    let m = current(st, session_id)?;
+    Ok(mission_summary(&m, status, &result, &checked))
+}
+
+/// Plan a new mission for `goal` and save it.
+async fn start_mission(
+    st: &Shared,
+    session_id: &str,
+    goal: &str,
+    deep: bool,
+    ws: &std::path::Path,
+    abort: &Arc<AtomicBool>,
+    note: &impl Fn(String),
+) -> Result<()> {
+    st.db.add_message(session_id, "user", &[Part::Text { text: format!("[mission] {goal}") }])?;
+    // The goal is kept with its spec: the plan, every step brief and the
+    // coordinator see the done-when checks, and the final check proves them.
+    let spec = make_spec(st, session_id, goal, abort).await;
+    let goal = spec.as_ref().map_or_else(|| goal.to_string(), |s| crate::spec::with_goal(goal, s));
+    note("mission: planning the steps…".into());
+    let steps = tagged("mission planning", session_id, plan(st, ws, &goal, abort)).await;
+    if abort.load(Ordering::SeqCst) {
+        anyhow::bail!("aborted");
+    }
+    st.db.mission_start(session_id, &goal, &steps, deep)?;
+    let m = current(st, session_id)?;
+    let shown = spec.as_ref().map(|s| format!("{}\n\n", crate::spec::for_user(s))).unwrap_or_default();
+    say(st, session_id, format!("{shown}**Mission plan** — I keep working until it is done:\n{}", plan_text(&m)));
+    Ok(())
+}
+
+/// Every step said done: prove the goal's checks on the whole result and
+/// judge the pages by eye, each in a chat of its own (still with automatic
+/// approvals). Returns the lines for the summary.
+async fn checks_after_mission(
+    st: &Shared,
+    session_id: &str,
+    mission_started: std::time::SystemTime,
+    abort: &Arc<AtomicBool>,
+) -> Result<String> {
     let mut checked = String::new();
-    if matches!(result, Ok(true)) && st.cfg.agent.final_check {
+    if st.cfg.agent.final_check {
         let goal = st.db.mission(session_id)?.map(|m| m.goal).unwrap_or_default();
         if let Some(spec) = crate::spec::from_goal(&goal) {
             let child = st.db.create_session("mission final check", Some(session_id))?;
@@ -279,7 +316,7 @@ pub(super) async fn run_mission(
     }
     // The pages the mission changed, judged by eye (a mission is where the
     // biggest sites get built, and it skipped this until the wiring audit).
-    if matches!(result, Ok(true)) && !abort.load(Ordering::SeqCst) {
+    if !abort.load(Ordering::SeqCst) {
         let goal = st.db.mission(session_id)?.map(|m| m.goal).unwrap_or_default();
         let spec = crate::spec::from_goal(&goal);
         let child = st.db.create_session("mission design review", Some(session_id))?;
@@ -287,33 +324,29 @@ pub(super) async fn run_mission(
             checked.push_str("\nDesign review: done — see the design review chat.");
         }
     }
-    let status = match &result {
-        Ok(true) => "done",
-        Ok(false) => "paused",
-        Err(_) if abort.load(Ordering::SeqCst) => "stopped",
-        Err(_) => "paused",
-    };
-    st.db.mission_set_status(session_id, status)?;
-    let m = current(st, session_id)?;
+    Ok(checked)
+}
+
+/// The mission's closing summary for its `status`.
+fn mission_summary(m: &Mission, status: &str, result: &Result<bool>, checked: &str) -> String {
     let counts = |s: &str| m.steps.iter().filter(|x| x.status == s).count();
-    let summary = match status {
+    match status {
         "done" => format!(
             "**Mission complete** — {} step(s) done{}.\n{}{checked}",
             counts("done"),
             if counts("failed") > 0 { format!(", {} failed", counts("failed")) } else { String::new() },
-            plan_text(&m)
+            plan_text(m)
         ),
-        "stopped" => format!("**Mission stopped.** `/mission resume` carries on.\n{}", plan_text(&m)),
+        "stopped" => format!("**Mission stopped.** `/mission resume` carries on.\n{}", plan_text(m)),
         _ => format!(
             "**Mission paused** ({}). `/mission resume` carries on.\n{}",
-            match &result {
+            match result {
                 Err(e) => format!("{e:#}"),
                 _ => "step limit reached (agent.mission_max_steps)".into(),
             },
-            plan_text(&m)
+            plan_text(m)
         ),
-    };
-    Ok(summary)
+    }
 }
 
 /// Work through the steps. `Ok(true)` = mission complete, `Ok(false)` = the
@@ -352,25 +385,9 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
         // No slack: files the previous step wrote a moment ago must not
         // count as this step's (they would show up in its receipt).
         let since = std::time::SystemTime::now();
-        // Deep: the step is tried several times in separate copies and the
-        // best checked attempt is applied. Without git it runs once.
-        let run = tagged("mission step", &child.id, async { if deep {
-            match super::deep::run_deep(st, &child.id, &brief, st.cfg.agent.deep_attempts, abort).await {
-                Ok(summary) => {
-                    if !summary.is_empty() {
-                        st.db.add_message(&child.id, "assistant", &[Part::Text { text: summary.clone() }])?;
-                    }
-                    Ok(summary)
-                }
-                Err(e) if format!("{e:#}").contains("needs a git repository") => agent_inner(st, &child.id, &brief, abort).await.map(LoopEnd::into_legacy),
-                Err(e) => Err(e),
-            }
-        } else {
-            agent_inner(st, &child.id, &brief, abort).await.map(LoopEnd::into_legacy)
-        } }).await;
+        let run = tagged("mission step", &child.id, run_step(st, &child.id, &brief, deep, abort)).await;
         if abort.load(Ordering::SeqCst) {
-            st.db.mission_step_update(step.id, "pending", attempts - 1, &step.result, None)?;
-            agent_status(st, &info, "failed", "stopped".into());
+            put_step_back(st, &step, attempts, &info)?;
             anyhow::bail!("aborted");
         }
         let report = match &run {
@@ -387,100 +404,183 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
             continue;
         }
         errors = 0;
-        let mut files = crate::keepbest::written_since(ws, since);
-        files.extend(crate::pagecheck::recently_modified(ws, since));
-        files.sort();
-        files.dedup();
+        let files = step_files(ws, since);
         let checks = if files.is_empty() {
             None
         } else {
             agent_status(st, &info, "working", "checking the result…".into());
             check_after_run(st, &child.id, &brief, since, true, abort, None).await
         };
-        // The step's own check, proven with tools in the step's chat. The
-        // last step's whole-goal check is the mission's final check instead.
-        let proof = match split_check(&step.title).1 {
-            Some(check) if st.cfg.agent.final_check && !check.to_ascii_lowercase().contains("every done-when") => {
-                agent_status(st, &info, "working", "proving the step's check…".into());
-                let spec = crate::spec::Spec {
-                    goal: split_check(&step.title).0.to_string(),
-                    output: "the work of this step".into(),
-                    done_when: vec![check.to_string()],
-                    assuming: vec![],
-                    design: None,
-                    skills: vec![],
-                };
-                Some(final_check(st, &child.id, &spec, abort, None).await)
-            }
-            _ => None,
-        };
+        let proof = prove_step_check(st, &child.id, &info, &step.title, abort).await;
         if abort.load(Ordering::SeqCst) {
-            st.db.mission_step_update(step.id, "pending", attempts - 1, &step.result, None)?;
-            agent_status(st, &info, "failed", "stopped".into());
+            put_step_back(st, &step, attempts, &info)?;
             anyhow::bail!("aborted");
         }
-        let shown: Vec<String> = files
-            .iter()
-            .take(12)
-            .map(|f| f.strip_prefix(ws).unwrap_or(f).to_string_lossy().replace('\\', "/"))
-            .collect();
-        let receipt = format!(
-            "{}\nFiles changed: {}\nChecks: {}{}",
-            report.trim(),
-            if shown.is_empty() { "none".to_string() } else { shown.join(", ") },
-            match &checks {
-                Some((true, s)) => format!("passed ({s})"),
-                Some((false, s)) => format!("still failing ({s})"),
-                None => "none ran".into(),
-            },
-            match proof {
-                Some(Some(true)) => "\nStep check: proven with tools".to_string(),
-                Some(None) => "\nStep check: could not run (provider unreachable); judge from the report".to_string(),
-                Some(Some(false)) => format!(
-                    "\nStep check: NOT proven ({}) — see the end of the step chat",
-                    split_check(&step.title).1.unwrap_or("")
-                ),
-                None => String::new(),
-            }
-        );
+        let receipt = step_receipt(ws, &report, &files, &checks, proof, &step.title);
         // The coordinator sees this step as the one just worked on.
         st.db.mission_step_update(step.id, "working", attempts, &receipt, None)?;
         let m = current(st, session_id)?;
         let verdict = tagged("mission planning", session_id, review(st, &m, n, &receipt, abort)).await;
         let first_line: String = report.trim().lines().next().unwrap_or("").chars().take(200).collect();
+        let done = StepDone { step: &step, n, attempts, receipt: &receipt, first_line: &first_line, info: &info };
         redo_reason = None;
-        match verdict {
-            Verdict::Redo(why) if attempts < MAX_ATTEMPTS => {
-                st.db.mission_step_update(step.id, "pending", attempts, &receipt, None)?;
-                agent_status(st, &info, "failed", format!("redo: {why}"));
-                say(st, session_id, format!("↻ Step {n} again — {}", if why.is_empty() { "not done yet".to_string() } else { why.clone() }));
-                redo_reason = Some(why);
-            }
-            Verdict::Redo(why) => {
-                st.db.mission_step_update(step.id, "failed", attempts, &receipt, None)?;
-                agent_status(st, &info, "failed", "gave up after 3 tries".into());
-                say(st, session_id, format!("✗ Step {n} failed after {MAX_ATTEMPTS} tries ({why}); moving on."));
-            }
-            Verdict::Add(new_step) if m.steps.len() < MAX_PLAN_STEPS => {
-                st.db.mission_step_update(step.id, "done", attempts, &receipt, None)?;
-                st.db.mission_step_insert_after(session_id, step.id, &new_step)?;
-                agent_status(st, &info, "done", first_line.clone());
-                say(st, session_id, format!("✓ Step {n}: {} — {first_line}\n➕ Added next: {new_step}", split_check(&step.title).0));
-            }
-            Verdict::Done => {
-                st.db.mission_step_update(step.id, "done", attempts, &receipt, None)?;
-                agent_status(st, &info, "done", first_line.clone());
-                say(st, session_id, format!("✓ Step {n}: {} — {first_line}", split_check(&step.title).0));
-                // The coordinator says the goal is reached: what is left is not needed.
-                return Ok(true);
-            }
-            Verdict::Next | Verdict::Add(_) => {
-                st.db.mission_step_update(step.id, "done", attempts, &receipt, None)?;
-                agent_status(st, &info, "done", first_line.clone());
-                say(st, session_id, format!("✓ Step {n}: {} — {first_line}", split_check(&step.title).0));
-            }
+        if apply_verdict(st, session_id, &m, &done, verdict, &mut redo_reason)? {
+            return Ok(true);
         }
     }
+}
+
+/// One run of a step. Deep: the step is tried several times in separate
+/// copies and the best checked attempt is applied. Without git it runs once.
+async fn run_step(st: &Shared, child_id: &str, brief: &str, deep: bool, abort: &Arc<AtomicBool>) -> Result<String> {
+    if deep {
+        match super::deep::run_deep(st, child_id, brief, st.cfg.agent.deep_attempts, abort).await {
+            Ok(summary) => {
+                if !summary.is_empty() {
+                    st.db.add_message(child_id, "assistant", &[Part::Text { text: summary.clone() }])?;
+                }
+                Ok(summary)
+            }
+            Err(e) if format!("{e:#}").contains("needs a git repository") => agent_inner(st, child_id, brief, abort).await.map(LoopEnd::into_legacy),
+            Err(e) => Err(e),
+        }
+    } else {
+        agent_inner(st, child_id, brief, abort).await.map(LoopEnd::into_legacy)
+    }
+}
+
+/// A stopped step goes back to pending, its try not counted.
+fn put_step_back(st: &Shared, step: &MissionStep, attempts: i64, info: &AgentInfo) -> Result<()> {
+    st.db.mission_step_update(step.id, "pending", attempts - 1, &step.result, None)?;
+    agent_status(st, info, "failed", "stopped".into());
+    Ok(())
+}
+
+/// Files the step wrote or changed since `since`.
+fn step_files(ws: &std::path::Path, since: std::time::SystemTime) -> Vec<PathBuf> {
+    let mut files = crate::keepbest::written_since(ws, since);
+    files.extend(crate::pagecheck::recently_modified(ws, since));
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// The step's own check, proven with tools in the step's chat. The
+/// last step's whole-goal check is the mission's final check instead.
+/// `None` = no check to prove.
+async fn prove_step_check(
+    st: &Shared,
+    child_id: &str,
+    info: &AgentInfo,
+    title: &str,
+    abort: &Arc<AtomicBool>,
+) -> Option<Option<bool>> {
+    match split_check(title).1 {
+        Some(check) if st.cfg.agent.final_check && !check.to_ascii_lowercase().contains("every done-when") => {
+            agent_status(st, info, "working", "proving the step's check…".into());
+            let spec = crate::spec::Spec {
+                goal: split_check(title).0.to_string(),
+                output: "the work of this step".into(),
+                done_when: vec![check.to_string()],
+                assuming: vec![],
+                design: None,
+                skills: vec![],
+            };
+            Some(final_check(st, child_id, &spec, abort, None).await)
+        }
+        _ => None,
+    }
+}
+
+/// The step's receipt: its report, the files it changed, and what the
+/// checks said.
+fn step_receipt(
+    ws: &std::path::Path,
+    report: &str,
+    files: &[PathBuf],
+    checks: &Option<(bool, String)>,
+    proof: Option<Option<bool>>,
+    title: &str,
+) -> String {
+    let shown: Vec<String> = files
+        .iter()
+        .take(12)
+        .map(|f| f.strip_prefix(ws).unwrap_or(f).to_string_lossy().replace('\\', "/"))
+        .collect();
+    format!(
+        "{}\nFiles changed: {}\nChecks: {}{}",
+        report.trim(),
+        if shown.is_empty() { "none".to_string() } else { shown.join(", ") },
+        match checks {
+            Some((true, s)) => format!("passed ({s})"),
+            Some((false, s)) => format!("still failing ({s})"),
+            None => "none ran".into(),
+        },
+        match proof {
+            Some(Some(true)) => "\nStep check: proven with tools".to_string(),
+            Some(None) => "\nStep check: could not run (provider unreachable); judge from the report".to_string(),
+            Some(Some(false)) => format!(
+                "\nStep check: NOT proven ({}) — see the end of the step chat",
+                split_check(title).1.unwrap_or("")
+            ),
+            None => String::new(),
+        }
+    )
+}
+
+/// A worked step, as the coordinator's verdict needs it.
+struct StepDone<'a> {
+    step: &'a MissionStep,
+    n: usize,
+    attempts: i64,
+    receipt: &'a str,
+    first_line: &'a str,
+    info: &'a AgentInfo,
+}
+
+/// Act on the coordinator's verdict for a worked step. `Ok(true)` = the
+/// goal is reached. A redo leaves its reason in `redo_reason`.
+fn apply_verdict(
+    st: &Shared,
+    session_id: &str,
+    m: &Mission,
+    done: &StepDone,
+    verdict: Verdict,
+    redo_reason: &mut Option<String>,
+) -> Result<bool> {
+    let StepDone { step, n, attempts, receipt, first_line, info } = *done;
+    match verdict {
+        Verdict::Redo(why) if attempts < MAX_ATTEMPTS => {
+            st.db.mission_step_update(step.id, "pending", attempts, receipt, None)?;
+            agent_status(st, info, "failed", format!("redo: {why}"));
+            say(st, session_id, format!("↻ Step {n} again — {}", if why.is_empty() { "not done yet".to_string() } else { why.clone() }));
+            *redo_reason = Some(why);
+        }
+        Verdict::Redo(why) => {
+            st.db.mission_step_update(step.id, "failed", attempts, receipt, None)?;
+            agent_status(st, info, "failed", "gave up after 3 tries".into());
+            say(st, session_id, format!("✗ Step {n} failed after {MAX_ATTEMPTS} tries ({why}); moving on."));
+        }
+        Verdict::Add(new_step) if m.steps.len() < MAX_PLAN_STEPS => {
+            st.db.mission_step_update(step.id, "done", attempts, receipt, None)?;
+            st.db.mission_step_insert_after(session_id, step.id, &new_step)?;
+            agent_status(st, info, "done", first_line.to_string());
+            say(st, session_id, format!("✓ Step {n}: {} — {first_line}\n➕ Added next: {new_step}", split_check(&step.title).0));
+        }
+        Verdict::Done => {
+            st.db.mission_step_update(step.id, "done", attempts, receipt, None)?;
+            agent_status(st, info, "done", first_line.to_string());
+            say(st, session_id, format!("✓ Step {n}: {} — {first_line}", split_check(&step.title).0));
+            // The coordinator says the goal is reached: what is left is not needed.
+            return Ok(true);
+        }
+        Verdict::Next | Verdict::Add(_) => {
+            st.db.mission_step_update(step.id, "done", attempts, receipt, None)?;
+            agent_status(st, info, "done", first_line.to_string());
+            say(st, session_id, format!("✓ Step {n}: {} — {first_line}", split_check(&step.title).0));
+        }
+    }
+    Ok(false)
 }
 
 /// `/mission status`: the plan with each step's state and receipt line.

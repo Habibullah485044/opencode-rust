@@ -476,11 +476,7 @@ pub(super) async fn check_after_run(
             return Some((false, best.summary));
         }
         note(format!("{VERIFY_PREFIX} {} failed — fix round {round} of {max_rounds}", best.summary));
-        let mut msg = format!("{VERIFY_PREFIX} {}\n", best.report);
-        if undone {
-            msg.push_str("Your last fix attempt did not reduce the problems, so its file changes were undone. Try a different fix.\n");
-        }
-        msg.push_str("Fix these problems, then stop.");
+        let msg = fix_round_message(&best.report, undone);
         let journal = crate::keepbest::Journal::begin(&ws);
         if let Err(e) = tagged("fix round", session_id, agent_inner(st, session_id, &msg, abort)).await {
             note(format!("{VERIFY_PREFIX} fix round failed: {e}"));
@@ -493,10 +489,7 @@ pub(super) async fn check_after_run(
         let now = run_gate(st, &ws, &mut gate, timeout, &note, abort).await?;
         if now.problems == 0 {
             note(format!("{VERIFY_PREFIX} {} passed after {round} fix round(s)", gate.label()));
-            // A failure the checks proved fixed is worth remembering here.
-            let fix = last_assistant_text(st, session_id).unwrap_or_default();
-            let (path, report) = (lessons_path(st, &ws), first_report.clone());
-            let _ = tokio::task::spawn_blocking(move || record_lesson_at(&path, &report, &fix)).await;
+            remember_fix(st, session_id, &ws, first_report.clone()).await;
             return Some((true, format!("{} (after {round} fix round(s))", now.summary)));
         }
         if now.problems < best.problems {
@@ -517,6 +510,24 @@ pub(super) async fn check_after_run(
         best.summary
     ));
     Some((false, best.summary))
+}
+
+/// What a fix round asks the agent: the failing checks' report, and
+/// whether its last attempt was undone.
+fn fix_round_message(report: &str, undone: bool) -> String {
+    let mut msg = format!("{VERIFY_PREFIX} {report}\n");
+    if undone {
+        msg.push_str("Your last fix attempt did not reduce the problems, so its file changes were undone. Try a different fix.\n");
+    }
+    msg.push_str("Fix these problems, then stop.");
+    msg
+}
+
+/// A failure the checks proved fixed is worth remembering here.
+async fn remember_fix(st: &Shared, session_id: &str, ws: &std::path::Path, report: String) {
+    let fix = last_assistant_text(st, session_id).unwrap_or_default();
+    let path = lessons_path(st, ws);
+    let _ = tokio::task::spawn_blocking(move || record_lesson_at(&path, &report, &fix)).await;
 }
 
 /// The check command for `ws`: the configured one, else (with
@@ -677,61 +688,89 @@ pub(super) async fn run_gate(
     note: &impl Fn(String),
     abort: &AtomicBool,
 ) -> Option<GateResult> {
-    let mut problems = 0;
-    let mut report = String::new();
-    let mut summary = Vec::new();
-    let mut ran = false;
+    let mut tally = GateTally::default();
     if let Some(cmd) = gate.cmd.clone() {
-        note(format!("{VERIFY_PREFIX} running `{cmd}`…"));
-        match run_verify_command(&cmd, ws, timeout, abort).await {
-            Err(e) => {
-                note(format!("{VERIFY_PREFIX} could not run `{cmd}`: {e:#}"));
-                gate.cmd = None;
-            }
-            Ok((code, out)) if code != Some(0) && command_unavailable(&out) => {
-                note(format!("{VERIFY_PREFIX} skipped `{cmd}`: it is not available here"));
-                gate.cmd = None;
-            }
-            Ok((Some(0), _)) => {
-                ran = true;
-                summary.push(format!("`{cmd}` passed"));
-            }
-            Ok((code, out)) => {
-                ran = true;
-                let status = match code {
-                    Some(c) => format!("exit {c}"),
-                    None => "timed out or was killed".to_string(),
-                };
-                problems += failure_count(&out);
-                summary.push(format!("`{cmd}` ({status})"));
-                report.push_str(&format!(
-                    "`{cmd}` failed ({status}). Output (last 4000 chars):\n```\n{}\n```\n",
-                    tail_chars(&out, 4000)
-                ));
-            }
-        }
+        gate_command(&cmd, ws, gate, timeout, note, abort, &mut tally).await;
     }
     if abort.load(Ordering::SeqCst) {
         return None;
     }
+    gate_pages(st, ws, gate, note, &mut tally).await;
+    let GateTally { problems, report, summary, ran } = tally;
+    ran.then(|| GateResult { problems, report: report.trim_end().to_string(), summary: summary.join(", ") })
+}
+
+/// What one pass of the gate found so far.
+#[derive(Default)]
+struct GateTally {
+    problems: usize,
+    report: String,
+    summary: Vec<String>,
+    /// At least one check ran.
+    ran: bool,
+}
+
+/// The gate's check command (dropped from `gate` when it cannot run here).
+async fn gate_command(
+    cmd: &str,
+    ws: &std::path::Path,
+    gate: &mut Gate,
+    timeout: std::time::Duration,
+    note: &impl Fn(String),
+    abort: &AtomicBool,
+    tally: &mut GateTally,
+) {
+    note(format!("{VERIFY_PREFIX} running `{cmd}`…"));
+    match run_verify_command(cmd, ws, timeout, abort).await {
+        Err(e) => {
+            note(format!("{VERIFY_PREFIX} could not run `{cmd}`: {e:#}"));
+            gate.cmd = None;
+        }
+        Ok((code, out)) if code != Some(0) && command_unavailable(&out) => {
+            note(format!("{VERIFY_PREFIX} skipped `{cmd}`: it is not available here"));
+            gate.cmd = None;
+        }
+        Ok((Some(0), _)) => {
+            tally.ran = true;
+            tally.summary.push(format!("`{cmd}` passed"));
+        }
+        Ok((code, out)) => {
+            tally.ran = true;
+            let status = match code {
+                Some(c) => format!("exit {c}"),
+                None => "timed out or was killed".to_string(),
+            };
+            tally.problems += failure_count(&out);
+            tally.summary.push(format!("`{cmd}` ({status})"));
+            tally.report.push_str(&format!(
+                "`{cmd}` failed ({status}). Output (last 4000 chars):\n```\n{}\n```\n",
+                tail_chars(&out, 4000)
+            ));
+        }
+    }
+}
+
+/// The gate's page checks (a page that cannot be checked is dropped from
+/// `gate`). The first page checked is shown in the browser panel.
+async fn gate_pages(st: &Shared, ws: &std::path::Path, gate: &mut Gate, note: &impl Fn(String), tally: &mut GateTally) {
     let mut shown = false;
     for page in gate.pages.clone() {
         let widths: Vec<String> = crate::pagecheck::DEFAULT_WIDTHS.iter().map(|w| format!("{w}px")).collect();
         note(format!("{VERIFY_PREFIX} opening {page} in a browser at {}…", widths.join(" and ")));
         match crate::pagecheck::check(ws, &page, crate::pagecheck::DEFAULT_WIDTHS, &gate.expect).await {
             Ok(r) => {
-                ran = true;
+                tally.ran = true;
                 if !shown {
                     show_in_panel(st, &r.url);
                     shown = true;
                 }
                 if r.score() > 0 {
-                    problems += r.score();
-                    summary.push(format!("{page}: {} problem(s)", r.score()));
-                    report.push_str(&r.render());
-                    report.push('\n');
+                    tally.problems += r.score();
+                    tally.summary.push(format!("{page}: {} problem(s)", r.score()));
+                    tally.report.push_str(&r.render());
+                    tally.report.push('\n');
                 } else {
-                    summary.push(format!("{page} looks right"));
+                    tally.summary.push(format!("{page} looks right"));
                 }
             }
             Err(e) => {
@@ -740,10 +779,9 @@ pub(super) async fn run_gate(
             }
         }
     }
-    ran.then(|| GateResult { problems, report: report.trim_end().to_string(), summary: summary.join(", ") })
 }
 
-/// Web pages this run changed: files the tools wrote, plus (when shell
+// Web pages this run changed: files the tools wrote, plus (when shell
 /// commands ran) web files modified since the run started.
 pub(super) fn changed_web_pages(ws: &std::path::Path, since: std::time::SystemTime, bash_used: bool, enabled: bool) -> Vec<String> {
     if !enabled {

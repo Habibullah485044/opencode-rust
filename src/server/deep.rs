@@ -134,85 +134,18 @@ pub(super) async fn run_deep(
     st.db.add_message(session_id, "user", &[Part::Text { text: format!("[deep mode, {n} attempts] {task}") }])?;
     let started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
 
-    // The worktrees, one after the other (git locks the repository).
-    let mut wts = Vec::new();
-    for i in 1..=n {
-        let (w, sd) = (ws.clone(), st.state_dir.clone());
-        let made = tokio::task::spawn_blocking(move || Worktree::create(&w, &sd, &format!("deep{i}")))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        wts.push(made.map_err(|e| anyhow::anyhow!("Deep mode needs a git repository with at least one commit: {e:#}"))?);
-    }
-    let trees = Trees(Some(Arc::new(wts)));
+    let trees = Trees(Some(Arc::new(create_worktrees(st, &ws, n).await?)));
     let wts = trees.get();
 
-    // Attempt settings: no reviews inside an attempt, the model the chat
-    // uses now, and no approval waits (nobody can answer them). Writes stay
-    // inside the attempt's own copy, so they need no approval; commands do,
-    // so outside turbo they are off and the app runs the checks instead.
     // The chat's mode: a mission's step runs as turbo.
     let mode = st.perm_mode_for(session_id);
     let can_run_commands = mode == PermissionMode::Turbo;
-    let mut cfg = st.cfg.clone();
-    cfg.agent.auto_review = false;
-    cfg.provider.model = st.current_model().await;
-    cfg.permissions.approval_timeout_secs = 0;
-    // MCP servers act on the real project, not on an attempt's copy (and
-    // each attempt would start them again).
-    cfg.mcp.servers.clear();
-    // Nobody can answer approval prompts during an attempt: web reads are
-    // safe, so they stay allowed (otherwise every web lookup is denied on
-    // the spot); questions are denied so attempts decide for themselves.
-    for (tool, action) in [
-        ("write", "allow"),
-        ("edit", "allow"),
-        ("webfetch", "allow"),
-        ("ask_user", "deny"),
-    ] {
-        cfg.permissions.defaults.insert(tool.into(), action.into());
-    }
-    if !can_run_commands {
-        cfg.permissions.defaults.insert("bash".into(), "deny".into());
-    }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let infos: Vec<AgentInfo> = (1..=n)
-        .map(|i| AgentInfo {
-            id: format!("deep-{stamp}-{i}"),
-            parent: session_id.to_string(),
-            name: format!("attempt {i}"),
-            task: task.to_string(),
-        })
-        .collect();
+    let cfg = attempt_config(st, can_run_commands).await;
+    let infos = attempt_infos(session_id, task, n);
     note(format!("deep mode: {n} attempts at the same time, each in its own copy of the project"));
     let runs = futures::future::join_all(wts.iter().zip(&infos).enumerate().map(|(i, (wt, info))| {
-        let cfg = cfg.clone();
         let prompt = attempt_prompt(task, i, can_run_commands);
-        async move {
-            agent_status(st, info, "working", "starting…".into());
-            let worker = build_state_ephemeral(cfg, wt.workspace()).await;
-            let _ = worker.set_perm_mode(mode);
-            let fwd = forward_activity(st, &worker, info);
-            let res = match worker.db.create_session(&info.name, None) {
-                Ok(s) => agent_inner(&worker, &s.id, &prompt, abort).await.map_err(|e| format!("{e:#}")),
-                Err(e) => Err(format!("{e:#}")),
-            };
-            fwd.abort();
-            // The attempt's tokens count for this chat too (`/usage`).
-            let u = worker.db.usage_totals(None, None).unwrap_or_default();
-            if u.input + u.output > 0 {
-                let usage = crate::provider::Usage {
-                    input: u.input,
-                    cached: u.cached,
-                    cache_write: u.cache_write,
-                    output: u.output,
-                };
-                st.record_usage_as("deep attempt", session_id, &st.current_model().await, &usage);
-            }
-            (res, u.input + u.output)
-        }
+        run_attempt(st, session_id, cfg.clone(), mode, wt.workspace(), info, prompt, abort)
     }))
     .await;
     if abort.load(Ordering::SeqCst) {
@@ -223,59 +156,22 @@ pub(super) async fn run_deep(
     }
 
     // Check the attempts one after the other.
-    let timeout = std::time::Duration::from_secs(st.cfg.agent.verify_timeout_secs.max(1));
-    let expect = crate::pagecheck::expected_texts(task);
     let changes = trees.with(|wts| wts.iter().map(|wt| wt.changes().unwrap_or_default()).collect::<Vec<_>>()).await?;
-    // Asked once per command, not once per attempt: the attempts are copies
-    // of one project, and a prompt per attempt would ask the same thing n times.
-    let mut verify_ok: HashMap<String, bool> = HashMap::new();
+    let mut checks = AttemptChecks {
+        timeout: std::time::Duration::from_secs(st.cfg.agent.verify_timeout_secs.max(1)),
+        expect: crate::pagecheck::expected_texts(task),
+        verify_ok: HashMap::new(),
+    };
     let mut scored = Vec::new();
     for (i, ((wt, (res, tokens)), (files, lines))) in wts.iter().zip(runs).zip(changes).enumerate() {
         let info = &infos[i];
-        let attempt_ws = wt.workspace();
         let (failed, answer) = match res {
             Ok(LoopEnd::Aborted) => (Some("stopped".to_string()), String::new()),
             Ok(LoopEnd::Done(a)) => (None, a),
             Err(e) => (Some(e), String::new()),
         };
         let mut s = Scored { n: i + 1, failed, files, lines, problems: 0, checks: String::new(), answer, tokens };
-        if let Some(e) = &s.failed {
-            s.checks = format!("did not finish: {}", e.chars().take(120).collect::<String>());
-        } else if s.files.is_empty() {
-            s.checks = "changed no files".into();
-        } else {
-            agent_status(st, info, "working", "checking the result…".into());
-            let prefixed = |t: String| note(format!("attempt {}: {t}", i + 1));
-            let pages = if st.cfg.agent.check_pages {
-                crate::pagecheck::pages_for(&attempt_ws, &s.files, 3)
-            } else {
-                Vec::new()
-            };
-            // The check runs the attempt's code: only with the same
-            // permission any `bash` call needs (skipped when it is denied).
-            let cmd = match verify_command_for(st, &attempt_ws, &prefixed) {
-                Some(c) => {
-                    let ok = match verify_ok.get(&c) {
-                        Some(ok) => *ok,
-                        None => {
-                            let ok = verify_permitted(st, session_id, &c, &prefixed, abort).await;
-                            verify_ok.insert(c.clone(), ok);
-                            ok
-                        }
-                    };
-                    ok.then_some(c)
-                }
-                None => None,
-            };
-            let mut gate = Gate { cmd, pages, expect: expect.clone() };
-            match run_gate(st, &attempt_ws, &mut gate, timeout, &prefixed, abort).await {
-                Some(r) => {
-                    s.problems = r.problems;
-                    s.checks = if r.problems == 0 { format!("passed: {}", r.summary) } else { r.summary };
-                }
-                None => s.checks = "no checks to run".into(),
-            }
-        }
+        checks.check(st, session_id, info, &wt.workspace(), &mut s, &note, abort).await;
         let state = if s.failed.is_some() { "failed" } else { "done" };
         agent_status(st, info, state, s.checks.clone());
         scored.push(s);
@@ -283,29 +179,9 @@ pub(super) async fn run_deep(
 
     // Keep the best attempt.
     let best = scored.iter().min_by_key(|s| s.rank()).filter(|s| !s.rank().0).map(|s| s.n);
-    let mut out = format!("**Deep mode** — {n} attempts at: {task}\n\n");
-    for s in &scored {
-        let mark = if Some(s.n) == best { " ← kept" } else { "" };
-        out.push_str(&format!(
-            "- attempt {}: {} file(s), {} line(s) changed · {} · {} tokens{mark}\n",
-            s.n,
-            s.files.len(),
-            s.lines,
-            s.checks,
-            s.tokens
-        ));
-    }
+    let mut out = attempts_table(n, task, &scored, best);
     let Some(best) = best else {
-        // Every attempt hit the provider's door, not the task: say that.
-        let unreachable = scored.iter().all(|s| s.failed.as_deref().is_some_and(|e| e.contains("provider request to")));
-        if unreachable {
-            out.push_str(
-                "\nThe provider could not be reached during the attempts (the network or the endpoint was down), \
-                 so nothing was tried and nothing was applied. Send it again once the header says API Connected.",
-            );
-        } else {
-            out.push_str("\nNo attempt produced a change, so nothing was applied.");
-        }
+        out.push_str(no_winner_note(&scored));
         return Ok(out);
     };
     let winner = &scored[best - 1];
@@ -347,6 +223,195 @@ pub(super) async fn run_deep(
         return Ok(String::new());
     }
     Ok(out)
+}
+
+/// The worktrees, one after the other (git locks the repository).
+async fn create_worktrees(st: &Shared, ws: &std::path::Path, n: usize) -> Result<Vec<Worktree>> {
+    let mut wts = Vec::new();
+    for i in 1..=n {
+        let (w, sd) = (ws.to_path_buf(), st.state_dir.clone());
+        let made = tokio::task::spawn_blocking(move || Worktree::create(&w, &sd, &format!("deep{i}")))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        wts.push(made.map_err(|e| anyhow::anyhow!("Deep mode needs a git repository with at least one commit: {e:#}"))?);
+    }
+    Ok(wts)
+}
+
+/// Attempt settings: no reviews inside an attempt, the model the chat
+/// uses now, and no approval waits (nobody can answer them). Writes stay
+/// inside the attempt's own copy, so they need no approval; commands do,
+/// so outside turbo they are off and the app runs the checks instead.
+async fn attempt_config(st: &Shared, can_run_commands: bool) -> Config {
+    let mut cfg = st.cfg.clone();
+    cfg.agent.auto_review = false;
+    cfg.provider.model = st.current_model().await;
+    cfg.permissions.approval_timeout_secs = 0;
+    // MCP servers act on the real project, not on an attempt's copy (and
+    // each attempt would start them again).
+    cfg.mcp.servers.clear();
+    // Nobody can answer approval prompts during an attempt: web reads are
+    // safe, so they stay allowed (otherwise every web lookup is denied on
+    // the spot); questions are denied so attempts decide for themselves.
+    for (tool, action) in [
+        ("write", "allow"),
+        ("edit", "allow"),
+        ("webfetch", "allow"),
+        ("ask_user", "deny"),
+    ] {
+        cfg.permissions.defaults.insert(tool.into(), action.into());
+    }
+    if !can_run_commands {
+        cfg.permissions.defaults.insert("bash".into(), "deny".into());
+    }
+    cfg
+}
+
+/// The attempts' cards in the agents panel.
+fn attempt_infos(session_id: &str, task: &str, n: usize) -> Vec<AgentInfo> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    (1..=n)
+        .map(|i| AgentInfo {
+            id: format!("deep-{stamp}-{i}"),
+            parent: session_id.to_string(),
+            name: format!("attempt {i}"),
+            task: task.to_string(),
+        })
+        .collect()
+}
+
+/// Run one attempt in its own worktree. Returns how it ended and the
+/// tokens it used.
+#[allow(clippy::too_many_arguments)]
+async fn run_attempt(
+    st: &Shared,
+    session_id: &str,
+    cfg: Config,
+    mode: PermissionMode,
+    workspace: PathBuf,
+    info: &AgentInfo,
+    prompt: String,
+    abort: &Arc<AtomicBool>,
+) -> (std::result::Result<LoopEnd, String>, u64) {
+    agent_status(st, info, "working", "starting…".into());
+    let worker = build_state_ephemeral(cfg, workspace).await;
+    let _ = worker.set_perm_mode(mode);
+    let fwd = forward_activity(st, &worker, info);
+    let res = match worker.db.create_session(&info.name, None) {
+        Ok(s) => agent_inner(&worker, &s.id, &prompt, abort).await.map_err(|e| format!("{e:#}")),
+        Err(e) => Err(format!("{e:#}")),
+    };
+    fwd.abort();
+    // The attempt's tokens count for this chat too (`/usage`).
+    let u = worker.db.usage_totals(None, None).unwrap_or_default();
+    if u.input + u.output > 0 {
+        let usage = crate::provider::Usage {
+            input: u.input,
+            cached: u.cached,
+            cache_write: u.cache_write,
+            output: u.output,
+        };
+        st.record_usage_as("deep attempt", session_id, &st.current_model().await, &usage);
+    }
+    (res, u.input + u.output)
+}
+
+/// What checking the attempts shares between them.
+struct AttemptChecks {
+    timeout: std::time::Duration,
+    expect: Vec<String>,
+    /// Asked once per command, not once per attempt: the attempts are copies
+    /// of one project, and a prompt per attempt would ask the same thing n times.
+    verify_ok: HashMap<String, bool>,
+}
+
+impl AttemptChecks {
+    /// Run the checks on attempt `s` (when it finished with changes) and
+    /// fill in its problems and check line.
+    #[allow(clippy::too_many_arguments)]
+    async fn check(
+        &mut self,
+        st: &Shared,
+        session_id: &str,
+        info: &AgentInfo,
+        attempt_ws: &std::path::Path,
+        s: &mut Scored,
+        note: &impl Fn(String),
+        abort: &Arc<AtomicBool>,
+    ) {
+        if let Some(e) = &s.failed {
+            s.checks = format!("did not finish: {}", e.chars().take(120).collect::<String>());
+            return;
+        }
+        if s.files.is_empty() {
+            s.checks = "changed no files".into();
+            return;
+        }
+        agent_status(st, info, "working", "checking the result…".into());
+        let n = s.n;
+        let prefixed = |t: String| note(format!("attempt {n}: {t}"));
+        let pages = if st.cfg.agent.check_pages {
+            crate::pagecheck::pages_for(attempt_ws, &s.files, 3)
+        } else {
+            Vec::new()
+        };
+        // The check runs the attempt's code: only with the same
+        // permission any `bash` call needs (skipped when it is denied).
+        let cmd = match verify_command_for(st, attempt_ws, &prefixed) {
+            Some(c) => {
+                let ok = match self.verify_ok.get(&c) {
+                    Some(ok) => *ok,
+                    None => {
+                        let ok = verify_permitted(st, session_id, &c, &prefixed, abort).await;
+                        self.verify_ok.insert(c.clone(), ok);
+                        ok
+                    }
+                };
+                ok.then_some(c)
+            }
+            None => None,
+        };
+        let mut gate = Gate { cmd, pages, expect: self.expect.clone() };
+        match run_gate(st, attempt_ws, &mut gate, self.timeout, &prefixed, abort).await {
+            Some(r) => {
+                s.problems = r.problems;
+                s.checks = if r.problems == 0 { format!("passed: {}", r.summary) } else { r.summary };
+            }
+            None => s.checks = "no checks to run".into(),
+        }
+    }
+}
+
+/// The report's head: one line per attempt, the kept one marked.
+fn attempts_table(n: usize, task: &str, scored: &[Scored], best: Option<usize>) -> String {
+    let mut out = format!("**Deep mode** — {n} attempts at: {task}\n\n");
+    for s in scored {
+        let mark = if Some(s.n) == best { " ← kept" } else { "" };
+        out.push_str(&format!(
+            "- attempt {}: {} file(s), {} line(s) changed · {} · {} tokens{mark}\n",
+            s.n,
+            s.files.len(),
+            s.lines,
+            s.checks,
+            s.tokens
+        ));
+    }
+    out
+}
+
+/// Why nothing was applied when no attempt is worth keeping.
+fn no_winner_note(scored: &[Scored]) -> &'static str {
+    // Every attempt hit the provider's door, not the task: say that.
+    let unreachable = scored.iter().all(|s| s.failed.as_deref().is_some_and(|e| e.contains("provider request to")));
+    if unreachable {
+        "\nThe provider could not be reached during the attempts (the network or the endpoint was down), \
+         so nothing was tried and nothing was applied. Send it again once the header says API Connected."
+    } else {
+        "\nNo attempt produced a change, so nothing was applied."
+    }
 }
 
 #[cfg(test)]

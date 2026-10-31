@@ -280,13 +280,22 @@ pub(super) async fn check_permission_preview(
     preview: &str,
     abort: &AtomicBool,
 ) -> bool {
+    match decided_without_prompt(st, session_id, tool, detail) {
+        Some(allowed) => allowed,
+        None => ask_for_approval(st, session_id, tool, detail, preview, abort).await,
+    }
+}
+
+/// The answer the rules and the permission mode give without asking the
+/// user, or `None` when the user must be asked.
+fn decided_without_prompt(st: &Shared, session_id: &str, tool: &str, detail: &str) -> Option<bool> {
     // "Always allow" answers belong to this chat's workspace only (S-07).
     let ws_key = crate::db::workspace_key(&st.workspace_for(session_id));
     let remembered = |t: &str, d: &str| st.db.has_approval(&ws_key, t, d).unwrap_or(false);
     let decision = st.engine.evaluate(tool, detail, remembered);
     // Hard `deny` rules are policy, not prompts: they survive every mode.
     if matches!(decision.action, Action::Deny) {
-        return false;
+        return Some(false);
     }
     let allow = decision.action == Action::Allow;
     // Per chat: a running mission approves its own chats, never the others.
@@ -299,8 +308,21 @@ pub(super) async fn check_permission_preview(
         PermissionMode::Manual => allow && remembered(tool, detail),
     };
     if permitted {
-        return true;
+        return Some(true);
     }
+    None
+}
+
+/// Ask the user through every client and wait for the answer (or the
+/// timeout, or an abort). True when the call was allowed.
+async fn ask_for_approval(
+    st: &Shared,
+    session_id: &str,
+    tool: &str,
+    detail: &str,
+    preview: &str,
+    abort: &AtomicBool,
+) -> bool {
     // New (B-22): show what will change, right before the prompt.
     if !preview.is_empty() {
         let _ = st.events.send(ServerEvent::Note {
