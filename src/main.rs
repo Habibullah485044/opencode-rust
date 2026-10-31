@@ -358,7 +358,7 @@ async fn headless_run(
 ) -> Result<()> {
     println!("[boot] core ready in {boot_ms}ms at http://{addr}");
     let prompt = prompt.context("--headless requires a prompt argument")?;
-    let session = state.db.create_session("cli", None)?;
+    let session = state.db.run(|db| db.create_session("cli", None)).await?;
     println!("[session] {}", session.id);
 
     // Subscribe before starting so we see every event.
@@ -810,7 +810,7 @@ async fn tui_run(
     boot_ms: u128,
 ) -> Result<()> {
     // Create initial session.
-    let session = state.db.create_session("tui", None)?;
+    let session = state.db.run(|db| db.create_session("tui", None)).await?;
     let mut app = tui::App::new();
     app.session_id = Some(session.id.clone());
     app.push(
@@ -1011,12 +1011,17 @@ async fn tui_run(
                         tokio::spawn(snapshot_command(st2, sid2, true, false));
                     }
                     tui::InputAction::Fork => {
+                        // A fork copies the whole history: off the async worker.
+                        let from = sid.clone();
                         let forked = st
                             .db
-                            .get_session(&sid)
+                            .run(move |db| {
+                                let Some(s) = db.get_session(&from)? else { return Ok(None) };
+                                Ok(Some(db.fork_session(&s.id, &format!("{} (fork)", s.title))?))
+                            })
+                            .await
                             .ok()
-                            .flatten()
-                            .and_then(|s| st.db.fork_session(&s.id, &format!("{} (fork)", s.title)).ok());
+                            .flatten();
                         match forked {
                             Some(new) => {
                                 let transcript = st.transcript(&new.id).unwrap_or_default();
@@ -1144,7 +1149,7 @@ async fn tui_run(
                             }
                         }
                     }
-                    tui::InputAction::NewSession => match st.db.create_session("new session", None) {
+                    tui::InputAction::NewSession => match st.db.run(|db| db.create_session("new session", None)).await {
                         Ok(s) => {
                             sid = s.id.clone();
                             let _ = st.events.send(server::ServerEvent::SessionLoaded {
