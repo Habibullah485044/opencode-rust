@@ -71,6 +71,11 @@ rate_limit_wait_secs = 300
 # /usage can show cache hits. Set false if a server rejects the request.
 # stream_usage = true
 
+# Send images attached to a message to the model: "auto" (default; when the
+# model name says it can see, e.g. -vl, gpt-4o, claude, gemini), "on" or "off".
+# The design review needs it too.
+# images = "auto"
+
 [agent]
 max_steps = 40
 # Your own prompt (also in the desktop app: Settings -> System prompt).
@@ -113,8 +118,17 @@ reuse_gate = true
 # verify_command = "cargo test"
 # verify_max_rounds = 2
 # verify_timeout_secs = 600
+# With no verify_command, find the project's check on its own (Cargo.toml ->
+# cargo check, a package.json test script, pytest tests, go.mod).
+# auto_verify = true
+# After a run that changed a web page, open it in a headless browser at phone
+# and desktop width and hand the problems back to the agent.
+# check_pages = true
 
 [permissions]
+# Seconds an approval request waits for an answer before it is denied.
+# approval_timeout_secs = 300
+
 # Default action per tool: "allow" | "ask" | "deny"
 [permissions.defaults]
 # Letter case of the action word is ignored. Tools you leave out keep their
@@ -128,6 +142,23 @@ bash = "ask"
 write = "ask"
 edit = "ask"
 webfetch = "allow"
+# The other built-in defaults, shown here for reference:
+# check_page = "allow"
+# mcp_search = "allow"
+# ask_user = "allow"
+# todo = "allow"
+# spawn = "allow"
+# agent = "allow"
+# browser_navigate = "allow"
+# browser_snapshot = "allow"
+# browser_wait = "allow"
+# browser_screenshot = "allow"
+# browser_scroll = "allow"
+# browser_console = "allow"
+# browser_click = "ask"
+# browser_type = "ask"
+# browser_press = "ask"
+# browser_eval = "ask"
 
 # Rules are checked in order; the first match wins.
 # For file tools the pattern is matched against the path relative to the
@@ -138,6 +169,23 @@ webfetch = "allow"
 # tool = "read"
 # pattern = ".env"
 # action = "deny"
+
+[server]
+# Port of the local API server (always bound to 127.0.0.1). 0 (default) =
+# any free port. `--port N` on the command line overrides it.
+# port = 0
+
+# The desktop app's browser panel.
+[browser]
+# Master switch for the panel's web view. false = only its frame is drawn.
+# enabled = true
+# Page offered when the panel opens with nothing loaded ("" = none).
+# home_url = ""
+# false = the panel loads only this machine's addresses (localhost dev
+# servers), the safest setting.
+# allow_remote = true
+# Reserved for a dedicated browser profile folder; not used yet.
+# profile_dir = "C:/profiles/agent"
 
 # MCP servers (optional). Each runs as its own program; its tools reach the
 # model as mcp__<name>__<tool>. Run each command once in a terminal first:
