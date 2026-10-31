@@ -301,10 +301,28 @@ impl Isolation {
 
 impl Drop for Isolation {
     fn drop(&mut self) {
-        if let IsoState::Worktree(mut wt) = std::mem::replace(&mut self.state, IsoState::Done) {
-            let _ = wt.report(&self.patch_dir);
+        let IsoState::Worktree(wt) = std::mem::replace(&mut self.state, IsoState::Done) else {
+            return;
+        };
+        let patch_dir = self.patch_dir.clone();
+        // T-022: saving the patch and removing the worktree run git several
+        // times. Dropped in async code (an early `?`), that would hold up the
+        // tokio worker, so the work goes to a blocking thread.
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn_blocking(move || save_dropped(wt, &patch_dir));
+            }
+            Err(_) => save_dropped(wt, &patch_dir),
         }
     }
+}
+
+/// Save a dropped worker's changes as a patch; the worktree's own Drop then
+/// removes it.
+fn save_dropped(mut wt: Worktree, patch_dir: &Path) {
+    #[cfg(test)]
+    tests::note_cleanup(patch_dir);
+    let _ = wt.report(patch_dir);
 }
 
 /// System-prompt text for a worker that runs in its own worktree.
@@ -338,6 +356,15 @@ pub fn isolated_tools(role_tools: Option<&[String]>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Which thread saved each dropped worker (by patch folder).
+    static CLEANUPS: Mutex<Vec<(PathBuf, std::thread::ThreadId)>> = Mutex::new(Vec::new());
+
+    pub(super) fn note_cleanup(patch_dir: &Path) {
+        let mut v = CLEANUPS.lock().unwrap_or_else(|e| e.into_inner());
+        v.push((patch_dir.to_path_buf(), std::thread::current().id()));
+    }
 
     fn temp(tag: &str) -> PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -443,6 +470,45 @@ mod tests {
         assert!(!ws.exists());
         let branches = git(&repo, &["branch", "--list", "ocrs/*"]).unwrap();
         assert!(branches.trim().is_empty(), "branches deleted: {branches}");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// T-022: dropped on a tokio thread, the git work runs on a blocking
+    /// thread, not inline; the patch is still saved and the worktree removed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_in_a_runtime_saves_on_a_blocking_thread() {
+        let repo = temp("rt-drop-repo");
+        let state = temp("rt-drop-state");
+        git(&repo, &["init", "-q"]).unwrap();
+        git(&repo, &["config", "user.email", "t@t"]).unwrap();
+        git(&repo, &["config", "user.name", "t"]).unwrap();
+        git(&repo, &["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::write(repo.join("a.txt"), "one
+").unwrap();
+        git(&repo, &["add", "-A"]).unwrap();
+        git(&repo, &["commit", "-q", "-m", "init"]).unwrap();
+        let iso = Isolation::start(&repo, &state, "worker");
+        let ws = iso.workspace().unwrap();
+        std::fs::write(ws.join("a.txt"), "worker edit
+").unwrap();
+        let patch_dir = iso.patch_dir.clone();
+
+        drop(iso);
+        let me = std::thread::current().id();
+        let saved_by = |dir: &Path| {
+            let v = CLEANUPS.lock().unwrap_or_else(|e| e.into_inner());
+            v.iter().find(|(d, _)| d == dir).map(|(_, t)| *t)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while ws.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let thread = saved_by(&patch_dir).expect("the dropped worker was saved");
+        assert_ne!(thread, me, "git ran inline on the runtime thread");
+        assert!(!ws.exists(), "worktree removed");
+        let n = std::fs::read_dir(&patch_dir).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(n, 1, "the dropped worker's change is saved");
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&state);
     }

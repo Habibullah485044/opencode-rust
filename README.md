@@ -17,7 +17,8 @@ Three ways to use it:
 ## Features
 
 - Tools for the model: `bash`, `read`, `write`, `edit`, `list`, `glob`, `grep`,
-  `webfetch`, `todo`, tools from MCP servers (stdio), and browser tools in the
+  `webfetch`, `check_page`, `ask_user`, `todo`, `spawn` and `agent` (subagents),
+  tools from MCP servers (stdio or Streamable HTTP), and `browser_*` tools in the
   desktop app.
 - Permissions: allow / ask / deny per tool, pattern rules, approval prompts,
   "always allow".
@@ -61,8 +62,24 @@ model = "openai/gpt-4o"
 Environment variables override the file: `OPENCODE_RUST_API_KEY`,
 `OPENCODE_RUST_BASE_URL`, `OPENCODE_RUST_MODEL`.
 
-Sessions, snapshots and the crash log live in `%APPDATA%\opencode-rust`
-(Windows) or `~/.local/share/opencode-rust` (Linux/macOS).
+When `XDG_CONFIG_HOME` is set, the default config file is
+`$XDG_CONFIG_HOME/opencode-rust/config.toml` instead.
+
+State lives in `%APPDATA%\opencode-rust` (Windows) or
+`$XDG_DATA_HOME/opencode-rust`, by default `~/.local/share/opencode-rust`
+(Linux/macOS):
+
+| File | What it holds |
+|---|---|
+| `opencode.db` | Sessions, messages, token usage and todo lists (SQLite) |
+| `core.log` | Internal errors and warnings of the core |
+| `cache.log` | One line per provider request: the cached share of the prompt |
+| `crash.log` | Fatal errors and panics |
+| `api-token` | The local API's bearer token (unless `$OPENCODE_RUST_API_TOKEN` is set) |
+| `api_key.bin` | The API key saved in the desktop app's Settings (encrypted) |
+| `snaps_*/` | Git snapshots for `/undo` and `/redo`, one folder per workspace |
+| `workers/` | Git worktrees of isolated workers while they run |
+| `worker-patches/` | Isolated workers' changes, saved as patch files |
 
 ## Use
 
@@ -100,19 +117,27 @@ Inside the terminal UI, type `/` for the command palette or press F1:
 | `/model [id]` | Show or switch the model |
 | `/deep [n] <task>` | Deep mode: try the task n times (default 3, at most 5), each in its own git worktree; every attempt is checked (tests/build, page check) and the best one is applied (`/undo` takes it back). The Deep button in the desktop app does the same for one message |
 | `/parallel <task>` | Same as `/deep 2 <task>` |
+| `/ponytail [lite\|full\|ultra\|off]` | Show or set the ponytail rules' level for this chat |
 | `/review` | Senior-dev review of the uncommitted changes |
 | `/skill install <path\|url>`, `/skills` | Install / list skills |
 | `/team <goal>` | Plan → parallel workers → review → summary |
 | `/todos` | Show this session's todo list |
 | `/turbo [prompt]` | Full access, no approvals (careful) |
 | `/undo`, `/redo` | Restore / re-apply the last git snapshot |
+| `/usage` | Token usage and prompt-cache savings |
 | `/quit` | Exit |
 
 ## Permissions and safety
 
-By default `read`, `list`, `glob` and `grep` are allowed; `bash`, `write`,
-`edit` and `webfetch` ask first; unknown tools ask. Change this in
-`[permissions.defaults]` and add rules:
+By default the reading tools are allowed: `read`, `list`, `glob`, `grep`,
+`webfetch`, `check_page`, `mcp_search`, plus `ask_user`, `todo`, `spawn` and
+`agent` (a subagent still asks before its own writes and commands), and the
+browser tools that only look (`browser_navigate`, `browser_snapshot`,
+`browser_wait`, `browser_screenshot`, `browser_scroll`, `browser_console`).
+`bash`, `write`, `edit` and the browser tools that act (`browser_click`,
+`browser_type`, `browser_press`, `browser_eval`) ask first; unknown tools,
+MCP tools included, ask. Change this in `[permissions.defaults]` (a tool you
+leave out keeps its default) and add rules:
 
 ```toml
 [[permissions.rules]]
@@ -140,13 +165,28 @@ project you ever open.
   `~/.config/opencode-rust/skills/`.
 - **Command templates:** `.opencode/commands/<name>.md`; `$ARGUMENTS` is replaced
   by what you type after `/<name>`.
-- **MCP servers:**
+- **Subagent roles:** Markdown files with `name`, `description` and optional
+  `tools`, `model`, `max_steps`, `isolation` frontmatter; the body is the role's
+  system prompt. They are read from `~/.config/opencode-rust/agents/*.md`
+  (yours; may replace a built-in role, and without `tools:` gets every tool),
+  and from the project's `.claude/agents/` and `.opencode/agents/`. A project
+  role without a `tools:` line is read-only (`read`, `list`, `glob`, `grep`,
+  `webfetch`; `tools: all` asks for every tool), and one named like a built-in
+  or user role loads as `project-<name>` instead of replacing it.
+- **MCP servers:** a program over stdio (`command`, `args`), or a Streamable
+  HTTP server (`url`, optional `headers`; nothing is started):
 
 ```toml
 [[mcp.servers]]
 name = "my-server"
 command = "npx"
 args = ["-y", "some-mcp-server"]
+
+[[mcp.servers]]
+name = "remote"
+url = "https://example.com/mcp"
+[mcp.servers.headers]
+Authorization = "Bearer your-token"
 ```
 
 ## Development
