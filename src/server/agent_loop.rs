@@ -526,7 +526,7 @@ pub(crate) async fn run_loop_inner(
 
         let StreamedReply { mut text, reasoning, acc, mut shown, finish_reason, broke_off, request_usage } =
             match read_reply(st, session_id, opts, model, &mut stream, abort, &mut stream_drops).await? {
-                StreamOutcome::Reply(reply) => reply,
+                StreamOutcome::Reply(reply) => *reply,
                 StreamOutcome::Aborted => return Ok(LoopEnd::Aborted),
                 StreamOutcome::Dropped => {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -678,7 +678,7 @@ struct StreamedReply {
 
 /// How reading one reply's stream ended.
 enum StreamOutcome {
-    Reply(StreamedReply),
+    Reply(Box<StreamedReply>),
     /// Cut off before anything was saved: ask the same step again.
     Dropped,
     Aborted,
@@ -784,7 +784,7 @@ async fn read_reply(
             _ => acc.push(&ev),
         }
     }
-    Ok(StreamOutcome::Reply(StreamedReply { text, reasoning, acc, shown, finish_reason, broke_off, request_usage }))
+    Ok(StreamOutcome::Reply(Box::new(StreamedReply { text, reasoning, acc, shown, finish_reason, broke_off, request_usage })))
 }
 
 /// The reply was an upstream error served as text. `Ok` means ask the same
