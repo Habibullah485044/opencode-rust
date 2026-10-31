@@ -369,102 +369,146 @@ const CMD_KEYWORDS: &[&str] = &["if", "for"];
 /// `cmd` variables, unbalanced quotes): the caller must ask.
 pub fn split_command(line: &str, shell: Shell) -> Option<Vec<CommandPart>> {
     let chars: Vec<char> = line.chars().collect();
-    let mut parts = Vec::new();
-    let mut cur = String::new();
-    let mut writes = false;
-    let mut quote: Option<char> = None;
+    let mut s = Splitter { shell, parts: Vec::new(), cur: String::new(), writes: false, quote: None };
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         let next = chars.get(i + 1).copied();
-        if let Some(q) = quote {
-            cur.push(c);
-            if c == q {
-                quote = None;
-            } else if q == '"' && shell == Shell::Posix {
-                match c {
-                    '\\' => {
-                        if let Some(n) = next {
-                            cur.push(n);
-                            i += 1;
-                        }
+        // Each step returns how many characters after `c` it also took.
+        i += 1 + match s.quote {
+            Some(q) => s.quoted(q, c, next)?,
+            None => s.unquoted(&chars, i, c, next)?,
+        };
+    }
+    if s.quote.is_some() {
+        return None;
+    }
+    s.end_part();
+    if starts_compound(&s.parts, shell) {
+        return None;
+    }
+    Some(s.parts)
+}
+
+/// The state of [`split_command`] while it walks a line.
+struct Splitter {
+    shell: Shell,
+    parts: Vec<CommandPart>,
+    /// The part being read.
+    cur: String,
+    /// The part being read sends output into a file.
+    writes: bool,
+    /// The quote character while inside quotes.
+    quote: Option<char>,
+}
+
+impl Splitter {
+    fn end_part(&mut self) {
+        end_part(&mut self.parts, &mut self.cur, &mut self.writes);
+    }
+
+    /// `c` inside quotes `q`. `None`: syntax the splitter does not follow.
+    fn quoted(&mut self, q: char, c: char, next: Option<char>) -> Option<usize> {
+        self.cur.push(c);
+        if c == q {
+            self.quote = None;
+        } else if q == '"' && self.shell == Shell::Posix {
+            match c {
+                '\\' => {
+                    if let Some(n) = next {
+                        self.cur.push(n);
+                        return Some(1);
                     }
-                    '`' => return None,
-                    '$' if next == Some('(') => return None,
-                    _ => {}
                 }
+                '`' => return None,
+                '$' if next == Some('(') => return None,
+                _ => {}
             }
-            i += 1;
-            continue;
         }
+        Some(0)
+    }
+
+    /// `c` (at `chars[i]`) outside quotes. `None`: syntax the splitter does
+    /// not follow.
+    fn unquoted(&mut self, chars: &[char], i: usize, c: char, next: Option<char>) -> Option<usize> {
+        let shell = self.shell;
         match (shell, c) {
             (_, '"') | (Shell::Posix, '\'') => {
-                quote = Some(c);
-                cur.push(c);
+                self.quote = Some(c);
+                self.cur.push(c);
             }
             (Shell::Posix, '\\') | (Shell::Cmd, '^') => {
                 // Escape: the next character is literal. A trailing escape
                 // continues the line, which we do not follow.
                 let n = next?;
-                cur.push(c);
-                cur.push(n);
-                i += 1;
+                self.cur.push(c);
+                self.cur.push(n);
+                return Some(1);
             }
             (_, '(') | (_, ')') => return None,
             (Shell::Posix, '`') | (Shell::Posix, '{') | (Shell::Posix, '}') => return None,
             (Shell::Cmd, '%') => return None,
             (Shell::Posix, '$') if matches!(next, Some('(') | Some('\'')) => return None,
             (_, '<') if next == Some('<') => return None,
-            (Shell::Posix, ';') | (_, '\n') | (_, '\r') => end_part(&mut parts, &mut cur, &mut writes),
-            (_, '&') => {
-                let prev = cur.chars().last();
-                if next == Some('&') {
-                    end_part(&mut parts, &mut cur, &mut writes);
-                    i += 1;
-                } else if matches!(prev, Some('>') | Some('<')) || next == Some('>') {
-                    cur.push(c); // part of a redirection: `2>&1`, `<&3`, `&> file`
-                } else {
-                    end_part(&mut parts, &mut cur, &mut writes); // background, or cmd's `&`
-                }
-            }
-            (_, '|') => {
-                end_part(&mut parts, &mut cur, &mut writes);
-                if next == Some('|') || (shell == Shell::Posix && next == Some('&')) {
-                    i += 1;
-                }
-            }
-            (_, '>') => {
-                if shell == Shell::Posix && next == Some('|') {
-                    return None; // `>|` (force overwrite) is rare: ask
-                }
-                cur.push(c);
-                if next == Some('>') {
-                    cur.push('>');
-                    i += 1;
-                }
-                if !redirect_is_harmless(&chars, i + 1, shell) {
-                    writes = true;
-                }
-            }
-            _ => cur.push(c),
+            (Shell::Posix, ';') | (_, '\n') | (_, '\r') => self.end_part(),
+            (_, '&') => return Some(self.ampersand(c, next)),
+            (_, '|') => return Some(self.pipe(next)),
+            (_, '>') => return self.redirect(chars, i, c, next),
+            _ => self.cur.push(c),
         }
-        i += 1;
+        Some(0)
     }
-    if quote.is_some() {
-        return None;
+
+    /// `&`: `&&`, part of a redirection, or the end of a background part.
+    fn ampersand(&mut self, c: char, next: Option<char>) -> usize {
+        let prev = self.cur.chars().last();
+        if next == Some('&') {
+            self.end_part();
+            return 1;
+        }
+        if matches!(prev, Some('>') | Some('<')) || next == Some('>') {
+            self.cur.push(c); // part of a redirection: `2>&1`, `<&3`, `&> file`
+        } else {
+            self.end_part(); // background, or cmd's `&`
+        }
+        0
     }
-    end_part(&mut parts, &mut cur, &mut writes);
+
+    /// `|`, `||` or (POSIX) `|&`.
+    fn pipe(&mut self, next: Option<char>) -> usize {
+        self.end_part();
+        usize::from(next == Some('|') || (self.shell == Shell::Posix && next == Some('&')))
+    }
+
+    /// `>` or `>>` at `chars[i]`: marks the part as writing a file unless
+    /// the output goes nowhere on disk.
+    fn redirect(&mut self, chars: &[char], i: usize, c: char, next: Option<char>) -> Option<usize> {
+        if self.shell == Shell::Posix && next == Some('|') {
+            return None; // `>|` (force overwrite) is rare: ask
+        }
+        self.cur.push(c);
+        let mut took = 0;
+        if next == Some('>') {
+            self.cur.push('>');
+            took = 1;
+        }
+        if !redirect_is_harmless(chars, i + took + 1, self.shell) {
+            self.writes = true;
+        }
+        Some(took)
+    }
+}
+
+/// Does a part start with a compound-command keyword (see `POSIX_KEYWORDS`)?
+fn starts_compound(parts: &[CommandPart], shell: Shell) -> bool {
     let keywords = match shell {
         Shell::Posix => POSIX_KEYWORDS,
         Shell::Cmd => CMD_KEYWORDS,
     };
-    for p in &parts {
+    parts.iter().any(|p| {
         let first = p.text.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-        if keywords.contains(&first.as_str()) {
-            return None;
-        }
-    }
-    Some(parts)
+        keywords.contains(&first.as_str())
+    })
 }
 
 /// Finish the current part (empty parts are dropped).
