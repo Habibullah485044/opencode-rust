@@ -94,6 +94,12 @@ sed -n '/pub const RUNTIME_JS/,/^})();"#;$/p' "$root/src/browser.rs" \
 <a href="https://example.com/x">Docs</a>
 <div style="display:none"><button id="hidden">Nope</button></div>
 <script>
+// The runtime captures window.ipc when it loads (wry defines it before any
+// init script), so the stub has to exist first; runtime.js reads the frames.
+window.__frames = [];
+window.ipc = { postMessage: function (s) { window.__frames.push(JSON.parse(s)); } };
+</script>
+<script>
 HTML
   cat "$tmp/runtime.js"
   printf '</script>\n<script>\n'
