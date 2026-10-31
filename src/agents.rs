@@ -212,7 +212,8 @@ pub fn load_subagents(workspace: &Path) -> Vec<SubagentDef> {
 }
 
 /// The role files in `dir`, sorted by file name, each with whether it had
-/// a `tools:` line. Unreadable and broken files are left out.
+/// a `tools:` line. Unreadable and broken files are left out, and logged
+/// to core.log (once per file and reason: roles load on every request).
 fn read_role_dir(dir: &Path) -> Vec<(SubagentDef, bool)> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut files: Vec<std::path::PathBuf> = entries
@@ -223,8 +224,35 @@ fn read_role_dir(dir: &Path) -> Vec<(SubagentDef, bool)> {
     files.sort();
     files
         .iter()
-        .filter_map(|path| parse_role(path, &std::fs::read_to_string(path).ok()?))
+        .filter_map(|path| {
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    log_skipped_role(path, &format!("unreadable: {e}"));
+                    return None;
+                }
+            };
+            let role = parse_role(path, &text);
+            if role.is_none() {
+                log_skipped_role(path, "needs `---` frontmatter with a name, and a prompt after it");
+            }
+            role
+        })
         .collect()
+}
+
+/// Write "skipping role file <path>: <why>" to core.log, the first time
+/// only. True when it was written.
+fn log_skipped_role(path: &Path, why: &str) -> bool {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let line = format!("[agents] skipping role file {}: {why}", path.display());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.get_or_insert_with(Default::default).insert(line.clone()) {
+        return false;
+    }
+    drop(seen);
+    crate::server::core_log(&line);
+    true
 }
 
 /// A role file: `---` frontmatter, then the role's system prompt.
@@ -883,6 +911,24 @@ mod tests {
         assert_eq!(worker.tools.as_deref(), Some(&READ_TOOLS.iter().map(|s| s.to_string()).collect::<Vec<_>>()[..]));
         assert!(worker.read_only);
         assert!(roles.iter().any(|r| r.name == "explore"), "built-ins stay");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// T-059: a broken role file is logged once and the others still load.
+    #[test]
+    fn broken_role_files_are_logged_once() {
+        let ws = std::env::temp_dir().join(format!("ocrs-roles-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let dir = ws.join(".opencode").join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.md"), "---\nname: \n---\n").unwrap();
+        std::fs::write(dir.join("ok.md"), "---\nname: fine\n---\nDo fine work.\n").unwrap();
+        let roles = load_subagents(&ws);
+        assert!(roles.iter().any(|r| r.name == "fine"), "the good role still loads");
+        let log = std::fs::read_to_string(crate::config::default_state_dir().join("core.log")).unwrap_or_default();
+        let line = format!("[agents] skipping role file {}", dir.join("x.md").display());
+        assert!(log.contains(&line), "core.log has the broken file");
+        assert!(!log_skipped_role(&dir.join("x.md"), "needs `---` frontmatter with a name, and a prompt after it"));
         let _ = std::fs::remove_dir_all(&ws);
     }
 
