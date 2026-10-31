@@ -209,45 +209,95 @@ impl Drop for Worktree {
 }
 
 /// A worker's isolation: its worktree, or the reason it runs without one.
-pub enum Isolation {
+/// Dropped without [`Isolation::finish`] or [`Isolation::discard`] (an early
+/// error return, a panic), the worktree's changes are still saved as a
+/// patch, so a failed worker's work is never lost with the worktree.
+pub struct Isolation {
+    state: IsoState,
+    patch_dir: PathBuf,
+}
+
+enum IsoState {
     Worktree(Worktree),
     Skipped(String),
+    /// Finished or discarded: nothing left to do.
+    Done,
 }
 
 impl Isolation {
     /// Never fails. When no worktree can be made, the worker runs in the real
-    /// workspace as before, and the reason is reported.
+    /// workspace as before, and the reason is reported. Runs git: call it
+    /// from blocking code (`spawn_blocking` in async code).
     pub fn start(workspace: &Path, state_dir: &Path, label: &str) -> Self {
-        match Worktree::create(workspace, state_dir, label) {
-            Ok(wt) => Isolation::Worktree(wt),
-            Err(e) => Isolation::Skipped(format!("{e:#}")),
-        }
+        let state = match Worktree::create(workspace, state_dir, label) {
+            Ok(wt) => IsoState::Worktree(wt),
+            Err(e) => IsoState::Skipped(format!("{e:#}")),
+        };
+        Self { state, patch_dir: state_dir.join("worker-patches") }
+    }
+
+    /// [`Isolation::start`] on a blocking thread, for async callers.
+    pub async fn start_async(workspace: PathBuf, state_dir: PathBuf, label: String) -> Self {
+        let sd = state_dir.clone();
+        tokio::task::spawn_blocking(move || Self::start(&workspace, &state_dir, &label))
+            .await
+            .unwrap_or_else(|e| Self {
+                state: IsoState::Skipped(format!("worktree setup crashed: {e}")),
+                patch_dir: sd.join("worker-patches"),
+            })
     }
 
     /// The folder for the worker's tools. `None` = the real workspace.
     pub fn workspace(&self) -> Option<PathBuf> {
-        match self {
-            Isolation::Worktree(wt) => Some(wt.workspace()),
-            Isolation::Skipped(_) => None,
+        match &self.state {
+            IsoState::Worktree(wt) => Some(wt.workspace()),
+            _ => None,
         }
     }
 
     /// Why there is no worktree (`None` when the worker is isolated).
     pub fn skipped(&self) -> Option<&str> {
-        match self {
-            Isolation::Skipped(reason) => Some(reason.as_str()),
-            Isolation::Worktree(_) => None,
+        match &self.state {
+            IsoState::Skipped(reason) => Some(reason.as_str()),
+            _ => None,
         }
     }
 
     /// Text for the worker's summary: the patch report, or why the worker
-    /// was not isolated. Removes the worktree.
-    pub fn finish(self, state_dir: &Path) -> String {
-        match self {
-            Isolation::Worktree(mut wt) => wt.report(&state_dir.join("worker-patches")),
-            Isolation::Skipped(reason) => {
+    /// was not isolated. Removes the worktree. Runs git (see `start`).
+    pub fn finish(mut self) -> String {
+        match std::mem::replace(&mut self.state, IsoState::Done) {
+            IsoState::Worktree(mut wt) => wt.report(&self.patch_dir),
+            IsoState::Skipped(reason) => {
                 format!("[not isolated: {reason}; this worker changed the workspace directly]")
             }
+            IsoState::Done => String::new(),
+        }
+    }
+
+    /// [`Isolation::finish`] on a blocking thread, for async callers.
+    pub async fn finish_async(self) -> String {
+        tokio::task::spawn_blocking(move || self.finish())
+            .await
+            .unwrap_or_else(|e| format!("[isolated worktree] collecting the changes crashed: {e}"))
+    }
+
+    /// Remove the worktree WITHOUT saving its changes (the worker was
+    /// stopped, so its half-done work is dropped on purpose).
+    pub fn discard(mut self) {
+        self.state = IsoState::Done; // the Worktree's own Drop removes it
+    }
+
+    /// [`Isolation::discard`] on a blocking thread, for async callers.
+    pub async fn discard_async(self) {
+        let _ = tokio::task::spawn_blocking(move || self.discard()).await;
+    }
+}
+
+impl Drop for Isolation {
+    fn drop(&mut self) {
+        if let IsoState::Worktree(mut wt) = std::mem::replace(&mut self.state, IsoState::Done) {
+            let _ = wt.report(&self.patch_dir);
         }
     }
 }
@@ -267,6 +317,17 @@ pub fn isolation_prompt(ws: &Path) -> String {
 /// browser act on the real workspace, so they would break the isolation.
 pub fn local_tool_names() -> Vec<String> {
     crate::tools::tool_specs().into_iter().map(|s| s.function.name).collect()
+}
+
+/// The tools an isolated role keeps: its own list narrowed to the built-in
+/// ones (`None` = every built-in tool). Isolation only ever takes tools
+/// away: a `[read, grep]` role in a worktree must not gain bash or write.
+pub fn isolated_tools(role_tools: Option<&[String]>) -> Vec<String> {
+    let local = local_tool_names();
+    match role_tools {
+        Some(own) => own.iter().filter(|t| local.contains(t)).cloned().collect(),
+        None => local,
+    }
 }
 
 #[cfg(test)]
@@ -316,7 +377,7 @@ mod tests {
         // The "worker": edit one file, add another.
         std::fs::write(ws.join("a.txt"), "three\n").unwrap();
         std::fs::write(ws.join("new.txt"), "from worker\n").unwrap();
-        let report = iso.finish(&state);
+        let report = iso.finish();
         assert!(report.contains("NOT applied"), "{report}");
         assert!(report.contains("2 files changed"), "{report}");
         assert!(!ws.exists(), "worktree folder removed");
@@ -336,6 +397,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
+    #[test]
+    fn isolation_narrows_a_roles_tools_and_never_adds_any() {
+        let own = vec!["read".to_string(), "grep".to_string(), "mcp_thing".to_string()];
+        assert_eq!(isolated_tools(Some(&own)), ["read", "grep"], "no bash/write gained, MCP dropped");
+        let all = isolated_tools(None);
+        assert!(all.iter().any(|t| t == "bash") && all.iter().any(|t| t == "read"));
+    }
+
+    /// A worker that ends without `finish` (an error returned early) still
+    /// gets its changes saved as a patch; `discard` saves nothing. Either
+    /// way the worktree and its branch are gone.
+    #[test]
+    fn dropped_isolation_saves_a_patch_and_discard_does_not() {
+        let repo = temp("drop-repo");
+        let state = temp("drop-state");
+        git(&repo, &["init", "-q"]).unwrap();
+        git(&repo, &["config", "user.email", "t@t"]).unwrap();
+        git(&repo, &["config", "user.name", "t"]).unwrap();
+        git(&repo, &["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&repo, &["add", "-A"]).unwrap();
+        git(&repo, &["commit", "-q", "-m", "init"]).unwrap();
+        let patches = |state: &Path| {
+            std::fs::read_dir(state.join("worker-patches")).map(|d| d.count()).unwrap_or(0)
+        };
+
+        let iso = Isolation::start(&repo, &state, "worker");
+        let ws = iso.workspace().unwrap();
+        std::fs::write(ws.join("a.txt"), "worker edit\n").unwrap();
+        drop(iso);
+        assert_eq!(patches(&state), 1, "the dropped worker's change is saved");
+        assert!(!ws.exists(), "worktree removed after saving");
+
+        let iso = Isolation::start(&repo, &state, "worker");
+        let ws = iso.workspace().unwrap();
+        std::fs::write(ws.join("a.txt"), "stopped edit\n").unwrap();
+        iso.discard();
+        assert_eq!(patches(&state), 1, "a discarded worker saves nothing");
+        assert!(!ws.exists());
+        let branches = git(&repo, &["branch", "--list", "ocrs/*"]).unwrap();
+        assert!(branches.trim().is_empty(), "branches deleted: {branches}");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
     /// No git repository: the worker runs as before, and the summary says so.
     #[test]
     fn non_git_workspace_runs_without_isolation() {
@@ -345,7 +451,7 @@ mod tests {
         assert!(iso.workspace().is_none());
         let reason = iso.skipped().unwrap_or_default().to_string();
         assert!(reason.contains("not a git repository"), "{reason}");
-        assert!(iso.finish(&state).contains("not isolated"));
+        assert!(iso.finish().contains("not isolated"));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&state);
     }

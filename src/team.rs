@@ -1,5 +1,6 @@
 use crate::db::Part;
 use crate::server::{one_shot, Shared, ServerEvent};
+use crate::worktree::Isolation;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,15 +18,44 @@ pub struct Subtask {
     pub instructions: String,
 }
 
+/// How one worker ended. Serialized in lower case ("done", "failed",
+/// "aborted"): the reviewer reads the reports as JSON, and the synthesis
+/// shows the same words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Outcome {
+    Done,
+    Failed,
+    Aborted,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Done => "done",
+            Outcome::Failed => "failed",
+            Outcome::Aborted => "aborted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerReport {
     pub subtask: String,
-    pub outcome: String, // "done" | "failed" | "aborted"
+    pub outcome: Outcome,
     pub summary: String,
 }
 
 /// Most subtasks one /team run starts (B-18); the planner is asked for 1-4.
 const MAX_SUBTASKS: usize = 4;
+
+/// B-18: longest worker summary kept, in characters.
+const MAX_SUMMARY_CHARS: usize = 4000;
+
+/// Stream one line of team progress to the parent chat.
+fn say(st: &Shared, session_id: &str, text: String) {
+    let _ = st.events.send(ServerEvent::AssistantDelta { session_id: session_id.to_string(), text });
+}
 
 pub async fn run_team(
     st: &Shared,
@@ -40,64 +70,15 @@ pub async fn run_team(
              Switch with /build first."
         );
     }
-    let _ = st.events.send(ServerEvent::AssistantDelta {
-        session_id: session_id.to_string(),
-        text: format!("[team] decomposing goal: {goal}\n"),
-    });
-
+    say(st, session_id, format!("[team] decomposing goal: {goal}\n"));
     st.db.add_message(session_id, "user", &[Part::Text { text: format!("/team {goal}") }])?;
 
     // 1. PLANNER — read-only agent proposes subtasks as JSON.
     let subtasks = crate::server::tagged("team", session_id, plan(st, goal, &abort)).await?;
-    let _ = st.events.send(ServerEvent::AssistantDelta {
-        session_id: session_id.to_string(),
-        text: format!("[team] plan: {} subtask(s)\n", subtasks.len()),
-    });
-    for (i, t) in subtasks.iter().enumerate() {
-        let task = if t.instructions.trim().is_empty() { &t.title } else { &t.instructions };
-        let _ = st.events.send(ServerEvent::AssistantDelta {
-            session_id: session_id.to_string(),
-            text: format!("  {}. {} — {}\n", i + 1, t.title.replace('\n', " "), task.replace('\n', " ")),
-        });
-    }
+    announce_plan(st, session_id, &subtasks);
 
     // 2. WORKERS — one child session per subtask, run in parallel.
-    let mut reports = Vec::new();
-    let mut handles = Vec::new();
-    for (i, task) in subtasks.iter().enumerate() {
-        let st2 = st.clone();
-        let parent = session_id.to_string();
-        let task = task.clone();
-        let abort2 = abort.clone();
-        let goal = goal.to_string();
-        handles.push(tokio::spawn(async move {
-            let r = worker(&st2, &parent, i, &task, &goal, abort2).await;
-            (i, task.title.clone(), r)
-        }));
-    }
-    // B-18: longest worker summary kept, in characters.
-    const MAX_SUMMARY_CHARS: usize = 4000;
-    for (n, h) in handles.into_iter().enumerate() {
-        let title = subtasks[n].title.clone();
-        let (outcome, summary) = match h.await {
-            // B-18: run_loop returns "aborted" when stopped; that is not "done".
-            Ok((_, _, Ok(s))) if s.trim() == "aborted" => ("aborted", "stopped before it finished".to_string()),
-            Ok((_, _, Ok(s))) => ("done", s.chars().take(MAX_SUMMARY_CHARS).collect()),
-            Ok((_, _, Err(e))) => ("failed", format!("error: {e:#}")),
-            Err(e) => ("failed", format!("worker crashed: {e}")),
-        };
-        // The TUI team panel looks for "done" and "failed": keep those words.
-        let status = match outcome {
-            "done" => "done".to_string(),
-            "aborted" => "failed: aborted".to_string(),
-            _ => format!("failed: {}", summary.replace('\n', " ")),
-        };
-        let _ = st.events.send(ServerEvent::AssistantDelta {
-            session_id: session_id.to_string(),
-            text: format!("[team] worker {n} ({title}) {status}\n"),
-        });
-        reports.push(WorkerReport { subtask: title, outcome: outcome.into(), summary });
-    }
+    let reports = run_workers(st, session_id, goal, &subtasks, &abort).await;
 
     // 3. REVIEWER — one call verifies the reports (plan: "reviewer agent
     // verifies"), using the small model when configured.
@@ -110,25 +91,73 @@ pub async fn run_team(
             Err(e) => format!("reviewer unavailable: {e:#}"),
         }
     };
-    let _ = st.events.send(ServerEvent::AssistantDelta {
-        session_id: session_id.to_string(),
-        text: format!("[team] reviewer: {}\n", verdict.lines().next().unwrap_or("-")),
-    });
+    say(st, session_id, format!("[team] reviewer: {}\n", verdict.lines().next().unwrap_or("-")));
 
     // 4. SYNTHESIS — verdict + per-report results in the parent session.
-    let mut summary = format!("[team] results for: {goal}\n");
-    summary.push_str(&format!("[team] reviewer: {verdict}\n"));
-    for r in &reports {
-        summary.push_str(&format!("- [{}] {}: {}\n", r.outcome, r.subtask, r.summary));
-    }
+    let summary = synthesis(goal, &verdict, &reports);
     st.db.add_message(session_id, "assistant", &[Part::Text { text: summary.clone() }])?;
     // B-34: stream the synthesis too. Clients see the per-worker results,
     // and the TUI team panel reaches "done" on its `[team] results for:` line.
-    let _ = st.events.send(ServerEvent::AssistantDelta {
-        session_id: session_id.to_string(),
-        text: summary.clone(),
-    });
+    say(st, session_id, summary.clone());
     Ok(summary)
+}
+
+/// Stream the planner's subtasks, one numbered line each.
+fn announce_plan(st: &Shared, session_id: &str, subtasks: &[Subtask]) {
+    say(st, session_id, format!("[team] plan: {} subtask(s)\n", subtasks.len()));
+    for (i, t) in subtasks.iter().enumerate() {
+        let task = if t.instructions.trim().is_empty() { &t.title } else { &t.instructions };
+        say(st, session_id, format!("  {}. {} — {}\n", i + 1, t.title.replace('\n', " "), task.replace('\n', " ")));
+    }
+}
+
+/// Start one worker per subtask, all at once, and collect their reports in
+/// plan order, streaming each worker's end state.
+async fn run_workers(
+    st: &Shared,
+    session_id: &str,
+    goal: &str,
+    subtasks: &[Subtask],
+    abort: &Arc<AtomicBool>,
+) -> Vec<WorkerReport> {
+    let handles: Vec<_> = subtasks
+        .iter()
+        .map(|task| {
+            let (st2, parent, task, abort2, goal) =
+                (st.clone(), session_id.to_string(), task.clone(), abort.clone(), goal.to_string());
+            tokio::spawn(async move { worker(&st2, &parent, &task, &goal, abort2).await })
+        })
+        .collect();
+    let mut reports = Vec::new();
+    for (n, h) in handles.into_iter().enumerate() {
+        let title = subtasks[n].title.clone();
+        let (outcome, summary) = match h.await {
+            // B-18: run_loop returns "aborted" when stopped; that is not "done".
+            Ok(Ok(s)) if s.trim() == "aborted" => (Outcome::Aborted, "stopped before it finished".to_string()),
+            Ok(Ok(s)) => (Outcome::Done, s.chars().take(MAX_SUMMARY_CHARS).collect()),
+            Ok(Err(e)) => (Outcome::Failed, format!("error: {e:#}")),
+            Err(e) => (Outcome::Failed, format!("worker crashed: {e}")),
+        };
+        // The TUI team panel looks for "done" and "failed": keep those words.
+        let status = match outcome {
+            Outcome::Done => "done".to_string(),
+            Outcome::Aborted => "failed: aborted".to_string(),
+            Outcome::Failed => format!("failed: {}", summary.replace('\n', " ")),
+        };
+        say(st, session_id, format!("[team] worker {n} ({title}) {status}\n"));
+        reports.push(WorkerReport { subtask: title, outcome, summary });
+    }
+    reports
+}
+
+/// The final message: the reviewer's verdict, then one line per worker.
+fn synthesis(goal: &str, verdict: &str, reports: &[WorkerReport]) -> String {
+    let mut summary = format!("[team] results for: {goal}\n");
+    summary.push_str(&format!("[team] reviewer: {verdict}\n"));
+    for r in reports {
+        summary.push_str(&format!("- [{}] {}: {}\n", r.outcome.as_str(), r.subtask, r.summary));
+    }
+    summary
 }
 
 /// Planner: one non-streamed call asking for JSON array of subtasks.
@@ -231,7 +260,6 @@ fn parse_subtask_array(text: &str) -> Vec<Subtask> {
 async fn worker(
     st: &Shared,
     parent: &str,
-    _idx: usize,
     task: &Subtask,
     goal: &str,
     abort: Arc<AtomicBool>,
@@ -255,31 +283,13 @@ async fn run_worker_agent(
     st.db.add_message(session_id, "user", &[Part::Text { text: prompt.to_string() }])?;
     // The worker works in its parent chat's project folder.
     let project_ws = st.workspace_for(session_id);
-    let mut system = format!(
-        "You are a focused worker agent in team mode. Complete only your subtask.\n\n\
-         Workspace: {}.\nNobody can answer questions during this run: make reasonable \
-         decisions yourself and finish. Report a 1-2 sentence summary when finished.",
-        project_ws.display()
-    );
-    if let Some(md) = crate::skills::load_agents_md(&project_ws) {
-        system.push_str("\n\n## Project instructions (AGENTS.md)\n\n");
-        system.push_str(md.trim());
-    }
-    // P-05: a team worker follows its parent session's ponytail level.
-    let parent = st.db.get_session(session_id).ok().flatten().and_then(|s| s.parent_id);
-    let level = st.ponytail_level(parent.as_deref().unwrap_or(session_id));
-    system.push_str(&crate::agents::ponytail_section(level));
-    for s in crate::skills::load_baked(&st.skill_base) {
-        system.push_str(&format!("\n\n## Skill: {} — always active\n\n", s.name));
-        system.push_str(s.body.trim());
-    }
+    let mut system = worker_system(st, session_id, &project_ws);
     // F-05: with `agent.isolate_workers`, each team worker runs in its own
     // git worktree. The prompt names the folder it really works in.
-    let iso = st
-        .cfg
-        .agent
-        .isolate_workers
-        .then(|| crate::worktree::Isolation::start(&project_ws, &st.state_dir, "team"));
+    let iso = match st.cfg.agent.isolate_workers {
+        true => Some(Isolation::start_async(project_ws.clone(), st.state_dir.clone(), "team".into()).await),
+        false => None,
+    };
     let iso_ws = iso.as_ref().and_then(|i| i.workspace());
     if let Some(ws) = &iso_ws {
         system.push_str(&crate::worktree::isolation_prompt(ws));
@@ -291,26 +301,56 @@ async fn run_worker_agent(
         system,
         emit_activity: false,
         // F-05: an isolated worker keeps to the built-in tools.
-        allow: iso_ws.as_ref().map(|_| crate::worktree::local_tool_names()),
+        allow: iso_ws.as_ref().map(|_| crate::worktree::isolated_tools(None)),
         can_spawn: false,
         workspace: iso_ws.or_else(|| st.run_workspace(session_id)),
     };
-    let out = crate::server::run_loop(st, session_id, &opts, abort).await?;
-    // F-05: report what the worktree produced, or why there was none. The
-    // report goes first, so a later size cap cannot cut it off, and the user
-    // sees it as a note in the parent session. An aborted worker's changes
-    // are dropped.
-    let Some(iso) = iso.filter(|_| !abort.load(std::sync::atomic::Ordering::SeqCst)) else {
-        return Ok(out);
-    };
-    let report = iso.finish(&st.state_dir);
+    let out = crate::server::run_loop(st, session_id, &opts, abort).await;
+    // An aborted worker's changes are dropped.
+    let Some(iso) = iso else { return out };
+    if abort.load(std::sync::atomic::Ordering::SeqCst) {
+        iso.discard_async().await;
+        return out;
+    }
+    // F-05: report what the worktree produced, or why there was none — also
+    // when the loop failed, so a failed worker's work is saved, not deleted
+    // with its worktree. The report goes first, so a later size cap cannot
+    // cut it off, and the user sees it as a note in the parent session.
+    let report = iso.finish_async().await;
     if let Some(parent) = st.db.get_session(session_id).ok().flatten().and_then(|s| s.parent_id) {
         let _ = st.events.send(ServerEvent::Note {
             session_id: parent,
             text: format!("team worker {session_id}: {report}"),
         });
     }
-    Ok(format!("{report}\n\n{out}"))
+    match out {
+        Ok(text) => Ok(format!("{report}\n\n{text}")),
+        Err(e) => Err(anyhow::anyhow!("{report}\n\n{e:#}")),
+    }
+}
+
+/// The team worker's system prompt: its rules, the project instructions,
+/// the parent's ponytail level and the baked-in skills.
+fn worker_system(st: &Shared, session_id: &str, project_ws: &std::path::Path) -> String {
+    let mut system = format!(
+        "You are a focused worker agent in team mode. Complete only your subtask.\n\n\
+         Workspace: {}.\nNobody can answer questions during this run: make reasonable \
+         decisions yourself and finish. Report a 1-2 sentence summary when finished.",
+        project_ws.display()
+    );
+    if let Some(md) = crate::skills::load_agents_md(project_ws) {
+        system.push_str("\n\n## Project instructions (AGENTS.md)\n\n");
+        system.push_str(md.trim());
+    }
+    // P-05: a team worker follows its parent session's ponytail level.
+    let parent = st.db.get_session(session_id).ok().flatten().and_then(|s| s.parent_id);
+    let level = st.ponytail_level(parent.as_deref().unwrap_or(session_id));
+    system.push_str(&crate::agents::ponytail_section(level));
+    for s in crate::skills::load_baked(&st.skill_base) {
+        system.push_str(&format!("\n\n## Skill: {} — always active\n\n", s.name));
+        system.push_str(s.body.trim());
+    }
+    system
 }
 
 #[cfg(test)]
@@ -433,6 +473,93 @@ mod tests {
         let list = git(&["worktree", "list", "--porcelain"]);
         let count = list.lines().filter(|l| l.starts_with("worktree ")).count();
         assert_eq!(count, 1, "only the main worktree is left: {list}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+
+    /// Planner, reviewer and a worker that writes a file and then fails
+    /// (the provider errors on its second call).
+    async fn failing_worker_llm() -> String {
+        use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: axum::extract::Json<Value>| async move {
+                let sys = body["messages"][0]["content"].as_str().unwrap_or("").to_string();
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                let last_role = msgs.last().and_then(|m| m["role"].as_str()).unwrap_or("").to_string();
+                let sse = |frames: Vec<Value>| {
+                    let mut out: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+                    out.push_str("data: [DONE]\n\n");
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], out).into_response()
+                };
+                let text = |t: &str| serde_json::json!({"choices": [{"delta": {"content": t}, "finish_reason": "stop"}]});
+                if sys.contains("planning agent") {
+                    return sse(vec![text("[{\"title\":\"sub\",\"instructions\":\"write it\"}]")]);
+                }
+                if sys.contains("reviewer agent") {
+                    return sse(vec![text("VERDICT: FAIL\n- the worker failed")]);
+                }
+                if last_role == "tool" {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "provider down").into_response();
+                }
+                let args = serde_json::json!({"path": "from_worker.txt", "content": "kept\n"}).to_string();
+                sse(vec![
+                    serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+                        "index": 0, "id": "call_w", "function": {"name": "write", "arguments": args}
+                    }]}, "finish_reason": null}]}),
+                    serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+                ])
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/v1")
+    }
+
+    /// Before: the worker's error returned early and dropping its worktree
+    /// deleted the file it wrote. Now the failed worker's change is saved as
+    /// a patch and its report says where.
+    #[tokio::test]
+    async fn a_failed_isolated_worker_keeps_its_changes_as_a_patch() {
+        let dir = std::env::temp_dir().join(format!("ocrs-team-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| crate::gitsnap::git(&dir, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.autocrlf", "false"]);
+        std::fs::write(dir.join("readme.txt"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.isolate_workers = true;
+        cfg.permissions.defaults.insert("write".into(), "allow".into());
+        cfg.permissions.approval_timeout_secs = 2;
+        cfg.provider.base_url = failing_worker_llm().await;
+        cfg.provider.model = "mock".into();
+        cfg.provider.max_retries = 0;
+        let st = crate::server::build_state_ephemeral(cfg, dir.clone()).await;
+        let s = st.db.create_session("team", None).unwrap();
+        let out = run_team(&st, &s.id, "write a file", Arc::new(AtomicBool::new(false))).await.unwrap();
+        assert!(out.contains("- [failed] sub:"), "{out}");
+        let patch = out
+            .lines()
+            .find_map(|l| l.strip_prefix("Patch: "))
+            .unwrap_or_else(|| panic!("the failed worker's patch is reported: {out}"))
+            .to_string();
+        assert!(std::fs::read_to_string(&patch).unwrap().contains("from_worker.txt"));
+        let list = git(&["worktree", "list", "--porcelain"]);
+        assert_eq!(list.lines().filter(|l| l.starts_with("worktree ")).count(), 1, "{list}");
+        let _ = std::fs::remove_file(&patch);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

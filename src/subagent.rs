@@ -10,6 +10,7 @@ use crate::agents::{self, SubagentDef};
 use crate::db::Part;
 use crate::provider::{ToolFnSpec, ToolSpec};
 use crate::server::{agent_status, run_loop, AgentInfo, LoopOpts, Shared};
+use crate::worktree::Isolation;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -77,14 +78,36 @@ pub fn agent_tool_specs() -> Vec<ToolSpec> {
     )]
 }
 
-/// One spawned agent, from start until the app closes.
+/// Where a spawned agent is. `as_str` is the word the agents panel, the
+/// `agent list` rows and the report header show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunState {
+    Queued,
+    Working,
+    Done,
+    Failed,
+    Stopped,
+}
+
+impl RunState {
+    fn as_str(self) -> &'static str {
+        match self {
+            RunState::Queued => "queued",
+            RunState::Working => "working",
+            RunState::Done => "done",
+            RunState::Failed => "failed",
+            RunState::Stopped => "stopped",
+        }
+    }
+}
+
+/// One spawned agent, from start until it is pruned (see `prune_finished`).
 #[derive(Clone)]
 struct Run {
     parent: String,
     role: SubagentDef,
     task: String,
-    /// queued | working | done | failed | stopped
-    state: &'static str,
+    state: RunState,
     started: Instant,
     ended: Option<Instant>,
     report: Option<String>,
@@ -98,7 +121,7 @@ struct Run {
 
 impl Run {
     fn running(&self) -> bool {
-        matches!(self.state, "queued" | "working")
+        matches!(self.state, RunState::Queued | RunState::Working)
     }
 
     fn elapsed(&self) -> Duration {
@@ -117,14 +140,58 @@ fn with_runs<T>(f: impl FnOnce(&mut HashMap<String, Run>) -> T) -> T {
     f(&mut map)
 }
 
+/// Finished runs whose report was read, kept for `agent list`/`send`. Older
+/// ones are forgotten, so a long session does not keep every run forever.
+const MAX_FINISHED_RUNS: usize = 64;
+
+/// Forget the oldest finished, delivered runs beyond `MAX_FINISHED_RUNS`.
+/// Running runs and unread reports are always kept.
+fn prune_finished(m: &mut HashMap<String, Run>) {
+    let mut old: Vec<(Instant, String)> = m
+        .iter()
+        .filter(|(_, r)| !r.running() && r.delivered)
+        .map(|(id, r)| (r.ended.unwrap_or(r.started), id.clone()))
+        .collect();
+    if old.len() <= MAX_FINISHED_RUNS {
+        return;
+    }
+    old.sort();
+    let extra = old.len() - MAX_FINISHED_RUNS;
+    for (_, id) in old.into_iter().take(extra) {
+        m.remove(&id);
+    }
+}
+
 /// The running places of each parent chat: `agent.max_subagents` permits,
-/// so extra spawns wait in line instead of failing.
+/// so extra spawns wait in line instead of failing. `max` is read on every
+/// call, so a changed limit applies from the next spawn on.
 fn slots(parent: &str, max: usize) -> Arc<tokio::sync::Semaphore> {
-    static SLOTS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> = OnceLock::new();
+    type Slots = HashMap<String, (usize, Arc<tokio::sync::Semaphore>)>;
+    static SLOTS: OnceLock<Mutex<Slots>> = OnceLock::new();
+    let max = max.max(1);
     let mut map = SLOTS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    map.entry(parent.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(max.max(1))))
-        .clone()
+    // A chat with nobody running or waiting holds no clone: forget it.
+    map.retain(|_, (_, sem)| Arc::strong_count(sem) > 1);
+    let (limit, sem) = map
+        .entry(parent.to_string())
+        .or_insert_with(|| (max, Arc::new(tokio::sync::Semaphore::new(max))));
+    if *limit < max {
+        sem.add_permits(max - *limit);
+    } else if *limit > max {
+        // Take away the free places now, the rest as running agents give
+        // theirs back.
+        let owed = (*limit - max) - sem.forget_permits(*limit - max);
+        if owed > 0 {
+            let sem = sem.clone();
+            tokio::spawn(async move {
+                if let Ok(p) = sem.acquire_many_owned(owed as u32).await {
+                    p.forget();
+                }
+            });
+        }
+    }
+    *limit = max;
+    sem.clone()
 }
 
 fn info(id: &str, run: &Run) -> AgentInfo {
@@ -182,8 +249,8 @@ pub async fn spawn_subagent(
     })
     .ok_or_else(|| anyhow!("subagent `{name}` disappeared"))?;
     match run.state {
-        "done" => Ok(run.report.unwrap_or_default()),
-        _ => Err(anyhow!("{}", run.report.unwrap_or_else(|| format!("subagent `{name}` {}", run.state)))),
+        RunState::Done => Ok(run.report.unwrap_or_default()),
+        state => Err(anyhow!("{}", run.report.unwrap_or_else(|| format!("subagent `{name}` {}", state.as_str())))),
     }
 }
 
@@ -197,7 +264,7 @@ fn start(st: &Shared, parent: &str, role: SubagentDef, task: &str, background: b
         parent: parent.to_string(),
         role,
         task: task.to_string(),
-        state: "queued",
+        state: RunState::Queued,
         started: Instant::now(),
         ended: None,
         report: None,
@@ -207,7 +274,10 @@ fn start(st: &Shared, parent: &str, role: SubagentDef, task: &str, background: b
         delivered: false,
     };
     agent_status(st, &info(&session.id, &run), "queued", "waiting for a free place…".into());
-    with_runs(|m| m.insert(session.id.clone(), run));
+    with_runs(|m| {
+        m.insert(session.id.clone(), run);
+        prune_finished(m);
+    });
     launch(st.clone(), session.id.clone());
     Ok(session.id)
 }
@@ -219,7 +289,7 @@ fn launch(st: Shared, id: String) {
     tokio::spawn(async move {
         let (state, report) = match run_child(&st, &id).await {
             Ok((state, report)) => (state, report),
-            Err(e) => ("failed", format!("error: {e:#}")),
+            Err(e) => (RunState::Failed, format!("error: {e:#}")),
         };
         finish(&st, &id, state, report);
     });
@@ -227,7 +297,7 @@ fn launch(st: Shared, id: String) {
 
 /// Record how a run ended and tell the agents panel (and, for a background
 /// agent, the parent chat).
-fn finish(st: &Shared, id: &str, state: &'static str, report: String) {
+fn finish(st: &Shared, id: &str, state: RunState, report: String) {
     let Some(run) = with_runs(|m| {
         let run = m.get_mut(id)?;
         run.state = state;
@@ -238,18 +308,19 @@ fn finish(st: &Shared, id: &str, state: &'static str, report: String) {
         return;
     };
     let first = report.lines().nth(1).or(report.lines().next()).unwrap_or("");
-    agent_status(st, &info(id, &run), if state == "stopped" { "failed" } else { state }, first.to_string());
+    let panel = if state == RunState::Stopped { "failed" } else { state.as_str() };
+    agent_status(st, &info(id, &run), panel, first.to_string());
     if run.background {
         let _ = st.events.send(crate::server::ServerEvent::Note {
             session_id: run.parent.clone(),
-            text: format!("background agent `{}` ({id}) {state}", run.role.name),
+            text: format!("background agent `{}` ({id}) {}", run.role.name, state.as_str()),
         });
     }
 }
 
 /// Wait for a place, run the role's loop (again while messages arrive), and
 /// build the report. Returns the end state and the report.
-async fn run_child(st: &Shared, id: &str) -> Result<(&'static str, String)> {
+async fn run_child(st: &Shared, id: &str) -> Result<(RunState, String)> {
     let run = with_runs(|m| m.get(id).cloned()).ok_or_else(|| anyhow!("unknown agent {id}"))?;
     let abort = run.abort.clone();
     let role = run.role.clone();
@@ -260,44 +331,26 @@ async fn run_child(st: &Shared, id: &str) -> Result<(&'static str, String)> {
         _ = wait_flag(&abort) => None,
     };
     if abort.load(Ordering::SeqCst) {
-        return Ok(("stopped", report(st, id, &run, "stopped", "stopped before it started")));
+        let stopped = RunState::Stopped;
+        return Ok((stopped, report(st, id, &run, stopped.as_str(), "stopped before it started")));
     }
-    with_runs(|m| m.get_mut(id).map(|r| r.state = "working"));
+    with_runs(|m| m.get_mut(id).map(|r| r.state = RunState::Working));
     agent_status(st, &agent, "working", "starting…".into());
 
-    // The child works in its parent chat's project folder, with the project
-    // instructions and the role's prompt.
     let project_ws = st.workspace_for(id);
-    let agents_md = crate::skills::load_agents_md(&project_ws);
-    let system = agents::compose_system(agents::PromptInputs {
-        workspace: &project_ws,
-        mode: crate::agents::AgentMode::Build,
-        configured: Some(&role.system),
-        agents_md: agents_md.as_deref(),
-        skills: &[],
-        ponytail: st.ponytail_level(&run.parent), // P-05: parent's level
-        baked: &crate::skills::load_baked(&st.skill_base),
-        lessons: crate::server::load_lessons(st, &project_ws).as_deref(),
-        web: crate::agents::is_web_task(&run.task),
-        map: Some(&crate::repomap::for_chat(id, &project_ws, &st.state_dir, &run.task, st.cfg.agent.repo_map_tokens)),
-    });
-    // B-27: the shared prompt says "ask when unclear"; a child has nobody to ask.
-    const CHILD_RULES: &str = "\n\n## Running as a subagent\n\n\
-        Nobody can answer questions during this run. Do not ask clarifying \
-        questions: make the most reasonable assumption, say which one in your \
-        summary, and finish the task. End with a short report: what you found \
-        or changed (with file paths), how you checked it, and anything left open.";
-    let mut system = format!("{system}{CHILD_RULES}");
-
+    let mut system = child_system(st, id, &run, &project_ws);
     // F-05: an isolated role runs in its own git worktree and keeps to the
-    // built-in tools.
+    // built-in tools among its own.
     let isolate = role.isolate.unwrap_or(st.cfg.agent.isolate_workers && role.name == "worker");
-    let iso = isolate.then(|| crate::worktree::Isolation::start(&project_ws, &st.state_dir, &role.name));
+    let iso = match isolate {
+        true => Some(Isolation::start_async(project_ws.clone(), st.state_dir.clone(), role.name.clone()).await),
+        false => None,
+    };
     let iso_ws = iso.as_ref().and_then(|i| i.workspace());
     let mut allow = role.tools.clone();
     if let Some(ws) = &iso_ws {
         system.push_str(&crate::worktree::isolation_prompt(ws));
-        allow = Some(crate::worktree::local_tool_names());
+        allow = Some(crate::worktree::isolated_tools(role.tools.as_deref()));
     }
     // A read-only role may use the cheaper small model.
     let model = role.model.clone().or_else(|| {
@@ -313,37 +366,79 @@ async fn run_child(st: &Shared, id: &str) -> Result<(&'static str, String)> {
         model,
         max_steps: role.max_steps,
     };
-    let mut out = run_loop(st, id, &opts, &abort).await;
-    // A message that came in after the last step starts another round.
+    let out = run_rounds(st, id, &opts, &abort).await;
+    let aborted = abort.load(Ordering::SeqCst);
+    let (state, mut summary) = end_state(out, aborted);
+    // F-05: report what the worktree produced, or why there was none. The
+    // user sees it as a note too. A stopped worker's changes are dropped;
+    // a failed one's are saved like a finished one's.
+    match iso {
+        Some(iso) if aborted => iso.discard_async().await,
+        Some(iso) => {
+            let made = iso.finish_async().await;
+            let _ = st.events.send(crate::server::ServerEvent::Note {
+                session_id: run.parent.clone(),
+                text: format!("{} {id}: {made}", role.name),
+            });
+            summary.push_str("\n\n");
+            summary.push_str(&made);
+        }
+        None => {}
+    }
+    Ok((state, report(st, id, &run, state.as_str(), &summary)))
+}
+
+/// The child's system prompt: the shared prompt for its parent chat's
+/// project folder, the role's prompt, and the subagent rules.
+fn child_system(st: &Shared, id: &str, run: &Run, project_ws: &std::path::Path) -> String {
+    let agents_md = crate::skills::load_agents_md(project_ws);
+    let system = agents::compose_system(agents::PromptInputs {
+        workspace: project_ws,
+        mode: crate::agents::AgentMode::Build,
+        configured: Some(&run.role.system),
+        agents_md: agents_md.as_deref(),
+        skills: &[],
+        ponytail: st.ponytail_level(&run.parent), // P-05: parent's level
+        baked: &crate::skills::load_baked(&st.skill_base),
+        lessons: crate::server::load_lessons(st, project_ws).as_deref(),
+        web: crate::agents::is_web_task(&run.task),
+        map: Some(&crate::repomap::for_chat(id, project_ws, &st.state_dir, &run.task, st.cfg.agent.repo_map_tokens)),
+    });
+    // B-27: the shared prompt says "ask when unclear"; a child has nobody to ask.
+    const CHILD_RULES: &str = "\n\n## Running as a subagent\n\n\
+        Nobody can answer questions during this run. Do not ask clarifying \
+        questions: make the most reasonable assumption, say which one in your \
+        summary, and finish the task. End with a short report: what you found \
+        or changed (with file paths), how you checked it, and anything left open.";
+    format!("{system}{CHILD_RULES}")
+}
+
+/// Run the loop, and again for each message that came in after the last
+/// step. An error ends the rounds; the caller still collects the worktree.
+async fn run_rounds(st: &Shared, id: &str, opts: &LoopOpts, abort: &AtomicBool) -> Result<String> {
+    let mut out = run_loop(st, id, opts, abort).await;
     while out.is_ok() && !abort.load(Ordering::SeqCst) {
         let Some(text) = take_inbox(id) else { break };
         st.db.add_message(id, "user", &[Part::Text { text }])?;
-        out = run_loop(st, id, &opts, &abort).await;
+        out = run_loop(st, id, opts, abort).await;
     }
-    let aborted = abort.load(Ordering::SeqCst);
+    out
+}
+
+/// How the rounds ended, and the child's summary (capped).
+fn end_state(out: Result<String>, aborted: bool) -> (RunState, String) {
     let (state, mut summary) = match out {
         // B-27: run_loop returns "aborted" when stopped; that is not a result.
-        _ if aborted => ("stopped", "stopped before it finished".to_string()),
-        Ok(text) if text.trim() == "aborted" => ("stopped", "stopped before it finished".to_string()),
-        Ok(text) if text.trim().is_empty() => ("done", "(no summary)".to_string()),
-        Ok(text) => ("done", text),
-        Err(e) => ("failed", format!("error: {e:#}")),
+        _ if aborted => (RunState::Stopped, "stopped before it finished".to_string()),
+        Ok(text) if text.trim() == "aborted" => (RunState::Stopped, "stopped before it finished".to_string()),
+        Ok(text) if text.trim().is_empty() => (RunState::Done, "(no summary)".to_string()),
+        Ok(text) => (RunState::Done, text),
+        Err(e) => (RunState::Failed, format!("error: {e:#}")),
     };
     if summary.chars().count() > 4000 {
         summary = summary.chars().take(4000).collect::<String>() + "…";
     }
-    // F-05: report what the worktree produced, or why there was none. The
-    // user sees it as a note too. A stopped worker's changes are dropped.
-    if let Some(iso) = iso.filter(|_| !aborted) {
-        let made = iso.finish(&st.state_dir);
-        let _ = st.events.send(crate::server::ServerEvent::Note {
-            session_id: run.parent.clone(),
-            text: format!("{} {id}: {made}", role.name),
-        });
-        summary.push_str("\n\n");
-        summary.push_str(&made);
-    }
-    Ok((state, report(st, id, &run, state, &summary)))
+    (state, summary)
 }
 
 /// Resolves once `flag` is set.
@@ -439,7 +534,7 @@ pub fn stop(id: &str) -> bool {
 pub fn reviewed_since(parent: &str, since: Instant) -> bool {
     with_runs(|m| {
         m.values().any(|r| {
-            r.parent == parent && r.role.name == "review" && r.state == "done" && r.started >= since
+            r.parent == parent && r.role.name == "review" && r.state == RunState::Done && r.started >= since
         })
     })
 }
@@ -508,7 +603,7 @@ async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, 
                     .filter(|(_, r)| r.parent == parent)
                     .map(|(id, r)| {
                         let task: String = r.task.chars().take(80).collect();
-                        (r.started, format!("{id} · {} · {} · {:.0}s · {task}", r.role.name, r.state, r.elapsed().as_secs_f64()))
+                        (r.started, format!("{id} · {} · {} · {:.0}s · {task}", r.role.name, r.state.as_str(), r.elapsed().as_secs_f64()))
                     })
                     .collect()
             });
@@ -537,7 +632,7 @@ async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, 
             st.db.add_message(&id, "user", &[Part::Text { text: message.to_string() }])?;
             with_runs(|m| {
                 m.get_mut(&id).map(|r| {
-                    r.state = "queued";
+                    r.state = RunState::Queued;
                     r.ended = None;
                     r.delivered = false;
                     r.abort = Arc::new(AtomicBool::new(false));
@@ -574,7 +669,7 @@ async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, 
                 for id in &ids {
                     let Some(r) = m.get_mut(id) else { continue };
                     if r.running() {
-                        busy.push(format!("{id} ({}, {}, {:.0}s)", r.role.name, r.state, r.elapsed().as_secs_f64()));
+                        busy.push(format!("{id} ({}, {}, {:.0}s)", r.role.name, r.state.as_str(), r.elapsed().as_secs_f64()));
                     } else {
                         r.delivered = true;
                         done.push(r.report.clone().unwrap_or_default());
@@ -1046,7 +1141,7 @@ mod b27_tests {
     }
 
     fn states(parent: &str) -> Vec<&'static str> {
-        let mut v: Vec<_> = with_runs(|m| m.values().filter(|r| r.parent == parent).map(|r| r.state).collect());
+        let mut v: Vec<_> = with_runs(|m| m.values().filter(|r| r.parent == parent).map(|r| r.state.as_str()).collect());
         v.sort();
         v
     }
@@ -1056,6 +1151,57 @@ mod b27_tests {
         let out = spawn_subagent(st, parent, &args, &AtomicBool::new(false)).await.unwrap();
         assert!(out.contains("started in the background"), "{out}");
         out.split("session ").nth(1).unwrap().split(' ').next().unwrap().to_string()
+    }
+
+    fn finished_run(parent: &str, delivered: bool) -> Run {
+        Run {
+            parent: parent.into(),
+            role: agents::builtin_subagents().remove(0),
+            task: "t".into(),
+            state: RunState::Done,
+            started: Instant::now(),
+            ended: Some(Instant::now()),
+            report: Some("r".into()),
+            abort: Arc::new(AtomicBool::new(false)),
+            inbox: Vec::new(),
+            background: true,
+            delivered,
+        }
+    }
+
+    /// Finished, read runs are forgotten beyond the cap; running ones and
+    /// unread reports never are.
+    #[test]
+    fn finished_runs_are_pruned_but_unread_and_running_ones_stay() {
+        let mut m = HashMap::new();
+        for i in 0..MAX_FINISHED_RUNS + 10 {
+            m.insert(format!("read{i:03}"), finished_run("p", true));
+        }
+        m.insert("unread".into(), finished_run("p", false));
+        let mut busy = finished_run("p", true);
+        busy.state = RunState::Working;
+        m.insert("busy".into(), busy);
+        prune_finished(&mut m);
+        assert_eq!(m.len(), MAX_FINISHED_RUNS + 2);
+        assert!(m.contains_key("unread") && m.contains_key("busy"));
+        assert!(m.contains_key(&format!("read{:03}", MAX_FINISHED_RUNS + 9)), "the newest stay");
+    }
+
+    /// A changed `max_subagents` applies to the parent's next spawn, and an
+    /// idle parent's entry is dropped.
+    #[test]
+    fn slots_follow_the_configured_limit() {
+        let parent = format!("slots-{}", std::process::id());
+        let a = slots(&parent, 2);
+        assert_eq!(a.available_permits(), 2);
+        let b = slots(&parent, 3);
+        assert!(Arc::ptr_eq(&a, &b), "same chat, same places");
+        assert_eq!(b.available_permits(), 3, "a higher limit adds places");
+        let c = slots(&parent, 1);
+        assert_eq!(c.available_permits(), 1, "a lower limit takes free places away");
+        drop((a, b, c));
+        let d = slots(&parent, 4);
+        assert_eq!(d.available_permits(), 4, "an idle chat starts fresh");
     }
 
     #[tokio::test]
