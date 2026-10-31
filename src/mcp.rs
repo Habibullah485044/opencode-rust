@@ -19,8 +19,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 /// Version we announce; servers answer with their own and we don't enforce it.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
-const INIT_TIMEOUT: Duration = Duration::from_secs(20);
-const CALL_TIMEOUT: Duration = Duration::from_secs(300);
+// Time limits for both transports (mcp_http.rs uses these too).
+pub(crate) const INIT_TIMEOUT: Duration = Duration::from_secs(20);
+/// `tools/list` must answer within this time (B-19).
+pub(crate) const LIST_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Largest tool result handed to the model, in bytes (B-19).
 const MAX_RESULT_BYTES: usize = 60_000;
 /// Providers accept function names of at most 64 characters (B-19).
@@ -51,6 +54,8 @@ pub struct Client<R, W> {
     /// Bytes of a line not finished yet (B-28). `read_until` appends here and
     /// keeps them even when a timeout cancels the read.
     line: Vec<u8>,
+    /// How long `tools/call` may run before it is cancelled (tests shorten it).
+    call_timeout: Duration,
 }
 
 impl<R, W> Client<R, W>
@@ -59,7 +64,7 @@ where
     W: AsyncWrite + Unpin,
 {
     pub fn new(reader: R, writer: W) -> Self {
-        Self { reader, writer, next_id: 0, line: Vec::new() }
+        Self { reader, writer, next_id: 0, line: Vec::new(), call_timeout: CALL_TIMEOUT }
     }
 
     async fn write_msg(&mut self, value: &Value) -> Result<()> {
@@ -150,8 +155,6 @@ where
     }
 
     pub async fn list_tools(&mut self) -> Result<Vec<McpTool>> {
-        // `tools/list` must answer within this time (B-19).
-        const LIST_TIMEOUT: Duration = Duration::from_secs(20);
         self.list_tools_within(LIST_TIMEOUT).await
     }
 
@@ -190,12 +193,23 @@ where
     /// Call a tool; returns concatenated text content. Server-reported
     /// `isError` results come back as `Err` carrying the text.
     pub async fn call_tool(&mut self, name: &str, args: &Value) -> Result<String> {
-        let res = tokio::time::timeout(
-            CALL_TIMEOUT,
+        let res = match tokio::time::timeout(
+            self.call_timeout,
             self.request("tools/call", json!({ "name": name, "arguments": args })),
         )
         .await
-        .context("mcp tools/call timed out")??;
+        {
+            Ok(res) => res?,
+            Err(elapsed) => {
+                // T-038: tell the server, or it keeps working on a call
+                // nobody waits for. Best effort: the error stands anyway.
+                let id = self.next_id - 1;
+                let cancel = json!({ "requestId": id, "reason": "timed out" });
+                let _ = tokio::time::timeout(Duration::from_secs(2), self.notify("notifications/cancelled", cancel))
+                    .await;
+                return Err(anyhow::Error::new(elapsed).context("mcp tools/call timed out"));
+            }
+        };
         let (is_error, text) = call_result_text(&res);
         if is_error {
             Err(anyhow!("{}", if text.is_empty() { "tool error".to_string() } else { cap_result(text) }))
@@ -250,12 +264,7 @@ pub fn sanitize_server(name: &str) -> String {
 
 /// Short, stable hash (FNV-1a, 32 bit): same input, same output, every run.
 fn short_hash(s: &str) -> String {
-    let mut h: u32 = 0x811c_9dc5;
-    for b in s.bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    format!("{h:08x}")
+    format!("{:08x}", crate::hash::fnv1a32(s.as_bytes()))
 }
 
 /// The model-facing function name for an MCP tool, always matching
@@ -468,9 +477,18 @@ impl McpConn {
         // the server also stops what it started (see `Live`'s Drop).
         #[cfg(unix)]
         cmd.process_group(0);
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawning `{}`", cfg.command))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                // T-053: the usual cause on Windows is `npx` (a .cmd script).
+                anyhow!(
+                    "`{0}` was not found on PATH; on Windows start it through cmd: \
+                     command = \"cmd\", args = [\"/c\", \"{0}\", ...]",
+                    cfg.command
+                )
+            } else {
+                anyhow::Error::new(e).context(format!("spawning `{}`", cfg.command))
+            }
+        })?;
         crate::tools::adopt_into_job(&child);
         let stderr = collect_stderr(child.stderr.take().context("mcp child has no stderr")?);
         let stdin = child.stdin.take().context("mcp child has no stdin")?;
@@ -515,6 +533,20 @@ impl McpConn {
     }
 }
 
+/// An MCP start result, to stderr and to core.log: a GUI started from a
+/// shortcut has no console (T-056).
+fn mcp_log(line: &str) {
+    eprintln!("{line}");
+    crate::server::core_log(line);
+}
+
+/// Why `[[mcp.servers]]` entry `i` cannot start, if it cannot (T-037).
+fn unusable(i: usize, cfg: &McpServerCfg) -> Option<String> {
+    let has_url = cfg.url.as_deref().is_some_and(|u| !u.trim().is_empty());
+    (cfg.name.is_empty() || (cfg.command.is_empty() && !has_url))
+        .then(|| format!("[mcp] skipping mcp.servers[{i}]: needs a name and a command or url"))
+}
+
 /// All configured MCP servers, keyed by sanitized server name.
 #[derive(Default)]
 pub struct Registry {
@@ -529,9 +561,9 @@ impl Registry {
         // the initialize and tools/list time limits.
         let mut starts = Vec::new();
         let mut planned = std::collections::HashSet::new();
-        for cfg in servers {
-            let has_url = cfg.url.as_deref().is_some_and(|u| !u.trim().is_empty());
-            if cfg.name.is_empty() || (cfg.command.is_empty() && !has_url) {
+        for (i, cfg) in servers.iter().enumerate() {
+            if let Some(why) = unusable(i, cfg) {
+                mcp_log(&why);
                 continue;
             }
             let key = sanitize_server(&cfg.name);
@@ -539,7 +571,7 @@ impl Registry {
                 continue; // already running
             }
             if !planned.insert(key.clone()) {
-                eprintln!("[mcp] skipping `{}`: another server already uses the name `{key}`", cfg.name);
+                mcp_log(&format!("[mcp] skipping `{}`: another server already uses the name `{key}`", cfg.name));
                 continue;
             }
             starts.push(async move { (key, cfg, McpConn::spawn(&cfg.name, cfg).await) });
@@ -547,14 +579,10 @@ impl Registry {
         for (key, cfg, result) in futures::future::join_all(starts).await {
             match result {
                 Ok(conn) => {
-                    eprintln!(
-                        "[mcp] {} connected ({} tool(s))",
-                        conn.server,
-                        conn.tools.len()
-                    );
+                    mcp_log(&format!("[mcp] {} connected ({} tool(s))", conn.server, conn.tools.len()));
                     self.conns.insert(key, conn);
                 }
-                Err(e) => eprintln!("[mcp] failed to start `{}`: {e:#}", cfg.name),
+                Err(e) => mcp_log(&format!("[mcp] failed to start `{}`: {e:#}", cfg.name)),
             }
         }
     }
@@ -898,6 +926,38 @@ mod tests {
         assert!(err.contains("missing-module-xyz"), "stderr tail shown: {err}");
     }
 
+    /// T-053/T-056: a command that is not installed says how to start it
+    /// on Windows, and the failure reaches core.log.
+    #[tokio::test]
+    async fn a_missing_command_gets_a_path_hint_and_is_logged() {
+        let name = format!("nocmd{}", std::process::id());
+        let cfg = McpServerCfg { name: name.clone(), command: "ocrs-no-such-command-xyz".into(), ..Default::default() };
+        let err = match McpConn::spawn(&name, &cfg).await {
+            Ok(_) => panic!("the command does not exist"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("`ocrs-no-such-command-xyz` was not found on PATH"), "{err}");
+        assert!(err.contains(r#"command = "cmd", args = ["/c", "ocrs-no-such-command-xyz", ...]"#), "{err}");
+        let mut reg = Registry::default();
+        reg.start_all(&[cfg]).await;
+        let log = std::fs::read_to_string(crate::config::default_state_dir().join("core.log")).unwrap_or_default();
+        assert!(log.contains(&format!("[mcp] failed to start `{name}`")), "core.log has the failure");
+    }
+
+    /// T-037: entries that cannot start say which one and what is missing.
+    #[test]
+    fn unusable_entries_are_named_by_index() {
+        let nameless = McpServerCfg { command: "x".into(), ..Default::default() };
+        assert_eq!(
+            unusable(0, &nameless).as_deref(),
+            Some("[mcp] skipping mcp.servers[0]: needs a name and a command or url")
+        );
+        let empty = McpServerCfg { name: "a".into(), url: Some("  ".into()), ..Default::default() };
+        assert!(unusable(3, &empty).unwrap().contains("mcp.servers[3]"));
+        let ok = McpServerCfg { name: "a".into(), url: Some("http://x".into()), ..Default::default() };
+        assert_eq!(unusable(1, &ok), None);
+    }
+
     #[test]
     fn fn_name_roundtrip_and_sanitization() {
         assert_eq!(tool_fn_name("my-server", "do_thing"), "mcp__my-server__do_thing");
@@ -1028,6 +1088,19 @@ mod b19_names_tests {
             assert_eq!(resolve_tool_name(&srv, &tools, &part), t.name);
         }
         assert_eq!(tool_fn_name("srv", "plain_name"), "mcp__srv__plain_name");
+    }
+
+    /// Tool names are part of the cached prompt: these outputs must never
+    /// change (T-081).
+    #[test]
+    fn short_hash_and_sanitize_server_are_pinned() {
+        assert_eq!(short_hash(""), "811c9dc5");
+        assert_eq!(short_hash("read.file"), "2d6f0437");
+        assert_eq!(short_hash("a b/c"), "570e31cc");
+        assert_eq!(sanitize_server("my.server v2"), "my-server-v2");
+        assert_eq!(sanitize_server("a".repeat(30).as_str()).len(), MAX_SERVER_PART);
+        assert_eq!(tool_fn_name("my.server v2", "read.file"), "mcp__my-server-v2__read_file_2d6f0437");
+        assert_eq!(tool_fn_name("srv", "a b/c"), "mcp__srv__a_b_c_570e31cc");
     }
 
     #[test]
@@ -1220,6 +1293,28 @@ mod b28_reply_tests {
         assert_eq!(tools.len(), 1);
         let pong = server.await.unwrap();
         assert!(pong.get("result").is_some() && pong.get("method").is_none(), "{pong}");
+    }
+
+    /// T-038: a call that runs past its time limit is cancelled at the
+    /// server with the request's id.
+    #[tokio::test]
+    async fn a_timed_out_call_is_cancelled_at_the_server() {
+        let (client_end, server_end) = duplex(64 * 1024);
+        let (r, w) = tokio::io::split(client_end);
+        let mut client = Client::new(BufReader::new(r), w);
+        client.call_timeout = Duration::from_millis(200);
+        let server = tokio::spawn(async move {
+            let (rs, _ws) = tokio::io::split(server_end);
+            let mut lines = BufReader::new(rs).lines();
+            let call: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let cancel: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            (call, cancel)
+        });
+        let err = format!("{:#}", client.call_tool("slow", &json!({})).await.unwrap_err());
+        assert!(err.contains("timed out"), "{err}");
+        let (call, cancel) = server.await.unwrap();
+        assert_eq!(cancel["method"], "notifications/cancelled");
+        assert_eq!(cancel["params"]["requestId"], call["id"]);
     }
 
     #[tokio::test]
