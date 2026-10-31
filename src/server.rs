@@ -1003,12 +1003,20 @@ async fn delete_session_route(
 ) -> Result<StatusCode, StatusCode> {
     st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
     if st.abort_run(&id).await {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while st.run_active(&id).await {
-            if std::time::Instant::now() >= deadline {
-                return Err(StatusCode::CONFLICT);
+        // Woken when a run lets go of its slot (no polling).
+        let wait = async {
+            loop {
+                let released = run_released().notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                if !st.run_active(&id).await {
+                    return;
+                }
+                released.await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(10), wait).await.is_err() {
+            return Err(StatusCode::CONFLICT);
         }
     }
     if st.db.delete_session(&id).map_err(internal)? {
@@ -1833,6 +1841,7 @@ impl AppState {
         let mut busy = self.busy.write().await;
         if busy.get(session_id).map(|f| Arc::ptr_eq(f, flag)).unwrap_or(false) {
             busy.remove(session_id);
+            run_released().notify_waiters();
         }
     }
 
@@ -1929,6 +1938,7 @@ impl Drop for RunSlot {
         if let Ok(mut busy) = self.st.busy.try_write() {
             if busy.get(&self.session_id).is_some_and(|f| Arc::ptr_eq(f, &flag)) {
                 busy.remove(&self.session_id);
+                run_released().notify_waiters();
             }
             return;
         }
@@ -1938,6 +1948,12 @@ impl Drop for RunSlot {
             h.spawn(async move { st.release_run(&session_id, &flag).await });
         }
     }
+}
+
+/// Woken whenever a run frees its busy slot (DELETE waits on it).
+fn run_released() -> &'static tokio::sync::Notify {
+    static N: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
 }
 
 /// Wakers for everything waiting on an abort flag, by the flag's address
@@ -3204,7 +3220,7 @@ pub(crate) async fn run_loop_inner(
                     stream_drops += 1;
                     // The part already on screen is asked again from the
                     // start: take it back, or partial + full reply show.
-                    retract_shown(st, session_id, &text[..shown]);
+                    retract_shown(st, session_id, text.get(..shown).map_or(0, |s| s.chars().count()));
                     let _ = st.events.send(ServerEvent::Note {
                         session_id: session_id.to_string(),
                         text: format!(
@@ -3271,15 +3287,10 @@ pub(crate) async fn run_loop_inner(
 
         log_cache(st, session_id, request_usage.as_ref(), &prefix_note);
         let mut calls = acc.finish();
+        // What the clients got, in characters, before any are taken out.
+        let streamed_chars = text.get(..shown).map_or(0, |s| s.chars().count());
         if text.contains(['\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}']) {
-            // `shown` counts bytes of the text as it streamed: the shown part
-            // shrinks by the characters taken out of it, not to `min(len)`
-            // (that dropped or doubled the end of the reply).
-            if text.is_char_boundary(shown) {
-                shown = strip_invisible(&text[..shown]).len();
-            }
-            text = strip_invisible(&text);
-            shown = shown.min(text.len());
+            (text, shown) = strip_streamed(&text, shown);
         }
         // An upstream failure served as fake reply text (see
         // `is_wrapped_error`). Never save it as an answer: shorten the
@@ -3287,7 +3298,7 @@ pub(crate) async fn run_loop_inner(
         // with the message when it keeps coming back.
         if calls.is_empty() && is_wrapped_error(&text) {
             // It streamed in as reply text: take it off the screen.
-            retract_shown(st, session_id, &text[..shown.min(text.len())]);
+            retract_shown(st, session_id, streamed_chars);
             if !compacted && is_context_overflow(&text) {
                 compacted = true;
                 let _ = st.events.send(ServerEvent::Note {
@@ -3573,10 +3584,20 @@ pub(crate) async fn run_loop_inner(
     Ok(LoopEnd::Done(final_text))
 }
 
-/// Take back reply text already streamed (`shown`) when its step is asked
-/// again ([`ServerEvent::ReplyRetracted`]).
-fn retract_shown(st: &Shared, session_id: &str, shown: &str) {
-    let chars = shown.chars().count();
+/// `text` without invisible characters, and `shown` (bytes of `text` already
+/// streamed) moved to the same place in the cleaned text: the shown part
+/// shrinks by the characters taken out of it. `min(len)` dropped or doubled
+/// the end of the reply.
+fn strip_streamed(text: &str, shown: usize) -> (String, usize) {
+    let cleaned = strip_invisible(text);
+    let shown = text.get(..shown).map_or(shown, |head| strip_invisible(head).len());
+    let shown = shown.min(cleaned.len());
+    (cleaned, shown)
+}
+
+/// Take back `chars` characters of reply text already streamed when its
+/// step is asked again ([`ServerEvent::ReplyRetracted`]).
+fn retract_shown(st: &Shared, session_id: &str, chars: usize) {
     if chars > 0 {
         let _ = st.events.send(ServerEvent::ReplyRetracted { session_id: session_id.to_string(), chars });
     }
@@ -9125,5 +9146,198 @@ mod prompt_budget_tests {
         assert!(tools <= 1275, "tool list ~{tools} tokens ({count} tools)");
         assert!(st.usage_report(&s.id).contains("Each request of this chat starts with about"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Regression tests for the server review fixes (fix/server).
+#[cfg(test)]
+mod review_fix_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Invisible characters taken out after streaming move the shown mark by
+    /// what was taken out of the shown part, not to `min(len)`.
+    #[test]
+    fn stripping_keeps_the_shown_mark_in_place() {
+        // "a\u{200b}b" streamed (5 bytes), then "cd" not yet shown.
+        let (t, shown) = strip_streamed("a\u{200b}bcd", 5);
+        assert_eq!((t.as_str(), shown), ("abcd", 2), "the rest to send is `cd`, once");
+        let (t, shown) = strip_streamed("abc\u{feff}", 3);
+        assert_eq!((t.as_str(), shown), ("abc", 3));
+        let (t, shown) = strip_streamed("\u{2060}x", 0);
+        assert_eq!((t.as_str(), shown), ("x", 0));
+    }
+
+    /// A user message typed to look like the app's own is stored guarded,
+    /// so it neither counts as a turbo continuation nor hides the request.
+    #[test]
+    fn user_text_cannot_pass_for_the_apps() {
+        for typed in ["[app] do it", "TURBO-CONTINUE: go", "[verify] ok", "  [app] x"] {
+            let stored = neutralize_user_text(typed);
+            assert!(stored.starts_with(USER_TEXT_GUARD), "{typed}");
+            assert!(!APP_MARKERS.iter().any(|m| stored.starts_with(m)), "{typed}");
+        }
+        assert_eq!(neutralize_user_text("fix the bug"), "fix the bug", "ordinary text is unchanged");
+        assert_eq!(rewind_key(&neutralize_user_text("[app] x")), rewind_key("[app] x"), "rewind still finds it");
+        let msg = |text: &str| Message {
+            id: "m".into(),
+            session_id: "s".into(),
+            role: "user".into(),
+            parts: vec![Part::Text { text: text.into() }],
+            created_at: 0,
+        };
+        let spoofed = vec![msg(&format!("{TURBO_CONTINUE_PREFIX} a")), msg(&neutralize_user_text(&format!("{TURBO_CONTINUE_PREFIX} b")))];
+        assert_eq!(turbo_streak_in(&spoofed), 0, "the typed one is the user's and ends the streak");
+    }
+
+    /// Only jobs the agent started skip the approval; the user's terminal
+    /// commands (`term<n>`) are asked about like any other call.
+    #[test]
+    fn only_agent_jobs_skip_the_permission_check() {
+        assert!(agent_job(&json!({"job": "job3"})));
+        assert!(!agent_job(&json!({"job": "term1"})));
+        assert!(!agent_job(&json!({"job": "job"})));
+        assert!(!agent_job(&json!({"job": "jobx"})));
+        assert_eq!(job_detail("bash", &json!({"job": "term2", "stop": true})).as_deref(), Some("stop job term2"));
+        assert_eq!(job_detail("bash", &json!({"job": "term2"})).as_deref(), Some("read job term2"));
+        assert_eq!(job_detail("bash", &json!({"command": "ls"})), None);
+    }
+
+    /// One prompt gets a fixed number of extra passes; the user is told
+    /// once when one is skipped.
+    #[tokio::test]
+    async fn extra_passes_per_prompt_are_capped() {
+        let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let mut rx = st.events.subscribe();
+        let budget = PassBudget::new();
+        let shared = budget.clone();
+        for _ in 0..MAX_EXTRA_PASSES {
+            assert!(shared.take(&st, "s", "a fix round"));
+        }
+        assert!(!budget.take(&st, "s", "a fix round"), "a continuation shares the prompt's budget");
+        assert!(!budget.take(&st, "s", "the design review"));
+        assert!(spend(None, &st, "s", "x"), "missions and deep mode have their own limits");
+        let mut notes = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::Note { text, .. } = ev {
+                assert!(text.contains("skipping a fix round"), "{text}");
+                notes += 1;
+            }
+        }
+        assert_eq!(notes, 1, "told once per prompt");
+    }
+
+    /// The scratch folder is held per project: another project's run does
+    /// not keep it, and the last holder removes it.
+    #[test]
+    fn scratch_is_held_per_project() {
+        let base = std::env::temp_dir().join(format!("ocrs-scratch-pp-{}", std::process::id()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        scratch_hold(&a);
+        scratch_hold(&b);
+        scratch_hold(&a);
+        scratch_let_go(&b);
+        assert!(!scratch_dir(&b).exists(), "b's last run ended: gone, though a still runs");
+        assert!(!b.join(".opencode").exists(), "the project is left as it was");
+        scratch_let_go(&a);
+        assert!(scratch_dir(&a).exists(), "a still has a run");
+        scratch_let_go(&a);
+        assert!(!scratch_dir(&a).exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The project's own check command runs only with a bash approval; the
+    /// one the user configured runs without asking.
+    #[tokio::test]
+    async fn auto_verify_asks_like_bash() {
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.approval_timeout_secs = 5;
+        let st = build_state_ephemeral(cfg.clone(), std::env::temp_dir()).await;
+        st.set_perm_mode(PermissionMode::Manual);
+        let s = st.db.create_session("v", None).unwrap();
+        let none = AtomicBool::new(false);
+        let notes = Mutex::new(Vec::new());
+        let note = |t: String| notes.lock().unwrap().push(t);
+        let mut rx = st.events.subscribe();
+        let (st2, sid) = (st.clone(), s.id.clone());
+        let denier = tokio::spawn(async move {
+            loop {
+                if let Ok(ServerEvent::ApprovalNeeded { approval_id, .. }) = rx.recv().await {
+                    st2.decide(&approval_id, false, false);
+                    return;
+                }
+            }
+        });
+        assert!(!verify_permitted(&st, &sid, "cargo check", &note, &none).await, "asked, and denied");
+        denier.await.unwrap();
+        assert!(notes.lock().unwrap()[0].contains("not approved"));
+
+        cfg.agent.verify_command = Some("make check".into());
+        let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+        st.set_perm_mode(PermissionMode::Manual);
+        assert!(verify_permitted(&st, &s.id, "make check", &note, &none).await, "the user's own command");
+        st.set_perm_mode(PermissionMode::Turbo);
+        assert!(verify_permitted(&st, &s.id, "cargo check", &note, &none).await, "turbo needs no prompt");
+    }
+
+    /// A run that panics still frees its chat's busy slot.
+    #[tokio::test]
+    async fn a_panicking_run_frees_its_slot() {
+        let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        st.kick_task("s".into(), |_, _, _| async move { panic!("run blew up") }).await;
+        let freed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while st.run_active("s").await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(freed.is_ok(), "the slot was left busy");
+    }
+
+    /// `signal_abort` wakes a waiter at once, not on the next poll.
+    #[tokio::test]
+    async fn an_abort_wakes_its_waiters_at_once() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let f2 = flag.clone();
+        let waiter = tokio::spawn(async move { aborted(&f2).await });
+        tokio::task::yield_now().await;
+        let t = std::time::Instant::now();
+        signal_abort(&flag);
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter).await.unwrap().unwrap();
+        assert!(t.elapsed() < std::time::Duration::from_millis(400), "woken, not polled: {:?}", t.elapsed());
+    }
+
+    /// A deleted chat's in-memory state goes with it.
+    #[tokio::test]
+    async fn deleting_a_chat_forgets_its_state() {
+        let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let s = st.db.create_session("x", None).unwrap();
+        st.set_mode(&s.id, AgentMode::Plan);
+        let grant = st.auto_approve_session(&s.id);
+        std::mem::forget(grant);
+        st.forget_session(&s.id);
+        assert_eq!(st.mode_for(&s.id), AgentMode::default());
+        assert!(st.auto_approve.lock().unwrap().is_empty());
+    }
+
+    /// An export cannot write outside the workspace through a linked folder.
+    #[test]
+    fn export_refuses_a_path_through_a_link() {
+        let base = std::env::temp_dir().join(format!("ocrs-export-link-{}", std::process::id()));
+        let (ws, outside) = (base.join("ws"), base.join("outside"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, ws.join("docs"));
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, ws.join("docs"));
+        assert!(AppState::export_stays_inside(&ws, &ws.join("chat.md")).is_ok());
+        if linked.is_ok() {
+            let err = AppState::export_stays_inside(&ws, &ws.join("docs").join("chat.md")).unwrap_err();
+            assert!(format!("{err}").contains("through a link"), "{err}");
+        } // else: no right to make links here (Windows without developer mode)
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
