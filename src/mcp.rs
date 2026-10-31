@@ -196,24 +196,7 @@ where
         )
         .await
         .context("mcp tools/call timed out")??;
-        let is_error = res.get("isError").and_then(Value::as_bool).unwrap_or(false);
-        let text = res
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(|p| {
-                        if p.get("type").and_then(Value::as_str) == Some("text") {
-                            p.get("text").and_then(Value::as_str).map(String::from)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
+        let (is_error, text) = call_result_text(&res);
         if is_error {
             Err(anyhow!("{}", if text.is_empty() { "tool error".to_string() } else { cap_result(text) }))
         } else if text.is_empty() {
@@ -222,6 +205,25 @@ where
             Ok(cap_result(text))
         }
     }
+}
+
+/// A `tools/call` result as (isError, its text parts joined by newlines).
+/// Shared by the stdio and HTTP clients.
+pub(crate) fn call_result_text(res: &Value) -> (bool, String) {
+    let is_error = res.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let text = res
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    (is_error, text)
 }
 
 /// Cut an over-long tool result to MAX_RESULT_BYTES (B-19).
@@ -326,6 +328,92 @@ pub struct Live {
     pub client: Transport,
 }
 
+impl Drop for Live {
+    /// `kill_on_drop` ends only the direct child; an `npx`/`cmd` launcher's
+    /// node grandchild would outlive us. End the whole tree.
+    fn drop(&mut self) {
+        let pid = self.child.as_ref().and_then(|c| c.id());
+        if pid.is_some() {
+            // Drop cannot await; outside a runtime only kill_on_drop applies
+            // (and on Windows the Job Object still ends the tree when we exit).
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(crate::tools::kill_tree(pid));
+            }
+        }
+    }
+}
+
+/// How much of a server's stderr is kept for error messages.
+const STDERR_KEEP: usize = 4_096;
+
+/// Keep the last `STDERR_KEEP` bytes a server writes to stderr. Read to the
+/// end so a chatty server never blocks on a full pipe.
+fn collect_stderr(
+    stderr: tokio::process::ChildStderr,
+) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    use tokio::io::AsyncReadExt;
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let keep = tail.clone();
+    tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut buf = [0u8; 2048];
+        while let Ok(n) = stderr.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            let mut t = keep.lock().unwrap_or_else(|e| e.into_inner());
+            t.extend_from_slice(&buf[..n]);
+            let extra = t.len().saturating_sub(STDERR_KEEP);
+            t.drain(..extra);
+        }
+    });
+    tail
+}
+
+/// The stderr tail as text for an error message ("" when there is none).
+fn stderr_tail(tail: &std::sync::Mutex<Vec<u8>>) -> String {
+    let t = tail.lock().unwrap_or_else(|e| e.into_inner());
+    let text = String::from_utf8_lossy(&t);
+    let text = text.trim();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("
+--- server stderr (last lines) ---
+{text}")
+    }
+}
+
+/// Windows: `Command::new("npx")` finds only `npx.exe`, but npm installs
+/// `npx.cmd`. A bare name (no path, no extension) is looked up on PATH with
+/// PATHEXT the way a shell would; anything else is used as given.
+fn resolve_command(command: &str) -> std::path::PathBuf {
+    if cfg!(windows) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        if let Some(found) = resolve_on_path(command, &path, &exts) {
+            return found;
+        }
+    }
+    std::path::PathBuf::from(command)
+}
+
+fn resolve_on_path(command: &str, path: &std::ffi::OsStr, exts: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(command);
+    if p.extension().is_some() || p.components().count() != 1 {
+        return None;
+    }
+    for dir in std::env::split_paths(path) {
+        for ext in exts.split(';').filter(|e| !e.is_empty()) {
+            let cand = dir.join(format!("{command}{}", ext.to_ascii_lowercase()));
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 /// How we talk to one MCP server (F-03).
 pub enum Transport {
     /// A child process: newline-delimited JSON-RPC on stdin/stdout.
@@ -368,22 +456,42 @@ impl McpConn {
             let live = std::sync::Arc::new(tokio::sync::Mutex::new(live));
             return Ok(Self { live, tools, server });
         }
-        let mut cmd = tokio::process::Command::new(&cfg.command);
+        let mut cmd = tokio::process::Command::new(resolve_command(&cfg.command));
         cmd.args(&cfg.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         // S-05: MCP servers never see our provider key or API token.
         crate::tools::scrub_secrets(&mut cmd);
+        // Its own process group (Unix) / Job Object (Windows), so stopping
+        // the server also stops what it started (see `Live`'s Drop).
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning `{}`", cfg.command))?;
+        crate::tools::adopt_into_job(&child);
+        let stderr = collect_stderr(child.stderr.take().context("mcp child has no stderr")?);
         let stdin = child.stdin.take().context("mcp child has no stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("mcp child has no stdout")?);
         let mut client = Client::new(stdout, stdin);
-        client.initialize().await?;
-        let mut tools = client.list_tools().await?;
+        let started = async {
+            client.initialize().await?;
+            client.list_tools().await
+        }
+        .await;
+        let mut tools = match started {
+            Ok(t) => t,
+            Err(e) => {
+                // A server that dies at startup says why on stderr; give
+                // it a moment to finish writing, then show the tail.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let tail = stderr_tail(&stderr);
+                crate::tools::kill_tree(child.id()).await;
+                return Err(anyhow!("{e:#}{tail}"));
+            }
+        };
         // B-19: two tools with the same model-facing name would be ambiguous.
         let mut seen = std::collections::HashSet::new();
         tools.retain(|t| {
@@ -756,6 +864,38 @@ mod tests {
             err.to_string().contains("tools/list"),
             "error names the method: {err}"
         );
+    }
+
+    /// `npx` on Windows is `npx.cmd`: a bare name is found on PATH with
+    /// PATHEXT; a name with a path or an extension is left alone.
+    #[test]
+    fn bare_command_names_resolve_through_pathext() {
+        let dir = std::env::temp_dir().join(format!("ocrs-mcp-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fakenpx.cmd"), "@echo off").unwrap();
+        let path = std::env::join_paths([dir.clone()]).unwrap();
+        let got = resolve_on_path("fakenpx", &path, ".EXE;.CMD").unwrap();
+        assert_eq!(got, dir.join("fakenpx.cmd"));
+        assert!(resolve_on_path("fakenpx.cmd", &path, ".EXE;.CMD").is_none());
+        assert!(resolve_on_path("sub/fakenpx", &path, ".EXE;.CMD").is_none());
+        assert!(resolve_on_path("missing", &path, ".EXE;.CMD").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server that dies at startup: its stderr tail is in the error.
+    #[tokio::test]
+    async fn startup_failure_shows_the_servers_stderr() {
+        let (command, args) = if cfg!(windows) {
+            ("cmd".to_string(), vec!["/c".to_string(), "echo missing-module-xyz 1>&2".to_string()])
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), "echo missing-module-xyz >&2".to_string()])
+        };
+        let cfg = McpServerCfg { name: "bad".into(), command, args, ..Default::default() };
+        let err = match McpConn::spawn("bad", &cfg).await {
+            Ok(_) => panic!("a server that exits cannot start"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("missing-module-xyz"), "stderr tail shown: {err}");
     }
 
     #[test]

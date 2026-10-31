@@ -106,7 +106,8 @@ pub enum ProviderApi {
     Anthropic,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+// Debug by hand: the derived one printed `api_key` in plain text.
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProviderCfg {
     /// OpenAI-compatible base, e.g. "https://xyz.trycloudflare.com/v1" or "http://127.0.0.1:11434/v1"
@@ -156,6 +157,79 @@ pub struct ProviderCfg {
     /// (`stream_options.include_usage`), so `/usage` can show cache hits.
     /// Turn off for a server that rejects the field.
     pub stream_usage: bool,
+    /// The origin (`scheme://host:port`) `api_key` is bound to: the address
+    /// it was saved for. `None` = from `OPENCODE_RUST_API_KEY`, sent to any
+    /// host. Set by `Config::load`, never read from or written to the file.
+    #[serde(skip)]
+    pub api_key_origin: Option<String>,
+    /// A key was found but not sent, because it belongs to this other
+    /// origin than `base_url`'s. Lets a 401 say why no key went along.
+    #[serde(skip)]
+    pub key_withheld_for: Option<String>,
+}
+
+impl std::fmt::Debug for ProviderCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = if self.api_key.is_empty() { "" } else { "<redacted>" };
+        f.debug_struct("ProviderCfg")
+            .field("base_url", &self.base_url)
+            .field("api_key", &key)
+            .field("model", &self.model)
+            .field("api", &self.api)
+            .field("max_tokens", &self.max_tokens)
+            .field("small_model", &self.small_model)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("max_retries", &self.max_retries)
+            .field("rate_limit_wait_secs", &self.rate_limit_wait_secs)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("temperature", &self.temperature)
+            .field("images", &self.images)
+            .field("prompt_cache", &self.prompt_cache)
+            .field("stream_usage", &self.stream_usage)
+            .field("api_key_origin", &self.api_key_origin)
+            .field("key_withheld_for", &self.key_withheld_for)
+            .finish()
+    }
+}
+
+/// The origin of a provider address (`https://api.example.com:443` style,
+/// lowercased), which an API key is bound to. An address that does not
+/// parse is its own origin.
+pub fn key_origin(base_url: &str) -> String {
+    let u = base_url.trim();
+    match reqwest::Url::parse(u) {
+        Ok(url) if url.has_host() => url.origin().ascii_serialization().to_ascii_lowercase(),
+        _ => u.trim_end_matches('/').to_ascii_lowercase(),
+    }
+}
+
+/// Which API key to send to `base_url`. `OPENCODE_RUST_API_KEY` (`env`)
+/// always wins and goes to any host. Otherwise the first of `candidates`
+/// (key, origin it was saved for) whose origin is `base_url`'s: a key
+/// saved for one provider is never sent to another one after the address
+/// changed (in Settings, the file or `OPENCODE_RUST_BASE_URL`). Returns
+/// the key (maybe empty), its origin, and the origin of a key that was
+/// held back.
+pub fn choose_api_key(
+    base_url: &str,
+    env: Option<&str>,
+    candidates: &[(String, String)],
+) -> (String, Option<String>, Option<String>) {
+    if let Some(k) = env.map(str::trim).filter(|k| !k.is_empty()) {
+        return (k.to_string(), None, None);
+    }
+    let want = key_origin(base_url);
+    let mut withheld = None;
+    for (key, origin) in candidates {
+        if key.trim().is_empty() {
+            continue;
+        }
+        if *origin == want {
+            return (key.trim().to_string(), Some(want), None);
+        }
+        withheld.get_or_insert_with(|| origin.clone());
+    }
+    (String::new(), None, withheld)
 }
 
 /// `provider.prompt_cache`: when to send prompt-caching markers.
@@ -188,6 +262,8 @@ impl Default for ProviderCfg {
             images: "auto".into(),
             prompt_cache: PromptCache::Auto,
             stream_usage: true,
+            api_key_origin: None,
+            key_withheld_for: None,
         }
     }
 }
@@ -418,23 +494,31 @@ impl Config {
         } else {
             Config::default()
         };
-        // Environment overrides — API key should prefer env over file.
-        if let Ok(k) = std::env::var("OPENCODE_RUST_API_KEY") {
-            if !k.is_empty() { cfg.provider.api_key = k; }
-        }
+        // The file's key is bound to the file's address: when the
+        // environment points elsewhere, it is not sent there.
+        let file_key = std::mem::take(&mut cfg.provider.api_key);
+        // (A file with no address binds its key to the one in use.)
+        let file_base = cfg.provider.base_url.trim().to_string();
         if let Ok(u) = std::env::var("OPENCODE_RUST_BASE_URL") {
             if !u.is_empty() { cfg.provider.base_url = u; }
         }
         if let Ok(m) = std::env::var("OPENCODE_RUST_MODEL") {
             if !m.is_empty() { cfg.provider.model = m; }
         }
-        // The key saved from the desktop app's Settings (encrypted), when
-        // neither the file nor the environment has one.
-        if cfg.provider.api_key.is_empty() {
-            if let Some(k) = crate::settings::load_api_key() {
-                cfg.provider.api_key = k;
-            }
+        // Key precedence: environment > file > the key saved from the
+        // desktop app's Settings (encrypted). File and saved keys only go
+        // to the origin they were saved for. A saved key from before keys
+        // were bound counts as saved for the file's address.
+        let file_origin = key_origin(if file_base.is_empty() { &cfg.provider.base_url } else { &file_base });
+        let mut candidates = vec![(file_key, file_origin.clone())];
+        if let Some((k, origin)) = crate::settings::load_api_key() {
+            candidates.push((k, origin.unwrap_or(file_origin)));
         }
+        let env_key = std::env::var("OPENCODE_RUST_API_KEY").ok();
+        let (key, origin, withheld) = choose_api_key(&cfg.provider.base_url, env_key.as_deref(), &candidates);
+        cfg.provider.api_key = key;
+        cfg.provider.api_key_origin = origin;
+        cfg.provider.key_withheld_for = withheld;
         cfg.permissions
             .validate()
             .with_context(|| format!("checking [permissions] in {}", path.display()))?;
@@ -665,5 +749,47 @@ mod f03_tests {
         assert_eq!(s.headers.get("Authorization").map(String::as_str), Some("Bearer t"));
         assert!(s.command.is_empty());
         assert!(McpServerCfg::default().url.is_none(), "stdio stays the default");
+    }
+}
+
+#[cfg(test)]
+mod key_binding_tests {
+    use super::*;
+
+    fn c(k: &str, url: &str) -> (String, String) {
+        (k.to_string(), key_origin(url))
+    }
+
+    #[test]
+    fn a_key_only_goes_to_the_origin_it_was_saved_for() {
+        let saved = [c("sk-or", "https://openrouter.ai/api/v1")];
+        let (k, o, w) = choose_api_key("https://openrouter.ai/api/v1/", None, &saved);
+        assert_eq!((k.as_str(), o.as_deref(), w), ("sk-or", Some("https://openrouter.ai"), None));
+        // Another host (Settings changed, or OPENCODE_RUST_BASE_URL): not sent.
+        let (k, _, w) = choose_api_key("https://evil.example/v1", None, &saved);
+        assert_eq!(k, "");
+        assert_eq!(w.as_deref(), Some("https://openrouter.ai"));
+        // Same host, other port: another origin.
+        assert_eq!(choose_api_key("https://openrouter.ai:8443/v1", None, &saved).0, "");
+    }
+
+    #[test]
+    fn the_environment_key_wins_then_the_file_then_the_saved_key() {
+        let cands = [c("file", "https://a.example/v1"), c("saved", "https://a.example/v1")];
+        assert_eq!(choose_api_key("https://a.example/v1", Some("env"), &cands).0, "env");
+        assert_eq!(choose_api_key("https://a.example/v1", Some(" "), &cands).0, "file");
+        let cands = [c("", "https://a.example/v1"), c("saved", "https://a.example/v1")];
+        assert_eq!(choose_api_key("https://a.example/v1", None, &cands).0, "saved");
+        // A file key for another host does not block a matching saved key.
+        let cands = [c("file", "https://b.example/v1"), c("saved", "https://a.example/v1")];
+        assert_eq!(choose_api_key("https://a.example/v1", None, &cands).0, "saved");
+    }
+
+    #[test]
+    fn debug_output_does_not_show_the_api_key() {
+        let p = ProviderCfg { api_key: "sk-very-secret".into(), ..Default::default() };
+        let shown = format!("{p:?}");
+        assert!(!shown.contains("sk-very-secret"), "{shown}");
+        assert!(shown.contains("<redacted>"));
     }
 }

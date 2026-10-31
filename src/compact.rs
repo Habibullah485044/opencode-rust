@@ -166,7 +166,9 @@ pub async fn compact(
     session_id: &str,
     abort: &AtomicBool,
 ) -> Result<CompactOutcome> {
-    let msgs = st.db.messages(session_id)?;
+    // SQLite blocks: keep it off the async worker.
+    let sid = session_id.to_string();
+    let msgs = st.db.run(move |db| db.messages(&sid)).await?;
     let Some(split) = safe_split(&msgs) else {
         bail!(
             "nothing to compact — only {} message(s) (need > {}), or no safe split point",
@@ -192,7 +194,10 @@ pub async fn compact(
         bail!("summarizer returned an empty summary — compaction cancelled");
     }
     let wrapped = format!("{SUMMARY_MARKER} ({} earlier messages summarized)\n{summary}", prefix.len());
-    st.db.replace_with_summary(session_id, &summarized_ids, &wrapped)?;
+    {
+        let (sid, text) = (session_id.to_string(), wrapped.clone());
+        st.db.run(move |db| db.replace_with_summary(&sid, &summarized_ids, &text)).await?;
+    }
     let _ = st.events.send(ServerEvent::AssistantDelta {
         session_id: session_id.to_string(),
         text: String::new(), // no streaming text; the caller reports the outcome

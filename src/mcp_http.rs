@@ -19,6 +19,44 @@ pub const HTTP_PROTOCOL_VERSION: &str = "2025-11-25";
 const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 const LIST_TIMEOUT: Duration = Duration::from_secs(20);
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Largest answer read from a server, JSON or SSE. Tool results are cut to
+/// 60 KB later anyway; this only stops a broken or hostile server from
+/// filling memory.
+const MAX_BODY: usize = 16 * 1024 * 1024;
+
+/// The URL for messages: no query, fragment or user info, which may hold a
+/// token (`?key=...`).
+fn redact_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut u) => {
+            let had_query = u.query().is_some();
+            u.set_query(None);
+            u.set_fragment(None);
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            let mut s = u.to_string();
+            if had_query {
+                s.push_str("?...");
+            }
+            s
+        }
+        Err(_) => "(the configured url)".to_string(),
+    }
+}
+
+/// Read a whole body, failing once it passes `limit` bytes.
+async fn read_capped(resp: reqwest::Response, limit: usize, method: &str) -> Result<Vec<u8>> {
+    let mut stream = Box::pin(resp.bytes_stream());
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| anyhow!("mcp `{method}`: reading the answer failed: {}", e.without_url()))?;
+        if body.len() + chunk.len() > limit {
+            bail!("mcp `{method}`: answer is larger than {limit} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 /// One MCP server reached over HTTP.
 pub struct HttpClient {
@@ -62,7 +100,10 @@ impl HttpClient {
         if let Some(version) = &self.protocol {
             req = req.header("MCP-Protocol-Version", version);
         }
-        req.send().await.with_context(|| format!("mcp http request to {} failed", self.url))
+        // reqwest's error text includes the full URL; ours is redacted.
+        req.send()
+            .await
+            .map_err(|e| anyhow!("mcp http request to {} failed: {}", redact_url(&self.url), e.without_url()))
     }
 
     /// Send a request, return its `result`. If the server forgot our session
@@ -89,7 +130,8 @@ impl HttpClient {
             return Ok(None);
         }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = read_capped(resp, 64 * 1024, method).await.unwrap_or_default();
+            let body = String::from_utf8_lossy(&body);
             bail!("mcp `{method}`: server returned {status}: {}", body.chars().take(300).collect::<String>());
         }
         if method == "initialize" {
@@ -101,7 +143,8 @@ impl HttpClient {
         let reply = if content_type.is_some_and(|v| v.starts_with("text/event-stream")) {
             self.read_sse(resp, id, method).await?
         } else {
-            resp.json::<Value>().await.with_context(|| format!("mcp `{method}`: answer is not JSON"))?
+            let body = read_capped(resp, MAX_BODY, method).await?;
+            serde_json::from_slice::<Value>(&body).with_context(|| format!("mcp `{method}`: answer is not JSON"))?
         };
         if let Some(err) = reply.get("error") {
             bail!("mcp `{method}` failed: {err}");
@@ -117,6 +160,7 @@ impl HttpClient {
         let mut stream = Box::pin(resp.bytes_stream());
         let mut buf: Vec<u8> = Vec::new();
         let mut data = String::new(); // the `data:` lines of the current event
+        let mut read = 0usize; // bytes of this answer so far
         loop {
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let raw: Vec<u8> = buf.drain(..=pos).collect();
@@ -137,8 +181,14 @@ impl HttpClient {
                 // `event:`, `id:`, `retry:` and `:` comment lines are ignored.
             }
             match stream.next().await {
-                Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
-                Some(Err(e)) => bail!("mcp `{method}`: the answer stream broke: {e}"),
+                Some(Ok(chunk)) => {
+                    read += chunk.len();
+                    if read > MAX_BODY {
+                        bail!("mcp `{method}`: answer stream passed {MAX_BODY} bytes without our answer");
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Some(Err(e)) => bail!("mcp `{method}`: the answer stream broke: {}", e.without_url()),
                 None => {
                     // The last event may lack its closing blank line.
                     let event = std::mem::take(&mut data);
@@ -245,14 +295,7 @@ impl HttpClient {
         let res = tokio::time::timeout(CALL_TIMEOUT, self.request("tools/call", params))
             .await
             .context("mcp tools/call timed out")??;
-        let is_error = res.get("isError").and_then(Value::as_bool).unwrap_or(false);
-        let parts = res.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
-        let text = parts
-            .iter()
-            .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let (is_error, text) = crate::mcp::call_result_text(&res);
         if is_error {
             bail!("{}", if text.is_empty() { "tool error" } else { text.as_str() });
         }
@@ -362,6 +405,22 @@ mod tests {
     #[tokio::test]
     async fn json_answers_work() {
         handshake_list_call(false).await;
+    }
+
+    #[test]
+    fn urls_in_errors_lose_their_secrets() {
+        assert_eq!(redact_url("https://u:p@example.com/mcp?key=sk-123#x"), "https://example.com/mcp?...");
+        assert_eq!(redact_url("http://127.0.0.1:9/mcp"), "http://127.0.0.1:9/mcp");
+        assert!(!redact_url("not a url ?key=sk").contains("sk"));
+    }
+
+    /// A refused connection names the server without the query's token.
+    #[tokio::test]
+    async fn a_failed_request_does_not_show_the_query() {
+        let c = HttpClient::new("http://127.0.0.1:9/mcp?key=sk-secret-1", &HashMap::new()).unwrap();
+        let err = format!("{:#}", c.post(&json!({})).await.unwrap_err());
+        assert!(!err.contains("sk-secret-1"), "{err}");
+        assert!(err.contains("127.0.0.1:9/mcp"), "{err}");
     }
 
     #[tokio::test]
