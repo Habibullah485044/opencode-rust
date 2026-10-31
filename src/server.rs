@@ -4709,7 +4709,8 @@ async fn execute_routed(
             None => (format!("error: unknown browser tool {name}"), false),
         };
     }
-    match tools::execute(name, input, &st.workspace, abort).await {
+    // grep/glob skip each file a `read` deny rule covers.
+    match tools::execute_with(name, input, &st.workspace, abort, &st.engine.read_filter(name)).await {
         Ok(out) => (out, true),
         Err(e) => (format!("error: {e}"), false),
     }
@@ -4735,7 +4736,7 @@ async fn execute_for(
     }
     if let Some(ws) = &opts.workspace {
         if WORKSPACE_TOOLS.contains(&name) {
-            return match tools::execute(name, input, ws, abort).await {
+            return match tools::execute_with(name, input, ws, abort, &st.engine.read_filter(name)).await {
                 Ok(out) => (out, true),
                 Err(e) => (format!("error: {e}"), false),
             };

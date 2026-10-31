@@ -55,8 +55,8 @@ pub fn resolve_in_workspace(workspace: &Path, path: &str) -> Result<PathBuf> {
 /// `deny` rule for `read` (the file goes to the model) or `edit` (the file
 /// is rewritten) on this path stops it before anything is read. `ask`
 /// needs no extra prompt: the diff preview is the question.
-pub fn check_edit_allowed(st: &Shared, path: &str) -> Result<()> {
-    let detail = crate::permissions::normalize_path_detail(&st.workspace, path);
+pub fn check_edit_allowed(st: &Shared, workspace: &Path, path: &str) -> Result<()> {
+    let detail = crate::permissions::normalize_path_detail(workspace, path);
     for tool in ["read", "edit"] {
         let decision = st.engine.evaluate(tool, &detail, |_, _| false);
         if decision.action == crate::permissions::Action::Deny {
@@ -67,8 +67,11 @@ pub fn check_edit_allowed(st: &Shared, path: &str) -> Result<()> {
 }
 
 /// Ask the model for the new file content, then build the diff preview.
+/// Paths are in chat `session_id`'s own folder (`workspace_for`), like the
+/// agent's tools, not in the folder Habi started in.
 pub async fn propose(
     st: &Shared,
+    session_id: &str,
     path: &str,
     instruction: &str,
     abort: &AtomicBool,
@@ -76,8 +79,9 @@ pub async fn propose(
     if instruction.trim().is_empty() {
         bail!("edit instruction is empty");
     }
-    let abs = resolve_in_workspace(&st.workspace, path)?;
-    check_edit_allowed(st, path)?;
+    let workspace = st.workspace_for(session_id);
+    let abs = resolve_in_workspace(&workspace, path)?;
+    check_edit_allowed(st, &workspace, path)?;
     // B-49: check the size before reading, so a huge file is refused at once.
     let size = std::fs::metadata(&abs).with_context(|| format!("reading {}", abs.display()))?.len();
     if size > MAX_EDIT_BYTES as u64 {
@@ -122,7 +126,9 @@ pub fn apply(abs: &Path, expected_old: &str, new: &str) -> Result<()> {
     if current != expected_old {
         bail!("file changed since the preview was generated — re-run /edit");
     }
-    std::fs::write(abs, new).with_context(|| format!("writing {}", abs.display()))?;
+    // Like the edit tool: never half written, and a keep-best round can
+    // put the file back (`write_atomic` tells it first).
+    crate::tools::write_atomic(abs, new.as_bytes()).with_context(|| format!("writing {}", abs.display()))?;
     Ok(())
 }
 
@@ -338,9 +344,30 @@ mod tests {
         let st = crate::server::build_state_ephemeral(cfg, dir.clone()).await;
         let abort = AtomicBool::new(false);
         // The check runs before any model call, so no mock server is needed.
-        let err = propose(&st, ".env", "change it", &abort).await.unwrap_err();
+        let err = propose(&st, "no-session", ".env", "change it", &abort).await.unwrap_err();
         assert!(err.to_string().contains("denies"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/edit` in a chat of another project edits that project's file, like
+    /// the agent's tools, not the file of the folder Habi started in.
+    #[tokio::test]
+    async fn propose_uses_the_chats_own_folder() {
+        let start = temp_ws("start-folder");
+        let project = temp_ws("chat-project");
+        // Too big for /edit: refused after the file was found, before any
+        // model call.
+        std::fs::write(project.join("big.txt"), "x".repeat(MAX_EDIT_BYTES + 1)).unwrap();
+        let st = crate::server::build_state_ephemeral(crate::config::Config::default(), start.clone()).await;
+        let p = st.db.upsert_project(&project).unwrap();
+        let chat = st.db.create_session_in("t", None, Some(&p.id)).unwrap();
+        let abort = AtomicBool::new(false);
+        let err = propose(&st, &chat.id, "big.txt", "change it", &abort).await.unwrap_err();
+        assert!(err.to_string().contains("caps at"), "found in the chat's project: {err}");
+        let err = propose(&st, "no-session", "big.txt", "change it", &abort).await.unwrap_err();
+        assert!(err.to_string().contains("reading"), "not in the start folder: {err}");
+        let _ = std::fs::remove_dir_all(&start);
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
@@ -507,7 +534,7 @@ mod tests {
         let st = crate::server::build_state_ephemeral(cfg, dir.clone()).await;
         let abort = AtomicBool::new(false);
 
-        let p = propose(&st, "app.rs", "log x", &abort).await.unwrap();
+        let p = propose(&st, "no-session", "app.rs", "log x", &abort).await.unwrap();
         assert_eq!(p.path, "app.rs");
         assert!(p.new.contains("println!"), "fence stripped, new content present");
         assert!(!p.new.contains("```"));
@@ -520,11 +547,11 @@ mod tests {
         assert!(std::fs::read_to_string(dir.join("app.rs")).unwrap().contains("println!"));
 
         // Missing file → clear error.
-        let err = propose(&st, "nope.rs", "x", &abort).await.unwrap_err();
+        let err = propose(&st, "no-session", "nope.rs", "x", &abort).await.unwrap_err();
         assert!(err.to_string().contains("reading"));
 
         // Path escape → rejected before any IO.
-        let err = propose(&st, "../outside.rs", "x", &abort).await.unwrap_err();
+        let err = propose(&st, "no-session", "../outside.rs", "x", &abort).await.unwrap_err();
         assert!(err.to_string().contains(".."), "got: {err}");
 
         let _ = std::fs::remove_dir_all(&dir);

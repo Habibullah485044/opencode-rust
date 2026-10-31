@@ -87,20 +87,68 @@ pub fn image_paths(text: &str) -> Vec<PathBuf> {
     out
 }
 
-/// `data:` URL of an image file for the model, or `None` (missing, too big).
+/// Is `path` (already canonical) in a folder Habi itself writes pictures
+/// to? Any `[image: …]` marker in a tool result or message is otherwise
+/// trusted text: `[image: ~/.ssh/id_rsa.png]` in a fetched page must not
+/// send that file to the provider. The folders: a project's attachments
+/// (`.opencode/attachments`), `check_page`'s screenshots
+/// (`.opencode/scratch/shots`) and the desktop app's captures (the temp
+/// folder's `opencode-rust-screenshots`).
+fn in_picture_dir(path: &Path) -> bool {
+    let Some(parent) = path.parent() else { return false };
+    let names: Vec<String> = parent
+        .components()
+        .rev()
+        .take(3)
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        // Windows folder names ignore case.
+        .map(|n| if cfg!(windows) { n.to_ascii_lowercase() } else { n })
+        .collect();
+    let ends = |tail: &[&str]| tail.iter().enumerate().all(|(i, n)| names.get(i).is_some_and(|x| x == n));
+    if ends(&["attachments", ".opencode"]) || ends(&["shots", "scratch", ".opencode"]) {
+        return true;
+    }
+    std::env::temp_dir()
+        .join("opencode-rust-screenshots")
+        .canonicalize()
+        .is_ok_and(|shots| shots.as_path() == parent)
+}
+
+/// The image type from the file's first bytes (PNG, JPEG, GIF, WebP).
+fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// `data:` URL of an image file for the model, or `None`: missing, too
+/// big, not a picture Habi saved (see `in_picture_dir`), or not really an
+/// image (the extension and the first bytes must both say so).
 pub fn data_url(path: &Path) -> Option<String> {
     use base64::Engine;
-    let size = std::fs::metadata(path).ok()?.len();
-    if size == 0 || size > MAX_IMAGE_BYTES {
+    use std::io::Read;
+    // Canonical first: a link in the attachments folder to another file
+    // is judged by where it leads.
+    let path = path.canonicalize().ok()?;
+    if !is_image(&path) || !in_picture_dir(&path) {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
-    let mime = match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        _ => "image/png",
-    };
+    // Read at most one byte past the limit instead of trusting the size
+    // the metadata reported a moment ago.
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path).ok()?.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let mime = sniff_mime(&bytes)?;
     Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
 }
 
@@ -217,6 +265,41 @@ mod tests {
         assert_eq!(msgs[3]["role"], "user");
         assert_eq!(msgs[3]["content"][1]["type"], "image_url");
         assert!(msgs[2]["content"].is_string(), "the tool result itself stays text");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// An `[image: …]` marker is text anyone can write (a fetched page, a
+    /// file the agent read): only pictures in Habi's own folders, that
+    /// really are images, are sent to the provider.
+    #[test]
+    fn only_real_images_from_habis_folders_are_sent() {
+        let ws = std::env::temp_dir().join(format!("ocrs-attach-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let png: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82];
+        let inside = save_bytes(&ws, "ok.png", png).unwrap();
+        assert!(data_url(&inside).unwrap().starts_with("data:image/png;base64,"));
+        // A real PNG anywhere else (a secret named .png, say).
+        let outside = ws.join("secret.png");
+        std::fs::write(&outside, png).unwrap();
+        assert!(data_url(&outside).is_none(), "outside the picture folders");
+        // `..` back out of the attachments folder does not count either.
+        let sneaky = dir(&ws).join("..").join("..").join("secret.png");
+        assert!(data_url(&sneaky).is_none());
+        // Text named .png in the attachments folder: not an image.
+        let fake = save_bytes(&ws, "key.png", b"-----BEGIN OPENSSH PRIVATE KEY-----").unwrap();
+        assert!(data_url(&fake).is_none(), "the first bytes must be an image");
+        // A non-image extension, even with image bytes.
+        let txt = save_bytes(&ws, "x.txt", png).unwrap();
+        assert!(data_url(&txt).is_none());
+        // check_page's screenshots are allowed.
+        let shots = ws.join(".opencode").join("scratch").join("shots");
+        std::fs::create_dir_all(&shots).unwrap();
+        std::fs::write(shots.join("desktop.png"), png).unwrap();
+        assert!(data_url(&shots.join("desktop.png")).is_some());
+        assert_eq!(sniff_mime(b"GIF89a.."), Some("image/gif"));
+        assert_eq!(sniff_mime(b"RIFF....WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff_mime(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
         let _ = std::fs::remove_dir_all(&ws);
     }
 }
