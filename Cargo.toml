@@ -44,6 +44,9 @@ regex = "1"
 anyhow = "1"
 bytes = "1"
 
+# The API token comes from the OS CSPRNG (already in Cargo.lock via ring).
+getrandom = "0.2"
+
 # M4: embedded preview browser — Rust shell (tao window + wry WebView2).
 # The engine itself is the OS out-of-process Chromium (WebView2), which is
 # the lowest-RAM option that can still run real JS dev-server apps.

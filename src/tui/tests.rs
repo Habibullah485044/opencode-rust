@@ -73,6 +73,22 @@
         assert!(!app.busy);
     }
 
+    /// A reply that broke off and is asked again is taken back, so the
+    /// retry does not show after the half reply.
+    #[test]
+    fn a_retried_reply_replaces_the_broken_one() {
+        let mut app = App::new();
+        app.on_event(ServerEvent::AssistantDelta { session_id: "s".into(), text: "Earlier answer.".into() });
+        app.push(EntryKind::User, "next".to_string());
+        app.on_event(ServerEvent::AssistantDelta { session_id: "s".into(), text: "Hé".into() });
+        app.on_event(ServerEvent::ReasoningDelta { session_id: "s".into(), text: "hm".into() });
+        app.on_event(ServerEvent::AssistantDelta { session_id: "s".into(), text: "llo wor".into() });
+        app.on_event(ServerEvent::ReplyRetracted { session_id: "s".into(), chars: 9 });
+        app.on_event(ServerEvent::AssistantDelta { session_id: "s".into(), text: "Hello world".into() });
+        let shown: Vec<&str> = app.entries.iter().filter(|e| e.kind == EntryKind::Assistant).map(|e| e.text.as_str()).collect();
+        assert_eq!(shown, ["Earlier answer.", "Hello world"], "the half reply is gone, the earlier one stays");
+    }
+
     #[test]
     fn laziness_meter_tracks_stats_and_commands() {
         let mut app = App::new();

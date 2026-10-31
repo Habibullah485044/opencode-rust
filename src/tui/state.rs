@@ -1044,6 +1044,28 @@ impl App {
                     _ => self.push(EntryKind::Assistant, text),
                 }
             }
+            // A reply broke off and is asked again: drop the part of it that
+            // streamed in, or the retry shows after the half reply.
+            ServerEvent::ReplyRetracted { chars, .. } => {
+                let mut left = chars;
+                while left > 0 {
+                    // Back over the reply's text (its thinking may sit
+                    // between two pieces), never past anything else.
+                    let Some(i) = self.entries.iter().rposition(|e| e.kind != EntryKind::Thinking) else { break };
+                    if self.entries[i].kind != EntryKind::Assistant {
+                        break;
+                    }
+                    let text = &mut self.entries[i].text;
+                    let count = text.chars().count();
+                    let keep = count.saturating_sub(left);
+                    let cut = text.char_indices().nth(keep).map_or(text.len(), |(b, _)| b);
+                    text.truncate(cut);
+                    left -= count - keep;
+                    if text.is_empty() {
+                        self.entries.remove(i);
+                    }
+                }
+            }
             ServerEvent::ReasoningDelta { text, .. } => {
                 // Same streaming semantics as assistant text, own entry kind.
                 match self.entries.last_mut() {
