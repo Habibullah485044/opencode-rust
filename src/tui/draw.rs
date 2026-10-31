@@ -1,7 +1,9 @@
 //! Drawing: the Freebuff-CLI palette, the frame layout, and the widgets.
 //! The team and spawned-agent panels share [`draw_agent_card`].
 
-use super::state::{wrap_n, App, EntryKind, TeamPhase, TeamStatus};
+use super::state::{
+    wrap_n, App, EntryKind, MissionPicker, PendingEdit, SessionsOverlay, TeamPhase, TeamStatus,
+};
 use crate::commands::{builtins, help_text};
 use ratatui::{
     prelude::*,
@@ -43,8 +45,37 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    // Header — Freebuff style: dark surface bar, green brand chip, muted details.
-    // Busy spinner: the loop redraws ~20×/s so the frame keeps moving.
+    draw_header(f, app, chunks[0]);
+    let transcript_area = draw_panels(f, app, chunks[1]);
+    draw_transcript(f, app, transcript_area);
+    draw_input(f, app, chunks[2]);
+    draw_palette(f, app, chunks[2]);
+    draw_footer(f, app, chunks[3]);
+
+    // Approval overlay — centered box on top (rendered last = on top).
+    // B-15: the overlays below are skipped while one that gets the keys
+    // first (state.rs `on_key`) is open, so nothing ever covers it.
+    draw_approval(f, app);
+
+    let covered = app.approval.is_some() || app.pending_edit.is_some();
+    if let Some(mp) = app.mission_picker.as_ref().filter(|_| !covered) {
+        draw_mission_picker(f, mp);
+    }
+    // M3: inline-edit diff preview overlay (B-15: never over an approval).
+    if let Some(pe) = app.pending_edit.as_ref().filter(|_| app.approval.is_none()) {
+        draw_edit_preview(f, app, pe);
+    }
+    if app.help && !covered && app.mission_picker.is_none() && app.sessions.is_none() {
+        draw_help(f, app);
+    }
+    if let Some(ov) = app.sessions.as_ref().filter(|_| !covered && app.mission_picker.is_none()) {
+        draw_sessions(f, ov);
+    }
+}
+
+/// Header — Freebuff style: dark surface bar, green brand chip, muted details.
+/// Busy spinner: the loop redraws ~20×/s so the frame keeps moving.
+fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     const SPIN: [&str; 4] = ["◐", "◓", "◑", "◒"];
     let status = if app.busy {
         format!("{} working", SPIN[app.tick as usize % SPIN.len()])
@@ -108,7 +139,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(right_w)])
-        .split(chunks[0]);
+        .split(area);
     f.render_widget(
         Paragraph::new(Line::from(left)).style(Style::default().bg(FB_SURFACE)),
         cols[0],
@@ -117,14 +148,16 @@ pub fn draw(f: &mut Frame, app: &App) {
         Paragraph::new(Line::from(right)).style(Style::default().bg(FB_SURFACE)),
         cols[1],
     );
+}
 
-    // Live panels above the transcript: team cards and/or spawned-agent
-    // cards (the transcript below doubles as the activity log). The agents
-    // panel wins contested space.
-    let show_agents = !app.agents.is_empty() && chunks[1].height >= TEAM_H + 6;
+/// Live panels above the transcript: team cards and/or spawned-agent
+/// cards (the transcript below doubles as the activity log). The agents
+/// panel wins contested space. Returns the area left for the transcript.
+fn draw_panels(f: &mut Frame, app: &App, area: Rect) -> Rect {
+    let show_agents = !app.agents.is_empty() && area.height >= TEAM_H + 6;
     let show_team = app.team.is_some()
-        && chunks[1].height >= TEAM_H + 6 + if show_agents { TEAM_H } else { 0 };
-    let transcript_area = if show_team || show_agents {
+        && area.height >= TEAM_H + 6 + if show_agents { TEAM_H } else { 0 };
+    if show_team || show_agents {
         let mut cons: Vec<Constraint> = Vec::new();
         if show_team {
             cons.push(Constraint::Length(TEAM_H));
@@ -136,7 +169,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         let parts = Layout::default()
             .direction(Direction::Vertical)
             .constraints(cons)
-            .split(chunks[1]);
+            .split(area);
         let mut i = 0;
         if show_team {
             draw_team(f, app, parts[i]);
@@ -148,10 +181,12 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         parts[i]
     } else {
-        chunks[1]
-    };
+        area
+    }
+}
 
-    // Transcript
+/// The transcript: one styled row per line, scrolled in screen rows.
+fn draw_transcript(f: &mut Frame, app: &App, transcript_area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     for e in &app.entries {
         let style = match e.kind {
@@ -196,15 +231,17 @@ pub fn draw(f: &mut Frame, app: &App) {
         )
         .scroll((top.min(u16::MAX as usize) as u16, 0));
     f.render_widget(transcript, transcript_area);
+}
 
-    // Input
+/// The message box, with the terminal cursor placed in it when idle.
+fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let placeholder = if app.busy {
         " agent working — input queued until ready"
     } else {
         " type your message…"
     };
     // B-35: show the slice around the cursor, measured in terminal columns.
-    let input_w = chunks[2].width.saturating_sub(2) as usize;
+    let input_w = area.width.saturating_sub(2) as usize;
     let (input_text, cursor_col) = if app.input.is_empty() {
         (placeholder.to_string(), 0)
     } else {
@@ -229,57 +266,60 @@ pub fn draw(f: &mut Frame, app: &App) {
             }))
             .title(" message "),
     );
-    f.render_widget(input, chunks[2]);
+    f.render_widget(input, area);
     if !app.busy {
-        let x = chunks[2].x + 1 + cursor_col.min(u16::MAX as usize) as u16;
-        let y = chunks[2].y + 1;
-        if x < chunks[2].right().saturating_sub(1) {
+        let x = area.x + 1 + cursor_col.min(u16::MAX as usize) as u16;
+        let y = area.y + 1;
+        if x < area.right().saturating_sub(1) {
             f.set_cursor_position((x, y));
         }
     }
+}
 
-    // M6: command palette — floats directly above the input box.
-    if let Some(pal) = &app.palette {
-        let want = pal.matches.len() as u16 + 2;
-        let h = want.min(chunks[2].y.saturating_sub(1));
-        if h >= 3 {
-            let area = Rect {
-                x: chunks[2].x,
-                y: chunks[2].y - h,
-                width: chunks[2].width.min(64),
-                height: h,
-            };
-            f.render_widget(Clear, area);
-            let mut lines: Vec<Line> = Vec::new();
-            // B-41: scroll the list so the selected row is always drawn.
-            let rows = h as usize - 2;
-            let first = pal.sel.saturating_sub(rows.saturating_sub(1));
-            for (i, &idx) in pal.matches.iter().enumerate().skip(first).take(rows) {
-                let b = &builtins()[idx];
-                let sel = i == pal.sel;
-                lines.push(
-                    Line::from(format!(" {:<26} {}", b.usage(), b.help)).style(if sel {
-                        Style::default()
-                            .fg(FB_INK)
-                            .bg(FB_GREEN)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(FB_FG)
-                    }),
-                );
-            }
-            let block = Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(FB_BORDER))
-                    .title(" commands "),
+/// M6: command palette — floats directly above the input box (`input`).
+fn draw_palette(f: &mut Frame, app: &App, input: Rect) {
+    let Some(pal) = &app.palette else { return };
+    let want = pal.matches.len() as u16 + 2;
+    let h = want.min(input.y.saturating_sub(1));
+    if h >= 3 {
+        let area = Rect {
+            x: input.x,
+            y: input.y - h,
+            width: input.width.min(64),
+            height: h,
+        };
+        f.render_widget(Clear, area);
+        let mut lines: Vec<Line> = Vec::new();
+        // B-41: scroll the list so the selected row is always drawn.
+        let rows = h as usize - 2;
+        let first = pal.sel.saturating_sub(rows.saturating_sub(1));
+        for (i, &idx) in pal.matches.iter().enumerate().skip(first).take(rows) {
+            let b = &builtins()[idx];
+            let sel = i == pal.sel;
+            lines.push(
+                Line::from(format!(" {:<26} {}", b.usage(), b.help)).style(if sel {
+                    Style::default()
+                        .fg(FB_INK)
+                        .bg(FB_GREEN)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(FB_FG)
+                }),
             );
-            f.render_widget(block, area);
         }
+        let block = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(FB_BORDER))
+                .title(" commands "),
+        );
+        f.render_widget(block, area);
     }
+}
 
-    // Footer hint — inverted green CTA bar when action is required.
+/// Footer hint — inverted green CTA bar when action is required.
+fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let (hint, attention) = if app.approval.is_some() {
         (" APPROVAL NEEDED: [y] once  [a] always  [n/Esc] deny ", true)
     } else if app.pending_edit.is_some() {
@@ -306,193 +346,187 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else {
         Style::default().fg(FB_MUTED).bg(FB_SURFACE)
     });
-    f.render_widget(footer, chunks[3]);
+    f.render_widget(footer, area);
+}
 
-    // Approval overlay — centered box on top (rendered last = on top).
-    // B-15: the overlays below are skipped while one that gets the keys
-    // first (state.rs `on_key`) is open, so nothing ever covers it.
-    draw_approval(f, app);
-
-    // Mission picker overlay — Freebuff's Missions dialog layout:
-    // mission list with the chosen one checked, effort row underneath.
-    let covered = app.approval.is_some() || app.pending_edit.is_some();
-    if let Some(mp) = app.mission_picker.as_ref().filter(|_| !covered) {
-        let area = centered_rect(60, 45, f.area());
-        f.render_widget(Clear, area);
-        let mut lines: Vec<Line> = vec![
-            Line::from("Missions").style(Style::default().fg(FB_FG).add_modifier(Modifier::BOLD)),
-            Line::from(""),
-        ];
-        for (i, k) in crate::mission::MissionKind::all().iter().enumerate() {
-            let checked = if i == mp.kind_idx { "✓" } else { " " };
-            lines.push(
-                Line::from(format!("  {checked} {}", k.label()))
-                    .style(if i == mp.kind_idx {
-                        Style::default().fg(FB_GREEN).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(FB_FG)
-                    }),
-            );
-        }
-        lines.push(Line::from(""));
+/// Mission picker overlay — Freebuff's Missions dialog layout:
+/// mission list with the chosen one checked, effort row underneath.
+fn draw_mission_picker(f: &mut Frame, mp: &MissionPicker) {
+    let area = centered_rect(60, 45, f.area());
+    f.render_widget(Clear, area);
+    let mut lines: Vec<Line> = vec![
+        Line::from("Missions").style(Style::default().fg(FB_FG).add_modifier(Modifier::BOLD)),
+        Line::from(""),
+    ];
+    for (i, k) in crate::mission::MissionKind::all().iter().enumerate() {
+        let checked = if i == mp.kind_idx { "✓" } else { " " };
         lines.push(
-            Line::from("Mission effort")
-                .style(Style::default().fg(FB_FG).add_modifier(Modifier::BOLD)),
+            Line::from(format!("  {checked} {}", k.label()))
+                .style(if i == mp.kind_idx {
+                    Style::default().fg(FB_GREEN).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(FB_FG)
+                }),
         );
-        let row: Vec<Span> = crate::mission::Effort::all()
-            .iter()
-            .enumerate()
-            .flat_map(|(i, e)| {
-                let sel = i == mp.effort_idx;
-                let mut v = vec![Span::styled(
-                    format!(" {} ", e.label()),
-                    if sel {
-                        Style::default()
-                            .fg(FB_INK)
-                            .bg(FB_GREEN)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(FB_MUTED)
-                    },
-                )];
-                if i + 1 < crate::mission::Effort::all().len() {
-                    v.push(Span::styled("·", Style::default().fg(FB_BORDER)));
-                }
-                v
-            })
-            .collect();
-        lines.push(Line::from(row));
-        lines.push(Line::from(""));
-        lines.push(
-            Line::from("[↑↓] mission  [←→] effort  [Enter] run  [Esc] cancel")
-                .style(Style::default().fg(FB_GREEN)),
-        );
-        let block = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(FB_BORDER))
-                    .title(" mission "),
-            )
-            .wrap(Wrap { trim: false });
-        f.render_widget(block, area);
     }
-
-    // M3: inline-edit diff preview overlay (B-15: never over an approval).
-    if let Some(pe) = app.pending_edit.as_ref().filter(|_| app.approval.is_none()) {
-        let area = centered_rect(80, 70, f.area());
-        f.render_widget(Clear, area);
-        let mut lines: Vec<Line> = vec![
-            Line::from(format!(" edit {}  (first change at line {})", pe.path, pe.line))
-                .style(Style::default().fg(FB_GREEN).add_modifier(Modifier::BOLD)),
-            Line::from(""),
-        ];
-        for d in &pe.diff {
-            let style = if d.starts_with('+') {
-                Style::default().fg(FB_SUCCESS)
-            } else if d.starts_with('-') {
-                Style::default().fg(FB_ERROR)
-            } else {
-                Style::default().fg(FB_MUTED)
-            };
-            lines.push(Line::from(d.clone()).style(style));
-        }
-        // B-41: the key hint sits on the border, so a long diff that is
-        // scrolled can never push it off screen. Scrolling stops at the end
-        // (rows counted after wrapping, before the block is set — see B-14).
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let end = paragraph
-            .line_count(area.width.saturating_sub(2))
-            .saturating_sub(area.height.saturating_sub(2) as usize)
-            .min(u16::MAX as usize) as u16;
-        app.edit_scroll_max.set(end);
-        let block = paragraph
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(FB_BORDER))
-                    .title(" edit preview ")
-                    .title_bottom(
-                        Line::from(" [y] apply   [n/Esc] reject   [↑↓] scroll ")
-                            .style(Style::default().fg(FB_GREEN)),
-                    ),
-            )
-            .scroll((app.edit_scroll.min(end), 0));
-        f.render_widget(block, area);
-    }
-
-    // M6: `/help` reference overlay (also F1). Any key closes it.
-    if app.help && !covered && app.mission_picker.is_none() && app.sessions.is_none() {
-        let area = centered_rect(76, 84, f.area());
-        f.render_widget(Clear, area);
-        // B-41: scrollable, stopping at the end (rows counted as in B-14).
-        let paragraph = Paragraph::new(help_text()).wrap(Wrap { trim: false });
-        let end = paragraph
-            .line_count(area.width.saturating_sub(2))
-            .saturating_sub(area.height.saturating_sub(2) as usize)
-            .min(u16::MAX as usize) as u16;
-        app.help_scroll_max.set(end);
-        let block = paragraph
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(FB_BORDER))
-                    .title(" help — any key to close "),
-            )
-            .scroll((app.help_scroll.min(end), 0));
-        f.render_widget(block, area);
-    }
-
-    // M6: `/sessions` browser (newest first; ↳ marks a fork of another session).
-    if let Some(ov) = app.sessions.as_ref().filter(|_| !covered && app.mission_picker.is_none()) {
-        let area = centered_rect(72, 70, f.area());
-        f.render_widget(Clear, area);
-        let rows = area.height.saturating_sub(4) as usize;
-        let mut lines: Vec<Line> = Vec::new();
-        if ov.items.is_empty() {
-            lines.push(Line::from("no sessions yet").style(Style::default().fg(FB_MUTED)));
-        }
-        // B-41: scroll the list so the selected session is always drawn.
-        let first = ov.sel.saturating_sub(rows.max(1) - 1);
-        for (i, s) in ov.items.iter().enumerate().skip(first).take(rows.max(1)) {
-            let sel = i == ov.sel;
-            let fork = if s.parent_id.is_some() { "↳" } else { " " };
-            lines.push(
-                Line::from(format!(
-                    " {fork} {} {}",
-                    truncate_str(&s.id, 20),
-                    // B-35: one row per session — line breaks would merge text.
-                    truncate_str(&s.title.replace(['\r', '\n'], " "), 44)
-                ))
-                .style(if sel {
+    lines.push(Line::from(""));
+    lines.push(
+        Line::from("Mission effort")
+            .style(Style::default().fg(FB_FG).add_modifier(Modifier::BOLD)),
+    );
+    let row: Vec<Span> = crate::mission::Effort::all()
+        .iter()
+        .enumerate()
+        .flat_map(|(i, e)| {
+            let sel = i == mp.effort_idx;
+            let mut v = vec![Span::styled(
+                format!(" {} ", e.label()),
+                if sel {
                     Style::default()
                         .fg(FB_INK)
                         .bg(FB_GREEN)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(FB_FG)
-                }),
-            );
-        }
-        lines.push(Line::from(""));
-        lines.push(
-            Line::from("[↑↓] select   [Enter] switch   [Esc] close")
-                .style(Style::default().fg(FB_GREEN)),
-        );
-        let block = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(FB_BORDER))
-                    .title(" sessions "),
-            )
-            .wrap(Wrap { trim: false });
-        f.render_widget(block, area);
+                    Style::default().fg(FB_MUTED)
+                },
+            )];
+            if i + 1 < crate::mission::Effort::all().len() {
+                v.push(Span::styled("·", Style::default().fg(FB_BORDER)));
+            }
+            v
+        })
+        .collect();
+    lines.push(Line::from(row));
+    lines.push(Line::from(""));
+    lines.push(
+        Line::from("[↑↓] mission  [←→] effort  [Enter] run  [Esc] cancel")
+            .style(Style::default().fg(FB_GREEN)),
+    );
+    let block = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(FB_BORDER))
+                .title(" mission "),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(block, area);
+}
+
+/// M3: inline-edit diff preview overlay.
+fn draw_edit_preview(f: &mut Frame, app: &App, pe: &PendingEdit) {
+    let area = centered_rect(80, 70, f.area());
+    f.render_widget(Clear, area);
+    let mut lines: Vec<Line> = vec![
+        Line::from(format!(" edit {}  (first change at line {})", pe.path, pe.line))
+            .style(Style::default().fg(FB_GREEN).add_modifier(Modifier::BOLD)),
+        Line::from(""),
+    ];
+    for d in &pe.diff {
+        let style = if d.starts_with('+') {
+            Style::default().fg(FB_SUCCESS)
+        } else if d.starts_with('-') {
+            Style::default().fg(FB_ERROR)
+        } else {
+            Style::default().fg(FB_MUTED)
+        };
+        lines.push(Line::from(d.clone()).style(style));
     }
+    // B-41: the key hint sits on the border, so a long diff that is
+    // scrolled can never push it off screen. Scrolling stops at the end
+    // (rows counted after wrapping, before the block is set — see B-14).
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let end = paragraph
+        .line_count(area.width.saturating_sub(2))
+        .saturating_sub(area.height.saturating_sub(2) as usize)
+        .min(u16::MAX as usize) as u16;
+    app.edit_scroll_max.set(end);
+    let block = paragraph
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(FB_BORDER))
+                .title(" edit preview ")
+                .title_bottom(
+                    Line::from(" [y] apply   [n/Esc] reject   [↑↓] scroll ")
+                        .style(Style::default().fg(FB_GREEN)),
+                ),
+        )
+        .scroll((app.edit_scroll.min(end), 0));
+    f.render_widget(block, area);
+}
+
+/// M6: `/help` reference overlay (also F1). Any key closes it.
+fn draw_help(f: &mut Frame, app: &App) {
+    let area = centered_rect(76, 84, f.area());
+    f.render_widget(Clear, area);
+    // B-41: scrollable, stopping at the end (rows counted as in B-14).
+    let paragraph = Paragraph::new(help_text()).wrap(Wrap { trim: false });
+    let end = paragraph
+        .line_count(area.width.saturating_sub(2))
+        .saturating_sub(area.height.saturating_sub(2) as usize)
+        .min(u16::MAX as usize) as u16;
+    app.help_scroll_max.set(end);
+    let block = paragraph
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(FB_BORDER))
+                .title(" help — any key to close "),
+        )
+        .scroll((app.help_scroll.min(end), 0));
+    f.render_widget(block, area);
+}
+
+/// M6: `/sessions` browser (newest first; ↳ marks a fork of another session).
+fn draw_sessions(f: &mut Frame, ov: &SessionsOverlay) {
+    let area = centered_rect(72, 70, f.area());
+    f.render_widget(Clear, area);
+    let rows = area.height.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    if ov.items.is_empty() {
+        lines.push(Line::from("no sessions yet").style(Style::default().fg(FB_MUTED)));
+    }
+    // B-41: scroll the list so the selected session is always drawn.
+    let first = ov.sel.saturating_sub(rows.max(1) - 1);
+    for (i, s) in ov.items.iter().enumerate().skip(first).take(rows.max(1)) {
+        let sel = i == ov.sel;
+        let fork = if s.parent_id.is_some() { "↳" } else { " " };
+        lines.push(
+            Line::from(format!(
+                " {fork} {} {}",
+                truncate_str(&s.id, 20),
+                // B-35: one row per session — line breaks would merge text.
+                truncate_str(&s.title.replace(['\r', '\n'], " "), 44)
+            ))
+            .style(if sel {
+                Style::default()
+                    .fg(FB_INK)
+                    .bg(FB_GREEN)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(FB_FG)
+            }),
+        );
+    }
+    lines.push(Line::from(""));
+    lines.push(
+        Line::from("[↑↓] select   [Enter] switch   [Esc] close")
+            .style(Style::default().fg(FB_GREEN)),
+    );
+    let block = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(FB_BORDER))
+                .title(" sessions "),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(block, area);
 }
 
 /// Team panel body: header (goal + phase + verdict) with one card per
