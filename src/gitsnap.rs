@@ -12,9 +12,16 @@
 //!   the index history, or the user's commits).
 //! - Restore semantics: paths dirty at snapshot time are rewritten from
 //!   their stored bytes; paths dirty *now* but clean at snapshot time were
-//!   changed by the run, so they go back to their index/HEAD content via a
-//!   scoped `git checkout -- <path>`; untracked files created after the
-//!   snapshot are removed.
+//!   changed by the run, so they go back to their snapshot-time content via
+//!   a scoped `git checkout <tree> -- <path>`; untracked files created after
+//!   the snapshot are removed.
+//! - The index (what is staged) is recorded too, as a tree object written
+//!   through a COPY of the index file, so a run's `git add` is undone and
+//!   the user's own staging comes back. The user's index file is only
+//!   changed by undo/redo, path by path.
+//! - Files over `MAX_SNAPSHOT_FILE_BYTES`, or past `MAX_SNAPSHOT_BYTES` in
+//!   one snapshot, are not copied: they are listed as `skipped`, undo
+//!   leaves them as they are and says so.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -35,7 +42,24 @@ pub struct Manifest {
     /// or deletes through a link, so these are left exactly as they are.
     #[serde(default)]
     pub links: Vec<String>,
+    /// The index at snapshot time as a tree id (`None` = not recorded:
+    /// older snapshots, or an unfinished merge). Undo restores staging
+    /// from it.
+    #[serde(default)]
+    pub index_tree: Option<String>,
+    /// Dirty files too big to copy (see `MAX_SNAPSHOT_FILE_BYTES`). Undo
+    /// leaves them exactly as they are and reports them.
+    #[serde(default)]
+    pub skipped: Vec<String>,
 }
+
+/// Largest file one snapshot copies. Bigger dirty files (build output,
+/// data dumps that are not ignored) are skipped and reported.
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Most bytes one snapshot copies in all; files past it are skipped. Up to
+/// `MAX_STACK` snapshots are kept per workspace.
+const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// `rel` as a safe workspace-relative path: not empty, and made only of
 /// normal names (no `.`, `..`, root or drive parts). Manifests and stacks
@@ -81,8 +105,16 @@ fn now_ms() -> i64 {
 
 /// Run git in `cwd`; Err with stderr when git fails.
 pub fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+    git_env(cwd, args, &[])
+}
+
+/// [`git`] with extra environment variables (e.g. a private index file).
+fn git_env(cwd: &Path, args: &[&str], envs: &[(&str, &std::ffi::OsStr)]) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.args(args).current_dir(cwd);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     // S-05: git hooks never see our provider key or API token.
     for key in crate::tools::SECRET_ENV_VARS {
         cmd.env_remove(key);
@@ -150,8 +182,9 @@ struct DirtyEntry {
     root_rel: String,
     /// Absolute path on disk.
     abs: PathBuf,
-    /// For renames/copies: the old path (workspace-relative), if any.
-    old_rel: Option<String>,
+    /// For renames/copies: the old path, workspace-relative and
+    /// repo-root-relative (`None` when it is outside the workspace).
+    old: Option<(String, String)>,
 }
 
 /// Status entries with root-relative git paths resolved onto the
@@ -190,12 +223,13 @@ fn dirty_entries(workspace: &Path, state_dir: &Path) -> Result<Vec<DirtyEntry>> 
         if state_hit {
             continue;
         }
+        let ws_rel = |p: &Path| p.strip_prefix(&workspace_c).ok().map(|r| r.to_string_lossy().replace('\\', "/"));
         let abs = root.join(&path);
-        let rel = match abs.strip_prefix(&workspace_c) {
-            Ok(r) => r.to_string_lossy().replace('\\', "/"),
-            Err(_) => continue, // outside the workspace: not ours to touch
+        let Some(rel) = ws_rel(&abs) else {
+            continue; // outside the workspace: not ours to touch
         };
-        out.push(DirtyEntry { kind, rel, root_rel: path, abs, old_rel: old });
+        let old = old.and_then(|o| Some((ws_rel(&root.join(&o))?, o)));
+        out.push(DirtyEntry { kind, rel, root_rel: path, abs, old });
     }
     Ok(out)
 }
@@ -217,12 +251,18 @@ fn snap_root(state_dir: &Path, workspace: &Path) -> PathBuf {
     if cfg!(windows) {
         key = key.to_lowercase();
     }
+    state_dir.join(format!("snaps_{:016x}", fnv1a(key.as_bytes())))
+}
+
+/// 64-bit FNV-1a: fixed across builds and Rust versions (folder names and
+/// stored hashes depend on it).
+fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in key.as_bytes() {
+    for b in bytes {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    state_dir.join(format!("snaps_{h:016x}"))
+    h
 }
 
 fn read_stack(path: &Path) -> Vec<String> {
@@ -277,11 +317,14 @@ pub fn take_snapshot(workspace: &Path, state_dir: &Path, label: &str) -> Result<
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let base_sha = git(workspace, &["rev-parse", "HEAD"]).ok().map(|s| s.trim().to_string());
+    let index_tree = snapshot_index(workspace, &dir);
     let mut present = Vec::new();
     let mut absent = Vec::new();
     let mut links = Vec::new();
+    let mut skipped = Vec::new();
+    let mut stored_bytes: u64 = 0;
     for e in dirty_entries(workspace, state_dir)? {
-        if let Some(old) = e.old_rel {
+        if let Some((old, _)) = e.old {
             if checked_rel(&old).is_some() {
                 absent.push(old);
             }
@@ -294,9 +337,14 @@ pub fn take_snapshot(workspace: &Path, state_dir: &Path, label: &str) -> Result<
         let meta = std::fs::symlink_metadata(&e.abs);
         if meta.as_ref().is_ok_and(|m| m.file_type().is_symlink()) {
             links.push(e.rel);
-        } else if meta.as_ref().is_ok_and(|m| m.is_file()) {
+        } else if let Some(len) = meta.as_ref().ok().filter(|m| m.is_file()).map(|m| m.len()) {
+            if len > MAX_SNAPSHOT_FILE_BYTES || stored_bytes + len > MAX_SNAPSHOT_BYTES {
+                skipped.push(e.rel);
+                continue;
+            }
             let bytes = std::fs::read(&e.abs)
                 .with_context(|| format!("reading {} for snapshot", e.abs.display()))?;
+            stored_bytes += bytes.len() as u64;
             let stored = dir.join(&e.rel);
             if let Some(parent) = stored.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -318,9 +366,27 @@ pub fn take_snapshot(workspace: &Path, state_dir: &Path, label: &str) -> Result<
         present,
         absent,
         links,
+        index_tree,
+        skipped,
     };
     std::fs::write(dir.join("manifest.json"), serde_json::to_string_pretty(&manifest)?)?;
     Ok(Some(manifest))
+}
+
+/// The index as a tree id, written through a COPY of the index file so the
+/// user's index is never touched. `None` when it cannot be written (an
+/// unfinished merge has conflict entries): undo then leaves staging alone.
+fn snapshot_index(workspace: &Path, dir: &Path) -> Option<String> {
+    let index = git(workspace, &["rev-parse", "--git-path", "index"]).ok()?;
+    let index = workspace.join(index.trim());
+    let copy = std::path::absolute(dir.join("index.tmp")).ok()?;
+    // No index file yet (nothing ever staged): the copy starts empty.
+    if index.is_file() {
+        std::fs::copy(&index, &copy).ok()?;
+    }
+    let tree = git_env(workspace, &["write-tree"], &[("GIT_INDEX_FILE", copy.as_os_str())]);
+    let _ = std::fs::remove_file(&copy);
+    tree.ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
 fn load_manifest(root: &Path, id: &str) -> Result<Manifest> {
@@ -334,7 +400,7 @@ fn load_manifest(root: &Path, id: &str) -> Result<Manifest> {
         return Err(anyhow!("snapshot {id}: manifest names a different id ({})", m.id));
     }
     // A manifest is a file on disk: check every path before trusting it.
-    for p in m.present.iter().chain(&m.absent).chain(&m.links) {
+    for p in m.present.iter().chain(&m.absent).chain(&m.links).chain(&m.skipped) {
         if checked_rel(p).is_none() {
             return Err(anyhow!("snapshot {id}: refusing unsafe path {p:?} in manifest"));
         }
@@ -348,11 +414,42 @@ fn restore_manifest(
     root: &Path,
     m: &Manifest,
 ) -> Result<()> {
-    let dir = root.join(&m.id);
     // Problems are collected, not swallowed: undo must say what it could
     // not put back.
     let mut problems: Vec<String> = Vec::new();
-    // 1) Rewrite files that existed at snapshot time.
+    // The recorded index, if git still has it (gc may prune an old tree).
+    let index_tree = m
+        .index_tree
+        .clone()
+        .filter(|t| git(workspace, &["cat-file", "-e", &format!("{t}^{{tree}}")]).is_ok());
+    if m.index_tree.is_some() && index_tree.is_none() {
+        problems.push("the recorded staging is gone from git; staging was left as it is".into());
+    }
+    restore_present(workspace, &root.join(&m.id), m, &mut problems)?;
+    remove_absent(workspace, m, &mut problems);
+    if let Some(tree) = &index_tree {
+        restore_staging(workspace, tree, m, &mut problems);
+    }
+    // Snapshot-time content of a file that was clean then: the recorded
+    // index (clean = same as the index), else the commit.
+    let clean_source = index_tree.as_deref().or(m.base_sha.as_deref());
+    revert_run_changes(workspace, state_dir, m, clean_source, &mut problems)?;
+    for p in &m.skipped {
+        problems.push(format!("{p}: too big to snapshot, left as it is"));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "undo restored what it could, but {} path(s) need a look:\n  {}",
+            problems.len(),
+            problems.join("\n  ")
+        ))
+    }
+}
+
+/// 1) Rewrite files that existed at snapshot time from their stored copies.
+fn restore_present(workspace: &Path, dir: &Path, m: &Manifest, problems: &mut Vec<String>) -> Result<()> {
     for p in &m.present {
         let stored = dir.join(p);
         if !stored.is_file() {
@@ -379,8 +476,12 @@ fn restore_manifest(
             problems.push(format!("{p}: {e}"));
         }
     }
-    // 2) Paths that must not exist (pre-snapshot renames/deletes). A symlink
-    //    here is removed as a link; its target is never touched.
+    Ok(())
+}
+
+/// 2) Paths that must not exist (pre-snapshot renames/deletes). A symlink
+///    here is removed as a link; its target is never touched.
+fn remove_absent(workspace: &Path, m: &Manifest, problems: &mut Vec<String>) {
     for p in &m.absent {
         if under_symlinked_dir(workspace, p) {
             problems.push(format!("{p}: inside a symlinked folder, not removed"));
@@ -394,42 +495,105 @@ fn restore_manifest(
             }
         }
     }
-    // 3) Dirty now but clean at snapshot time → the run changed it.
-    let snapshot_set: std::collections::HashSet<String> =
-        m.present.iter().chain(&m.absent).chain(&m.links).cloned().collect();
+}
+
+/// Put the staging of the snapshot's dirty paths back as recorded: a path
+/// staged then is staged again with the same content, one that was not
+/// tracked leaves the index. Only these paths' index entries change.
+fn restore_staging(workspace: &Path, tree: &str, m: &Manifest, problems: &mut Vec<String>) {
+    let paths: Vec<&str> = m
+        .present
+        .iter()
+        .chain(&m.absent)
+        .filter(|p| !under_symlinked_dir(workspace, p))
+        .map(String::as_str)
+        .collect();
+    // Paths are workspace-relative, and git reads pathspecs relative to
+    // its working folder: run it in the workspace. Chunks keep the command
+    // line short (Windows caps it at 32K characters).
+    for chunk in paths.chunks(200) {
+        let mut args = vec!["--literal-pathspecs", "reset", "-q", tree, "--"];
+        args.extend_from_slice(chunk);
+        if let Err(err) = git(workspace, &args) {
+            problems.push(format!("staging of {} path(s) not restored: {err}", chunk.len()));
+        }
+    }
+}
+
+/// 3) Dirty now but clean at snapshot time → the run changed it: put back
+///    its snapshot-time content and staging from `source` (a tree or
+///    commit), or remove it when it did not exist then.
+fn revert_run_changes(
+    workspace: &Path,
+    state_dir: &Path,
+    m: &Manifest,
+    source: Option<&str>,
+    problems: &mut Vec<String>,
+) -> Result<()> {
+    let snapshot_set: std::collections::HashSet<&String> =
+        m.present.iter().chain(&m.absent).chain(&m.links).chain(&m.skipped).collect();
     let repo = repo_root(workspace);
     for e in dirty_entries(workspace, state_dir)? {
+        // A rename the run staged also moved the old path: put that back.
+        if let Some((old_rel, old_root_rel)) = &e.old {
+            if !snapshot_set.contains(old_rel) && !under_symlinked_dir(workspace, old_rel) {
+                revert_tracked(&repo, old_rel, old_root_rel, &workspace.join(old_rel), source, problems);
+            }
+        }
         if snapshot_set.contains(&e.rel) || under_symlinked_dir(workspace, &e.rel) {
             continue;
         }
         if e.kind == "??" {
             // File (or symlink) the run created: remove it. Removing a
             // symlink removes the link only.
-            let file_or_link = std::fs::symlink_metadata(&e.abs)
-                .is_ok_and(|md| md.is_file() || md.file_type().is_symlink());
-            if file_or_link {
-                if let Err(err) = std::fs::remove_file(&e.abs) {
-                    problems.push(format!("{}: cannot remove: {err}", e.rel));
-                }
-            }
+            remove_file_or_link(&e.abs, &e.rel, problems);
         } else {
-            // Tracked file the run modified: check out its index/HEAD
-            // content (= its clean-at-snapshot content). `root_rel` is
-            // relative to the repo root, so git must run there; literal
-            // pathspecs keep `[`, `*` and `?` in names from matching others.
-            if let Err(err) = git(&repo, &["--literal-pathspecs", "checkout", "--", &e.root_rel]) {
-                problems.push(format!("{}: {err}", e.rel));
-            }
+            revert_tracked(&repo, &e.rel, &e.root_rel, &e.abs, source, problems);
         }
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "undo restored what it could, but {} path(s) need a look:\n  {}",
-            problems.len(),
-            problems.join("\n  ")
-        ))
+    Ok(())
+}
+
+/// One tracked path the run changed (edited, staged, deleted or added to
+/// the index). `root_rel` is relative to the repo root, so git runs there;
+/// literal pathspecs keep `[`, `*` and `?` in names from matching others.
+fn revert_tracked(
+    repo: &Path,
+    rel: &str,
+    root_rel: &str,
+    abs: &Path,
+    source: Option<&str>,
+    problems: &mut Vec<String>,
+) {
+    let result = match source {
+        // In the snapshot: index entry and file both from it.
+        Some(src) if git(repo, &["cat-file", "-e", &format!("{src}:{root_rel}")]).is_ok() => {
+            git(repo, &["--literal-pathspecs", "checkout", src, "--", root_rel]).map(|_| ())
+        }
+        // Not there then: the run added it to the index. Unstage it and
+        // remove the file, like any file the run created. An ignored file
+        // is only unstaged: status never lists those, so it may be the
+        // user's own from before the run (`git add -f`).
+        Some(_) => git(repo, &["--literal-pathspecs", "rm", "-q", "--cached", "--ignore-unmatch", "--", root_rel]).map(|_| {
+            let ignored = git(repo, &["check-ignore", "-q", "--no-index", "--", root_rel]).is_ok();
+            if !ignored {
+                remove_file_or_link(abs, rel, problems);
+            }
+        }),
+        // Nothing recorded (no commit yet, no index tree): the index copy.
+        None => git(repo, &["--literal-pathspecs", "checkout", "--", root_rel]).map(|_| ()),
+    };
+    if let Err(err) = result {
+        problems.push(format!("{rel}: {err}"));
+    }
+}
+
+fn remove_file_or_link(abs: &Path, rel: &str, problems: &mut Vec<String>) {
+    let file_or_link = std::fs::symlink_metadata(abs).is_ok_and(|md| md.is_file() || md.file_type().is_symlink());
+    if file_or_link {
+        if let Err(err) = std::fs::remove_file(abs) {
+            problems.push(format!("{rel}: cannot remove: {err}"));
+        }
     }
 }
 
@@ -508,14 +672,7 @@ struct AfterRun {
 /// FNV-1a of a file's bytes, or "absent".
 fn content_hash(path: &Path) -> String {
     match std::fs::read(path) {
-        Ok(bytes) => {
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for b in &bytes {
-                h ^= u64::from(*b);
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            format!("{h:016x}")
-        }
+        Ok(bytes) => format!("{:016x}", fnv1a(&bytes)),
         Err(_) => "absent".into(),
     }
 }
@@ -568,8 +725,14 @@ pub fn changed_since_run(workspace: &Path, state_dir: &Path) -> Vec<String> {
     let Some(after) = after else { return out };
     // Every file undo would rewrite, remove or check out.
     let mut touched: std::collections::BTreeSet<String> = m.present.iter().chain(&m.absent).cloned().collect();
-    if let Ok(dirty) = dirty_entries(workspace, state_dir) {
-        touched.extend(dirty.into_iter().map(|e| e.rel));
+    // One `git status` for every file below, not one per file.
+    let dirty: std::collections::HashSet<String> = dirty_entries(workspace, state_dir)
+        .map(|d| d.into_iter().map(|e| e.rel).collect())
+        .unwrap_or_default();
+    touched.extend(dirty.iter().cloned());
+    // Skipped files are never touched by undo.
+    for p in &m.skipped {
+        touched.remove(p);
     }
     for rel in touched {
         if checked_rel(&rel).is_none() || under_symlinked_dir(workspace, &rel) {
@@ -581,17 +744,13 @@ pub fn changed_since_run(workspace: &Path, state_dir: &Path) -> Vec<String> {
             Some(h) => h != now,
             // Clean when the run ended: changed since if it differs from
             // the commit's copy (it is dirty now) or is gone.
-            None => dirty_now(workspace, state_dir, &rel),
+            None => dirty.contains(&rel),
         };
         if changed {
             out.push(rel);
         }
     }
     out
-}
-
-fn dirty_now(workspace: &Path, state_dir: &Path, rel: &str) -> bool {
-    dirty_entries(workspace, state_dir).is_ok_and(|d| d.iter().any(|e| e.rel == rel))
 }
 
 /// When the newest undo point was taken (ms), if there is one.
@@ -962,6 +1121,92 @@ mod tests {
         undo(&r.dir, &r.state).unwrap().unwrap();
         let root = snap_root(&r.state, &r.dir);
         assert!(!root.join(&snap.id).exists(), "the restored snapshot folder is removed");
+    }
+
+    fn staged(r: &TestRepo, rel: &str) -> String {
+        git(&r.dir, &["show", &format!(":{rel}")]).unwrap_or_else(|_| "<not staged>".into())
+    }
+
+    /// Before: undo ran `git checkout -- a.txt`, which restores FROM the
+    /// index, so a run that staged its edit kept it. Now the clean file
+    /// comes back with its original content, unstaged.
+    #[test]
+    fn undo_reverts_a_change_the_run_staged() {
+        let r = test_repo();
+        record_before_run(&r.dir, &r.state, "pre-run").unwrap().unwrap();
+        std::fs::write(r.dir.join("a.txt"), "run edit\n").unwrap();
+        git(&r.dir, &["add", "a.txt"]).unwrap();
+        // A new file the run staged goes too.
+        std::fs::write(r.dir.join("n.txt"), "run file\n").unwrap();
+        git(&r.dir, &["add", "n.txt"]).unwrap();
+        undo(&r.dir, &r.state).unwrap().expect("undo works");
+        assert_eq!(read(&r.dir.join("a.txt")), "original a\n");
+        assert!(!r.dir.join("n.txt").exists(), "the run's staged new file is removed");
+        let status = git(&r.dir, &["status", "--porcelain", "--", "a.txt", "n.txt"]).unwrap();
+        assert!(status.trim().is_empty(), "nothing staged or changed: {status:?}");
+    }
+
+    /// The user's own staging from before the run comes back: the staged
+    /// copy and the unstaged edit on top of it.
+    #[test]
+    fn undo_restores_the_users_staging() {
+        let r = test_repo();
+        std::fs::write(r.dir.join("a.txt"), "staged by the user\n").unwrap();
+        git(&r.dir, &["add", "a.txt"]).unwrap();
+        std::fs::write(r.dir.join("a.txt"), "edited on top\n").unwrap();
+        std::fs::write(r.dir.join("u.txt"), "untracked\n").unwrap();
+        record_before_run(&r.dir, &r.state, "pre-run").unwrap().unwrap();
+        let status = |r: &TestRepo| git(&r.dir, &["status", "--porcelain", "--", "a.txt", "u.txt"]).unwrap();
+        let status_before = status(&r);
+
+        // The run stages both files and edits a.txt again. (Not `add -A`:
+        // the test's state dir is inside the repo.)
+        std::fs::write(r.dir.join("a.txt"), "run edit\n").unwrap();
+        git(&r.dir, &["add", "a.txt", "u.txt"]).unwrap();
+        undo(&r.dir, &r.state).unwrap().expect("undo works");
+        assert_eq!(read(&r.dir.join("a.txt")), "edited on top\n");
+        assert_eq!(staged(&r, "a.txt"), "staged by the user\n", "the staged copy is back");
+        assert_eq!(staged(&r, "u.txt"), "<not staged>", "u.txt is untracked again");
+        assert_eq!(status(&r), status_before);
+
+        // Redo brings the run's staging back.
+        redo(&r.dir, &r.state).unwrap().expect("redo works");
+        assert_eq!(staged(&r, "a.txt"), "run edit\n");
+        assert_eq!(staged(&r, "u.txt"), "untracked\n");
+    }
+
+    /// Taking a snapshot never changes the user's index file.
+    #[test]
+    fn snapshot_leaves_the_index_file_alone() {
+        let r = test_repo();
+        std::fs::write(r.dir.join("a.txt"), "staged\n").unwrap();
+        git(&r.dir, &["add", "a.txt"]).unwrap();
+        let index = r.dir.join(".git").join("index");
+        let before = std::fs::read(&index).unwrap();
+        let snap = record_before_run(&r.dir, &r.state, "pre-run").unwrap().unwrap();
+        assert!(snap.index_tree.is_some(), "staging recorded");
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+    }
+
+    /// A dirty file over the per-file cap is not copied; undo leaves it as
+    /// it is and says so, and puts the rest back.
+    #[test]
+    fn a_file_too_big_to_snapshot_is_skipped_and_reported() {
+        let r = test_repo();
+        let big = vec![b'x'; (MAX_SNAPSHOT_FILE_BYTES + 1) as usize];
+        std::fs::write(r.dir.join("big.bin"), &big).unwrap();
+        let snap = record_before_run(&r.dir, &r.state, "pre-run").unwrap().unwrap();
+        assert_eq!(snap.skipped, ["big.bin"]);
+        assert!(!snap.present.contains(&"big.bin".to_string()));
+        let stored = snap_root(&r.state, &r.dir).join(&snap.id).join("big.bin");
+        assert!(!stored.exists(), "not copied");
+
+        std::fs::write(r.dir.join("a.txt"), "run edit\n").unwrap();
+        std::fs::write(r.dir.join("big.bin"), b"run changed it").unwrap();
+        let err = undo(&r.dir, &r.state).unwrap_err().to_string();
+        assert!(err.contains("big.bin: too big to snapshot"), "{err}");
+        assert_eq!(read(&r.dir.join("a.txt")), "original a\n", "the rest is restored");
+        assert_eq!(read(&r.dir.join("big.bin")), "run changed it", "left as it is, not deleted");
     }
 
     #[test]
