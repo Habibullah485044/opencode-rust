@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Message part stored as JSON — keeps us fork/branch-ready like OpenCode's sessions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -63,11 +63,14 @@ pub struct SessionRow {
     pub has_messages: bool,
 }
 
+/// The app's database. Cheap to clone: clones share one connection, so a
+/// clone can be moved into `spawn_blocking` (see `Db::run`).
+#[derive(Clone)]
 pub struct Db {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
     /// The project new top-level chats are filed under (the folder the app
     /// started in). Child chats (subagents, forks) take their parent's.
-    default_project: Mutex<Option<String>>,
+    default_project: Arc<Mutex<Option<String>>>,
 }
 
 /// Columns of `sessions` in the order `session_from_row` reads them.
@@ -90,6 +93,73 @@ fn project_from_row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
     Ok(Project { id: r.get(0)?, name: r.get(1)?, root: r.get(2)?, created_at: r.get(3)? })
 }
 
+/// Column names of `table` (empty when the table does not exist).
+fn columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    Ok(names.collect::<std::result::Result<_, _>>()?)
+}
+
+/// The first tables: chats and their messages.
+fn migrate_base(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            parent_id TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            parts TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);",
+    )?;
+    Ok(())
+}
+
+/// Usage counts and log, prices, missions.
+fn migrate_usage_and_missions(conn: &Connection) -> Result<()> {
+    conn.execute_batch(USAGE_SCHEMA)?;
+    conn.execute_batch(USAGE_LOG_SCHEMA)?;
+    conn.execute_batch(MISSION_SCHEMA)?;
+    Ok(())
+}
+
+/// The schema steps, in order; `PRAGMA user_version` = how many have run.
+/// Databases from before `user_version` was used are at 0 and may already
+/// be in any later state, so every step checks before it changes anything
+/// (IF NOT EXISTS, column lists). A new step goes at the end, never in
+/// between.
+const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
+    migrate_base,
+    migrate_approvals,
+    migrate_usage_and_missions,
+    migrate_missions,
+    migrate_projects,
+];
+
+/// Bring the schema up to date: the steps `user_version` says are missing,
+/// all in one `BEGIN IMMEDIATE` transaction, so two processes opening the
+/// same file do not both run an ALTER (the second waits, then sees the
+/// new version), and a failed step leaves the database as it was.
+fn init_schema(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let done: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    for (i, step) in MIGRATIONS.iter().enumerate().skip(done.max(0) as usize) {
+        step(&tx).with_context(|| format!("database schema step {}", i + 1))?;
+    }
+    if (done.max(0) as usize) < MIGRATIONS.len() {
+        tx.pragma_update(None, "user_version", MIGRATIONS.len() as i64)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Projects table, and the project/pin/archive columns on `sessions`
 /// (added in place to databases from older builds).
 fn migrate_projects(conn: &Connection) -> Result<()> {
@@ -102,11 +172,7 @@ fn migrate_projects(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL
         );",
     )?;
-    let cols: Vec<String> = {
-        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
-        names.collect::<std::result::Result<_, _>>()?
-    };
+    let cols = columns(conn, "sessions")?;
     for (col, def) in [
         ("project_id", "TEXT"),
         ("pinned", "INTEGER NOT NULL DEFAULT 0"),
@@ -164,12 +230,7 @@ const APPROVALS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS approvals (
 /// The `deep` column on `missions` (added in place to databases from
 /// older builds, which only have goal/status).
 fn migrate_missions(conn: &Connection) -> Result<()> {
-    let cols: Vec<String> = {
-        let mut stmt = conn.prepare("PRAGMA table_info(missions)")?;
-        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
-        names.collect::<std::result::Result<_, _>>()?
-    };
-    if !cols.iter().any(|c| c == "deep") {
+    if !columns(conn, "missions")?.iter().any(|c| c == "deep") {
         conn.execute_batch("ALTER TABLE missions ADD COLUMN deep INTEGER NOT NULL DEFAULT 0;")?;
     }
     Ok(())
@@ -294,10 +355,7 @@ pub struct UsageTotals {
 /// apply anywhere (the user is simply asked again).
 fn migrate_approvals(conn: &Connection) -> Result<()> {
     let has_workspace_column = {
-        let mut stmt = conn.prepare("PRAGMA table_info(approvals)")?;
-        let names = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<std::result::Result<Vec<String>, _>>()?;
+        let names = columns(conn, "approvals")?;
         // No rows means the table does not exist yet.
         names.is_empty() || names.iter().any(|n| n == "workspace")
     };
@@ -330,65 +388,45 @@ impl Db {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        // Another process (a second window, the CLI) may hold the write
+        // lock for a moment: wait for it instead of failing at once.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // SQLite ignores REFERENCES / ON DELETE CASCADE unless this is on.
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                parent_id TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                role TEXT NOT NULL,
-                parts TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);",
-        )?;
-        migrate_approvals(&conn)?;
-        conn.execute_batch(USAGE_SCHEMA)?;
-        conn.execute_batch(USAGE_LOG_SCHEMA)?;
-        conn.execute_batch(MISSION_SCHEMA)?;
-        migrate_missions(&conn)?;
-        migrate_projects(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
+        init_schema(&mut conn).with_context(|| format!("updating {}", path.display()))?;
+        Ok(Self::from_conn(conn))
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
         // Same rules and schema as the file database.
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                parent_id TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                role TEXT NOT NULL,
-                parts TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);",
-        )?;
-        migrate_approvals(&conn)?;
-        conn.execute_batch(USAGE_SCHEMA)?;
-        conn.execute_batch(USAGE_LOG_SCHEMA)?;
-        conn.execute_batch(MISSION_SCHEMA)?;
-        migrate_missions(&conn)?;
-        migrate_projects(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), default_project: Mutex::new(None) })
+        init_schema(&mut conn)?;
+        Ok(Self::from_conn(conn))
+    }
+
+    fn from_conn(conn: Connection) -> Self {
+        Self { conn: Arc::new(Mutex::new(conn)), default_project: Arc::new(Mutex::new(None)) }
+    }
+
+    /// The connection. A panic while another thread held it does not make
+    /// every later call panic too: SQLite rolled back whatever was open.
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run `f` on a blocking thread with a clone of this database, for
+    /// async code: SQLite calls block, and on a tokio worker they hold up
+    /// every other task on it.
+    pub async fn run<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Db) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || f(&db)).await.context("database task failed")?
     }
 
     /// A new chat. A child chat (subagent) joins its parent's project; a
@@ -396,7 +434,7 @@ impl Db {
     pub fn create_session(&self, title: &str, parent_id: Option<&str>) -> Result<Session> {
         let project = match parent_id {
             Some(p) => self.get_session(p)?.and_then(|s| s.project_id),
-            None => self.default_project.lock().unwrap().clone(),
+            None => self.default_project.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         };
         self.create_session_in(title, parent_id, project.as_deref())
     }
@@ -419,7 +457,7 @@ impl Db {
             pinned: false,
             archived: false,
         };
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "INSERT INTO sessions (id, title, parent_id, created_at, updated_at, project_id)
              VALUES (?1,?2,?3,?4,?5,?6)",
             params![s.id, s.title, s.parent_id, s.created_at, s.updated_at, s.project_id],
@@ -428,7 +466,7 @@ impl Db {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(&format!("SELECT {SESSION_COLS} FROM sessions ORDER BY updated_at DESC"))?;
         let rows = stmt.query_map([], session_from_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -437,7 +475,7 @@ impl Db {
     /// Every chat with whether it has any message (empty chats are hidden
     /// in the sidebar), newest first.
     pub fn list_session_rows(&self) -> Result<Vec<SessionRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let cols: Vec<String> = SESSION_COLS.split(',').map(|c| format!("s.{c}")).collect();
         let mut stmt = conn.prepare(&format!(
             "SELECT {}, EXISTS(SELECT 1 FROM messages m WHERE m.session_id = s.id)
@@ -452,14 +490,14 @@ impl Db {
 
     /// File new top-level chats under this project from now on.
     pub fn set_default_project(&self, project_id: Option<&str>) {
-        *self.default_project.lock().unwrap() = project_id.map(str::to_string);
+        *self.default_project.lock().unwrap_or_else(|e| e.into_inner()) = project_id.map(str::to_string);
     }
 
     /// The project for folder `root` (matched by its canonical path),
     /// created and named after the folder when it is new.
     pub fn upsert_project(&self, root: &Path) -> Result<Project> {
         let key = workspace_key(root);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let found = conn
             .query_row(
                 "SELECT id,name,root,created_at FROM projects WHERE root_key=?1",
@@ -484,14 +522,14 @@ impl Db {
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare("SELECT id,name,root,created_at FROM projects ORDER BY lower(name)")?;
         let rows = stmt.query_map([], project_from_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     pub fn get_project(&self, id: &str) -> Result<Option<Project>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         Ok(conn
             .query_row("SELECT id,name,root,created_at FROM projects WHERE id=?1", params![id], project_from_row)
             .optional()?)
@@ -499,7 +537,7 @@ impl Db {
 
     /// Take a project off the list. Its chats stay, without a project.
     pub fn remove_project(&self, id: &str) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute("UPDATE sessions SET project_id=NULL WHERE project_id=?1", params![id])?;
         tx.execute("DELETE FROM projects WHERE id=?1", params![id])?;
@@ -508,9 +546,7 @@ impl Db {
     }
 
     pub fn set_session_project(&self, id: &str, project_id: Option<&str>) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
+        self.conn()
             .execute("UPDATE sessions SET project_id=?2 WHERE id=?1", params![id, project_id])?;
         Ok(())
     }
@@ -518,16 +554,14 @@ impl Db {
     /// File every top-level chat that has no project under `project_id`
     /// (chats made before projects existed). Returns how many moved.
     pub fn adopt_unfiled_sessions(&self, project_id: &str) -> Result<usize> {
-        Ok(self.conn.lock().unwrap().execute(
+        Ok(self.conn().execute(
             "UPDATE sessions SET project_id=?1 WHERE project_id IS NULL AND parent_id IS NULL",
             params![project_id],
         )?)
     }
 
     pub fn set_session_pinned(&self, id: &str, pinned: bool) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
+        self.conn()
             .execute("UPDATE sessions SET pinned=?2 WHERE id=?1", params![id, pinned as i64])?;
         Ok(())
     }
@@ -539,13 +573,13 @@ impl Db {
         } else {
             "UPDATE sessions SET archived=0 WHERE id=?1"
         };
-        self.conn.lock().unwrap().execute(sql, params![id])?;
+        self.conn().execute(sql, params![id])?;
         Ok(())
     }
 
     /// Rename a session (the GUI titles chats after their first message).
     pub fn set_session_title(&self, id: &str, title: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "UPDATE sessions SET title=?2, updated_at=?3 WHERE id=?1",
             params![id, title, now_ms()],
         )?;
@@ -555,7 +589,7 @@ impl Db {
     /// Start a mission in chat `session_id` with these steps (replaces any
     /// earlier mission of the chat).
     pub fn mission_start(&self, session_id: &str, goal: &str, steps: &[String], deep: bool) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let now = now_ms();
         let deep = deep as i64;
@@ -577,7 +611,7 @@ impl Db {
 
     /// The chat's mission with its steps in order, if it has one.
     pub fn mission(&self, session_id: &str) -> Result<Option<Mission>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let head = conn
             .query_row(
                 "SELECT goal, status, deep FROM missions WHERE session_id=?1",
@@ -605,7 +639,7 @@ impl Db {
     }
 
     pub fn mission_set_status(&self, session_id: &str, status: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "UPDATE missions SET status=?2, updated_at=?3 WHERE session_id=?1",
             params![session_id, status, now_ms()],
         )?;
@@ -614,7 +648,7 @@ impl Db {
 
     /// Save a step's state and receipt.
     pub fn mission_step_update(&self, id: i64, status: &str, attempts: i64, result: &str, child_id: Option<&str>) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "UPDATE mission_steps SET status=?2, attempts=?3, result=?4, child_id=COALESCE(?5, child_id) WHERE id=?1",
             params![id, status, attempts, result, child_id],
         )?;
@@ -623,7 +657,7 @@ impl Db {
 
     /// Insert a new pending step right after step `after`.
     pub fn mission_step_insert_after(&self, session_id: &str, after: i64, title: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let pos: f64 = conn.query_row("SELECT pos FROM mission_steps WHERE id=?1", params![after], |r| r.get(0))?;
         let next: Option<f64> = conn
             .query_row(
@@ -644,7 +678,7 @@ impl Db {
     /// Add one reply's token counts to today's row for `session_id`.
     pub fn add_usage(&self, session_id: &str, u: &crate::provider::Usage) -> Result<()> {
         let day = now_ms() / 86_400_000;
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "INSERT INTO usage (session_id, day, requests, input, cached, cache_write, output)
              VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6)
              ON CONFLICT (session_id, day) DO UPDATE SET
@@ -658,7 +692,7 @@ impl Db {
     /// Record one model request: the daily totals and the detailed log.
     pub fn add_usage_entry(&self, session_id: &str, model: &str, purpose: &str, u: &crate::provider::Usage) -> Result<()> {
         self.add_usage(session_id, u)?;
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "INSERT INTO usage_log (ts, session_id, model, purpose, input, cached, cache_write, output)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![now_ms(), session_id, model, purpose, u.input as i64, u.cached as i64, u.cache_write as i64, u.output as i64],
@@ -668,7 +702,7 @@ impl Db {
 
     /// Logged requests since `from_ms` (epoch ms), oldest first.
     pub fn usage_log(&self, from_ms: i64) -> Result<Vec<UsageEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT ts, session_id, model, purpose, input, cached, cache_write, output
              FROM usage_log WHERE ts >= ?1 ORDER BY ts, id",
@@ -690,7 +724,7 @@ impl Db {
 
     /// Every model's price (per 1M tokens), by model name.
     pub fn prices(&self) -> Result<std::collections::HashMap<String, Price>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare("SELECT model, input, cached, output FROM prices")?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, String>(0)?, Price { input: r.get(1)?, cached: r.get(2)?, output: r.get(3)? }))
@@ -699,7 +733,7 @@ impl Db {
     }
 
     pub fn set_price(&self, model: &str, p: Price) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "INSERT INTO prices (model, input, cached, output) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (model) DO UPDATE SET input = ?2, cached = ?3, output = ?4",
             params![model, p.input, p.cached, p.output],
@@ -711,7 +745,7 @@ impl Db {
     /// N UTC days (today included) or all time.
     pub fn usage_totals(&self, session: Option<&str>, days: Option<i64>) -> Result<UsageTotals> {
         let from = days.map(|d| now_ms() / 86_400_000 - (d - 1)).unwrap_or(i64::MIN);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let t = conn.query_row(
             "SELECT COALESCE(SUM(requests),0), COALESCE(SUM(input),0), COALESCE(SUM(cached),0),
                     COALESCE(SUM(cache_write),0), COALESCE(SUM(output),0)
@@ -733,7 +767,7 @@ impl Db {
     /// New (F-12): delete a session and its messages in one transaction.
     /// False when the id is unknown.
     pub fn delete_session(&self, id: &str) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM messages WHERE session_id=?1", params![id])?;
         let n = tx.execute("DELETE FROM sessions WHERE id=?1", params![id])?;
@@ -742,7 +776,7 @@ impl Db {
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let s = conn
             .query_row(&format!("SELECT {SESSION_COLS} FROM sessions WHERE id=?1"), params![id], session_from_row)
             .optional()?;
@@ -768,10 +802,22 @@ impl Db {
             parts: parts.to_vec(),
             created_at,
         };
-        let mut conn = self.conn.lock().unwrap();
+        let mut m = m;
+        let mut conn = self.conn();
         let json = serde_json::to_string(&m.parts)?;
         // The message and the session's timestamp change together or not at all.
         let tx = conn.transaction()?;
+        // Messages are read back ordered by `created_at`: a clock that steps
+        // back must not put a tool result before its call. Each message is
+        // at least 1 ms after the chat's newest one.
+        let last: Option<i64> = tx.query_row(
+            "SELECT MAX(created_at) FROM messages WHERE session_id=?1",
+            params![m.session_id],
+            |r| r.get(0),
+        )?;
+        if let Some(last) = last {
+            m.created_at = m.created_at.max(last.saturating_add(1));
+        }
         tx.execute(
             "INSERT INTO messages (id, session_id, role, parts, created_at) VALUES (?1,?2,?3,?4,?5)",
             params![m.id, m.session_id, m.role, json, m.created_at],
@@ -802,7 +848,7 @@ impl Db {
             archived: false,
         };
         // One transaction: a failed fork leaves no half-copied session.
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO sessions (id, title, parent_id, created_at, updated_at, project_id)
@@ -836,7 +882,7 @@ impl Db {
         summarized_ids: &[String],
         summary: &str,
     ) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let mut first_at: Option<i64> = None;
         {
@@ -869,7 +915,7 @@ impl Db {
     /// Delete message `from_id` and every later message of the chat (rewind).
     /// Returns how many went.
     pub fn delete_messages_from(&self, session_id: &str, from_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let (t, row): (i64, i64) = conn.query_row(
             "SELECT created_at, rowid FROM messages WHERE id=?1 AND session_id=?2",
             params![from_id, session_id],
@@ -883,7 +929,7 @@ impl Db {
     }
 
     pub fn messages(&self, session_id: &str) -> Result<Vec<Message>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, role, parts, created_at FROM messages WHERE session_id=?1 ORDER BY created_at, rowid",
         )?;
@@ -910,7 +956,7 @@ impl Db {
     /// [`workspace_key`] of the workspace. Saving the same approval twice
     /// keeps one row (UNIQUE constraint + INSERT OR IGNORE).
     pub fn add_approval(&self, workspace: &str, tool: &str, pattern: &str, scope: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "INSERT OR IGNORE INTO approvals (id, workspace, tool, pattern, scope, created_at) \
              VALUES (?1,?2,?3,?4,?5,?6)",
             params![new_id("apr"), workspace, tool, pattern, scope, now_ms()],
@@ -921,7 +967,7 @@ impl Db {
     /// True when this workspace has an "always allow" for (tool, pattern).
     /// Approvals saved for other workspaces never count.
     pub fn has_approval(&self, workspace: &str, tool: &str, pattern: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM approvals WHERE workspace=?1 AND tool=?2 AND pattern=?3",
             params![workspace, tool, pattern],
@@ -1302,5 +1348,114 @@ mod tests {
         assert_eq!(ids.len(), 10_000);
         let one = new_id("msg");
         assert!(one.starts_with("msg_") && one.len() == 20, "{one}");
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn version(db: &Db) -> i64 {
+        db.conn().pragma_query_value(None, "user_version", |r| r.get(0)).unwrap()
+    }
+
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ocrs-{tag}-{}-{}.db", std::process::id(), now_ms()))
+    }
+
+    fn remove(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// A database from before `user_version` (version 0, but already with
+    /// some later columns) is brought up to date without errors, and opening
+    /// it again runs nothing twice.
+    #[test]
+    fn versioned_migrations_take_any_older_database() {
+        let path = temp_db("migrate");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, parent_id TEXT,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE missions (session_id TEXT PRIMARY KEY, goal TEXT NOT NULL, status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 INSERT INTO sessions VALUES ('s1','old',NULL,1,1,1);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(version(&db), MIGRATIONS.len() as i64);
+        let s = db.get_session("s1").unwrap().unwrap();
+        assert!(s.pinned && !s.archived && s.project_id.is_none(), "old row kept, new columns added");
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(version(&db), MIGRATIONS.len() as i64);
+        assert_eq!(version(&Db::open_in_memory().unwrap()), MIGRATIONS.len() as i64);
+        drop(db);
+        remove(&path);
+    }
+
+    /// Two connections opening one new file at once both succeed: the
+    /// schema steps run once, inside BEGIN IMMEDIATE.
+    #[test]
+    fn two_processes_opening_at_once_do_not_race_on_alter() {
+        let path = temp_db("race");
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Db::open(&path).map(|_| ()))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        remove(&path);
+    }
+
+    /// A clock that steps back does not reorder a chat: each new message
+    /// sorts after the newest one.
+    #[test]
+    fn a_clock_stepping_back_keeps_message_order() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("c", None).unwrap();
+        let t = now_ms();
+        db.insert_message(&s.id, "assistant", &[Part::Text { text: "call".into() }], t).unwrap();
+        // The clock went back 10 s before the tool result was saved.
+        db.insert_message(&s.id, "tool", &[Part::Text { text: "result".into() }], t - 10_000).unwrap();
+        let roles: Vec<String> = db.messages(&s.id).unwrap().into_iter().map(|m| m.role).collect();
+        assert_eq!(roles, ["assistant", "tool"]);
+        let msgs = db.messages(&s.id).unwrap();
+        assert!(msgs[1].created_at > msgs[0].created_at);
+        // Compaction's summary still goes before what it replaced.
+        db.replace_with_summary(&s.id, &[msgs[0].id.clone()], "sum").unwrap();
+        let after = db.messages(&s.id).unwrap();
+        assert_eq!((after[0].role.as_str(), after[1].role.as_str()), ("system", "tool"));
+    }
+
+    /// A panic while the connection was held does not break the database
+    /// for every later caller.
+    #[test]
+    fn a_poisoned_lock_does_not_break_later_calls() {
+        let db = Db::open_in_memory().unwrap();
+        let db2 = db.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = db2.conn();
+            panic!("boom");
+        })
+        .join();
+        assert!(db.conn.is_poisoned());
+        db.create_session("still works", None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_moves_a_call_off_the_async_thread() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("c", None).unwrap();
+        let id = s.id.clone();
+        let n = db.run(move |db| Ok(db.messages(&id)?.len())).await.unwrap();
+        assert_eq!(n, 0);
     }
 }
