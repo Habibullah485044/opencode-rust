@@ -2685,16 +2685,16 @@
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21.4 11.1l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8l8.5-8.5a3.7 3.7 0 0 1 5.2 5.2l-8.5 8.5a1.8 1.8 0 0 1-2.6-2.6l7.8-7.8"/></svg>
             </button>
             <div id="git-wrap" hidden>
-              <button type="button" id="git-chip" title="Git branch: new branch, commit, pull request" aria-haspopup="menu">
+              <button type="button" id="git-chip" title="Git branch: new branch, commit, pull request" aria-haspopup="menu" aria-expanded="false" aria-controls="git-menu">
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 7v10M18 10c0 4-6 3-11 7"/></svg>
                 <span id="git-branch"></span><span id="git-count"></span>
               </button>
               <div id="git-menu" role="menu" hidden>
-                <button type="button" class="git-item" data-git="new">New branch…</button>
-                <div id="git-new" hidden><input id="git-new-name" placeholder="branch-name" spellcheck="false"><button type="button" class="next-opt" id="git-new-ok">Make</button></div>
-                <button type="button" class="git-item" data-git="changes">Show changes</button>
-                <button type="button" class="git-item" data-git="commit">Commit the changes</button>
-                <button type="button" class="git-item" data-git="pr">Push and open a pull request</button>
+                <button type="button" class="git-item" role="menuitem" data-git="new">New branch…</button>
+                <div id="git-new" hidden><input id="git-new-name" aria-label="New branch name" placeholder="branch-name" spellcheck="false"><button type="button" class="next-opt" id="git-new-ok">Make</button></div>
+                <button type="button" class="git-item" role="menuitem" data-git="changes">Show changes</button>
+                <button type="button" class="git-item" role="menuitem" data-git="commit">Commit the changes</button>
+                <button type="button" class="git-item" role="menuitem" data-git="pr">Push and open a pull request</button>
               </div>
             </div>
             <button type="button" id="mission-btn" class="mode-toggle" aria-pressed="false"
@@ -2798,13 +2798,13 @@
     </div>
     <div class="set-layout">
       <nav class="set-nav" role="tablist" aria-label="Settings pages">
-        <button type="button" role="tab" data-pane="models" aria-selected="true">Models</button>
-        <button type="button" role="tab" data-pane="prompt" aria-selected="false">Prompt &amp; Temperature</button>
-        <button type="button" role="tab" data-pane="appearance" aria-selected="false">Appearance</button>
-        <button type="button" role="tab" data-pane="usage" aria-selected="false">Usage</button>
+        <button type="button" role="tab" id="set-tab-models" data-pane="models" aria-selected="true" aria-controls="set-pane-models" tabindex="0">Models</button>
+        <button type="button" role="tab" id="set-tab-prompt" data-pane="prompt" aria-selected="false" aria-controls="set-pane-prompt" tabindex="-1">Prompt &amp; Temperature</button>
+        <button type="button" role="tab" id="set-tab-appearance" data-pane="appearance" aria-selected="false" aria-controls="set-pane-appearance" tabindex="-1">Appearance</button>
+        <button type="button" role="tab" id="set-tab-usage" data-pane="usage" aria-selected="false" aria-controls="set-pane-usage" tabindex="-1">Usage</button>
       </nav>
       <form id="set-form" class="set-body" novalidate>
-        <section class="set-pane" data-pane="models" role="tabpanel" aria-label="Models">
+        <section class="set-pane" id="set-pane-models" data-pane="models" role="tabpanel" aria-label="Models">
 <!-- settings:models (Models page: provider, model, API key, thinking effort) -->
       <h2 class="set-title">Models</h2>
       <p class="set-hint mdl-lead">Where Habi sends requests, which model answers, and how hard it thinks.</p>
@@ -2864,7 +2864,7 @@
       </div>
 <!-- /settings:models -->
         </section>
-        <section class="set-pane" data-pane="prompt" role="tabpanel" aria-label="Prompt and temperature" hidden>
+        <section class="set-pane" id="set-pane-prompt" data-pane="prompt" role="tabpanel" aria-label="Prompt and temperature" hidden>
 <!-- settings:prompt (Prompt & Temperature page: system prompt, temperature) -->
       <h2 class="set-title">Prompt &amp; Temperature</h2>
       <div class="pt-group">
@@ -2899,7 +2899,7 @@
       </div>
 <!-- /settings:prompt -->
         </section>
-        <section class="set-pane" data-pane="appearance" role="tabpanel" aria-label="Appearance" hidden>
+        <section class="set-pane" id="set-pane-appearance" data-pane="appearance" role="tabpanel" aria-label="Appearance" hidden>
 <!-- settings:appearance (Appearance page: theme) -->
       <h2 class="set-title">Appearance</h2>
       <p class="thm-label" id="thm-label">Theme</p>
@@ -2935,7 +2935,7 @@
       <p class="set-hint" id="thm-hint">Pick a theme to try it right away. Save keeps it; closing Settings without saving puts the old one back.</p>
 <!-- /settings:appearance -->
         </section>
-        <section class="set-pane" data-pane="usage" role="tabpanel" aria-label="Usage" hidden>
+        <section class="set-pane" id="set-pane-usage" data-pane="usage" role="tabpanel" aria-label="Usage" hidden>
       <h2 class="set-title">Usage</h2>
       <p class="set-hint">Tokens and costs of every model request, by day, purpose, model and chat, with the prices you set per model.</p>
       <button type="button" id="set-usage" class="set-usage" title="Tokens and costs by day, model, purpose and chat">Token usage &amp; costs &rarr;</button>
@@ -3740,6 +3740,7 @@
     var row = document.createElement("div");
     row.className = "sess" + (s.active ? " active" : "");
     row.setAttribute("role", "button");
+    if (s.active) row.setAttribute("aria-current", "page");
     row.tabIndex = 0;
     row.dataset.id = s.id;
     var state = s.needs ? "needs" : s.running ? "run" : "";
@@ -3800,7 +3801,10 @@
       postToRust({ type: "load", id: s.id });
     });
     row.addEventListener("keydown", function (ev) {
-      if (ev.key === "Enter" && ev.target === row) postToRust({ type: "load", id: s.id });
+      if ((ev.key === "Enter" || ev.key === " ") && ev.target === row) {
+        ev.preventDefault(); // Space would scroll the sidebar
+        postToRust({ type: "load", id: s.id });
+      }
       if (ev.key === "F2") { renamingId = s.id; renderSidebar(); }
     });
     row.addEventListener("contextmenu", function (ev) {
@@ -5041,8 +5045,10 @@
   })();
   // /settings:appearance
   function showSettingsPane(name) {
+    // Roving tabindex: only the current tab is in the Tab order; arrows move.
     [].forEach.call(document.querySelectorAll("#settings .set-nav button"), function (b) {
       b.setAttribute("aria-selected", String(b.dataset.pane === name));
+      b.tabIndex = b.dataset.pane === name ? 0 : -1;
     });
     [].forEach.call(document.querySelectorAll("#settings .set-pane"), function (p) {
       p.hidden = p.dataset.pane !== name;
@@ -5937,6 +5943,26 @@
           showSettingsPane(b.dataset.pane);
         });
       });
+      // Tablist keys (same as the effort radio group): arrows wrap, Home/End
+      // jump, and the matching pane shows at once.
+      var setNav = setBox.querySelector(".set-nav");
+      if (setNav) {
+        setNav.addEventListener("keydown", function (ev) {
+          var tabs = [].slice.call(setNav.querySelectorAll('[role="tab"]'));
+          var at = tabs.indexOf(document.activeElement);
+          if (at < 0) return;
+          var to = -1;
+          if (ev.key === "ArrowRight" || ev.key === "ArrowDown") to = (at + 1) % tabs.length;
+          else if (ev.key === "ArrowLeft" || ev.key === "ArrowUp") to = (at + tabs.length - 1) % tabs.length;
+          else if (ev.key === "Home") to = 0;
+          else if (ev.key === "End") to = tabs.length - 1;
+          if (to < 0) return;
+          ev.preventDefault();
+          setBox.dataset.pane = tabs[to].dataset.pane;
+          showSettingsPane(tabs[to].dataset.pane);
+          tabs[to].focus();
+        });
+      }
     }
     document.addEventListener("keydown", function (ev) {
       if ((ev.ctrlKey || ev.metaKey) && ev.key === ",") { ev.preventDefault(); openSettings(); }
@@ -6103,13 +6129,45 @@
     var gitChip = document.getElementById("git-chip");
     var gitMenu = document.getElementById("git-menu");
     if (gitChip && gitMenu) {
+      // One place opens and closes the menu so aria-expanded always matches.
+      var setGitMenu = function (open, refocus) {
+        gitMenu.hidden = !open;
+        gitChip.setAttribute("aria-expanded", open ? "true" : "false");
+        if (open) {
+          document.getElementById("git-new").hidden = true;
+          var firstItem = gitMenu.querySelector(".git-item");
+          if (firstItem) firstItem.focus();
+        } else if (refocus) {
+          gitChip.focus();
+        }
+      };
       gitChip.addEventListener("click", function (ev) {
         ev.stopPropagation();
-        gitMenu.hidden = !gitMenu.hidden;
-        document.getElementById("git-new").hidden = true;
+        setGitMenu(gitMenu.hidden, false);
       });
       document.addEventListener("click", function (ev) {
-        if (!gitMenu.hidden && !(ev.target && ev.target.closest && ev.target.closest("#git-wrap"))) gitMenu.hidden = true;
+        if (!gitMenu.hidden && !(ev.target && ev.target.closest && ev.target.closest("#git-wrap"))) setGitMenu(false, false);
+      });
+      // Keyboard: arrows move between items, Home/End jump, Escape closes
+      // and gives focus back to the chip.
+      gitMenu.addEventListener("keydown", function (ev) {
+        if (ev.key === "Escape") {
+          ev.preventDefault();
+          ev.stopPropagation();
+          setGitMenu(false, true);
+          return;
+        }
+        if (ev.target && ev.target.id === "git-new-name") return;
+        var its = [].slice.call(gitMenu.querySelectorAll(".git-item"));
+        var at = its.indexOf(document.activeElement);
+        var to = -1;
+        if (ev.key === "ArrowDown") to = (at + 1) % its.length;
+        else if (ev.key === "ArrowUp") to = at <= 0 ? its.length - 1 : at - 1;
+        else if (ev.key === "Home") to = 0;
+        else if (ev.key === "End") to = its.length - 1;
+        if (to < 0) return;
+        ev.preventDefault();
+        its[to].focus();
       });
       var makeBranch = function () {
         var nameEl = document.getElementById("git-new-name");
@@ -6117,12 +6175,11 @@
         if (!name) return;
         postToRust({ type: "new_branch", name: name });
         nameEl.value = "";
-        gitMenu.hidden = true;
+        setGitMenu(false, true);
       };
       document.getElementById("git-new-ok").addEventListener("click", makeBranch);
       document.getElementById("git-new-name").addEventListener("keydown", function (ev) {
         if (ev.key === "Enter") { ev.preventDefault(); makeBranch(); }
-        if (ev.key === "Escape") gitMenu.hidden = true;
       });
       var items = gitMenu.querySelectorAll(".git-item");
       for (var gi = 0; gi < items.length; gi++) {
@@ -6134,8 +6191,8 @@
             document.getElementById("git-new-name").focus();
             return;
           }
-          gitMenu.hidden = true;
-          if (what === "changes") postToRust({ type: "load_changes" });
+          setGitMenu(false, false);
+          if (what === "changes") loadChanges();
           else runFollowup(GIT_PROMPTS[what]);
         });
       }
