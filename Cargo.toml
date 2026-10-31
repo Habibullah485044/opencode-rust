@@ -11,8 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "net"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net"] }
 futures = "0.3"
 
 # core HTTP server + SSE (TUI talks to it like an API client)
