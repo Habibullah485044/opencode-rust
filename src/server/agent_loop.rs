@@ -474,37 +474,7 @@ pub(crate) async fn run_loop_inner(
     let mut nudges = 0;
     // The history was summarized once this run because it was too long.
     let mut compacted = false;
-    // Spec list: base tools + MCP tools (+ spawn), then filter by mode/role.
-    let mut specs = tools::tool_specs();
-    // Browser tools only work while a GUI panel is attached. Advertising them
-    // in the TUI/headless just invites calls that can only fail — and it is
-    // one more way for a small model to decide "hi" needs tooling.
-    if st.browser.lock().map(|g| g.is_some()).unwrap_or(false) {
-        specs.extend(crate::browser::specs());
-    }
-    specs.extend(mcp_specs_for_prompt(st.mcp.lock().await.specs()));
-    if opts.can_spawn {
-        let roles = agents::load_subagents(&st.workspace_for(session_id));
-        specs.push(crate::subagent::spawn_spec(&roles));
-        specs.extend(crate::subagent::agent_tool_specs());
-    }
-    let mut specs = mode.filter_specs(specs);
-    // A subagent skips `todo`: the plan list belongs to the chat, and the
-    // spec is sent with every request.
-    if opts.agent.is_some() {
-        specs.retain(|s| s.function.name != "todo" && s.function.name != "ask_user");
-    }
-    // Turbo means "decide yourself": no questions.
-    if turbo {
-        specs.retain(|s| s.function.name != "ask_user");
-    }
-    let specs: Vec<_> = match &opts.allow {
-        Some(allow) => specs
-            .into_iter()
-            .filter(|s| allow.contains(&s.function.name))
-            .collect(),
-        None => specs,
-    };
+    let specs = run_specs(st, session_id, opts, mode, turbo).await;
 
     let mut final_text = String::new();
     // New (B-26): set when the model stopped asking for tools by itself.
@@ -529,7 +499,6 @@ pub(crate) async fn run_loop_inner(
             msgs = build_chat_messages(st, session_id, &opts.system)?;
         }
         let prefix_note = prefix_change(session_id, &msgs, &specs);
-        let mut request_usage: Option<crate::provider::Usage> = None;
         // B-29: copy the client out of the lock; never hold it while waiting.
         let client = st.client.lock().await.clone();
         let model = opts.model.as_deref().unwrap_or(&client.model);
@@ -555,100 +524,15 @@ pub(crate) async fn run_loop_inner(
             _ = aborted(abort) => return Ok(LoopEnd::Aborted),
         };
 
-        let mut text = String::new();
-        let mut reasoning = String::new();
-        let mut acc = ToolCallAccumulator::default();
-        // How much of `text` was already streamed to the clients.
-        let mut shown = 0usize;
-        let mut finish_reason: Option<String> = None;
-        // Poll the stream in racing with the abort flag: a replaced run must
-        // exit promptly even when the transport yields nothing at all.
-        let stop = aborted(abort);
-        tokio::pin!(stop);
-        let mut dropped = false;
-        // The stream broke off for good: the part that arrived is kept.
-        let mut broke_off = false;
-        loop {
-            let ev = tokio::select! {
-                ev = stream.next() => ev,
-                _ = &mut stop => return Ok(LoopEnd::Aborted),
-            };
-            let Some(ev) = ev else { break };
-            if abort.load(Ordering::SeqCst) {
-                return Ok(LoopEnd::Aborted);
-            }
-            // Nothing of a cut-off reply is saved yet: ask the same step again
-            // instead of ending the run (a free provider drops streams often).
-            let ev = match ev {
-                Ok(ev) => ev,
-                Err(e) if stream_drops < MAX_STREAM_DROPS => {
-                    stream_drops += 1;
-                    // The part already on screen is asked again from the
-                    // start: take it back, or partial + full reply show.
-                    retract_shown(st, session_id, text.get(..shown).map_or(0, |s| s.chars().count()));
-                    let _ = st.events.send(ServerEvent::Note {
-                        session_id: session_id.to_string(),
-                        text: format!(
-                            "the model's reply broke off ({e:#}); asking again \
-                             ({stream_drops}/{MAX_STREAM_DROPS})"
-                        ),
-                    });
-                    dropped = true;
-                    break;
-                }
-                // The stream keeps breaking off (tunnel, proxy): throwing
-                // the reply away and failing the run loses work the user
-                // already watched stream in. Keep what arrived instead.
-                Err(e) => {
-                    if text.is_empty() && acc.is_empty() {
-                        return Err(e);
-                    }
-                    broke_off = true;
-                    break;
+        let StreamedReply { mut text, reasoning, acc, mut shown, finish_reason, broke_off, request_usage } =
+            match read_reply(st, session_id, opts, model, &mut stream, abort, &mut stream_drops).await? {
+                StreamOutcome::Reply(reply) => reply,
+                StreamOutcome::Aborted => return Ok(LoopEnd::Aborted),
+                StreamOutcome::Dropped => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
                 }
             };
-            match &ev {
-                StreamEvent::Text(t) => {
-                    text.push_str(t);
-                    // Show the reply as it comes, but not a tool call the model
-                    // writes as text (`<tool_call>…`): hold back from its start,
-                    // and a possible start at the very end, until we know.
-                    let limit = text.find("<tool_call").unwrap_or_else(|| {
-                        let tail = text.rfind('<').filter(|&i| "<tool_call>".starts_with(&text[i..]));
-                        tail.unwrap_or(text.len())
-                    });
-                    if limit > shown {
-                        let _ = st.events.send(ServerEvent::AssistantDelta {
-                            session_id: session_id.to_string(),
-                            text: text[shown..limit].to_string(),
-                        });
-                        shown = limit;
-                    }
-                }
-                StreamEvent::Reasoning(t) => {
-                    reasoning.push_str(t);
-                    if opts.emit_activity {
-                        let _ = st.events.send(ServerEvent::ReasoningDelta {
-                            session_id: session_id.to_string(),
-                            text: t.clone(),
-                        });
-                    }
-                }
-                StreamEvent::Usage(u) => {
-                    st.record_usage_as(if opts.agent.is_some() { "subagent" } else { usage_tag().0 }, session_id, model, u);
-                    request_usage = Some(*u);
-                }
-                StreamEvent::Done { finish_reason: fr } => {
-                    finish_reason = fr.clone();
-                    break;
-                }
-                _ => acc.push(&ev),
-            }
-        }
-        if dropped {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            continue;
-        }
 
         log_cache(st, session_id, request_usage.as_ref(), &prefix_note);
         let mut calls = acc.finish();
@@ -664,28 +548,8 @@ pub(crate) async fn run_loop_inner(
         if calls.is_empty() && is_wrapped_error(&text) {
             // It streamed in as reply text: take it off the screen.
             retract_shown(st, session_id, streamed_chars);
-            if !compacted && is_context_overflow(&text) {
-                compacted = true;
-                let _ = st.events.send(ServerEvent::Note {
-                    session_id: session_id.to_string(),
-                    text: "the chat got too long for the model — summarizing the older part and trying again".into(),
-                });
-                if crate::compact::compact(st, session_id, abort).await.is_ok() {
-                    continue;
-                }
-            }
-            if stream_drops < MAX_STREAM_DROPS {
-                stream_drops += 1;
-                let _ = st.events.send(ServerEvent::Note {
-                    session_id: session_id.to_string(),
-                    text: format!(
-                        "the provider sent an error instead of a reply — asking again \
-                         ({stream_drops}/{MAX_STREAM_DROPS})"
-                    ),
-                });
-                continue;
-            }
-            return Err(anyhow::anyhow!("the provider kept answering with an error: {}", text.trim()));
+            retry_after_wrapped_error(st, session_id, abort, &text, &mut compacted, &mut stream_drops).await?;
+            continue;
         }
         // Some models (Qwen through Ollama/llama.cpp without a tool parser)
         // write their tool calls into the reply text: wrapped, as the
@@ -709,112 +573,16 @@ pub(crate) async fn run_loop_inner(
         }
         // B-03: "length" = the model hit its output token limit.
         let truncated = finish_reason.as_deref() == Some("length");
-        if truncated {
-            let _ = st.events.send(ServerEvent::Note {
-                session_id: session_id.to_string(),
-                text: "the model's reply was cut off by its output token limit".to_string(),
-            });
-            if calls.is_empty() {
-                text.push_str(CUT_OFF_NOTE);
-            }
-        }
-        if broke_off {
-            let _ = st.events.send(ServerEvent::Note {
-                session_id: session_id.to_string(),
-                text: format!(
-                    "the connection broke off {} time(s) — keeping the part of the reply that arrived",
-                    stream_drops.max(1)
-                ),
-            });
-            if calls.is_empty() {
-                text.push_str(BROKE_OFF_NOTE);
-            }
-        }
+        note_cut_reply(st, session_id, truncated, broke_off, stream_drops, calls.is_empty(), &mut text);
         let cut_off = |v: &Value| v.as_object().map(|o| o.len() == 1 && o.contains_key("raw")).unwrap_or(false);
         if (truncated || broke_off) && calls.iter().any(|(_, _, input)| cut_off(input)) {
-            let mut parts = Vec::new();
-            if !reasoning.is_empty() {
-                parts.push(Part::Reasoning { text: reasoning.clone() });
-            }
-            if !text.is_empty() {
-                parts.push(Part::Text { text: text.clone() });
-            }
-            for (id, name, input) in &calls {
-                parts.push(Part::ToolCall { id: id.clone(), name: name.clone(), input: input.clone() });
-            }
-            st.db.add_message(session_id, "assistant", &parts)?;
-            for (id, _, _) in &calls {
-                let output = "not run: your reply hit the output token limit before this call's \
-                              arguments were complete. Send it again in smaller pieces (for \
-                              example write a big file in several steps)."
-                    .to_string();
-                st.db.add_message(
-                    session_id,
-                    "tool",
-                    &[Part::ToolResult { tool_id: id.clone(), output, is_error: true }],
-                )?;
-            }
+            save_cut_off_calls(st, session_id, &reasoning, &text, &calls)?;
             continue;
         }
-        let mut assistant_parts = Vec::new();
-        if !reasoning.is_empty() {
-            assistant_parts.push(Part::Reasoning { text: reasoning });
-        }
-        if !text.is_empty() {
-            assistant_parts.push(Part::Text { text: text.clone() });
-        }
-        for (id, name, input) in &calls {
-            assistant_parts.push(Part::ToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-            });
-        }
-        if !assistant_parts.is_empty() {
-            st.db.add_message(session_id, "assistant", &assistant_parts)?;
-        }
+        save_assistant_reply(st, session_id, reasoning, &text, &calls)?;
 
         if calls.is_empty() {
-            // A healthy transport cut by the output limit mid-task: ask for
-            // the rest instead of ending the turn on half an answer.
-            if truncated && nudges < MAX_NUDGES && !text.trim().is_empty() {
-                nudges += 1;
-                let _ = st.events.send(ServerEvent::Note {
-                    session_id: session_id.to_string(),
-                    text: "the reply hit its output limit mid-way — asking the model to continue".into(),
-                });
-                st.db
-                    .add_message(session_id, "user", &[Part::Text { text: CONTINUE_TEXT.to_string() }])?;
-                continue;
-            }
-            // "I'll build it now." and no tool call: weak models end their
-            // turn on a plan. Nothing happened, so ask once or twice for the
-            // work itself instead of reporting the plan as the answer.
-            if nudges < MAX_NUDGES && mode == AgentMode::Build && !truncated && announces_work(&text) {
-                nudges += 1;
-                let _ = st.events.send(ServerEvent::Note {
-                    session_id: session_id.to_string(),
-                    text: "the model said what it will do but did not do it — asking it to go ahead".into(),
-                });
-                st.db.add_message(session_id, "user", &[Part::Text { text: NUDGE_TEXT.to_string() }])?;
-                continue;
-            }
-            // "I can't see your files, please paste them": the model forgot
-            // it has tools. Remind it once or twice, with the folder.
-            if nudges < MAX_NUDGES && !truncated && !specs.is_empty() && denies_file_access(&text) {
-                nudges += 1;
-                let _ = st.events.send(ServerEvent::Note {
-                    session_id: session_id.to_string(),
-                    text: "the model said it cannot see the files — reminding it that it has tools".into(),
-                });
-                let folder = opts.workspace.clone().unwrap_or_else(|| st.workspace_for(session_id));
-                let reminder = format!(
-                    "[app] You can see the files: you have tools (list, glob, grep, read) that work in the project \
-                     folder {}. Do not ask the user to paste or upload anything. Use the tools now to do what \
-                     was asked.",
-                    folder.display()
-                );
-                st.db.add_message(session_id, "user", &[Part::Text { text: reminder }])?;
+            if nudge_on_empty_reply(st, session_id, opts, mode, truncated, &specs, &text, &mut nudges)? {
                 continue;
             }
             final_text = text;
@@ -822,29 +590,7 @@ pub(crate) async fn run_loop_inner(
             break;
         }
 
-        // Models trained on other agents call tools by those agents' names
-        // (`list_files`, `Bash`, `read_file`…): run them as ours.
-        let known: std::collections::HashSet<&str> = specs.iter().map(|s| s.function.name.as_str()).collect();
-        let calls: Vec<_> = calls
-            .into_iter()
-            .map(|(id, name, input)| match tool_alias(&name, &input).filter(|_| !known.contains(name.as_str())) {
-                Some((real, args)) if known.contains(real) => (id, real.to_string(), args),
-                _ => (id, name, input),
-            })
-            .collect();
-        // F-09 loop guard: an identical call repeated LOOP_GUARD_LIMIT times
-        // in a row is answered with an error and never runs (no approval
-        // prompt either). Every requested call counts, spawns included.
-        let calls = apply_loop_guard(st, opts, session_id, &mut loop_guard, calls)?;
-        // `mcp_call` runs as the MCP tool it names: permissions, role and
-        // mode rules and the activity view all see the real tool.
-        let calls: Vec<_> = calls
-            .into_iter()
-            .map(|(id, name, input)| match crate::mcp::unwrap_call(&name, &input) {
-                Some((inner, args)) => (id, inner, args),
-                None => (id, name, input),
-            })
-            .collect();
+        let calls = normalize_calls(st, opts, session_id, &specs, &mut loop_guard, calls)?;
         // A step that only ticks off todos next to a final answer needs no
         // further model call (Freebuff's bookkeeping tools): one request saved.
         let bookkeeping_only = calls.iter().all(|(_, n, i)| {
@@ -854,73 +600,7 @@ pub(crate) async fn run_loop_inner(
             .iter()
             .find(|(_, n, _)| n == "ask_user")
             .and_then(|(_, _, i)| i.get("question").and_then(Value::as_str).map(str::to_string));
-        // Execute each tool call: role gate → permission gate → route.
-        // `spawn` calls run concurrently with each other — the agents panel
-        // shows the parallel work — everything else keeps its call order.
-        // (Concrete boxed type: a `dyn Future + Send` here deadlocks the
-        // auto-trait proof for the run_loop ↔ spawn recursion.)
-        let mut spawns = Vec::new();
-        for (id, name, input) in calls {
-            let detail = tool_detail_for(st, opts, &name, &input);
-            tool_started(st, opts, session_id, &id, &name, &detail);
-            // New (B-06): once the run is aborted, the remaining calls of this
-            // turn are not run (each still gets a result, so the history
-            // stays valid).
-            let denied = if abort.load(Ordering::SeqCst) {
-                Some("not run: the run was aborted".to_string())
-            } else if !tool_allowed(mode, opts, &name) {
-                // Naming the tools that DO work turns "everything is
-                // blocked" flailing into one corrected call (seen live in
-                // the review run: it tried Bash twice, then claimed even
-                // grep was blocked).
-                Some(match &opts.allow {
-                    Some(allow) => format!(
-                        "tool blocked: this run can only call these tools: {}",
-                        allow.join(", ")
-                    ),
-                    None => "tool blocked: not allowed in this mode/role".to_string(),
-                })
-            } else if crate::tools::is_job_control(&name, &input) && agent_job(&input) {
-                None // reading or stopping a job it was allowed to start
-            } else if !check_permission_preview(
-                st,
-                session_id,
-                &name,
-                &job_detail(&name, &input).unwrap_or_else(|| detail.clone()),
-                &approval_preview(&name, &input),
-                abort,
-            )
-            .await
-            {
-                Some("permission denied by user".to_string())
-            } else {
-                None
-            };
-            if name == "spawn" && denied.is_none() {
-                let sid = session_id.to_string();
-                let inp = input.clone();
-                let fut = Box::pin(async move {
-                    match crate::subagent::spawn_subagent(st, &sid, &inp, abort).await {
-                        Ok(out) => (out, true),
-                        Err(e) => (format!("error: {e:#}"), false),
-                    }
-                });
-                spawns.push(((id, name, input, detail), fut));
-                continue;
-            }
-            let (output, ok) = match denied {
-                Some(m) => (m, false),
-                None => execute_for(st, session_id, opts, &name, &input, abort).await,
-            };
-            finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
-        }
-        // Join the parallel spawns; results are recorded in call order.
-        let (meta, futs): (Vec<_>, Vec<_>) = spawns.into_iter().unzip();
-        for ((id, name, input, _detail), (output, ok)) in
-            meta.into_iter().zip(futures::future::join_all(futs).await)
-        {
-            finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
-        }
+        run_tool_calls(st, session_id, opts, mode, calls, abort).await?;
         // The user was asked: stop until they answer.
         if let Some(question) = asked.filter(|_| opts.agent.is_none() && !turbo) {
             final_text = if text.trim().is_empty() { question } else { text };
@@ -936,17 +616,508 @@ pub(crate) async fn run_loop_inner(
     // New (B-26): the steps ran out while the model still wanted tools. Say
     // so instead of ending with an empty, "successful" answer.
     if !finished {
-        let msg = format!(
-            "stopped after {max_steps} steps (agent.max_steps) — the task may be unfinished. \
-             Send a message to continue, or raise agent.max_steps in the config."
-        );
-        let _ = st.events.send(ServerEvent::Note {
-            session_id: session_id.to_string(),
-            text: msg.clone(),
-        });
-        return Ok(LoopEnd::Done(msg));
+        return Ok(steps_ran_out(st, session_id, max_steps));
     }
     Ok(LoopEnd::Done(final_text))
+}
+
+/// The tool specs one run offers: base tools + MCP tools (+ spawn), then
+/// filtered by mode, role, turbo and the run's allow list.
+async fn run_specs(
+    st: &Shared,
+    session_id: &str,
+    opts: &LoopOpts,
+    mode: AgentMode,
+    turbo: bool,
+) -> Vec<crate::provider::ToolSpec> {
+    // Spec list: base tools + MCP tools (+ spawn), then filter by mode/role.
+    let mut specs = tools::tool_specs();
+    // Browser tools only work while a GUI panel is attached. Advertising them
+    // in the TUI/headless just invites calls that can only fail — and it is
+    // one more way for a small model to decide "hi" needs tooling.
+    if st.browser.lock().map(|g| g.is_some()).unwrap_or(false) {
+        specs.extend(crate::browser::specs());
+    }
+    specs.extend(mcp_specs_for_prompt(st.mcp.lock().await.specs()));
+    if opts.can_spawn {
+        let roles = agents::load_subagents(&st.workspace_for(session_id));
+        specs.push(crate::subagent::spawn_spec(&roles));
+        specs.extend(crate::subagent::agent_tool_specs());
+    }
+    let mut specs = mode.filter_specs(specs);
+    // A subagent skips `todo`: the plan list belongs to the chat, and the
+    // spec is sent with every request.
+    if opts.agent.is_some() {
+        specs.retain(|s| s.function.name != "todo" && s.function.name != "ask_user");
+    }
+    // Turbo means "decide yourself": no questions.
+    if turbo {
+        specs.retain(|s| s.function.name != "ask_user");
+    }
+    match &opts.allow {
+        Some(allow) => specs
+            .into_iter()
+            .filter(|s| allow.contains(&s.function.name))
+            .collect(),
+        None => specs,
+    }
+}
+
+/// One model reply as it streamed in.
+struct StreamedReply {
+    text: String,
+    reasoning: String,
+    acc: ToolCallAccumulator,
+    /// How much of `text` was already streamed to the clients.
+    shown: usize,
+    finish_reason: Option<String>,
+    /// The stream broke off for good: the part that arrived is kept.
+    broke_off: bool,
+    request_usage: Option<crate::provider::Usage>,
+}
+
+/// How reading one reply's stream ended.
+enum StreamOutcome {
+    Reply(StreamedReply),
+    /// Cut off before anything was saved: ask the same step again.
+    Dropped,
+    Aborted,
+}
+
+/// Read one reply's stream, showing its text as it comes.
+async fn read_reply(
+    st: &Shared,
+    session_id: &str,
+    opts: &LoopOpts,
+    model: &str,
+    stream: &mut futures::stream::BoxStream<'static, Result<StreamEvent>>,
+    abort: &AtomicBool,
+    stream_drops: &mut u32,
+) -> Result<StreamOutcome> {
+    let mut request_usage: Option<crate::provider::Usage> = None;
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut acc = ToolCallAccumulator::default();
+    // How much of `text` was already streamed to the clients.
+    let mut shown = 0usize;
+    let mut finish_reason: Option<String> = None;
+    // Poll the stream in racing with the abort flag: a replaced run must
+    // exit promptly even when the transport yields nothing at all.
+    let stop = aborted(abort);
+    tokio::pin!(stop);
+    // The stream broke off for good: the part that arrived is kept.
+    let mut broke_off = false;
+    loop {
+        let ev = tokio::select! {
+            ev = stream.next() => ev,
+            _ = &mut stop => return Ok(StreamOutcome::Aborted),
+        };
+        let Some(ev) = ev else { break };
+        if abort.load(Ordering::SeqCst) {
+            return Ok(StreamOutcome::Aborted);
+        }
+        // Nothing of a cut-off reply is saved yet: ask the same step again
+        // instead of ending the run (a free provider drops streams often).
+        let ev = match ev {
+            Ok(ev) => ev,
+            Err(e) if *stream_drops < MAX_STREAM_DROPS => {
+                *stream_drops += 1;
+                // The part already on screen is asked again from the
+                // start: take it back, or partial + full reply show.
+                retract_shown(st, session_id, text.get(..shown).map_or(0, |s| s.chars().count()));
+                let _ = st.events.send(ServerEvent::Note {
+                    session_id: session_id.to_string(),
+                    text: format!(
+                        "the model's reply broke off ({e:#}); asking again \
+                         ({}/{MAX_STREAM_DROPS})",
+                        *stream_drops
+                    ),
+                });
+                return Ok(StreamOutcome::Dropped);
+            }
+            // The stream keeps breaking off (tunnel, proxy): throwing
+            // the reply away and failing the run loses work the user
+            // already watched stream in. Keep what arrived instead.
+            Err(e) => {
+                if text.is_empty() && acc.is_empty() {
+                    return Err(e);
+                }
+                broke_off = true;
+                break;
+            }
+        };
+        match &ev {
+            StreamEvent::Text(t) => {
+                text.push_str(t);
+                // Show the reply as it comes, but not a tool call the model
+                // writes as text (`<tool_call>…`): hold back from its start,
+                // and a possible start at the very end, until we know.
+                let limit = text.find("<tool_call").unwrap_or_else(|| {
+                    let tail = text.rfind('<').filter(|&i| "<tool_call>".starts_with(&text[i..]));
+                    tail.unwrap_or(text.len())
+                });
+                if limit > shown {
+                    let _ = st.events.send(ServerEvent::AssistantDelta {
+                        session_id: session_id.to_string(),
+                        text: text[shown..limit].to_string(),
+                    });
+                    shown = limit;
+                }
+            }
+            StreamEvent::Reasoning(t) => {
+                reasoning.push_str(t);
+                if opts.emit_activity {
+                    let _ = st.events.send(ServerEvent::ReasoningDelta {
+                        session_id: session_id.to_string(),
+                        text: t.clone(),
+                    });
+                }
+            }
+            StreamEvent::Usage(u) => {
+                st.record_usage_as(if opts.agent.is_some() { "subagent" } else { usage_tag().0 }, session_id, model, u);
+                request_usage = Some(*u);
+            }
+            StreamEvent::Done { finish_reason: fr } => {
+                finish_reason = fr.clone();
+                break;
+            }
+            _ => acc.push(&ev),
+        }
+    }
+    Ok(StreamOutcome::Reply(StreamedReply { text, reasoning, acc, shown, finish_reason, broke_off, request_usage }))
+}
+
+/// The reply was an upstream error served as text. `Ok` means ask the same
+/// step again (after shortening the chat when it was too long); `Err` ends
+/// the run when the error keeps coming back.
+async fn retry_after_wrapped_error(
+    st: &Shared,
+    session_id: &str,
+    abort: &AtomicBool,
+    text: &str,
+    compacted: &mut bool,
+    stream_drops: &mut u32,
+) -> Result<()> {
+    if !*compacted && is_context_overflow(text) {
+        *compacted = true;
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: "the chat got too long for the model — summarizing the older part and trying again".into(),
+        });
+        if crate::compact::compact(st, session_id, abort).await.is_ok() {
+            return Ok(());
+        }
+    }
+    if *stream_drops < MAX_STREAM_DROPS {
+        *stream_drops += 1;
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: format!(
+                "the provider sent an error instead of a reply — asking again \
+                 ({}/{MAX_STREAM_DROPS})",
+                *stream_drops
+            ),
+        });
+        return Ok(());
+    }
+    Err(anyhow::anyhow!("the provider kept answering with an error: {}", text.trim()))
+}
+
+/// Tell the user a reply was cut off (output limit or a broken stream), and
+/// mark a reply without tool calls as cut off for the model.
+fn note_cut_reply(
+    st: &Shared,
+    session_id: &str,
+    truncated: bool,
+    broke_off: bool,
+    stream_drops: u32,
+    no_calls: bool,
+    text: &mut String,
+) {
+    if truncated {
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: "the model's reply was cut off by its output token limit".to_string(),
+        });
+        if no_calls {
+            text.push_str(CUT_OFF_NOTE);
+        }
+    }
+    if broke_off {
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: format!(
+                "the connection broke off {} time(s) — keeping the part of the reply that arrived",
+                stream_drops.max(1)
+            ),
+        });
+        if no_calls {
+            text.push_str(BROKE_OFF_NOTE);
+        }
+    }
+}
+
+/// Save a cut-off reply whose tool calls lost their arguments, each call
+/// answered with an error asking for smaller pieces.
+fn save_cut_off_calls(
+    st: &Shared,
+    session_id: &str,
+    reasoning: &str,
+    text: &str,
+    calls: &[(String, String, Value)],
+) -> Result<()> {
+    let mut parts = Vec::new();
+    if !reasoning.is_empty() {
+        parts.push(Part::Reasoning { text: reasoning.to_string() });
+    }
+    if !text.is_empty() {
+        parts.push(Part::Text { text: text.to_string() });
+    }
+    for (id, name, input) in calls {
+        parts.push(Part::ToolCall { id: id.clone(), name: name.clone(), input: input.clone() });
+    }
+    st.db.add_message(session_id, "assistant", &parts)?;
+    for (id, _, _) in calls {
+        let output = "not run: your reply hit the output token limit before this call's \
+                      arguments were complete. Send it again in smaller pieces (for \
+                      example write a big file in several steps)."
+            .to_string();
+        st.db.add_message(
+            session_id,
+            "tool",
+            &[Part::ToolResult { tool_id: id.clone(), output, is_error: true }],
+        )?;
+    }
+    Ok(())
+}
+
+/// Save the assistant's reply: reasoning, text and tool calls.
+fn save_assistant_reply(
+    st: &Shared,
+    session_id: &str,
+    reasoning: String,
+    text: &str,
+    calls: &[(String, String, Value)],
+) -> Result<()> {
+    let mut assistant_parts = Vec::new();
+    if !reasoning.is_empty() {
+        assistant_parts.push(Part::Reasoning { text: reasoning });
+    }
+    if !text.is_empty() {
+        assistant_parts.push(Part::Text { text: text.to_string() });
+    }
+    for (id, name, input) in calls {
+        assistant_parts.push(Part::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        });
+    }
+    if !assistant_parts.is_empty() {
+        st.db.add_message(session_id, "assistant", &assistant_parts)?;
+    }
+    Ok(())
+}
+
+/// A reply without tool calls that should not end the turn (cut off by the
+/// output limit, only a plan, or "I can't see your files"): add a message
+/// asking for more and return `true`.
+#[allow(clippy::too_many_arguments)]
+fn nudge_on_empty_reply(
+    st: &Shared,
+    session_id: &str,
+    opts: &LoopOpts,
+    mode: AgentMode,
+    truncated: bool,
+    specs: &[crate::provider::ToolSpec],
+    text: &str,
+    nudges: &mut u32,
+) -> Result<bool> {
+    // A healthy transport cut by the output limit mid-task: ask for
+    // the rest instead of ending the turn on half an answer.
+    if truncated && *nudges < MAX_NUDGES && !text.trim().is_empty() {
+        *nudges += 1;
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: "the reply hit its output limit mid-way — asking the model to continue".into(),
+        });
+        st.db
+            .add_message(session_id, "user", &[Part::Text { text: CONTINUE_TEXT.to_string() }])?;
+        return Ok(true);
+    }
+    // "I'll build it now." and no tool call: weak models end their
+    // turn on a plan. Nothing happened, so ask once or twice for the
+    // work itself instead of reporting the plan as the answer.
+    if *nudges < MAX_NUDGES && mode == AgentMode::Build && !truncated && announces_work(text) {
+        *nudges += 1;
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: "the model said what it will do but did not do it — asking it to go ahead".into(),
+        });
+        st.db.add_message(session_id, "user", &[Part::Text { text: NUDGE_TEXT.to_string() }])?;
+        return Ok(true);
+    }
+    // "I can't see your files, please paste them": the model forgot
+    // it has tools. Remind it once or twice, with the folder.
+    if *nudges < MAX_NUDGES && !truncated && !specs.is_empty() && denies_file_access(text) {
+        *nudges += 1;
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: "the model said it cannot see the files — reminding it that it has tools".into(),
+        });
+        let folder = opts.workspace.clone().unwrap_or_else(|| st.workspace_for(session_id));
+        let reminder = format!(
+            "[app] You can see the files: you have tools (list, glob, grep, read) that work in the project \
+             folder {}. Do not ask the user to paste or upload anything. Use the tools now to do what \
+             was asked.",
+            folder.display()
+        );
+        st.db.add_message(session_id, "user", &[Part::Text { text: reminder }])?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// The step's tool calls as they will run: other agents' tool names mapped
+/// to ours, the loop guard applied, and `mcp_call` unwrapped.
+fn normalize_calls(
+    st: &Shared,
+    opts: &LoopOpts,
+    session_id: &str,
+    specs: &[crate::provider::ToolSpec],
+    loop_guard: &mut LoopGuard,
+    calls: Vec<(String, String, Value)>,
+) -> Result<Vec<(String, String, Value)>> {
+    // Models trained on other agents call tools by those agents' names
+    // (`list_files`, `Bash`, `read_file`…): run them as ours.
+    let known: std::collections::HashSet<&str> = specs.iter().map(|s| s.function.name.as_str()).collect();
+    let calls: Vec<_> = calls
+        .into_iter()
+        .map(|(id, name, input)| match tool_alias(&name, &input).filter(|_| !known.contains(name.as_str())) {
+            Some((real, args)) if known.contains(real) => (id, real.to_string(), args),
+            _ => (id, name, input),
+        })
+        .collect();
+    // F-09 loop guard: an identical call repeated LOOP_GUARD_LIMIT times
+    // in a row is answered with an error and never runs (no approval
+    // prompt either). Every requested call counts, spawns included.
+    let calls = apply_loop_guard(st, opts, session_id, loop_guard, calls)?;
+    // `mcp_call` runs as the MCP tool it names: permissions, role and
+    // mode rules and the activity view all see the real tool.
+    Ok(calls
+        .into_iter()
+        .map(|(id, name, input)| match crate::mcp::unwrap_call(&name, &input) {
+            Some((inner, args)) => (id, inner, args),
+            None => (id, name, input),
+        })
+        .collect())
+}
+
+/// Execute each tool call: role gate → permission gate → route.
+/// `spawn` calls run concurrently with each other — the agents panel
+/// shows the parallel work — everything else keeps its call order.
+async fn run_tool_calls(
+    st: &Shared,
+    session_id: &str,
+    opts: &LoopOpts,
+    mode: AgentMode,
+    calls: Vec<(String, String, Value)>,
+    abort: &AtomicBool,
+) -> Result<()> {
+    // (Concrete boxed type: a `dyn Future + Send` here deadlocks the
+    // auto-trait proof for the run_loop ↔ spawn recursion.)
+    let mut spawns = Vec::new();
+    for (id, name, input) in calls {
+        let detail = tool_detail_for(st, opts, &name, &input);
+        tool_started(st, opts, session_id, &id, &name, &detail);
+        let denied = call_denied(st, session_id, opts, mode, &name, &input, &detail, abort).await;
+        if name == "spawn" && denied.is_none() {
+            let sid = session_id.to_string();
+            let inp = input.clone();
+            let fut = Box::pin(async move {
+                match crate::subagent::spawn_subagent(st, &sid, &inp, abort).await {
+                    Ok(out) => (out, true),
+                    Err(e) => (format!("error: {e:#}"), false),
+                }
+            });
+            spawns.push(((id, name, input, detail), fut));
+            continue;
+        }
+        let (output, ok) = match denied {
+            Some(m) => (m, false),
+            None => execute_for(st, session_id, opts, &name, &input, abort).await,
+        };
+        finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
+    }
+    // Join the parallel spawns; results are recorded in call order.
+    let (meta, futs): (Vec<_>, Vec<_>) = spawns.into_iter().unzip();
+    for ((id, name, input, _detail), (output, ok)) in
+        meta.into_iter().zip(futures::future::join_all(futs).await)
+    {
+        finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
+    }
+    Ok(())
+}
+
+/// Why a tool call may not run (aborted, blocked by mode/role, or refused
+/// by the user), or `None` when it may.
+#[allow(clippy::too_many_arguments)]
+async fn call_denied(
+    st: &Shared,
+    session_id: &str,
+    opts: &LoopOpts,
+    mode: AgentMode,
+    name: &str,
+    input: &Value,
+    detail: &str,
+    abort: &AtomicBool,
+) -> Option<String> {
+    // New (B-06): once the run is aborted, the remaining calls of this
+    // turn are not run (each still gets a result, so the history
+    // stays valid).
+    if abort.load(Ordering::SeqCst) {
+        Some("not run: the run was aborted".to_string())
+    } else if !tool_allowed(mode, opts, name) {
+        // Naming the tools that DO work turns "everything is
+        // blocked" flailing into one corrected call (seen live in
+        // the review run: it tried Bash twice, then claimed even
+        // grep was blocked).
+        Some(match &opts.allow {
+            Some(allow) => format!(
+                "tool blocked: this run can only call these tools: {}",
+                allow.join(", ")
+            ),
+            None => "tool blocked: not allowed in this mode/role".to_string(),
+        })
+    } else if crate::tools::is_job_control(name, input) && agent_job(input) {
+        None // reading or stopping a job it was allowed to start
+    } else if !check_permission_preview(
+        st,
+        session_id,
+        name,
+        &job_detail(name, input).unwrap_or_else(|| detail.to_string()),
+        &approval_preview(name, input),
+        abort,
+    )
+    .await
+    {
+        Some("permission denied by user".to_string())
+    } else {
+        None
+    }
+}
+
+/// The steps ran out while the model still wanted tools: say so.
+fn steps_ran_out(st: &Shared, session_id: &str, max_steps: usize) -> LoopEnd {
+    let msg = format!(
+        "stopped after {max_steps} steps (agent.max_steps) — the task may be unfinished. \
+         Send a message to continue, or raise agent.max_steps in the config."
+    );
+    let _ = st.events.send(ServerEvent::Note {
+        session_id: session_id.to_string(),
+        text: msg.clone(),
+    });
+    LoopEnd::Done(msg)
 }
 
 /// `text` without invisible characters, and `shown` (bytes of `text` already
