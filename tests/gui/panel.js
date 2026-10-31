@@ -1016,6 +1016,13 @@
   key(document.activeElement, "Escape");
   ok("Escape closes the menu and focuses the chip", gmenu.hidden && chip.getAttribute("aria-expanded") === "false" &&
     document.activeElement === chip);
+  // Changes opened from the menu: its item is hidden by close time, so focus goes to the chip.
+  click("git-chip");
+  gmenu.querySelector('.git-item[data-git="changes"]').click();
+  ok("Show changes from the git menu opens Changes", !byId("changes").hidden && gmenu.hidden);
+  key(byId("changes"), "Escape");
+  ok("closing Changes opened from the git menu focuses the chip", byId("changes").hidden && document.activeElement === chip,
+    document.activeElement && (document.activeElement.id || document.activeElement.tagName));
   window.render(payload(basePage));
 
   // Sidebar rows: Space opens, the active one is aria-current, the dot is named.

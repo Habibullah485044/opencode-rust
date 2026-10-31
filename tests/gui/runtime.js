@@ -1,8 +1,10 @@
 // Appended after the real RUNTIME_JS on a fixture page; writes PASS/FAIL into
 // #testout so `--dump-dom` can be grepped.
 (function () {
-  var frames = [];
-  window.ipc = { postMessage: function (s) { frames.push(JSON.parse(s)); } };
+  // Filled by the window.ipc stub run.sh installs before the runtime loads:
+  // the runtime binds postMessage at document creation, so stubbing it here
+  // (after) would never see a frame.
+  var frames = window.__frames;
 
   var log = [];
   function ok(n, c, x) {

@@ -6192,7 +6192,9 @@
             document.getElementById("git-new-name").focus();
             return;
           }
-          setGitMenu(false, false);
+          // Changes hands focus back to whatever had it when it opened; the
+          // item is hidden by then, so put focus on the chip first.
+          setGitMenu(false, what === "changes");
           if (what === "changes") loadChanges();
           else runFollowup(GIT_PROMPTS[what]);
         });
