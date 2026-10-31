@@ -26,6 +26,11 @@ pub struct Client {
     /// Without it a wedged provider (dead tunnel, stuck backend) freezes the
     /// agent loop until the total request timeout fires — or forever.
     stall: std::time::Duration,
+    /// `provider.request_timeout_secs`: bounds a whole non-streaming call
+    /// (`list_models`) and, for a streamed reply, only the wait for the
+    /// response headers. The streamed body has no total limit (a long
+    /// reply may stream for more than 10 min); `stall` bounds silence.
+    request_timeout: std::time::Duration,
     /// Extra tries after a failed request (`provider.max_retries`).
     max_retries: u32,
     /// Wait before the first retry; doubles each time. Tests make it tiny.
@@ -194,12 +199,13 @@ struct SseFnDelta {
 
 impl Client {
     pub fn new(base_url: &str, api_key: &str, model: &str, timeout_secs: u64) -> Result<Self> {
-        // `timeout_secs` bounds the whole request; `stall` bounds SILENCE on
-        // an established stream so a wedged provider surfaces in ≤2 min
-        // instead of freezing the run until the total timeout fires.
+        // `timeout_secs` bounds the wait for the response headers (and all
+        // of a non-streaming call); `stall` bounds SILENCE on an established
+        // stream so a wedged provider surfaces in ≤2 min. No client-wide
+        // `.timeout()`: reqwest applies it to the whole streamed body, which
+        // cut replies that streamed for longer than 10 min.
         let stall = std::time::Duration::from_secs(timeout_secs.clamp(5, 120));
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
             // Split over the host's addresses: a dead one costs 3 s (two
             // addresses) before the next is tried.
             .connect_timeout(std::time::Duration::from_secs(6))
@@ -213,6 +219,7 @@ impl Client {
             max_tokens: 8192,
             turns: Default::default(),
             stall,
+            request_timeout: std::time::Duration::from_secs(timeout_secs.max(1)),
             max_retries: 0,
             retry_base: std::time::Duration::from_secs(1),
             rate_limit_wait: std::time::Duration::ZERO,
@@ -320,9 +327,20 @@ impl Client {
             // Another request of the app hit a rate limit: wait it out too.
             self.gate.wait().await;
             attempt += 1;
+            // Only the headers are waited for here (see `request_timeout`).
+            let sent = match tokio::time::timeout(self.request_timeout, build().send()).await {
+                Ok(r) => r,
+                Err(_) => {
+                    return Err(anyhow!(
+                        "provider request to {url} timed out: no response within {}s \
+                         (provider.request_timeout_secs)",
+                        self.request_timeout.as_secs()
+                    ))
+                }
+            };
             // Each arm gives: error text, "worth retrying?", server's wait,
             // "rate limited?".
-            let (mut msg, retryable, retry_after, limited) = match build().send().await {
+            let (mut msg, retryable, retry_after, limited) = match sent {
                 Ok(resp) if resp.status().is_success() => {
                     self.key_rejected.store(false, std::sync::atomic::Ordering::Relaxed);
                     return Ok(resp);
@@ -434,7 +452,7 @@ impl Client {
         // max_tokens that does not fit.
         let limit = self.context.load(std::sync::atomic::Ordering::Relaxed);
         if limit > 0 {
-            let est = serde_json::to_string(&body).map(|s| s.len() / 4).unwrap_or(0);
+            let est = estimate_prompt_tokens(&body);
             let room = limit.saturating_sub(est).saturating_sub(256);
             if room > 0 {
                 body["max_tokens"] = json!((self.max_tokens as usize).min(room));
@@ -442,18 +460,9 @@ impl Client {
         }
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self
-            .send_body(&url, body, |body| {
-                let req = self.http.post(&url).json(body);
-                if self.api_key.is_empty() {
-                    req
-                } else {
-                    req.bearer_auth(&self.api_key)
-                }
-            })
+            .send_body(&url, body, |body| with_auth(self.http.post(&url), self.api, &self.api_key).json(body))
             .await?;
-    let byte_stream = resp.bytes_stream();
-    let event_stream = Box::pin(sse_event_stream(byte_stream, self.stall));
-    Ok(event_stream)
+        Ok(Box::pin(sse_event_stream(resp.bytes_stream(), self.stall)))
     }
 
     /// Send prompt-caching markers for this model? (`provider.prompt_cache`)
@@ -484,7 +493,8 @@ impl Client {
     /// endpoints that do not implement it (or answer with a different shape)
     /// simply yield an empty list instead of erroring the caller.
     pub async fn list_models(&self) -> Result<Vec<String>> {
-        let req = with_auth(self.http.get(format!("{}/models", self.base_url)), self.api, &self.api_key);
+        let req = with_auth(self.http.get(format!("{}/models", self.base_url)), self.api, &self.api_key)
+            .timeout(self.request_timeout);
         let resp = req.send().await?;
         if !resp.status().is_success() {
             return Ok(Vec::new());
@@ -552,95 +562,171 @@ fn add_openai_cache_markers(body: &mut Value) {
     }
 }
 
+/// What one attached image costs in prompt tokens, roughly (a ~1 MP
+/// screenshot on OpenAI's and Anthropic's tilings).
+const IMAGE_TOKENS: usize = 1_600;
+
+/// Rough prompt size of a request body in tokens: 4 bytes of JSON per
+/// token, but an attached image counts `IMAGE_TOKENS` instead of its base64
+/// (a 1 MB screenshot is not 250K tokens; counting it so dropped or
+/// omitted `max_tokens` whenever a picture went along).
+fn estimate_prompt_tokens(body: &Value) -> usize {
+    let total = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
+    let (mut images, mut image_bytes) = (0usize, 0usize);
+    for m in body["messages"].as_array().into_iter().flatten() {
+        for part in m["content"].as_array().into_iter().flatten() {
+            if let Some(url) = part["image_url"]["url"].as_str() {
+                images += 1;
+                image_bytes += url.len();
+            }
+        }
+    }
+    total.saturating_sub(image_bytes) / 4 + images * IMAGE_TOKENS
+}
+
 /// How long to wait for the usage chunk after a finish_reason when the
 /// server sends no `[DONE]`.
 const USAGE_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// One read from `SseLines::next`.
+pub(crate) enum SseRead {
+    /// A complete line, trimmed.
+    Line(String),
+    /// No bytes arrived within the wait.
+    Stalled,
+    /// The transport failed mid-stream.
+    Failed(reqwest::Error),
+    /// The server closed the stream; whatever followed the last newline
+    /// (trimmed, often empty).
+    Closed(String),
+}
+
+/// Splits an SSE byte stream into lines, waiting at most `wait` for each
+/// read. Shared by the OpenAI and Anthropic parsers, which differ only in
+/// what a line means and how long they wait. Remembers how far the buffer
+/// was already searched for a newline, so one long line arriving in many
+/// small chunks is not rescanned from the start each time.
+pub(crate) struct SseLines {
+    src: futures::stream::BoxStream<'static, reqwest::Result<bytes::Bytes>>,
+    buf: Vec<u8>,
+    /// `buf[..scanned]` holds no newline.
+    scanned: usize,
+}
+
+impl SseLines {
+    pub(crate) fn new(
+        byte_stream: impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
+    ) -> Self {
+        Self { src: Box::pin(byte_stream), buf: Vec::new(), scanned: 0 }
+    }
+
+    pub(crate) async fn next(&mut self, wait: std::time::Duration) -> SseRead {
+        loop {
+            if let Some(off) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=self.scanned + off).collect();
+                self.scanned = 0;
+                return SseRead::Line(String::from_utf8_lossy(&line).trim().to_string());
+            }
+            self.scanned = self.buf.len();
+            match tokio::time::timeout(wait, self.src.next()).await {
+                Err(_) => return SseRead::Stalled,
+                Ok(Some(Ok(bytes))) => self.buf.extend_from_slice(&bytes),
+                Ok(Some(Err(e))) => return SseRead::Failed(e),
+                Ok(None) => {
+                    let rest = String::from_utf8_lossy(&self.buf).trim().to_string();
+                    self.buf.clear();
+                    self.scanned = 0;
+                    return SseRead::Closed(rest);
+                }
+            }
+        }
+    }
+}
+
+/// Note a `data:` line whose JSON could not be read (the first few only,
+/// in core.log): silently dropping them hid a server sending a shape the
+/// parser does not know.
+pub(crate) fn log_unparsed_sse(data: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    if cfg!(test) || SEEN.fetch_add(1, Ordering::Relaxed) >= 5 {
+        return;
+    }
+    let head: String = data.chars().take(200).collect();
+    crate::server::core_log(&format!("[provider] unreadable SSE data line ({} bytes): {head}", data.len()));
+}
 
 fn sse_event_stream(
     byte_stream: impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
     stall: std::time::Duration,
 ) -> impl futures::Stream<Item = Result<StreamEvent>> + Send + 'static {
-    // Pin the inner stream so `next()` works inside the unfold closure.
-    let byte_stream = Box::pin(byte_stream);
-    // State: (source stream, line buffer, pending parsed events, the `Done`
-    // held back while the usage chunk may still come, terminal seen).
+    // State: (line reader, pending parsed events, the `Done` held back while
+    // the usage chunk may still come, terminal seen).
     futures::stream::unfold(
-        (byte_stream, Vec::<u8>::new(), std::collections::VecDeque::new(), None::<StreamEvent>, false),
-        move |(mut src, mut buf, mut pending, mut held, mut done)| async move {
+        (SseLines::new(byte_stream), std::collections::VecDeque::new(), None::<StreamEvent>, false),
+        move |(mut lines, mut pending, mut held, mut done)| async move {
             loop {
                 // 1) Emit any already-parsed event first.
                 if let Some(ev) = pending.pop_front() {
-                    return Some((Ok(ev), (src, buf, pending, held, done)));
+                    return Some((Ok(ev), (lines, pending, held, done)));
                 }
                 // 2) If we saw terminal [DONE] and drained pending, stop.
                 if done {
                     return None;
                 }
-                // 3) Extract complete lines from the buffer.
-                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=pos).collect();
-                    let line = String::from_utf8_lossy(&line).trim().to_string();
-                    // B-21: an `error` frame fails the stream loudly.
-                    if let Some(msg) = sse_error_message(&line) {
-                        return Some((Err(anyhow!("provider error: {msg}")), (src, buf, pending, held, true)));
-                    }
-                    if let Some((events, line_done)) = parse_sse_line(&line) {
-                        // B-21: `[DONE]` or a finish_reason ends the reply. A
-                        // finish_reason is held back until `[DONE]` (or a short
-                        // quiet spell): the usage chunk comes after it.
-                        for ev in events {
-                            match ev {
-                                StreamEvent::Done { .. } if held.is_none() => held = Some(ev),
-                                StreamEvent::Usage(_) => pending.push_back(ev),
-                                _ if held.is_some() => {} // nothing else after the finish
-                                _ => pending.push_back(ev),
+                // 3) Next line. Bound the wait: a silent stream means a dead
+                //    provider/tunnel — surface an error instead of hanging
+                //    the agent loop forever. After a finish_reason, wait only
+                //    briefly for the usage chunk.
+                let wait = if held.is_some() { USAGE_GRACE } else { stall };
+                match lines.next(wait).await {
+                    SseRead::Line(line) => {
+                        // B-21: an `error` frame fails the stream loudly.
+                        if let Some(msg) = sse_error_message(&line) {
+                            return Some((Err(anyhow!("provider error: {msg}")), (lines, pending, held, true)));
+                        }
+                        if let Some((events, line_done)) = parse_sse_line(&line) {
+                            // B-21: `[DONE]` or a finish_reason ends the reply. A
+                            // finish_reason is held back until `[DONE]` (or a short
+                            // quiet spell): the usage chunk comes after it.
+                            for ev in events {
+                                match ev {
+                                    StreamEvent::Done { .. } if held.is_none() => held = Some(ev),
+                                    StreamEvent::Usage(_) => pending.push_back(ev),
+                                    _ if held.is_some() => {} // nothing else after the finish
+                                    _ => pending.push_back(ev),
+                                }
+                            }
+                            if line_done {
+                                pending.extend(held.take());
+                                done = true;
                             }
                         }
-                        if line_done {
-                            pending.extend(held.take());
-                            done = true;
-                        }
                     }
-                    continue;
-                }
-                // 4) Need more bytes from the transport. Bound the wait: a
-                //    silent stream means a dead provider/tunnel — surface an
-                //    error instead of hanging the agent loop forever.
-                // After a finish_reason, wait only briefly for the usage chunk.
-                let wait = if held.is_some() { USAGE_GRACE } else { stall };
-                match tokio::time::timeout(wait, src.next()).await {
-                    Err(_) if held.is_some() => {
+                    SseRead::Stalled if held.is_some() => {
                         pending.extend(held.take());
                         done = true;
                     }
-                    Err(_) => {
+                    SseRead::Stalled => {
                         return Some((
-                            Err(anyhow!(
-                                "provider stream stalled: no data for {}s",
-                                stall.as_secs()
-                            )),
-                            (src, buf, pending, held, true),
+                            Err(anyhow!("provider stream stalled: no data for {}s", stall.as_secs())),
+                            (lines, pending, held, true),
                         ));
                     }
-                    Ok(Some(Ok(bytes))) => buf.extend_from_slice(&bytes),
-                    Ok(Some(Err(e))) => {
-                        return Some((Err(anyhow!("stream error: {e}")), (src, buf, pending, held, true)));
+                    SseRead::Failed(e) => {
+                        return Some((Err(anyhow!("stream error: {e}")), (lines, pending, held, true)));
                     }
-                    Ok(None) if held.is_some() => {
+                    SseRead::Closed(rest) if held.is_some() => {
                         // Closed after a finish_reason: the reply is complete.
-                        let rest = String::from_utf8_lossy(&buf).trim().to_string();
-                        buf.clear();
                         if let Some((events, _)) = parse_sse_line(&rest) {
                             pending.extend(events.into_iter().filter(|e| matches!(e, StreamEvent::Usage(_))));
                         }
                         pending.extend(held.take());
                         done = true;
                     }
-                    Ok(None) => {
+                    SseRead::Closed(rest) => {
                         // B-21: closed before `[DONE]` and before any finish_reason.
                         // A last line without its newline still counts.
-                        let rest = String::from_utf8_lossy(&buf).trim().to_string();
-                        buf.clear();
                         if let Some((events, line_done)) = parse_sse_line(&rest) {
                             if line_done || events.iter().any(|e| matches!(e, StreamEvent::Done { .. })) {
                                 pending.extend(events);
@@ -653,7 +739,7 @@ fn sse_event_stream(
                                 "provider stream ended early: the connection closed before \
                                  the reply was finished"
                             )),
-                            (src, buf, pending, held, true),
+                            (lines, pending, held, true),
                         ));
                     }
                 }
@@ -662,7 +748,7 @@ fn sse_event_stream(
     )
 }
 
-/// The message of a mid-stream error frame such as
+// The message of a mid-stream error frame such as
 /// `data: {"error": {"message": "..."}}` (B-21), or `None` for other lines.
 fn sse_error_message(line: &str) -> Option<String> {
     let data = line.strip_prefix("data:")?.trim();
@@ -689,7 +775,13 @@ fn parse_sse_line(line: &str) -> Option<(Vec<StreamEvent>, bool)> {
     if data == "[DONE]" {
         return Some((Vec::new(), true));
     }
-    let chunk: SseChunk = serde_json::from_str(data).ok()?;
+    let chunk: SseChunk = match serde_json::from_str(data) {
+        Ok(c) => c,
+        Err(_) => {
+            log_unparsed_sse(data);
+            return None;
+        }
+    };
     let mut events = Vec::new();
     for choice in &chunk.choices {
         // Thinking first: reasoning precedes content within a turn, and on the
@@ -1450,6 +1542,103 @@ mod tests {
             .expect("stall error should fire inside the stream, not hang the caller");
         let stalled = stalled.expect("stream item");
         assert!(stalled.is_err(), "expected a stall error after the silence");
+    }
+
+    /// `request_timeout_secs` bounds the wait for the headers, not the
+    /// streamed body: a reply that keeps streaming for longer than the
+    /// timeout must arrive whole (it was cut at 10 min before).
+    #[tokio::test]
+    async fn reply_streaming_longer_than_the_request_timeout_is_not_cut() {
+        use axum::{body::Body, routing::post, Router};
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let body = futures::stream::iter(0..6).then(|i| async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let line = if i < 5 {
+                        sse_data(&chunk(json!({"content": format!("{i}")}), Value::Null))
+                    } else {
+                        sse_data(&chunk(json!({}), json!("stop"))) + "data: [DONE]\n\n"
+                    };
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(line))
+                });
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(body))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // 1 s timeout; the reply takes ~1.8 s.
+        let client = Client::new(&format!("http://{addr}/v1"), "", "stub", 1).unwrap();
+        let s = client.stream(&client.model, &[], &[]).await.unwrap();
+        let evs: Vec<_> = s.collect().await;
+        let text: String = evs
+            .iter()
+            .map(|e| match e {
+                Ok(StreamEvent::Text(t)) => t.clone(),
+                Ok(_) => String::new(),
+                Err(e) => panic!("stream failed: {e}"),
+            })
+            .collect();
+        assert_eq!(text, "01234");
+        assert!(matches!(evs.last(), Some(Ok(StreamEvent::Done { .. }))));
+    }
+
+    /// ...but a server that never sends the headers still times out.
+    #[tokio::test]
+    async fn no_response_headers_times_out() {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                "late"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = Client::new(&format!("http://{addr}/v1"), "", "stub", 1).unwrap();
+        let started = std::time::Instant::now();
+        let err = client.stream(&client.model, &[], &[]).await.err().expect("timed out");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// An image's base64 is not counted as prompt tokens: a 400 KB data URL
+    /// with a 32K window still leaves room for a normal `max_tokens`.
+    #[test]
+    fn image_data_is_not_counted_as_prompt_tokens() {
+        let url = format!("data:image/png;base64,{}", "A".repeat(400_000));
+        let body = json!({ "messages": [
+            { "role": "user", "content": [
+                { "type": "text", "text": "look" },
+                { "type": "image_url", "image_url": { "url": url } }
+            ] }
+        ] });
+        let est = estimate_prompt_tokens(&body);
+        assert!(est >= IMAGE_TOKENS && est < IMAGE_TOKENS + 200, "{est}");
+    }
+
+    /// A long line arriving in many small chunks is split correctly (the
+    /// reader remembers how far it searched).
+    #[tokio::test]
+    async fn sse_lines_joins_a_line_split_over_many_chunks() {
+        let line = format!("data: {}\n", "x".repeat(10_000));
+        let pieces: Vec<reqwest::Result<bytes::Bytes>> = line
+            .as_bytes()
+            .chunks(7)
+            .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+            .chain(std::iter::once(Ok(bytes::Bytes::from_static(b"tail"))))
+            .collect();
+        let mut lines = SseLines::new(futures::stream::iter(pieces));
+        let wait = std::time::Duration::from_secs(5);
+        assert!(matches!(lines.next(wait).await, SseRead::Line(l) if l == line.trim()));
+        assert!(matches!(lines.next(wait).await, SseRead::Closed(r) if r == "tail"));
     }
 
     #[test]

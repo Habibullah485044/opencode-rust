@@ -283,9 +283,8 @@ mod translate_tests {
     }
 }
 
-use super::StreamEvent;
+use super::{SseLines, SseRead, StreamEvent};
 use anyhow::{anyhow, Result};
-use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// Tool-calling replies exactly as the model sent them (thinking blocks and
@@ -335,7 +334,10 @@ impl SseState {
     /// Turn one SSE line into zero or more events.
     fn line(&mut self, line: &str) -> Result<Vec<StreamEvent>> {
         let Some(data) = line.strip_prefix("data:") else { return Ok(Vec::new()) };
-        let Ok(v) = serde_json::from_str::<Value>(data.trim()) else { return Ok(Vec::new()) };
+        let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+            super::log_unparsed_sse(data.trim());
+            return Ok(Vec::new());
+        };
         let index = v["index"].as_u64().unwrap_or(0) as usize;
         let text = |s: &Value| s.as_str().unwrap_or("").to_string();
         let mut events = Vec::new();
@@ -476,45 +478,38 @@ impl SseState {
     }
 }
 
-/// Read Anthropic's SSE bytes and yield `StreamEvent`s (same line splitting
-/// and stall timeout as `sse_event_stream` in provider.rs).
+/// Read Anthropic's SSE bytes and yield `StreamEvent`s (line splitting and
+/// stall timeout shared with `sse_event_stream` via `SseLines`).
 pub(super) fn event_stream(
     byte_stream: impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
     stall: std::time::Duration,
     turns: TurnCache,
 ) -> impl futures::Stream<Item = Result<StreamEvent>> + Send + 'static {
-    let src = Box::pin(byte_stream);
     let state = SseState { turns, ..Default::default() };
     futures::stream::unfold(
-        (src, Vec::<u8>::new(), VecDeque::<StreamEvent>::new(), state, false),
-        move |(mut src, mut buf, mut pending, mut st, over)| async move {
+        (SseLines::new(byte_stream), VecDeque::<StreamEvent>::new(), state, false),
+        move |(mut lines, mut pending, mut st, over)| async move {
             loop {
                 if let Some(ev) = pending.pop_front() {
-                    return Some((Ok(ev), (src, buf, pending, st, over)));
+                    return Some((Ok(ev), (lines, pending, st, over)));
                 }
                 if over || st.finished {
                     return None;
                 }
-                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=pos).collect();
-                    let line = String::from_utf8_lossy(&line).trim().to_string();
-                    match st.line(&line) {
-                        Ok(events) => pending.extend(events),
-                        Err(e) => return Some((Err(e), (src, buf, pending, st, true))),
-                    }
-                    continue;
-                }
-                let err = match tokio::time::timeout(stall, src.next()).await {
-                    Ok(Some(Ok(bytes))) => {
-                        buf.extend_from_slice(&bytes);
-                        continue;
-                    }
-                    Err(_) => anyhow!("provider stream stalled: no data for {}s", stall.as_secs()),
-                    Ok(Some(Err(e))) => anyhow!("stream error: {e}"),
-                    Ok(None) if st.done_sent => return None,
-                    Ok(None) => anyhow!("provider closed the stream before the reply was complete"),
+                let err = match lines.next(stall).await {
+                    SseRead::Line(line) => match st.line(&line) {
+                        Ok(events) => {
+                            pending.extend(events);
+                            continue;
+                        }
+                        Err(e) => e,
+                    },
+                    SseRead::Stalled => anyhow!("provider stream stalled: no data for {}s", stall.as_secs()),
+                    SseRead::Failed(e) => anyhow!("stream error: {e}"),
+                    SseRead::Closed(_) if st.done_sent => return None,
+                    SseRead::Closed(_) => anyhow!("provider closed the stream before the reply was complete"),
                 };
-                return Some((Err(err), (src, buf, pending, st, true)));
+                return Some((Err(err), (lines, pending, st, true)));
             }
         },
     )
@@ -523,6 +518,7 @@ pub(super) fn event_stream(
 #[cfg(test)]
 mod sse_tests {
     use super::*;
+    use futures::StreamExt;
     use crate::provider::ToolCallAccumulator;
 
     /// Tool-use stream recorded from Anthropic's streaming docs (shortened).
@@ -669,6 +665,7 @@ impl super::Client {
 #[cfg(test)]
 mod e2e_tests {
     use super::*;
+    use futures::StreamExt;
     use crate::provider::{FunctionCall, ToolCallAccumulator, ToolCallReq};
     use axum::http::{header, HeaderMap, StatusCode};
     use axum::{response::IntoResponse, routing::get, routing::post, Json, Router};
