@@ -357,6 +357,45 @@ fn status(code: u16, text: &str) -> Resp {
     (axum::http::StatusCode::from_u16(code).unwrap_or(axum::http::StatusCode::NOT_FOUND), text.to_string()).into_response()
 }
 
+/// Largest file the preview server hands out.
+const MAX_SERVED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Find and read one served file. Same rule as the file tools: nothing
+/// outside the folder. The file is opened once and checked through that
+/// handle (a regular file, not too big), and its real path is checked again
+/// after opening, so swapping in a symlink between the check and the read
+/// cannot serve a file from elsewhere.
+fn read_served(root: &Path, path: &str) -> std::result::Result<(PathBuf, Vec<u8>), (u16, &'static str)> {
+    use std::io::Read;
+    let Ok(mut file) = crate::tools::confine_path(root, path) else {
+        return Err((403, "outside the served folder"));
+    };
+    if file.is_dir() {
+        file = file.join("index.html");
+    }
+    let f = std::fs::File::open(&file).map_err(|_| (404, "not found"))?;
+    let meta = f.metadata().map_err(|_| (404, "not found"))?;
+    if !meta.is_file() {
+        return Err((404, "not found"));
+    }
+    if meta.len() > MAX_SERVED_BYTES {
+        return Err((413, "file too large to preview"));
+    }
+    let inside = match (root.canonicalize(), file.canonicalize()) {
+        (Ok(r), Ok(f)) => f.starts_with(&r),
+        _ => false,
+    };
+    if !inside {
+        return Err((403, "outside the served folder"));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    f.take(MAX_SERVED_BYTES + 1).read_to_end(&mut bytes).map_err(|_| (404, "not found"))?;
+    if bytes.len() as u64 > MAX_SERVED_BYTES {
+        return Err((413, "file too large to preview"));
+    }
+    Ok((file, bytes))
+}
+
 async fn serve_file(
     axum::extract::State(p): axum::extract::State<Arc<Preview>>,
     axum::extract::Path((token, path)): axum::extract::Path<(String, String)>,
@@ -366,15 +405,12 @@ async fn serve_file(
     let Some(root) = p.roots.lock().unwrap_or_else(|e| e.into_inner()).get(&token).cloned() else {
         return status(404, "not found");
     };
-    // Same rule as the file tools: nothing outside the folder.
-    let Ok(mut file) = crate::tools::confine_path(&root, &path) else {
-        return status(403, "outside the served folder");
-    };
-    if file.is_dir() {
-        file = file.join("index.html");
-    }
-    let Ok(bytes) = std::fs::read(&file) else {
-        return status(404, "not found");
+    // Disk work off the async worker (a page may be many MB).
+    let read = tokio::task::spawn_blocking(move || read_served(&root, &path)).await;
+    let (file, bytes) = match read {
+        Ok(Ok(found)) => found,
+        Ok(Err((code, text))) => return status(code, text),
+        Err(_) => return status(500, "read failed"),
     };
     let kind = content_type(&file);
     let probe = query.as_deref().is_some_and(|q| q.split('&').any(|kv| kv == "__probe=1"));
@@ -954,6 +990,24 @@ pub fn recently_modified(root: &Path, since: std::time::SystemTime) -> Vec<PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn served_files_stay_inside_the_folder_and_bounded() {
+        let dir = std::env::temp_dir().join(format!("ocrs-serve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("site/sub")).unwrap();
+        std::fs::write(dir.join("site/index.html"), "<p>home</p>").unwrap();
+        std::fs::write(dir.join("site/sub/index.html"), "<p>sub</p>").unwrap();
+        std::fs::write(dir.join("secret.txt"), "nope").unwrap();
+        let root = dir.join("site");
+        let (_, b) = read_served(&root, "index.html").unwrap();
+        assert_eq!(b, b"<p>home</p>");
+        let (f, b) = read_served(&root, "sub").unwrap();
+        assert!(f.ends_with("index.html") && b == b"<p>sub</p>");
+        assert_eq!(read_served(&root, "../secret.txt").unwrap_err().0, 403);
+        assert_eq!(read_served(&root, "missing.html").unwrap_err().0, 404);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The pictures the model judges: real PNGs at desktop and phone width
     /// (the phone one laid out at 390px, not cropped from a wider window).
