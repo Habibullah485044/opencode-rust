@@ -678,7 +678,7 @@ mod winjob {
 }
 
 /// Put a just-started shell in its own Job Object (Windows; see `winjob`).
-fn adopt_into_job(child: &tokio::process::Child) {
+pub(crate) fn adopt_into_job(child: &tokio::process::Child) {
     #[cfg(windows)]
     if let (Some(pid), Some(handle)) = (child.id(), child.raw_handle()) {
         winjob::adopt(pid, handle);
@@ -690,7 +690,7 @@ fn adopt_into_job(child: &tokio::process::Child) {
 /// New (B-06): kill a shell and everything it started. Linux/macOS: signal
 /// the shell's process group (see `bash`). Windows: end its Job Object, and
 /// taskkill walks the tree too (a shell started before its job existed).
-async fn kill_tree(pid: Option<u32>) {
+pub(crate) async fn kill_tree(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     #[cfg(windows)]
     winjob::kill(pid);
