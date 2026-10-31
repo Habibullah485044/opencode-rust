@@ -172,6 +172,44 @@ mod tests {
         assert_eq!(day_label(11_016), "2000-02-29");
     }
 
+    /// T-082: cached tokens are priced apart from fresh input; no price,
+    /// no cost.
+    #[test]
+    fn cost_prices_cached_tokens_apart() {
+        let e = UsageEntry {
+            ts: 0,
+            session_id: String::new(),
+            model: "m".into(),
+            purpose: "chat".into(),
+            input: 1_000_000,
+            cached: 250_000,
+            cache_write: 0,
+            output: 2_000_000,
+        };
+        let p = Price { input: 4.0, cached: 1.0, output: 10.0 };
+        // 750K fresh x $4 + 250K cached x $1 + 2M out x $10 = 3 + 0.25 + 20.
+        let c = cost(&e, Some(&p)).unwrap();
+        assert!((c - 23.25).abs() < 1e-9, "{c}");
+        assert_eq!(cost(&e, None), None);
+        let odd = UsageEntry { cached: 5, input: 1, ..e.clone() };
+        assert!(cost(&odd, Some(&p)).unwrap() >= 0.0, "more cached than input does not go negative");
+    }
+
+    /// T-082: biggest cost first, then most tokens, then by name.
+    #[test]
+    fn ranked_orders_by_cost_then_tokens_then_name() {
+        let s = |cost: f64, input: u64| Sum { cost, input, ..Default::default() };
+        let map = HashMap::from([
+            ("cheap".to_string(), s(1.0, 900)),
+            ("dear".to_string(), s(5.0, 10)),
+            ("b-tie".to_string(), s(1.0, 100)),
+            ("a-tie".to_string(), s(1.0, 100)),
+            ("free".to_string(), s(0.0, 5000)),
+        ]);
+        let names: Vec<String> = ranked(map).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["dear", "cheap", "a-tie", "b-tie", "free"]);
+    }
+
     #[test]
     fn the_dashboard_adds_up_by_model_purpose_and_chat_with_costs() {
         let db = Db::open_in_memory().unwrap();

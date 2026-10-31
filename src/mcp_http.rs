@@ -5,7 +5,7 @@
 //! means "session expired". Not supported: the optional GET stream,
 //! resuming broken streams, servers that ONLY speak revision 2026-07-28.
 
-use crate::mcp::McpTool;
+use crate::mcp::{McpTool, CALL_TIMEOUT, INIT_TIMEOUT, LIST_TIMEOUT};
 use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
@@ -16,9 +16,6 @@ use std::time::Duration;
 /// The newest MCP revision that still starts with an `initialize` handshake.
 pub const HTTP_PROTOCOL_VERSION: &str = "2025-11-25";
 
-const INIT_TIMEOUT: Duration = Duration::from_secs(20);
-const LIST_TIMEOUT: Duration = Duration::from_secs(20);
-const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Largest answer read from a server, JSON or SSE. Tool results are cut to
 /// 60 KB later anyway; this only stops a broken or hostile server from
 /// filling memory.
@@ -69,6 +66,24 @@ pub struct HttpClient {
     session_id: Option<String>,
     /// The protocol version the server chose in `initialize`.
     protocol: Option<String>,
+    /// How long `tools/call` may run before it is cancelled (tests shorten it).
+    call_timeout: Duration,
+}
+
+/// T-039: end the session at the server (the spec's DELETE) when the
+/// connection goes away. Drop cannot await: best effort, on the runtime.
+impl Drop for HttpClient {
+    fn drop(&mut self) {
+        let Some(sid) = self.session_id.take() else { return };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let mut req = self.http.delete(&self.url).headers(self.extra.clone()).header("Mcp-Session-Id", sid);
+        if let Some(version) = &self.protocol {
+            req = req.header("MCP-Protocol-Version", version);
+        }
+        rt.spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(5), req.send()).await;
+        });
+    }
 }
 
 impl HttpClient {
@@ -83,7 +98,15 @@ impl HttpClient {
             extra.insert(name, value);
         }
         let http = reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build()?;
-        Ok(Self { http, url: url.to_string(), extra, next_id: 0, session_id: None, protocol: None })
+        Ok(Self {
+            http,
+            url: url.to_string(),
+            extra,
+            next_id: 0,
+            session_id: None,
+            protocol: None,
+            call_timeout: CALL_TIMEOUT,
+        })
     }
 
     /// POST one JSON-RPC message with the headers this transport needs.
@@ -292,9 +315,17 @@ impl HttpClient {
     /// back as `Err` with that text (same rules as the stdio client).
     pub async fn call_tool(&mut self, name: &str, args: &Value) -> Result<String> {
         let params = json!({ "name": name, "arguments": args });
-        let res = tokio::time::timeout(CALL_TIMEOUT, self.request("tools/call", params))
-            .await
-            .context("mcp tools/call timed out")??;
+        let res = match tokio::time::timeout(self.call_timeout, self.request("tools/call", params)).await {
+            Ok(res) => res?,
+            Err(elapsed) => {
+                // T-038: tell the server, or it keeps working on a call
+                // nobody waits for. Best effort: the error stands anyway.
+                let cancel = json!({ "requestId": self.next_id - 1, "reason": "timed out" });
+                let _ = tokio::time::timeout(Duration::from_secs(5), self.notify("notifications/cancelled", cancel))
+                    .await;
+                return Err(anyhow::Error::new(elapsed).context("mcp tools/call timed out"));
+            }
+        };
         let (is_error, text) = crate::mcp::call_result_text(&res);
         if is_error {
             bail!("{}", if text.is_empty() { "tool error" } else { text.as_str() });
@@ -319,6 +350,9 @@ mod tests {
         sessions: u32,      // how many sessions were started
         expire_once: bool,  // answer the next request with 404 once
         ping_answers: u32,  // how many of our pings the client answered
+        stall_calls: bool,  // never answer tools/call
+        cancels: Vec<Value>, // params of each notifications/cancelled
+        pub(super) deletes: u32, // DELETEs that ended the current session
     }
 
     pub(super) type FakeState = Arc<Mutex<Fake>>;
@@ -328,6 +362,11 @@ mod tests {
         if header("x-test") != "1" {
             return StatusCode::UNAUTHORIZED.into_response(); // the config header must arrive
         }
+        let stall = msg["method"] == "tools/call" && st.lock().unwrap().stall_calls;
+        if stall {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            return StatusCode::ACCEPTED.into_response();
+        }
         let mut f = st.lock().unwrap();
         let Some(method) = msg.get("method").and_then(Value::as_str) else {
             if msg["result"].is_object() {
@@ -335,6 +374,10 @@ mod tests {
             }
             return StatusCode::ACCEPTED.into_response();
         };
+        if method == "notifications/cancelled" {
+            f.cancels.push(msg["params"].clone());
+            return StatusCode::ACCEPTED.into_response();
+        }
         if method == "initialize" {
             f.sessions += 1;
             f.session = format!("s{}", f.sessions);
@@ -373,10 +416,21 @@ mod tests {
         ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
     }
 
+    /// DELETE ends the session (the MCP spec's session end).
+    async fn fake_delete(State(st): State<FakeState>, headers: HeaderMap) -> StatusCode {
+        let mut f = st.lock().unwrap();
+        let sid = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if sid != f.session {
+            return StatusCode::NOT_FOUND;
+        }
+        f.deletes += 1;
+        StatusCode::OK
+    }
+
     /// Start the fake server; returns its endpoint URL and its state.
     pub(super) async fn start(fake: Fake) -> (String, FakeState) {
         let st: FakeState = Arc::new(Mutex::new(fake));
-        let app = Router::new().route("/mcp", post(fake_mcp)).with_state(st.clone());
+        let app = Router::new().route("/mcp", post(fake_mcp).delete(fake_delete)).with_state(st.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -438,6 +492,20 @@ mod tests {
         assert_eq!(st.lock().unwrap().sessions, 2, "a new session was started");
     }
 
+    /// T-038: a call past its time limit is cancelled at the server.
+    #[tokio::test]
+    async fn a_timed_out_call_is_cancelled_at_the_server() {
+        let (url, st) = start(Fake { stall_calls: true, ..Default::default() }).await;
+        let mut c = HttpClient::new(&url, &test_headers()).unwrap();
+        c.initialize().await.unwrap();
+        c.call_timeout = Duration::from_millis(300);
+        let err = format!("{:#}", c.call_tool("echo", &json!({})).await.unwrap_err());
+        assert!(err.contains("timed out"), "{err}");
+        let cancels = st.lock().unwrap().cancels.clone();
+        assert_eq!(cancels.len(), 1, "{cancels:?}");
+        assert_eq!(cancels[0]["requestId"], json!(1), "initialize was 0, the call 1");
+    }
+
     #[tokio::test]
     async fn missing_header_and_bad_header_names_are_clear_errors() {
         let (url, _st) = start(Fake::default()).await;
@@ -467,5 +535,23 @@ mod registry_tests {
         assert_eq!(out, "echo: via registry");
         let route = reg.route("mcp__web__echo").unwrap(); // B-20's lock-free path
         assert_eq!(route.call(&json!({ "text": "via route" })).await.unwrap(), "echo: via route");
+    }
+
+    /// T-039: dropping the registry ends the HTTP session with one DELETE.
+    #[tokio::test]
+    async fn dropping_the_registry_ends_the_http_session() {
+        let (url, st) = start(Fake::default()).await;
+        let cfg = McpServerCfg { name: "web".into(), url: Some(url), headers: test_headers(), ..Default::default() };
+        let mut reg = crate::mcp::Registry::default();
+        reg.start_all(&[cfg]).await;
+        assert_eq!(st.lock().unwrap().deletes, 0);
+        drop(reg);
+        for _ in 0..100 {
+            if st.lock().unwrap().deletes > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(st.lock().unwrap().deletes, 1);
     }
 }

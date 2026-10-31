@@ -133,4 +133,22 @@ mod tests {
         assert!(msg.contains("- a.txt:2: keep it lowercase"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// T-084: comments on two files, each with its line number, in order.
+    #[test]
+    fn comments_message_names_file_and_line() {
+        let msg = comments_message(&[
+            ("src/a.rs".into(), 12, "  rename this  ".into()),
+            ("web/index.html".into(), 3, "wrong title".into()),
+            ("src/a.rs".into(), 40, "and this".into()),
+        ]);
+        assert_eq!(
+            msg,
+            "Review comments on your changes — address each one:\n\
+             - src/a.rs:12: rename this\n\
+             - web/index.html:3: wrong title\n\
+             - src/a.rs:40: and this\n"
+        );
+        assert_eq!(comments_message(&[]).lines().count(), 1, "just the heading");
+    }
 }

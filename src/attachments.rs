@@ -28,7 +28,8 @@ fn ready_dir(workspace: &Path) -> Result<PathBuf> {
 }
 
 /// A file name that is safe on every OS, prefixed with a time stamp.
-fn safe_name(name: &str) -> String {
+/// `n` > 0 adds a number after the stamp, for a name already taken.
+fn safe_name(name: &str, n: u32) -> String {
     let base = Path::new(name).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let clean: String = base
         .chars()
@@ -37,16 +38,37 @@ fn safe_name(name: &str) -> String {
         .collect();
     let clean = if clean.trim_matches(['.', '_']).is_empty() { "file".to_string() } else { clean };
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    format!("{stamp}-{clean}")
+    if n == 0 {
+        format!("{stamp}-{clean}")
+    } else {
+        format!("{stamp}-{n}-{clean}")
+    }
+}
+
+/// Create a new attachment file for `name`. Two pastes of the same name in
+/// the same millisecond must not overwrite each other: the file is created
+/// only if it does not exist yet, else the next number is tried.
+fn create_unique(workspace: &Path, name: &str) -> Result<(PathBuf, std::fs::File)> {
+    let dir = ready_dir(workspace)?;
+    for n in 0..1000 {
+        let path = dir.join(safe_name(name, n));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => return Ok((path, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("creating {}", path.display()))),
+        }
+    }
+    Err(anyhow!("no free attachment name for {name}"))
 }
 
 /// Save bytes (a pasted or dropped file) as an attachment.
 pub fn save_bytes(workspace: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    use std::io::Write;
     if bytes.len() as u64 > MAX_BYTES {
         return Err(anyhow!("{name} is larger than {} MB", MAX_BYTES / 1024 / 1024));
     }
-    let path = ready_dir(workspace)?.join(safe_name(name));
-    std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    let (path, mut file) = create_unique(workspace, name)?;
+    file.write_all(bytes).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
 }
 
@@ -56,8 +78,9 @@ pub fn copy_in(workspace: &Path, src: &Path) -> Result<PathBuf> {
     if size > MAX_BYTES {
         return Err(anyhow!("{} is larger than {} MB", src.display(), MAX_BYTES / 1024 / 1024));
     }
-    let path = ready_dir(workspace)?.join(safe_name(&src.to_string_lossy()));
-    std::fs::copy(src, &path).with_context(|| format!("copying {}", src.display()))?;
+    let mut from = std::fs::File::open(src).with_context(|| format!("reading {}", src.display()))?;
+    let (path, mut file) = create_unique(workspace, &src.to_string_lossy())?;
+    std::io::copy(&mut from, &mut file).with_context(|| format!("copying {}", src.display()))?;
     Ok(path)
 }
 
@@ -155,7 +178,7 @@ pub fn data_url(path: &Path) -> Option<String> {
 /// Can `model` take images? `setting` is `provider.images`: "on", "off",
 /// or "auto" (guess from the model name).
 pub fn model_sees_images(setting: &str, model: &str) -> bool {
-    match setting.trim() {
+    match setting.trim().to_ascii_lowercase().as_str() {
         "on" => true,
         "off" => false,
         _ => {
@@ -265,6 +288,42 @@ mod tests {
         assert_eq!(msgs[3]["role"], "user");
         assert_eq!(msgs[3]["content"][1]["type"], "image_url");
         assert!(msgs[2]["content"].is_string(), "the tool result itself stays text");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// T-079: only the file name is kept, made safe, capped at 80 chars.
+    #[test]
+    fn safe_names() {
+        let rest = |n: &str| safe_name(n, 0).split_once('-').unwrap().1.to_string();
+        assert_eq!(rest("some/dir\\deep/notes.txt"), "notes.txt");
+        assert_eq!(rest("héllo wörld.png"), "héllo_wörld.png", "letters of any script stay");
+        assert_eq!(rest("..."), "file");
+        assert_eq!(rest("a?*:"), "a___");
+        let long = format!("{}.txt", "x".repeat(200));
+        assert_eq!(rest(&long).chars().count(), 80);
+        let numbered = safe_name("a.txt", 3);
+        assert!(numbered.ends_with("-3-a.txt"), "{numbered}");
+    }
+
+    /// T-033: `provider.images` ignores letter case.
+    #[test]
+    fn the_images_setting_ignores_case() {
+        assert!(model_sees_images("ON", "deepseek/deepseek-chat"));
+        assert!(model_sees_images(" On ", "deepseek/deepseek-chat"));
+        assert!(!model_sees_images("OFF", "gpt-4o"));
+    }
+
+    /// T-036: the same name saved twice at once gives two files.
+    #[test]
+    fn the_same_name_twice_gives_two_files() {
+        let ws = std::env::temp_dir().join(format!("ocrs-attach-twice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let paths: Vec<PathBuf> = (0..20).map(|i| save_bytes(&ws, "paste.png", &[i]).unwrap()).collect();
+        let unique: std::collections::HashSet<&PathBuf> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "{paths:?}");
+        for (i, p) in paths.iter().enumerate() {
+            assert_eq!(std::fs::read(p).unwrap(), [i as u8], "nothing was overwritten");
+        }
         let _ = std::fs::remove_dir_all(&ws);
     }
 

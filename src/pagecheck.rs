@@ -92,6 +92,9 @@ impl Report {
 // ------------------------------------------------------------------ browser
 
 /// Edge or Chrome on this machine. `OPENCODE_RUST_BROWSER` picks one.
+/// The search runs once per process (about 10 paths plus every PATH
+/// folder, on every check_page call before T-065); the override is read
+/// each time, so it still wins.
 pub fn find_browser() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("OPENCODE_RUST_BROWSER") {
         let p = PathBuf::from(p.trim());
@@ -99,6 +102,18 @@ pub fn find_browser() -> Option<PathBuf> {
             return Some(p);
         }
     }
+    static FOUND: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FOUND.get_or_init(probe_browser).clone()
+}
+
+/// How often `probe_browser` ran (tests).
+#[cfg(test)]
+static PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Look for Edge or Chrome in the usual places, then on PATH.
+fn probe_browser() -> Option<PathBuf> {
+    #[cfg(test)]
+    let _ = PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut tries: Vec<PathBuf> = Vec::new();
     for var in ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"] {
         if let Ok(dir) = std::env::var(var) {
@@ -346,6 +361,13 @@ fn content_type(path: &Path) -> &'static str {
         Some("woff") => "font/woff",
         Some("ttf") => "font/ttf",
         Some("txt" | "md") => "text/plain; charset=utf-8",
+        // `WebAssembly.instantiateStreaming` refuses wasm of any other type.
+        Some("wasm") => "application/wasm",
+        Some("avif") => "image/avif",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("xml") => "application/xml",
+        Some("map") => "application/json",
         _ => "application/octet-stream",
     }
 }
@@ -985,6 +1007,53 @@ pub fn recently_modified(root: &Path, since: std::time::SystemTime) -> Vec<PathB
         }
     }
     out
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    /// T-045/T-080: the small helpers, one table each.
+    #[test]
+    fn path_type_and_text_helpers() {
+        for (rel, want) in [
+            ("index.html", "index.html"),
+            (r"sub\page.html", "sub/page.html"),
+            ("./a/b.css", "a/b.css"),
+            (r".\x.js", "x.js"),
+            ("/abs.png", "abs.png"),
+        ] {
+            assert_eq!(url_path(rel), want, "{rel}");
+        }
+        for (name, want) in [
+            ("a.HTML", "text/html; charset=utf-8"),
+            ("a.Js", "text/javascript; charset=utf-8"),
+            ("a.PNG", "image/png"),
+            ("a.wasm", "application/wasm"),
+            ("a.avif", "image/avif"),
+            ("a.mp4", "video/mp4"),
+            ("a.webm", "video/webm"),
+            ("a.xml", "application/xml"),
+            ("app.js.map", "application/json"),
+            ("a.unknownext", "application/octet-stream"),
+            ("noext", "application/octet-stream"),
+        ] {
+            assert_eq!(content_type(Path::new(name)), want, "{name}");
+        }
+        assert_eq!(html_unescape("&lt;b&gt; &quot;x&quot; &amp;lt;"), "<b> \"x\" &lt;");
+        assert_eq!(between("a [x] b", "[", "]"), Some("x"));
+        assert_eq!(between("a [x b", "[", "]"), None);
+        assert_eq!(between("no start", "[", "]"), None);
+    }
+
+    /// T-065: the browser search runs once; later calls use the result.
+    #[test]
+    fn the_browser_is_looked_for_once() {
+        let first = find_browser();
+        let second = find_browser();
+        assert_eq!(first, second);
+        assert!(PROBES.load(std::sync::atomic::Ordering::SeqCst) <= 1);
+    }
 }
 
 #[cfg(test)]

@@ -254,16 +254,9 @@ fn snap_root(state_dir: &Path, workspace: &Path) -> PathBuf {
     state_dir.join(format!("snaps_{:016x}", fnv1a(key.as_bytes())))
 }
 
-/// 64-bit FNV-1a: fixed across builds and Rust versions (folder names and
-/// stored hashes depend on it).
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
+// 64-bit FNV-1a: fixed across builds and Rust versions (folder names and
+// stored hashes depend on it; pinned in snapshot_folder_name_is_stable).
+use crate::hash::fnv1a64 as fnv1a;
 
 fn read_stack(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path)

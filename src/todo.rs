@@ -84,19 +84,28 @@ impl TodoStore {
     /// Store kept in the database file at `path` (the same file as `Db`).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
+        // `Db` writes to the same file on its own connection: wait for its
+        // write lock instead of failing with "database is locked".
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(TODO_SCHEMA)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
+    /// The connection. A panic while another thread held it does not make
+    /// every later todo call panic too (as `Db::conn`).
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn exec(&self, session_id: &str, op: TodoOp) -> TodoResult {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         exec_sql(&conn, session_id, op).unwrap_or_else(|e| TodoResult::Failed { error: e.to_string() })
     }
 
 
     /// Snapshot all todos for a session (used by `/todos` command or display).
     pub fn list_all(&self, session_id: &str) -> Vec<TodoItem> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         list_sql(&conn, session_id).unwrap_or_default()
     }
 }
@@ -264,5 +273,55 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    /// `Db` and two `TodoStore`s write to one file at once from three
+    /// threads: every write waits its turn, none fails with "locked".
+    #[test]
+    fn todo_writes_wait_for_other_writers_on_the_same_file() {
+        let path = std::env::temp_dir().join(format!("ocrs-todos-busy-{}.db", std::process::id()));
+        let db = crate::db::Db::open(&path).unwrap();
+        let a = std::sync::Arc::new(TodoStore::open(&path).unwrap());
+        let b = TodoStore::open(&path).unwrap();
+        let s = db.create_session("busy", None).unwrap();
+        let writer = std::thread::spawn(move || {
+            for i in 0..100 {
+                db.add_message(&s.id, "user", &[crate::db::Part::Text { text: format!("m{i}") }]).unwrap();
+            }
+        });
+        let a2 = a.clone();
+        let todos = std::thread::spawn(move || {
+            for i in 0..100 {
+                let r = a2.exec("s1", TodoOp::Add { content: format!("a{i}") });
+                assert!(matches!(r, TodoResult::Added { .. }), "{r:?}");
+            }
+        });
+        for i in 0..100 {
+            let r = b.exec("s2", TodoOp::Add { content: format!("b{i}") });
+            assert!(matches!(r, TodoResult::Added { .. }), "{r:?}");
+        }
+        writer.join().unwrap();
+        todos.join().unwrap();
+        assert_eq!(a.list_all("s1").len(), 100);
+        assert_eq!(b.list_all("s2").len(), 100);
+        drop((a, b));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// A panic while the connection was held does not break later calls.
+    #[test]
+    fn a_poisoned_lock_does_not_break_later_calls() {
+        let store = std::sync::Arc::new(TodoStore::new());
+        let s2 = store.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = s2.conn();
+            panic!("boom");
+        })
+        .join();
+        assert!(store.conn.is_poisoned());
+        assert!(matches!(store.exec("s", TodoOp::Add { content: "x".into() }), TodoResult::Added { .. }));
+        assert_eq!(store.list_all("s").len(), 1);
     }
 }
