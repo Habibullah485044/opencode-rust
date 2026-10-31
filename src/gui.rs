@@ -3186,7 +3186,11 @@ impl Bridge {
             let _ = req.reply.send(Err("the preview panel is not available".into()));
             return;
         };
-        // S-12: random ids, so a page cannot answer a request it never got.
+        // S-12: random ids, so a page cannot answer a request before it is
+        // sent. A page DOES see the id of a request it runs, so it could
+        // still tamper with that reply; `__habi` is frozen and captures
+        // postMessage/JSON.stringify at document creation to make that
+        // harder, and page output is labelled untrusted for the model.
         self.counter += 1;
         let mut id = unguessable_id(self.counter);
         while self.pending.contains_key(&id) {
@@ -3233,8 +3237,7 @@ impl Bridge {
                         .unwrap_or(500)
                         .clamp(1, MAX_WAIT_MS);
                     let js = format!(
-                        "setTimeout(function(){{window.ipc.postMessage(JSON.stringify(\
-                         {{hab:{id},ok:true,result:{{\"slept_ms\":{ms}}}}}));}}, {ms});"
+                        "setTimeout(function(){{window.__habi.reply({id},true,{{\"slept_ms\":{ms}}});}}, {ms});"
                     );
                     self.pending.insert(id, (req.reply, deadline));
                     let _ = wv.evaluate_script(&js);
