@@ -801,12 +801,15 @@ impl Db {
         Ok(t)
     }
 
-    /// New (F-12): delete a session and its messages in one transaction.
+    /// New (F-12): delete a session, its messages and its mission in one
+    /// transaction (missions have no foreign key, so nothing cascades).
     /// False when the id is unknown.
     pub fn delete_session(&self, id: &str) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM messages WHERE session_id=?1", params![id])?;
+        tx.execute("DELETE FROM mission_steps WHERE session_id=?1", params![id])?;
+        tx.execute("DELETE FROM missions WHERE session_id=?1", params![id])?;
         let n = tx.execute("DELETE FROM sessions WHERE id=?1", params![id])?;
         tx.commit()?;
         Ok(n > 0)
@@ -843,7 +846,11 @@ impl Db {
         let mut conn = self.conn();
         let json = serde_json::to_string(&m.parts)?;
         // The message and the session's timestamp change together or not at all.
-        let tx = conn.transaction()?;
+        // IMMEDIATE: this reads before it writes, and a read transaction
+        // that must turn into a write while another connection (TodoStore,
+        // a second window) wrote meanwhile fails at once with "locked",
+        // without waiting on busy_timeout.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Messages are read back ordered by `created_at`: a clock that steps
         // back must not put a tool result before its call. Each message is
         // at least 1 ms after the chat's newest one.
@@ -920,7 +927,8 @@ impl Db {
         summary: &str,
     ) -> Result<()> {
         let mut conn = self.conn();
-        let tx = conn.transaction()?;
+        // IMMEDIATE: reads before it writes (see `insert_message`).
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut first_at: Option<i64> = None;
         {
             let mut find =
@@ -1045,6 +1053,24 @@ mod mission_tests {
         let m = db.mission(&s.id).unwrap().unwrap();
         assert_eq!(m.steps.len(), 1);
         assert!(m.deep, "the deep flag is kept so resume carries it on");
+    }
+
+    /// Deleting a chat takes its mission and steps with it.
+    #[test]
+    fn deleting_a_session_deletes_its_mission() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("m", None).unwrap();
+        let other = db.create_session("keep", None).unwrap();
+        db.mission_start(&s.id, "goal", &["a".into(), "b".into()], false).unwrap();
+        db.mission_start(&other.id, "other", &["c".into()], false).unwrap();
+        assert!(db.delete_session(&s.id).unwrap());
+        assert!(db.mission(&s.id).unwrap().is_none());
+        let steps: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM mission_steps WHERE session_id=?1", params![s.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(steps, 0);
+        assert_eq!(db.mission(&other.id).unwrap().unwrap().steps.len(), 1, "other chats keep theirs");
     }
 }
 
@@ -1485,6 +1511,60 @@ mod schema_tests {
         .join();
         assert!(db.conn.is_poisoned());
         db.create_session("still works", None).unwrap();
+    }
+
+    /// Rewind removes the message and everything after it; two messages
+    /// with the same `created_at` are ordered by rowid, and an id from
+    /// another chat is an error that deletes nothing.
+    #[test]
+    fn delete_messages_from_breaks_time_ties_by_rowid() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("r", None).unwrap();
+        let other = db.create_session("o", None).unwrap();
+        let text = |t: &str| vec![Part::Text { text: t.into() }];
+        let a = db.add_message(&s.id, "user", &text("a")).unwrap();
+        let b = db.add_message(&s.id, "assistant", &text("b")).unwrap();
+        let c = db.add_message(&s.id, "user", &text("c")).unwrap();
+        let o = db.add_message(&other.id, "user", &text("o")).unwrap();
+        // insert_message keeps times apart; force the tie by hand.
+        db.conn()
+            .execute("UPDATE messages SET created_at=?1 WHERE id IN (?2, ?3)", params![b.created_at, b.id, c.id])
+            .unwrap();
+        assert!(db.delete_messages_from(&s.id, &o.id).is_err(), "an id from another chat");
+        assert_eq!(db.messages(&s.id).unwrap().len(), 3);
+        // `c` shares b's time but came later: only it goes.
+        assert_eq!(db.delete_messages_from(&s.id, &c.id).unwrap(), 1);
+        let ids: Vec<String> = db.messages(&s.id).unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, [a.id.clone(), b.id.clone()]);
+        assert_eq!(db.delete_messages_from(&s.id, &b.id).unwrap(), 1);
+        assert_eq!(db.messages(&s.id).unwrap().len(), 1);
+        assert_eq!(db.messages(&other.id).unwrap().len(), 1, "the other chat is untouched");
+    }
+
+    /// `usage_totals` filters by chat and by the last N days.
+    #[test]
+    fn usage_totals_filter_by_session_and_days() {
+        let db = Db::open_in_memory().unwrap();
+        let today = now_ms() / 86_400_000;
+        let put = |sid: &str, day: i64, input: i64| {
+            db.conn()
+                .execute(
+                    "INSERT INTO usage (session_id, day, requests, input, cached, cache_write, output)
+                     VALUES (?1, ?2, 1, ?3, 0, 0, 0)",
+                    params![sid, day, input],
+                )
+                .unwrap();
+        };
+        put("s1", today, 10);
+        put("s1", today - 6, 20);
+        put("s1", today - 8, 40);
+        put("s2", today, 100);
+        assert_eq!(db.usage_totals(None, None).unwrap().input, 170);
+        assert_eq!(db.usage_totals(Some("s1"), None).unwrap().input, 70);
+        let week = db.usage_totals(Some("s1"), Some(7)).unwrap();
+        assert_eq!((week.requests, week.input), (2, 30), "8 days ago is outside 7 days");
+        assert_eq!(db.usage_totals(None, Some(1)).unwrap().input, 110);
+        assert_eq!(db.usage_totals(Some("nobody"), None).unwrap().requests, 0);
     }
 
     #[tokio::test]
