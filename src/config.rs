@@ -479,6 +479,10 @@ impl Config {
             for key in unknown_config_keys(&text, &cfg) {
                 eprintln!("warning: {}: unknown key `{key}` (ignored)", path.display());
             }
+            for w in cfg.value_warnings() {
+                eprintln!("warning: {}: {w}", path.display());
+            }
+            cfg.check_ranges().with_context(|| format!("checking {}", path.display()))?;
             cfg
         } else {
             Config::default()
@@ -513,6 +517,33 @@ impl Config {
             .with_context(|| format!("checking [permissions] in {}", path.display()))?;
         let _ = workspace; // reserved: project-level .opencode-rust.toml in M2
         Ok(cfg)
+    }
+
+    /// Values that parse but mean nothing to this version: shown as
+    /// warnings at load, the config still loads.
+    pub fn value_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let images = self.provider.images.trim().to_ascii_lowercase();
+        if !matches!(images.as_str(), "auto" | "on" | "off") {
+            out.push(format!(
+                "provider.images = {:?} is not \"auto\", \"on\" or \"off\" (\"auto\" is used)",
+                self.provider.images
+            ));
+        }
+        if self.browser.profile_dir.is_some() {
+            out.push("browser.profile_dir is not used yet and has no effect".to_string());
+        }
+        out
+    }
+
+    /// Values out of range: an error naming the key, so startup stops.
+    pub fn check_ranges(&self) -> Result<()> {
+        if let Some(t) = self.provider.temperature {
+            if !(0.0..=2.0).contains(&t) {
+                anyhow::bail!("provider.temperature = {t} is out of range (use 0.0 to 2.0)");
+            }
+        }
+        Ok(())
     }
 
     pub fn effective_base_url(&self) -> Result<String> {
@@ -561,29 +592,37 @@ pub fn unknown_config_keys(text: &str, cfg: &Config) -> Vec<String> {
 /// the app starts and opens Settings instead of failing (nothing listens).
 pub const SETUP_PLACEHOLDER_URL: &str = "http://127.0.0.1:9/v1";
 
+/// An environment variable, `None` when unset or empty: the XDG spec says
+/// an empty value counts as unset (else the path would be relative).
+fn env_set(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
 pub fn default_config_path() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".config")
-        });
+    config_path_from(env_set)
+}
+
+fn config_path_from(env: impl Fn(&str) -> Option<String>) -> PathBuf {
+    let base = env("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        let home = env("USERPROFILE").or_else(|| env("HOME")).unwrap_or_else(|| ".".into());
+        PathBuf::from(home).join(".config")
+    });
     base.join("opencode-rust").join("config.toml")
 }
 
 pub fn default_state_dir() -> PathBuf {
+    state_dir_from(env_set)
+}
+
+fn state_dir_from(env: impl Fn(&str) -> Option<String>) -> PathBuf {
     // Windows: %APPDATA%\opencode-rust; elsewhere XDG data dir.
-    if let Ok(appdata) = std::env::var("APPDATA") {
+    if let Some(appdata) = env("APPDATA") {
         return PathBuf::from(appdata).join("opencode-rust");
     }
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".local").join("share")
-        });
+    let base = env("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        let home = env("HOME").unwrap_or_else(|| ".".into());
+        PathBuf::from(home).join(".local").join("share")
+    });
     base.join("opencode-rust")
 }
 
@@ -774,11 +813,76 @@ mod key_binding_tests {
         assert_eq!(choose_api_key("https://a.example/v1", None, &cands).0, "saved");
     }
 
+    /// T-092: the origin a key is bound to.
+    #[test]
+    fn key_origin_keeps_scheme_host_and_port_only() {
+        assert_eq!(key_origin("https://API.Example.com/v1/chat?x=1#f"), "https://api.example.com");
+        assert_eq!(key_origin("https://api.example.com:443/v1"), "https://api.example.com", "default port dropped");
+        assert_eq!(key_origin("http://localhost:8080/v1"), "http://localhost:8080");
+        assert_eq!(key_origin("  https://a.example/  "), "https://a.example");
+        // No host: the address itself, lower case, without a trailing slash.
+        assert_eq!(key_origin("Not A URL/"), "not a url");
+    }
+
     #[test]
     fn debug_output_does_not_show_the_api_key() {
         let p = ProviderCfg { api_key: "sk-very-secret".into(), ..Default::default() };
         let shown = format!("{p:?}");
         assert!(!shown.contains("sk-very-secret"), "{shown}");
         assert!(shown.contains("<redacted>"));
+    }
+}
+
+#[cfg(test)]
+mod value_tests {
+    use super::*;
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string()).filter(|v| !v.is_empty())
+    }
+
+    /// T-032: an empty XDG/APPDATA value counts as unset, never as "" (a
+    /// path relative to the working folder).
+    #[test]
+    fn empty_xdg_values_fall_back_to_home() {
+        let vars = [("XDG_CONFIG_HOME", ""), ("HOME", "/home/u"), ("APPDATA", ""), ("XDG_DATA_HOME", "")];
+        assert_eq!(
+            config_path_from(env(&vars)),
+            Path::new("/home/u").join(".config").join("opencode-rust").join("config.toml")
+        );
+        assert_eq!(state_dir_from(env(&vars)), Path::new("/home/u").join(".local").join("share").join("opencode-rust"));
+        let set = [("XDG_CONFIG_HOME", "/x"), ("APPDATA", "C:/AppData")];
+        assert_eq!(config_path_from(env(&set)), Path::new("/x").join("opencode-rust").join("config.toml"));
+        assert_eq!(state_dir_from(env(&set)), Path::new("C:/AppData").join("opencode-rust"));
+    }
+
+    /// T-033/T-048: unknown `provider.images` values and the unused
+    /// `browser.profile_dir` are warned about.
+    #[test]
+    fn odd_values_are_warned_about() {
+        let mut c = Config::default();
+        assert!(c.value_warnings().is_empty());
+        c.provider.images = "ON".into();
+        assert!(c.value_warnings().is_empty(), "letter case does not matter");
+        c.provider.images = "yes".into();
+        let w = c.value_warnings();
+        assert!(w.len() == 1 && w[0].contains("provider.images = \"yes\""), "{w:?}");
+        c.provider.images = "auto".into();
+        c.browser.profile_dir = Some("C:/p".into());
+        let w = c.value_warnings();
+        assert!(w.len() == 1 && w[0].contains("browser.profile_dir"), "{w:?}");
+    }
+
+    /// T-034: a temperature outside 0..=2 stops startup, naming the key.
+    #[test]
+    fn temperature_out_of_range_is_an_error() {
+        let c: Config = toml::from_str("[provider]\ntemperature = 5\n").unwrap();
+        let err = c.check_ranges().unwrap_err().to_string();
+        assert!(err.contains("provider.temperature"), "{err}");
+        for ok in [0.0, 0.7, 2.0] {
+            let c = Config { provider: ProviderCfg { temperature: Some(ok), ..Default::default() }, ..Default::default() };
+            assert!(c.check_ranges().is_ok(), "{ok}");
+        }
+        assert!(Config::default().check_ranges().is_ok(), "unset is fine");
     }
 }
