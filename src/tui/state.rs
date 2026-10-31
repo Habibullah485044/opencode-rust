@@ -136,8 +136,7 @@ impl TeamState {
     pub fn feed(&mut self, text: &str) {
         self.pending.push_str(text);
         let mut rest = std::mem::take(&mut self.pending);
-        loop {
-            let Some(nl) = rest.find('\n') else { break };
+        while let Some(nl) = rest.find('\n') {
             let line = rest[..nl].to_string();
             rest = rest[nl + 1..].to_string();
             self.feed_line(line.trim());
@@ -1239,6 +1238,12 @@ impl App {
                 }
             }
         }
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

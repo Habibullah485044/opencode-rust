@@ -40,6 +40,26 @@ jobs:
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo test --locked --no-default-features
 
+  lint:
+    name: Clippy (core, no GUI feature)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+
+  audit:
+    name: Dependency advisories (RustSec)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   windows:
     name: Windows (full build + GUI page tests)
     runs-on: windows-latest

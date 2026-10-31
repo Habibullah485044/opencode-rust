@@ -141,6 +141,7 @@ pub fn apply(abs: &Path, expected_old: &str, new: &str) -> Result<()> {
 ///   the first line of the old file;
 /// - the last non-empty line is a closing fence with the same backticks;
 /// - the old file does not itself start with a fence line.
+///
 /// Fences between the first and the last line are kept as they are.
 pub fn strip_fences(reply: &str, old: &str) -> String {
     let lines: Vec<&str> = reply.lines().collect();
@@ -232,6 +233,7 @@ impl JumpTracker {
     }
 
     /// Cycle forward with wrap-around. `None` when no sites are recorded.
+    #[allow(clippy::should_implement_trait)] // wraps around forever; not an Iterator
     pub fn next(&mut self) -> Option<JumpSite> {
         if self.sites.is_empty() {
             return None;

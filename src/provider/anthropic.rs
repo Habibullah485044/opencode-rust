@@ -77,10 +77,10 @@ pub(super) fn request_body(
         };
         push_merged(&mut out, role, blocks);
     }
-    if out.first().map_or(true, |m| m["role"] != "user") {
+    if out.first().is_none_or(|m| m["role"] != "user") {
         out.insert(0, json!({ "role": "user", "content": [{ "type": "text", "text": "(continued)" }] }));
     }
-    if out.last().map_or(false, |m| m["role"] == "assistant") {
+    if out.last().is_some_and(|m| m["role"] == "assistant") {
         push_merged(&mut out, "user", text_block("Continue."));
     }
     let mut body = json!({ "model": model, "max_tokens": max_tokens, "messages": out, "stream": true });
@@ -596,7 +596,7 @@ data: {"type":"message_stop"}
     #[tokio::test]
     async fn errors_cut_off_streams_and_tools_without_arguments() {
         let overloaded = "data: {\"type\": \"error\", \"error\": {\"type\": \"overloaded_error\", \"message\": \"Overloaded\"}}\n";
-        let err = run(overloaded).await.pop().unwrap().err().expect("error event must surface");
+        let err = run(overloaded).await.pop().unwrap().expect_err("error event must surface");
         assert!(err.to_string().contains("overloaded_error"), "{err}");
 
         let cut = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n";
@@ -735,11 +735,13 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = crate::config::ProviderCfg::default();
-        cfg.api_key = "sk-test".into();
-        cfg.model = "claude-sonnet-5-5".into();
-        cfg.api = crate::config::ProviderApi::Anthropic;
-        cfg.max_tokens = 321;
+        let cfg = crate::config::ProviderCfg {
+            api_key: "sk-test".into(),
+            model: "claude-sonnet-5-5".into(),
+            api: crate::config::ProviderApi::Anthropic,
+            max_tokens: 321,
+            ..Default::default()
+        };
         let client = crate::provider::Client::from_cfg(&format!("http://{addr}/v1"), &cfg).unwrap();
         let msg = |role: &str, text: Option<&str>| ChatMsg {
             role: role.into(),

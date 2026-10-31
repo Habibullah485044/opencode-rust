@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 /// 2. the config file: `$OPENCODE_RUST_CONFIG` when set (it must exist),
 ///    otherwise `~/.config/opencode-rust/config.toml` (skipped when missing);
 /// 3. built-in defaults.
+///
 /// Unknown keys in the file are reported on stderr and ignored.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
@@ -72,6 +73,7 @@ pub struct McpCfg {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct McpServerCfg {
     pub name: String,
     pub command: String,
@@ -83,17 +85,6 @@ pub struct McpServerCfg {
     pub headers: HashMap<String, String>,
 }
 
-impl Default for McpServerCfg {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            command: String::new(),
-            args: Vec::new(),
-            url: None,
-            headers: HashMap::new(),
-        }
-    }
-}
 
 /// Which wire protocol the provider speaks (`provider.api`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -373,14 +364,12 @@ pub struct RuleCfg {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ServerCfg {
     /// Loopback only, by design. 0 = ephemeral port (tests).
     pub port: u16,
 }
 
-impl Default for ServerCfg {
-    fn default() -> Self { Self { port: 0 } }
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]

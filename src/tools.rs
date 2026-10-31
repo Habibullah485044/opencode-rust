@@ -862,6 +862,7 @@ pub(crate) fn msys_to_windows(raw: &str) -> Option<String> {
 ///    symlinks). A symlink leading outside, or a broken symlink, is refused.
 /// 4. The result keeps the workspace prefix as `workspace` spells it (no
 ///    `\\?\` prefix on Windows).
+///
 /// Like [`confine_path`], for tools that only read (`read`, `list`): also
 /// allows the user's skills folder (`~/.config/opencode-rust/skills`), so a
 /// skill installed for every project can be read with its reference files.

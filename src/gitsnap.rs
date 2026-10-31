@@ -904,7 +904,7 @@ mod tests {
             .expect("snapshot in a git repo");
         assert_eq!(snap.label, "pre-run");
         assert!(snap.present.contains(&"a.txt".to_string()));
-        assert!(snap.present.contains(&"b.txt".to_string()) == false, "b.txt was deleted");
+        assert!(!snap.present.contains(&"b.txt".to_string()), "b.txt was deleted");
         assert!(snap.absent.iter().any(|p| p == "b.txt"));
         assert!(snap.base_sha.is_some());
 

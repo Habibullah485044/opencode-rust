@@ -4279,7 +4279,7 @@ mod tests {
     /// B-36: every wait must end before the 25 s request deadline.
     #[test]
     fn wait_budget_stays_below_the_request_deadline() {
-        assert!(MAX_WAIT_MS + 2_000 < 25_000);
+        const { assert!(MAX_WAIT_MS + 2_000 < 25_000) };
     }
 
     #[test]

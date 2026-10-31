@@ -56,8 +56,7 @@ async fn main() {
                 let is_browser_smoke = first_user.contains("browser-smoke");
                 let last_tool = msgs
                     .iter()
-                    .filter(|m| m["role"] == "tool")
-                    .last()
+                    .rfind(|m| m["role"] == "tool")
                     .and_then(|m| m["content"].as_str())
                     .unwrap_or("")
                     .to_string();
@@ -96,7 +95,7 @@ async fn main() {
                             )}),
                             Value::Null,
                         )),
-                        "data: [DONE]\n\n".to_string()
+                        "data: [DONE]\n\n"
                     )
                 } else if is_browser_smoke {
                     let args = json!({"url": "http://127.0.0.1:8791/"}).to_string();
@@ -106,7 +105,7 @@ async fn main() {
                             json!({"tool_calls": [{"index": 0, "id": "call_br", "function": {"name": "browser_navigate", "arguments": args}}]}),
                             json!("tool_calls"),
                         )),
-                        "data: [DONE]\n\n".to_string()
+                        "data: [DONE]\n\n"
                     )
                 } else if has_tool_result {
                     // Final answer: reasoning first (proves thinking display), then content.
@@ -121,7 +120,7 @@ async fn main() {
                             json!({"content": format!("Done. I created e2e-marker.txt via the write tool.{flag}")}),
                             Value::Null,
                         )),
-                        "data: [DONE]\n\n".to_string()
+                        "data: [DONE]\n\n"
                     )
                 } else if first_user.contains("text-call") {
                     // A model with no tool parser: the call written as one
@@ -133,7 +132,7 @@ async fn main() {
                             json!({"content": "CALL {\"name\":\"write\",\"arguments\":{\"path\":\"text-call-marker.txt\",\"content\":\"written by a text call\"}}"}),
                             Value::Null,
                         )),
-                        "data: [DONE]\n\n".to_string()
+                        "data: [DONE]\n\n"
                     )
                 } else if first_user.contains("parallel-agents") {
                     // M7: two spawns in ONE turn — the agents panel shows them
@@ -147,7 +146,7 @@ async fn main() {
                             ]}),
                             json!("tool_calls"),
                         )),
-                        "data: [DONE]\n\n".to_string()
+                        "data: [DONE]\n\n"
                     )
                 } else if first_user == "task one" || first_user == "task two" {
                     // A spawned child: report immediately, no tools.
@@ -157,7 +156,7 @@ async fn main() {
                             json!({"content": format!("child report: {first_user} ok")}),
                             Value::Null,
                         )),
-                        "data: [DONE]\n\n".to_string()
+                        "data: [DONE]\n\n"
                     )
                 } else {
                     // Tool call: brief reasoning, then arguments split across
@@ -176,7 +175,7 @@ async fn main() {
                             json!({"tool_calls": [{"index": 0, "function": {"arguments": "\"content\":\"hello from opencode-rust E2E\\n\"}"}}]}),
                             json!("tool_calls"),
                         )),
-                        "data: [DONE]\n\n".to_string()
+                        "data: [DONE]\n\n"
                     )
                 };
                 println!(

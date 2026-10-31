@@ -1635,7 +1635,7 @@ mod tests {
             ] }
         ] });
         let est = estimate_prompt_tokens(&body);
-        assert!(est >= IMAGE_TOKENS && est < IMAGE_TOKENS + 200, "{est}");
+        assert!((IMAGE_TOKENS..IMAGE_TOKENS + 200).contains(&est), "{est}");
     }
 
     /// A long line arriving in many small chunks is split correctly (the

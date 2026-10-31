@@ -3136,7 +3136,7 @@ pub(crate) async fn run_loop_inner(
     let specs: Vec<_> = match &opts.allow {
         Some(allow) => specs
             .into_iter()
-            .filter(|s| allow.iter().any(|a| *a == s.function.name))
+            .filter(|s| allow.contains(&s.function.name))
             .collect(),
         None => specs,
     };
@@ -3270,7 +3270,7 @@ pub(crate) async fn run_loop_inner(
                     }
                 }
                 StreamEvent::Usage(u) => {
-                    st.record_usage_as(if opts.agent.is_some() { "subagent" } else { usage_tag().0 }, session_id, model, &u);
+                    st.record_usage_as(if opts.agent.is_some() { "subagent" } else { usage_tag().0 }, session_id, model, u);
                     request_usage = Some(*u);
                 }
                 StreamEvent::Done { finish_reason: fr } => {
@@ -3644,6 +3644,7 @@ fn tool_started(st: &Shared, opts: &LoopOpts, session_id: &str, id: &str, name: 
 /// hint is appended to the result so the MODEL reads it mid-run —
 /// enforcement, not decoration), stats, the finish event, and the persisted
 /// tool message.
+#[allow(clippy::too_many_arguments)]
 fn finish_tool_call(
     st: &Shared,
     opts: &LoopOpts,
@@ -4137,6 +4138,7 @@ pub(crate) async fn final_check(
 /// to judge them against the brief and the AI look, then fix and look again.
 /// Skipped when off, when no page changed, or when the model takes no images
 /// (it would be judging pictures it cannot see).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn design_review(
     st: &Shared,
     session_id: &str,
@@ -4213,9 +4215,7 @@ async fn check_after_run(
         return None;
     }
     let timeout = std::time::Duration::from_secs(st.cfg.agent.verify_timeout_secs.max(1));
-    let Some(mut best) = run_gate(st, &ws, &mut gate, timeout, &note, abort).await else {
-        return None;
-    };
+    let mut best = run_gate(st, &ws, &mut gate, timeout, &note, abort).await?;
     if best.problems == 0 {
         note(format!("{VERIFY_PREFIX} {} passed", gate.label()));
         return Some((true, best.summary));
@@ -4245,9 +4245,7 @@ async fn check_after_run(
             return None;
         }
         gate.pages = pages(since);
-        let Some(now) = run_gate(st, &ws, &mut gate, timeout, &note, abort).await else {
-            return None;
-        };
+        let now = run_gate(st, &ws, &mut gate, timeout, &note, abort).await?;
         if now.problems == 0 {
             note(format!("{VERIFY_PREFIX} {} passed after {round} fix round(s)", gate.label()));
             // A failure the checks proved fixed is worth remembering here.
@@ -8470,7 +8468,7 @@ data: [DONE]
         let baked = crate::skills::load_baked(&base);
         assert_eq!(baked.len(), 1);
         // …and composed into the system prompt like the ponytail rules.
-        let system = st.composed_system(&"ses_x".to_string());
+        let system = st.composed_system("ses_x");
         assert!(
             system.contains("## Skill: ship-it — always active"),
             "baked skill present in system prompt"
@@ -9073,7 +9071,7 @@ fn short_count(n: u64) -> String {
 
 /// `part` as a whole percent of `whole` (0 when `whole` is 0).
 fn percent(part: u64, whole: u64) -> u64 {
-    if whole == 0 { 0 } else { part * 100 / whole }
+    (part * 100).checked_div(whole).unwrap_or(0)
 }
 
 #[cfg(test)]

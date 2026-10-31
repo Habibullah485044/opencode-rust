@@ -235,11 +235,11 @@ pub async fn spawn_subagent(
              Get its report with agent {{\"action\": \"wait\", \"ids\": [\"{id}\"]}}."
         ));
     }
-    wait_for(&[id.clone()], None, abort).await;
+    wait_for(std::slice::from_ref(&id), None, abort).await;
     if abort.load(Ordering::SeqCst) {
         stop(&id);
         // Give the child a moment to end, so its last status is out.
-        wait_for(&[id.clone()], Some(Duration::from_secs(5)), &AtomicBool::new(false)).await;
+        wait_for(std::slice::from_ref(&id), Some(Duration::from_secs(5)), &AtomicBool::new(false)).await;
         return Err(anyhow!("subagent `{name}` was aborted before it finished"));
     }
     let run = with_runs(|m| {
@@ -1227,7 +1227,7 @@ mod b27_tests {
         let (st, parent, dir) = state_with(50, 4, "send").await;
         let id = bg(&st, &parent, "look around").await;
         let no = AtomicBool::new(false);
-        wait_for(&[id.clone()], Some(Duration::from_secs(10)), &no).await;
+        wait_for(std::slice::from_ref(&id), Some(Duration::from_secs(10)), &no).await;
         // Not collected with agent_wait: it arrives as mail before the
         // parent's next step, once.
         let mail = take_mail(&parent).expect("finished background report");

@@ -11,6 +11,13 @@ target/
 *.o
 *.rlib
 
+# Saved build/test output and editor backups
+*-out.txt
+*.bak-*
+
+# Agent worktrees
+.claude/worktrees/
+
 # Python noise
 __pycache__/
 *.pyc
