@@ -65,6 +65,9 @@ pub struct Client {
     /// left in the window, so a reply is not cut off mid-text by a full
     /// window (seen with Ollama on a 8K context).
     context: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// A saved key was not sent because it belongs to this other origin
+    /// (`ProviderCfg::key_withheld_for`); named when the host answers 401.
+    key_withheld_for: Option<String>,
 }
 
 
@@ -232,6 +235,7 @@ impl Client {
             temperature_rejected: Default::default(),
             images: "auto".into(),
             context: Default::default(),
+            key_withheld_for: None,
         })
     }
 
@@ -306,6 +310,7 @@ impl Client {
         c.reasoning_effort = p.reasoning_effort.clone().filter(|e| !e.trim().is_empty());
         c.temperature = p.temperature;
         c.images = p.images.clone();
+        c.key_withheld_for = p.key_withheld_for.clone();
         Ok(c)
     }
 
@@ -352,10 +357,19 @@ impl Client {
                     }
                     let retry_after = retry_after_secs(resp.headers());
                     let text = resp.text().await.unwrap_or_default();
-                    let msg = format!(
+                    let mut msg = format!(
                         "provider returned {status}: {}",
                         text.chars().take(400).collect::<String>()
                     );
+                    if let Some(other) = self.key_withheld_for.as_ref().filter(|_| self.api_key.is_empty()) {
+                        if matches!(status.as_u16(), 401 | 403) {
+                            msg.push_str(&format!(
+                                " (no API key was sent to {}: the saved key is for {other}. Enter a key \
+                                 for this provider in Settings, or set OPENCODE_RUST_API_KEY)",
+                                crate::config::key_origin(&self.base_url)
+                            ));
+                        }
+                    }
                     (msg, is_retryable_status(status.as_u16()), retry_after, status.as_u16() == 429)
                 }
                 Err(e) => {

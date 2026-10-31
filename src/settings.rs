@@ -11,15 +11,37 @@ fn key_path() -> PathBuf {
     crate::config::default_state_dir().join("api_key.bin")
 }
 
-/// The API key saved from the Settings page, if any.
-pub fn load_api_key() -> Option<String> {
+/// First line of a saved key that names the origin it belongs to; the
+/// origin and the key follow on their own lines.
+const BOUND_KEY_TAG: &str = "habi-key-v2";
+
+/// The API key saved from the Settings page, if any, with the provider
+/// origin it was saved for (`config::key_origin`). `None` for the origin =
+/// a key saved before keys were bound to an address.
+pub fn load_api_key() -> Option<(String, Option<String>)> {
     let bytes = std::fs::read(key_path()).ok()?;
-    let plain = unprotect(&bytes).ok()?;
-    String::from_utf8(plain).ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+    let plain = String::from_utf8(unprotect(&bytes).ok()?).ok()?;
+    let (key, origin) = parse_saved_key(&plain);
+    (!key.is_empty()).then_some((key, origin))
 }
 
-/// Save (or, with an empty key, remove) the API key.
-pub fn save_api_key(key: &str) -> Result<()> {
+fn parse_saved_key(plain: &str) -> (String, Option<String>) {
+    let mut lines = plain.lines();
+    if lines.next() == Some(BOUND_KEY_TAG) {
+        let origin = lines.next().unwrap_or("").trim().to_string();
+        let key = lines.next().unwrap_or("").trim().to_string();
+        return (key, Some(origin));
+    }
+    (plain.trim().to_string(), None)
+}
+
+fn bound_key_text(key: &str, base_url: &str) -> String {
+    format!("{BOUND_KEY_TAG}\n{}\n{}", crate::config::key_origin(base_url), key.trim())
+}
+
+/// Save (or, with an empty key, remove) the API key, bound to the origin
+/// of `base_url`: it is only ever sent to that provider.
+pub fn save_api_key(key: &str, base_url: &str) -> Result<()> {
     let path = key_path();
     if key.trim().is_empty() {
         let _ = std::fs::remove_file(&path);
@@ -28,7 +50,7 @@ pub fn save_api_key(key: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let sealed = protect(key.trim().as_bytes())?;
+    let sealed = protect(bound_key_text(key, base_url).as_bytes())?;
     std::fs::write(&path, sealed).with_context(|| format!("writing {}", path.display()))?;
     #[cfg(unix)]
     {
@@ -281,5 +303,12 @@ max_steps = 7
         assert_eq!(unprotect(&sealed).unwrap(), b"sk-or-secret");
         #[cfg(all(windows, feature = "gui"))]
         assert!(!sealed.windows(6).any(|w| w == b"secret"), "DPAPI output does not contain the key");
+    }
+
+    #[test]
+    fn a_saved_key_remembers_its_origin_and_old_keys_still_read() {
+        let text = bound_key_text(" sk-1 ", "https://OpenRouter.ai/api/v1/");
+        assert_eq!(parse_saved_key(&text), ("sk-1".into(), Some("https://openrouter.ai".into())));
+        assert_eq!(parse_saved_key("sk-old\n"), ("sk-old".into(), None), "a key saved before binding");
     }
 }

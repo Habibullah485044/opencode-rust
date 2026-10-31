@@ -1035,6 +1035,15 @@ pub enum UiMsg {
 }
 
 /// Parse one IPC frame; `None` = ignore (unknown or malformed).
+/// What an IPC body is, safe to log: its `type` and length, never its
+/// fields (a `settings` body carries the API key).
+fn ipc_summary(raw: &str) -> String {
+    let kind = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t.chars().take(40).collect::<String>()));
+    format!("type={} ({} bytes)", kind.as_deref().unwrap_or("?"), raw.len())
+}
+
 pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     match v.get("type")?.as_str()? {
@@ -1430,18 +1439,29 @@ fn save_settings(
         anyhow::bail!("the provider address and the model are both needed");
     }
     let path = crate::settings::save_provider(base_url, model, effort)?;
-    if let Some(k) = api_key.filter(|k| !k.trim().is_empty()) {
-        crate::settings::save_api_key(k)?;
+    let typed = api_key.map(str::trim).filter(|k| !k.is_empty());
+    if let Some(k) = typed {
+        crate::settings::save_api_key(k, base_url)?;
     }
     let mut p = st.cfg.provider.clone();
     p.base_url = base_url.trim().to_string();
     p.model = model.trim().to_string();
     p.reasoning_effort = (!effort.trim().is_empty()).then(|| effort.trim().to_string());
-    p.api_key = api_key
-        .map(|k| k.trim().to_string())
-        .filter(|k| !k.is_empty())
-        .or_else(crate::settings::load_api_key)
-        .unwrap_or_else(|| st.cfg.provider.api_key.clone());
+    // Same precedence as `Config::load` (environment > typed/file > saved),
+    // and the old key does not follow a changed address to another host.
+    let origin = crate::config::key_origin(base_url);
+    let mut candidates: Vec<(String, String)> = typed.map(|k| (k.to_string(), origin.clone())).into_iter().collect();
+    if let Some(o) = &st.cfg.provider.api_key_origin {
+        candidates.push((st.cfg.provider.api_key.clone(), o.clone()));
+    }
+    if let Some((k, o)) = crate::settings::load_api_key() {
+        candidates.push((k, o.unwrap_or_else(|| crate::config::key_origin(&st.cfg.provider.base_url))));
+    }
+    let env_key = std::env::var("OPENCODE_RUST_API_KEY").ok();
+    let (key, key_origin, withheld) = crate::config::choose_api_key(base_url, env_key.as_deref(), &candidates);
+    p.api_key = key;
+    p.api_key_origin = key_origin;
+    p.key_withheld_for = withheld;
     let client = crate::provider::Client::from_cfg(p.base_url.trim_end_matches('/'), &p)?;
     Ok((path, client, !p.api_key.is_empty()))
 }
@@ -2251,7 +2271,8 @@ pub async fn run(
                 let _ = page_tx.send(UiMsg::Ipc(msg));
                 let _ = ipc_proxy.send_event(AppEvent::Wake);
             } else {
-                eprintln!("[gui] IPC: {}", req.body());
+                // Only the type and size: a body (Settings) may hold the API key.
+                eprintln!("[gui] IPC not understood: {}", ipc_summary(req.body()));
             }
         })
         .build(&window)
@@ -3433,6 +3454,15 @@ mod tests {
 
     fn delta(text: &str) -> ServerEvent {
         ServerEvent::AssistantDelta { session_id: "s".into(), text: text.into() }
+    }
+
+    #[test]
+    fn an_ipc_body_that_is_not_understood_is_logged_without_its_fields() {
+        let raw = r#"{"type":"settingz","api_key":"sk-secret-1"}"#;
+        let shown = ipc_summary(raw);
+        assert!(!shown.contains("sk-secret"), "{shown}");
+        assert!(shown.contains("settingz") && shown.contains(&raw.len().to_string()));
+        assert_eq!(ipc_summary("not json sk-x"), "type=? (13 bytes)");
     }
 
     #[test]
