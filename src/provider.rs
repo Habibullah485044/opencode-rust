@@ -333,34 +333,37 @@ impl Client {
             self.gate.wait().await;
             attempt += 1;
             // Only the headers are waited for here (see `request_timeout`).
-            let sent = match tokio::time::timeout(self.request_timeout, build().send()).await {
-                Ok(r) => r,
-                Err(_) => {
-                    return Err(anyhow!(
-                        "provider request to {url} timed out: no response within {}s \
-                         (provider.request_timeout_secs)",
-                        self.request_timeout.as_secs()
-                    ))
-                }
-            };
+            // A wait that ran out is retried like a failed send (T-040).
+            let sent = tokio::time::timeout(self.request_timeout, build().send()).await.ok();
             // Each arm gives: error text, "worth retrying?", server's wait,
             // "rate limited?".
             let (mut msg, retryable, retry_after, limited) = match sent {
-                Ok(resp) if resp.status().is_success() => {
+                None => {
+                    let msg = format!(
+                        "provider request to {url} timed out: no response within {}s \
+                         (provider.request_timeout_secs)",
+                        self.request_timeout.as_secs()
+                    );
+                    (msg, true, None, false)
+                }
+                Some(Ok(resp)) if resp.status().is_success() => {
                     self.key_rejected.store(false, std::sync::atomic::Ordering::Relaxed);
                     return Ok(resp);
                 }
-                Ok(resp) => {
+                Some(Ok(resp)) => {
                     let status = resp.status();
                     if matches!(status.as_u16(), 401 | 403) {
                         self.key_rejected.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     let retry_after = retry_after_secs(resp.headers());
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = error_body(resp, self.request_timeout).await;
                     let mut msg = format!(
                         "provider returned {status}: {}",
                         text.chars().take(400).collect::<String>()
                     );
+                    if status.as_u16() == 404 {
+                        msg.push_str(" (check provider.model and that base_url ends in /v1)");
+                    }
                     if let Some(other) = self.key_withheld_for.as_ref().filter(|_| self.api_key.is_empty()) {
                         if matches!(status.as_u16(), 401 | 403) {
                             msg.push_str(&format!(
@@ -372,7 +375,7 @@ impl Client {
                     }
                     (msg, is_retryable_status(status.as_u16()), retry_after, status.as_u16() == 429)
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     let msg = format!(
                         "provider request to {url} failed: {e:?} \
                          (tunnel down or endpoint unreachable — check the base URL / heartbeat in the header)"
@@ -1003,6 +1006,26 @@ fn is_retryable_status(code: u16) -> bool {
 fn rejects_temperature(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     e.contains("provider returned 400") && e.contains("temperature")
+}
+
+/// Most of an error body that is kept (only 400 characters are shown).
+const ERROR_BODY_MAX: usize = 4096;
+
+/// The start of an error response's body, read for at most `limit`: a
+/// server that sends the status and then stalls must not hang the request
+/// (T-041). Whatever arrived in time is kept.
+async fn error_body(resp: reqwest::Response, limit: std::time::Duration) -> String {
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::new();
+    while buf.len() < ERROR_BODY_MAX {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    buf.truncate(ERROR_BODY_MAX);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// The connection failed or broke before the response headers. Not
@@ -2002,6 +2025,101 @@ mod f01_tests {
         let t = std::time::Instant::now();
         gate.wait().await;
         assert!(t.elapsed() < Duration::from_millis(50), "no pause, no wait");
+    }
+
+    /// Serve `/v1/chat/completions` with `answer(n)` for request n.
+    async fn serve<F, Fut>(answer: F) -> String
+    where
+        F: Fn(usize) -> Fut + Clone + Send + Sync + 'static,
+        Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
+    {
+        use axum::{routing::post, Router};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let n = hits.fetch_add(1, Ordering::SeqCst);
+                answer(n)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn hello() -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+    }
+
+    /// T-040: no headers in time is retried; the last error still names
+    /// the setting.
+    #[tokio::test]
+    async fn a_header_timeout_is_retried() {
+        let base = serve(|n| async move {
+            if n == 0 {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            hello()
+        })
+        .await;
+        let mut client = fast_client(&base, 2);
+        client.request_timeout = Duration::from_millis(500);
+        assert!(client.stream("stub", &[], &[]).await.is_ok(), "the second try answers");
+
+        let base = serve(|_| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            hello()
+        })
+        .await;
+        let mut client = fast_client(&base, 1);
+        client.request_timeout = Duration::from_millis(300);
+        let err = client.stream("stub", &[], &[]).await.err().expect("never answers").to_string();
+        assert!(err.contains("provider.request_timeout_secs"), "{err}");
+        assert!(err.contains("gave up after 2 attempts"), "{err}");
+    }
+
+    /// T-041: an error status whose body never ends still returns in time,
+    /// with what arrived of the body.
+    #[tokio::test]
+    async fn a_stalled_error_body_does_not_hang() {
+        let base = serve(|_| async {
+            use axum::response::IntoResponse;
+            let body = futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from("partial"))])
+                .chain(futures::stream::pending());
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, axum::body::Body::from_stream(body)).into_response()
+        })
+        .await;
+        let mut client = fast_client(&base, 0);
+        client.request_timeout = Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let err = client.stream("stub", &[], &[]).await.err().expect("fails").to_string();
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(err.contains("500") && err.contains("partial"), "{err}");
+    }
+
+    /// T-050: a 404 says what is usually wrong.
+    #[tokio::test]
+    async fn a_404_hints_at_the_model_and_base_url() {
+        let (base, _) = scripted_provider(vec![(404, None)]).await;
+        let err = fast_client(&base, 3).stream("stub", &[], &[]).await.err().expect("fails").to_string();
+        assert!(err.contains("check provider.model and that base_url ends in /v1"), "{err}");
+    }
+
+    /// T-093: a refused connection is retried, a body that does not decode
+    /// is not.
+    #[tokio::test]
+    async fn which_send_errors_are_retried() {
+        let refused = reqwest::Client::new().get("http://127.0.0.1:9/").send().await.unwrap_err();
+        assert!(is_retryable_send_error(&refused), "{refused:?}");
+        let (base, _) = scripted_provider(vec![(503, None)]).await;
+        let resp = reqwest::Client::new().post(format!("{base}/chat/completions")).send().await.unwrap();
+        let decode = resp.json::<Value>().await.unwrap_err();
+        assert!(!is_retryable_send_error(&decode), "{decode:?}");
     }
 
     #[tokio::test]
