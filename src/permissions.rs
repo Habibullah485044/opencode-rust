@@ -150,6 +150,17 @@ impl Engine {
                     } else {
                         a
                     };
+                    // `git *` is meant for git, not for `git -c core.pager=sh…`:
+                    // a wildcard allow does not cover arguments that run code.
+                    // Only an approval of this exact command does.
+                    if action == Action::Allow
+                        && tool == "bash"
+                        && rule.pattern.contains(['*', '?'])
+                        && runs_code(detail)
+                        && !remembered(tool, detail)
+                    {
+                        return Decision { action: Action::Ask, key: format!("{tool}:{detail}") };
+                    }
                     return Decision { action, key: format!("{}:{}", rule.tool, rule.pattern) };
                 }
             }
@@ -169,28 +180,154 @@ impl Engine {
         };
         Decision { action, key: format!("{tool}:{detail}") }
     }
-}
 
-/// Minimal glob: `*` matches any run of chars (incl. `/` for simplicity), `?` one char.
-/// Anchored full-string match. Good enough for commands/paths; not a regex.
-pub fn glob_match(pattern: &str, text: &str) -> bool {
-    fn m(p: &[u8], t: &[u8]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some(b'*') => {
-                // try every split
-                for i in 0..=t.len() {
-                    if m(&p[1..], &t[i..]) {
-                        return true;
-                    }
-                }
-                false
-            }
-            Some(b'?') => !t.is_empty() && m(&p[1..], &t[1..]),
-            Some(c) => t.first() == Some(c) && m(&p[1..], &t[1..]),
+    /// The rules that hide files from `grep` and `glob` (`tool`), which
+    /// search a whole folder under one approval: a file whose first
+    /// matching `read` (or `tool`) rule is `deny` is skipped, so
+    /// `grep . .` cannot show what `read secrets/*` denies.
+    pub fn read_filter(&self, tool: &str) -> ReadFilter {
+        ReadFilter {
+            rules: self
+                .rules
+                .iter()
+                .filter(|r| glob_match(&r.tool, "read") || glob_match(&r.tool, tool))
+                .map(|r| (r.pattern.clone(), Action::parse(&r.action).unwrap_or(Action::Ask)))
+                .collect(),
+            fold_case: cfg!(windows),
         }
     }
-    m(pattern.as_bytes(), text.as_bytes())
+}
+
+/// See [`Engine::read_filter`]. The default hides nothing.
+#[derive(Debug, Clone, Default)]
+pub struct ReadFilter {
+    rules: Vec<(String, Action)>,
+    fold_case: bool,
+}
+
+impl ReadFilter {
+    /// Is `path` (a file found under `workspace`) denied for reading?
+    pub fn hides(&self, workspace: &std::path::Path, path: &std::path::Path) -> bool {
+        if self.rules.is_empty() {
+            return false;
+        }
+        // The same detail `normalize_path_detail` gives (the walk already
+        // stays in the workspace and skips symlinks, so no disk lookups).
+        let detail = match path.strip_prefix(workspace) {
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => format!("{OUTSIDE_PREFIX}{}", display_abs(path)),
+        };
+        let detail = if self.fold_case { detail.to_lowercase() } else { detail };
+        self.rules
+            .iter()
+            .find(|(pattern, _)| detail_matches(pattern, &detail, self.fold_case))
+            .is_some_and(|(_, a)| *a == Action::Deny)
+    }
+}
+
+/// Arguments that make an otherwise harmless command run other code or
+/// delete files. A command with one of them is not covered by a wildcard
+/// allow rule (`git *`, `find *`): it asks. A small list on purpose:
+/// - git: `-c`/`--config-env` (`core.pager`, `alias.x=!sh`), `--exec-path`,
+///   `--upload-pack`/`--receive-pack`, `rebase --exec`/`-x`;
+/// - find: `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`;
+/// - any command: `--exec`.
+pub fn runs_code(command: &str) -> bool {
+    let words: Vec<&str> = command
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c| c == '\'' || c == '"'))
+        .collect();
+    let first = words.first().map(|w| w.rsplit(['/', '\\']).next().unwrap_or(w)).unwrap_or("");
+    let first = first.strip_suffix(".exe").unwrap_or(first);
+    let flag = |w: &str, f: &str| w == f || w.starts_with(&format!("{f}="));
+    words.iter().skip(1).any(|w| {
+        flag(w, "--exec")
+            || match first {
+                "git" => {
+                    (w.starts_with("-c") && !w.starts_with("--"))
+                        || ["--config-env", "--exec-path", "--upload-pack", "--receive-pack"].iter().any(|f| flag(w, f))
+                        || (*w == "-x" && words.contains(&"rebase"))
+                }
+                "find" => ["-exec", "-execdir", "-ok", "-okdir", "-delete"].contains(w),
+                _ => false,
+            }
+    })
+}
+
+/// Anchored wildcard match, the one matcher for permission rules and the
+/// glob tool. `*` matches any run of characters; `?` one character.
+/// With `paths`, `*` and `?` stop at `/`, `**` crosses it and `**/` matches
+/// any number of whole folders (also none). Dynamic programming over
+/// (pattern, text) positions: no backtracking, so a hostile pattern like
+/// `*a*a*a*a*b` costs pattern × text steps, not exponential time.
+pub fn wildcard_match(pattern: &str, text: &str, paths: bool) -> bool {
+    #[derive(Clone, Copy)]
+    enum Tok {
+        Lit(char),
+        One,
+        Star,
+        AnyStar,
+        Folders,
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < p.len() {
+        match p[i] {
+            '*' => {
+                let mut n = 1;
+                while p.get(i + n) == Some(&'*') {
+                    n += 1;
+                }
+                i += n;
+                if !paths {
+                    toks.push(Tok::AnyStar);
+                } else if n == 1 {
+                    toks.push(Tok::Star);
+                } else if p.get(i) == Some(&'/') {
+                    i += 1;
+                    toks.push(Tok::Folders);
+                } else {
+                    toks.push(Tok::AnyStar);
+                }
+                continue;
+            }
+            '?' => toks.push(Tok::One),
+            c => toks.push(Tok::Lit(c)),
+        }
+        i += 1;
+    }
+    let t: Vec<char> = text.chars().collect();
+    let m = t.len();
+    // `next[j]`: do the tokens after the current one match `t[j..]`?
+    let mut next = vec![false; m + 1];
+    next[m] = true;
+    let mut cur = vec![false; m + 1];
+    for tok in toks.iter().rev() {
+        let sep = |j: usize| paths && t[j] == '/';
+        // Folders: some `k >= j` with `t[k] == '/'` and `next[k + 1]`.
+        let mut later_slash = false;
+        for j in (0..=m).rev() {
+            cur[j] = match *tok {
+                Tok::Lit(c) => j < m && t[j] == c && next[j + 1],
+                Tok::One => j < m && !sep(j) && next[j + 1],
+                Tok::Star => next[j] || (j < m && !sep(j) && cur[j + 1]),
+                Tok::AnyStar => next[j] || (j < m && cur[j + 1]),
+                Tok::Folders => {
+                    later_slash = j < m && ((t[j] == '/' && next[j + 1]) || later_slash);
+                    next[j] || later_slash
+                }
+            };
+        }
+        std::mem::swap(&mut next, &mut cur);
+    }
+    next[0]
+}
+
+/// Permission-rule glob: `*` matches any run of chars (incl. `/` for
+/// simplicity), `?` one char. Anchored full-string match; not a regex.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    wildcard_match(pattern, text, false)
 }
 
 /// The shell that runs `bash` tool commands: `sh -c` on Unix, Git Bash or
@@ -394,6 +531,17 @@ pub fn normalize_path_detail(workspace: &std::path::Path, path: &str) -> String 
 /// [`normalize_path_detail`] with explicit case folding, so tests can check
 /// the Windows behaviour on every platform.
 pub fn normalize_path_detail_with(workspace: &std::path::Path, path: &str, fold_case: bool) -> String {
+    // One resolver: inside the workspace the detail is the very file the
+    // tool opens (`confine_path` applies `..` before following links), so
+    // `link/../.env` is judged as `.env`, the file that is read.
+    if let Ok(abs) = crate::tools::confine_path(workspace, path.trim()) {
+        if let Ok(rel) = abs.strip_prefix(workspace) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            let out = if rel.is_empty() { ".".to_string() } else { rel };
+            return if fold_case { out.to_lowercase() } else { out };
+        }
+    }
+    // Refused by the tools anyway (outside, broken link): say where it points.
     let p = std::path::Path::new(path.trim());
     let joined = if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) };
     let ws = resolve_for_rules(workspace);
@@ -714,6 +862,68 @@ mod tests {
             assert_eq!(e.evaluate("bash", "ls", deny_all()).action, Action::Ask);
             assert_eq!(e.evaluate("some_mcp_tool", "x", deny_all()).action, Action::Allow);
         }
+    }
+
+    /// `git *` allows git, not code run through git's or find's arguments.
+    #[test]
+    fn wildcard_allow_does_not_cover_code_running_arguments() {
+        let e = bash_rules(&[("git -c color.ui=always log", "allow"), ("git *", "allow"), ("find *", "allow")]);
+        for cmd in [
+            "git -c core.pager=sh log",
+            "git -c alias.x=!id x",
+            "git -calias.x=!id x",
+            "git --config-env=core.pager=X log",
+            "git fetch --upload-pack=evil origin",
+            "git rebase -x 'make' main",
+            "git rebase --exec=make main",
+            "find . -exec rm {} ;",
+            "find . -name x -delete",
+            "find . -execdir sh -c id ;",
+        ] {
+            assert_eq!(e.evaluate("bash", cmd, deny_all()).action, Action::Ask, "{cmd}");
+        }
+        for cmd in ["git status", "git log --color", "git commit -m 'x'", "git -C sub log", "find . -name '*.rs'"] {
+            assert_eq!(e.evaluate("bash", cmd, deny_all()).action, Action::Allow, "{cmd}");
+        }
+        // An exact rule, or an exact earlier approval, still allows it.
+        assert_eq!(e.evaluate("bash", "git -c color.ui=always log", deny_all()).action, Action::Allow);
+        let yes = |_: &str, d: &str| d == "git -c core.pager=cat log";
+        assert_eq!(e.evaluate("bash", "git -c core.pager=cat log", yes).action, Action::Allow);
+    }
+
+    /// One resolver: the detail names the file the tool opens.
+    /// `link/../.env` is `.env` (applied as text, like `confine_path`), not
+    /// the `.env` next to where the link points.
+    #[cfg(unix)]
+    #[test]
+    fn detail_resolves_dot_dot_before_links_like_the_tools() {
+        let ws = tmp_ws("one-resolver");
+        let target = tmp_ws("one-resolver-target");
+        std::os::unix::fs::symlink(target.join("src"), ws.join("link")).unwrap();
+        std::fs::write(ws.join(".env"), "K=1").unwrap();
+        assert_eq!(normalize_path_detail_with(&ws, "link/../.env", false), ".env");
+        let opened = crate::tools::confine_path(&ws, "link/../.env").unwrap();
+        assert_eq!(opened, ws.join(".env"));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn read_filter_follows_rule_order() {
+        let cfg = PermissionsCfg {
+            rules: vec![
+                RuleCfg { tool: "read".into(), pattern: "secrets/public.txt".into(), action: "allow".into() },
+                RuleCfg { tool: "*".into(), pattern: "secrets/*".into(), action: "deny".into() },
+                RuleCfg { tool: "bash".into(), pattern: "*".into(), action: "deny".into() },
+            ],
+            ..Default::default()
+        };
+        let f = Engine::new(&cfg).read_filter("grep");
+        let ws = std::path::Path::new("/ws");
+        assert!(f.hides(ws, &ws.join("secrets").join("key.pem")));
+        assert!(!f.hides(ws, &ws.join("secrets").join("public.txt")));
+        assert!(!f.hides(ws, &ws.join("src").join("main.rs")));
+        assert!(!ReadFilter::default().hides(ws, &ws.join("secrets").join("key.pem")));
     }
 
     #[test]

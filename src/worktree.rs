@@ -33,7 +33,12 @@ pub struct Worktree {
 /// Run git with a private index file and a fixed identity, so the user's
 /// real index is never touched and `commit-tree` works without a git user.
 fn git_private_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
+    let mut cmd = Command::new("git");
+    // S-05: like `gitsnap::git`, hooks never see our provider key or token.
+    for key in crate::tools::SECRET_ENV_VARS {
+        cmd.env_remove(key);
+    }
+    let out = cmd
         .args(args)
         .current_dir(cwd)
         .env("GIT_INDEX_FILE", index)

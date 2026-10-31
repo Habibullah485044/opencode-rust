@@ -95,8 +95,29 @@ pub async fn execute(
     workspace: &Path,
     abort: &std::sync::atomic::AtomicBool,
 ) -> Result<String> {
+    execute_with(name, args, workspace, abort, &crate::permissions::ReadFilter::default()).await
+}
+
+/// [`execute`] with the read rules that `grep` and `glob` apply to each
+/// file they find (`Engine::read_filter`): their one approval covers a
+/// whole folder, and a denied file must not show up in it.
+pub async fn execute_with(
+    name: &str,
+    args: &Value,
+    workspace: &Path,
+    abort: &std::sync::atomic::AtomicBool,
+    hidden: &crate::permissions::ReadFilter,
+) -> Result<String> {
     if abort.load(std::sync::atomic::Ordering::SeqCst) {
         bail!("not run: the run was aborted");
+    }
+    if matches!(name, "read" | "write" | "edit" | "glob" | "grep" | "list") {
+        // File tools block (a big grep walks the whole tree): off the
+        // runtime threads, so other chats and the UI keep running.
+        let (tool, args, ws, hidden) = (name.to_string(), args.clone(), workspace.to_path_buf(), hidden.clone());
+        return tokio::task::spawn_blocking(move || file_tool(&tool, &args, &ws, &hidden))
+            .await
+            .map_err(|e| anyhow!("{name} failed: {e}"))?;
     }
     match name {
         "bash" if is_job_control(name, args) => {
@@ -119,6 +140,27 @@ pub async fn execute(
                 .clamp(1, 600);
             bash(cmd, workspace, Duration::from_secs(timeout), abort).await
         }
+        "webfetch" => {
+            if let Some(q) = args.get("query").and_then(Value::as_str).filter(|q| !q.trim().is_empty()) {
+                return tokio::select! {
+                    r = web_search(q.trim()) => r,
+                    _ = wait_for_abort(abort) => Err(anyhow!("aborted while searching")),
+                };
+            }
+            let url = arg_str(args, "url")?;
+            // New (B-06): stop waiting for a slow page when the run is aborted.
+            tokio::select! {
+                r = webfetch(url) => r,
+                _ = wait_for_abort(abort) => Err(anyhow!("aborted while fetching {url}")),
+            }
+        }
+        other => Err(anyhow!("unknown tool: {other}")),
+    }
+}
+
+/// The blocking file tools (run on a blocking thread, see `execute_with`).
+fn file_tool(name: &str, args: &Value, workspace: &Path, hidden: &crate::permissions::ReadFilter) -> Result<String> {
+    match name {
         "read" if args.get("outline").and_then(Value::as_bool).unwrap_or(false) => {
             read_outline(workspace, arg_str(args, "path")?)
         }
@@ -154,31 +196,19 @@ pub async fn execute(
                 ),
             }
         }
-        "glob" => glob_files(
+        "glob" => glob_files_with(
             workspace,
             arg_str(args, "pattern")?,
             args.get("path").and_then(Value::as_str),
+            hidden,
         ),
-        "grep" => grep_files(
+        "grep" => grep_files_with(
             workspace,
             arg_str(args, "pattern")?,
             args.get("path").and_then(Value::as_str),
             args.get("case_insensitive").and_then(Value::as_bool).unwrap_or(false),
+            hidden,
         ),
-        "webfetch" => {
-            if let Some(q) = args.get("query").and_then(Value::as_str).filter(|q| !q.trim().is_empty()) {
-                return tokio::select! {
-                    r = web_search(q.trim()) => r,
-                    _ = wait_for_abort(abort) => Err(anyhow!("aborted while searching")),
-                };
-            }
-            let url = arg_str(args, "url")?;
-            // New (B-06): stop waiting for a slow page when the run is aborted.
-            tokio::select! {
-                r = webfetch(url) => r,
-                _ = wait_for_abort(abort) => Err(anyhow!("aborted while fetching {url}")),
-            }
-        }
         "list" => list_dir(workspace, args.get("path").and_then(Value::as_str).unwrap_or(".")),
         other => Err(anyhow!("unknown tool: {other}")),
     }
@@ -309,16 +339,43 @@ async fn bash(
     let pid = child.id();
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
-    // Read both pipes to the end, then reap the shell (like wait_with_output).
+    // Read both pipes while waiting for the shell. Once the shell has exited,
+    // wait only a moment for the pipes: `server &` leaves a child holding
+    // them open, and the command would otherwise "time out" after it is done.
     let work = async move {
-        let (out, err) = tokio::join!(read_pipe(&mut stdout), read_pipe(&mut stderr));
-        (child.wait().await, out, err)
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut still_open = false;
+        let status = {
+            let reading = async {
+                tokio::join!(read_pipe_into(&mut stdout, &mut out), read_pipe_into(&mut stderr, &mut err));
+            };
+            tokio::pin!(reading);
+            let mut read_all = false;
+            let status = loop {
+                tokio::select! {
+                    _ = &mut reading, if !read_all => read_all = true,
+                    // `Child::wait` is cancel safe.
+                    s = child.wait() => break s,
+                }
+            };
+            if !read_all && tokio::time::timeout(PIPE_GRACE, &mut reading).await.is_err() {
+                still_open = true;
+            }
+            status
+        };
+        (status, out, err, still_open)
     };
     tokio::pin!(work);
     let stopped = tokio::select! {
-        (status, out, err) = &mut work => {
+        (status, out, err, still_open) = &mut work => {
             let status = status.map_err(|e| anyhow!("command failed to run: {e}"))?;
             let mut s = format!("exit code: {}\n", status.code().unwrap_or(-1));
+            if still_open {
+                s.push_str(
+                    "(something it started in the background still runs; its later output is not \
+                     shown. Start servers with bash background:true to read their output.)\n",
+                );
+            }
             if !out.is_empty() {
                 s.push_str("--- stdout ---\n");
                 s.push_str(&truncate_middle(&String::from_utf8_lossy(&out), 3_000, 9_000));
@@ -436,7 +493,9 @@ pub mod jobs {
                 Err(e) => format!("failed: {e}"),
             });
         });
-        jobs().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        let mut map = jobs().lock().unwrap_or_else(|e| e.into_inner());
+        prune(&mut map);
+        map.insert(
             id.clone(),
             Job {
                 command: command.to_string(),
@@ -450,6 +509,35 @@ pub mod jobs {
             },
         );
         Ok(id)
+    }
+
+    /// Ended agent jobs kept for reading (each holds up to `KEEP` bytes).
+    const KEEP_ENDED: usize = 20;
+
+    /// Forget the oldest ended agent jobs beyond [`KEEP_ENDED`]: the map
+    /// lived as long as Habi and kept every finished job's output. Running
+    /// jobs and the user's terminal commands (cleared by the user) stay.
+    fn prune(map: &mut HashMap<String, Job>) {
+        let num = |id: &str| id.trim_start_matches(|c: char| c.is_ascii_alphabetic()).parse::<u64>().unwrap_or(0);
+        let mut ended: Vec<u64> = map
+            .iter()
+            .filter(|(_, j)| !j.by_user && j.exit.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+            .map(|(id, _)| num(id))
+            .collect();
+        if ended.len() <= KEEP_ENDED {
+            return;
+        }
+        ended.sort_unstable();
+        let cutoff = ended[ended.len() - KEEP_ENDED];
+        map.retain(|id, j| {
+            j.by_user || j.exit.lock().unwrap_or_else(|e| e.into_inner()).is_none() || num(id) >= cutoff
+        });
+    }
+
+    /// How many jobs are remembered (tests).
+    #[cfg(test)]
+    pub fn count() -> usize {
+        jobs().lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// One job as the terminal panel shows it.
@@ -578,12 +666,20 @@ pub mod jobs {
     }
 }
 
-async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
-    let mut buf = Vec::new();
-    if let Some(p) = pipe.as_mut() {
-        let _ = tokio::io::AsyncReadExt::read_to_end(p, &mut buf).await;
+/// How long `bash` still reads the pipes after the shell itself exited.
+const PIPE_GRACE: Duration = Duration::from_millis(500);
+
+/// Read a child's pipe to the end into `buf`, chunk by chunk, so what was
+/// read is kept when the read is given up (see `PIPE_GRACE`).
+async fn read_pipe_into<R: tokio::io::AsyncRead + Unpin>(pipe: &mut Option<R>, buf: &mut Vec<u8>) {
+    let Some(p) = pipe.as_mut() else { return };
+    let mut chunk = [0u8; 8192];
+    while let Ok(n) = tokio::io::AsyncReadExt::read(p, &mut chunk).await {
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
     }
-    buf
 }
 
 /// Windows: every shell Habi starts runs in a Job Object. Its descendants
@@ -719,7 +815,8 @@ async fn wait_for_abort(abort: &std::sync::atomic::AtomicBool) {
 
 /// Keep the first `head` and the last `tail` bytes of long command output.
 /// Output is resent with every later request of the run, and what matters
-/// (the error, the test summary) is usually at the end.
+/// (the error, the test summary) is usually at the end. `tail == 0` keeps
+/// only the start.
 fn truncate_middle(s: &str, head: usize, tail: usize) -> String {
     if s.len() <= head + tail {
         return s.to_string();
@@ -728,6 +825,9 @@ fn truncate_middle(s: &str, head: usize, tail: usize) -> String {
     while !s.is_char_boundary(a) {
         a -= 1;
     }
+    if tail == 0 {
+        return format!("{}\n… [truncated {} bytes]", &s[..a], s.len() - a);
+    }
     let mut b = s.len() - tail;
     while !s.is_char_boundary(b) {
         b += 1;
@@ -735,16 +835,9 @@ fn truncate_middle(s: &str, head: usize, tail: usize) -> String {
     format!("{}\n… [{} bytes cut from the middle] …\n{}", &s[..a], b - a, &s[b..])
 }
 
+/// The first `max` bytes of `s` (on a character boundary), noting the cut.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut cut = max;
-        while !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        format!("{}\n… [truncated {} bytes]", &s[..cut], s.len() - max)
-    }
+    truncate_middle(s, max, 0)
 }
 
 /// `/c/Users/x` (Git Bash / MSYS form) → `C:/Users/x`. `None` for any
@@ -780,6 +873,9 @@ pub fn confine_read_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
         // project has no such file, the user's skills folder answers.
         Ok(p) if !p.exists() => Ok(user_skill_file(raw).unwrap_or(p)),
         Ok(p) => Ok(p),
+        // An absolute path into a skills folder. A relative one that left the
+        // workspace (`../x`) is not read relative to the skills folder.
+        Err(e) if !is_absolute_raw(raw) => Err(e),
         Err(e) => {
             for skills in crate::skills::shared_skill_dirs() {
                 let Ok(root) = skills.canonicalize() else { continue };
@@ -800,17 +896,48 @@ pub fn confine_read_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
 fn user_skill_file(raw: &str) -> Option<PathBuf> {
     let norm = raw.replace('\\', "/");
     let rest = norm.trim_start_matches("./").strip_prefix(".opencode/skills/")?;
+    // Only plain names below the skills folder: `../config.toml` (the API
+    // key), `/etc/passwd`, `C:/x` or `x::$DATA` would leave it.
+    let rest = Path::new(rest);
+    if rest.as_os_str().is_empty()
+        || !rest.components().all(|c| matches!(c, std::path::Component::Normal(n) if !is_stream_name(n)))
+    {
+        return None;
+    }
+    // A link inside a skills folder may not lead out of it either.
+    let inside = |root: &Path, p: PathBuf| -> Option<PathBuf> {
+        let real = p.canonicalize().ok()?;
+        real.starts_with(root.canonicalize().ok()?).then_some(p)
+    };
     let roots = crate::skills::shared_skill_dirs();
-    if let Some(direct) = roots.iter().map(|r| r.join(rest)).find(|p| p.exists()) {
+    if let Some(direct) = roots.iter().find_map(|r| inside(r, r.join(rest))) {
         return Some(direct);
     }
-    let mut found = roots
-        .iter()
-        .filter_map(|r| std::fs::read_dir(r).ok())
-        .flat_map(|d| d.flatten().map(|e| e.path().join(rest)))
-        .filter(|p| p.exists());
+    let mut found = roots.iter().flat_map(|r| {
+        std::fs::read_dir(r)
+            .into_iter()
+            .flat_map(|d| d.flatten())
+            .filter_map(move |e| inside(r, e.path().join(rest)))
+    });
     let one = found.next()?;
     found.next().is_none().then_some(one)
+}
+
+/// Is `raw` an absolute path (a Git Bash `/c/...` path counts on Windows)?
+fn is_absolute_raw(raw: &str) -> bool {
+    #[cfg(windows)]
+    if let Some(win) = msys_to_windows(raw) {
+        return Path::new(&win).is_absolute();
+    }
+    Path::new(raw).is_absolute()
+}
+
+/// Windows: a `:` in a path part names an alternate data stream
+/// (`.env::$DATA`, `secret.txt:hidden`), the same file under a name that
+/// deny rules do not match. Such names are refused. Elsewhere `:` is an
+/// ordinary character.
+fn is_stream_name(part: &std::ffi::OsStr) -> bool {
+    cfg!(windows) && part.to_string_lossy().contains(':')
 }
 
 pub fn confine_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
@@ -843,6 +970,9 @@ pub fn confine_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
                 if !norm.pop() {
                     return Err(outside());
                 }
+            }
+            std::path::Component::Normal(n) if is_stream_name(n) => {
+                bail!("`{raw}` names a data stream (`:` in a file name); use the plain file name")
             }
             other => norm.push(other.as_os_str()),
         }
@@ -985,7 +1115,7 @@ fn write_file(workspace: &Path, path: &str, content: &str) -> Result<String> {
 /// temporary file in the same folder, then rename it over the target.
 /// Keeps the old permissions, refuses read-only files, and falls back to
 /// a plain write when the rename is refused (Windows, file held open).
-fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // A keep-best fix round can put this file back if the round makes things worse.
     crate::keepbest::before_write(path);
@@ -1082,8 +1212,9 @@ fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<(St
         let out = if replace_all { text.replace(old.as_str(), &new) } else { text.replacen(old.as_str(), &new, 1) };
         return Ok((out, matches, false));
     }
-    // Loose: compare trimmed lines.
-    let eol = if crlf { "\r\n" } else { "\n" };
+    // Loose: compare trimmed lines. Each line keeps its own ending (a file
+    // with mixed endings is not rewritten to one kind).
+    let has_cr: Vec<bool> = text.split('\n').map(|l| l.ends_with('\r')).collect();
     let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
     let want: Vec<&str> = old.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
     let want: Vec<&str> = {
@@ -1104,10 +1235,14 @@ fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<(St
     if hits.is_empty() {
         return Err(anyhow!("old_str not found{}", closest_region(&lines, &want)));
     }
-    let indent = |l: &str| l.len() - l.trim_start().len();
+    // Indentation is spaces and tabs only: `trim_start` also takes NBSP and
+    // other multi-byte spaces, and cutting by its byte count could split a
+    // character (a panic, and release builds abort).
+    let indent = |l: &str| l.len() - l.trim_start_matches([' ', '\t']).len();
     let first = want.iter().find(|l| !l.trim().is_empty()).copied().unwrap_or("");
     let new_lines: Vec<&str> = new.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
-    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    let mut out: Vec<String> =
+        lines.iter().zip(&has_cr).map(|(l, cr)| if *cr { format!("{l}\r") } else { l.to_string() }).collect();
     // Replace from the last hit back, so earlier indexes stay valid.
     for &i in hits.iter().rev() {
         let file_first = lines[i..i + want.len()].iter().find(|l| !l.trim().is_empty()).copied().unwrap_or("");
@@ -1128,9 +1263,17 @@ fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<(St
                 }
             })
             .collect();
+        // New lines end like the replaced block: its first line's ending
+        // inside, its last line's ending at the end (no CR at a final line
+        // that had none).
+        let (inner_cr, last_cr) = (has_cr[i], has_cr[i + want.len() - 1]);
+        let n = fixed.len();
+        let fixed = fixed.into_iter().enumerate().map(|(k, l)| {
+            if (k + 1 < n && inner_cr) || (k + 1 == n && last_cr) { format!("{l}\r") } else { l }
+        });
         out.splice(i..i + want.len(), fixed);
     }
-    Ok((out.join(eol), hits.len(), true))
+    Ok((out.join("\n"), hits.len(), true))
 }
 
 /// " — closest match at lines N-M: ..." for a failed edit, or "" when
@@ -1160,7 +1303,23 @@ fn closest_region(lines: &[&str], want: &[&str]) -> String {
     )
 }
 
+#[cfg(test)]
 fn glob_files(workspace: &Path, pattern: &str, sub: Option<&str>) -> Result<String> {
+    glob_files_with(workspace, pattern, sub, &crate::permissions::ReadFilter::default())
+}
+
+/// A walked entry that is a regular file. Symlinks are skipped: `is_file`
+/// and reading would follow them out of the workspace.
+fn is_plain_file(entry: &ignore::DirEntry) -> bool {
+    entry.file_type().is_some_and(|t| t.is_file())
+}
+
+fn glob_files_with(
+    workspace: &Path,
+    pattern: &str,
+    sub: Option<&str>,
+    hidden: &crate::permissions::ReadFilter,
+) -> Result<String> {
     use ignore::WalkBuilder;
     let root = confine_path(workspace, sub.unwrap_or("."))?;
     let mut matches = Vec::new();
@@ -1176,7 +1335,7 @@ fn glob_files(workspace: &Path, pattern: &str, sub: Option<&str>) -> Result<Stri
         .flatten()
     {
         let path = entry.path();
-        if !path.is_file() {
+        if !is_plain_file(&entry) || hidden.hides(workspace, path) {
             continue;
         }
         // Match relative to the folder that was searched ...
@@ -1208,47 +1367,23 @@ fn expand_braces(pattern: &str) -> Vec<String> {
     body.split(',').flat_map(|alt| expand_braces(&format!("{head}{alt}{tail}"))).collect()
 }
 
-/// Glob with `*`, `?`, `**` (cross-separator) support.
+/// Glob with `*`, `?` (not across `/`), `**` and `**/` (across folders;
+/// B-32: `**/x` does not match `foox`). The permission matcher in path mode.
 fn match_glob(pattern: &str, text: &str) -> bool {
-    fn m(p: &[u8], t: &[u8]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some(b'*') => {
-                if p.len() > 1 && p[1] == b'*' {
-                    // `**` — match across separators, also collapse `**/`
-                    let rest = &p[2..];
-                    if rest.first() == Some(&b'/') {
-                        // `**/x` matches `x` or `any/x`. B-32: only restart
-                        // right after a `/`, so `**/x` does not match `foox`.
-                        return m(&rest[1..], t)
-                            || (0..t.len()).any(|i| t[i] == b'/' && m(&rest[1..], &t[i + 1..]));
-                    }
-                    (0..=t.len()).any(|i| m(rest, &t[i..]))
-                } else {
-                    // single `*` — does not cross path separators
-                    for i in 0..=t.len() {
-                        if m(&p[1..], &t[i..]) {
-                            return true;
-                        }
-                        if t.get(i) == Some(&b'/') {
-                            break;
-                        }
-                    }
-                    false
-                }
-            }
-            Some(b'?') => !t.is_empty() && t[0] != b'/' && m(&p[1..], &t[1..]),
-            Some(c) => !t.is_empty() && t[0] == *c && m(&p[1..], &t[1..]),
-        }
-    }
-    m(pattern.as_bytes(), text.as_bytes())
+    crate::permissions::wildcard_match(pattern, text, true)
 }
 
-fn grep_files(
+#[cfg(test)]
+fn grep_files(workspace: &Path, pattern: &str, sub: Option<&str>, case_insensitive: bool) -> Result<String> {
+    grep_files_with(workspace, pattern, sub, case_insensitive, &crate::permissions::ReadFilter::default())
+}
+
+fn grep_files_with(
     workspace: &Path,
     pattern: &str,
     sub: Option<&str>,
     case_insensitive: bool,
+    hidden: &crate::permissions::ReadFilter,
 ) -> Result<String> {
     use ignore::WalkBuilder;
     let re = {
@@ -1269,11 +1404,11 @@ fn grep_files(
         .flatten()
     {
         let path = entry.path();
-        if !path.is_file() {
+        if !is_plain_file(&entry) || hidden.hides(workspace, path) {
             continue;
         }
         // Skip big files
-        let Ok(meta) = std::fs::metadata(path) else { continue };
+        let Ok(meta) = std::fs::symlink_metadata(path) else { continue };
         if meta.len() > 2_000_000 {
             skipped += 1;
             continue;
@@ -1347,6 +1482,11 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
             if s[0] == 0x2002 {
                 return is_public_ip(embedded(s[1], s[2]));
             }
+            // 2001::/32 (Teredo) tunnels to an IPv4 address hidden in the
+            // address (XOR-ed); no public page needs it, so it is refused.
+            if s[0] == 0x2001 && s[1] == 0 {
+                return false;
+            }
             !(v6.is_unspecified()
                 || v6.is_loopback()
                 || v6.is_multicast()
@@ -1405,6 +1545,10 @@ async fn fetch_body(url: &str, allowed: fn(std::net::IpAddr) -> bool) -> Result<
             .connect_timeout(Duration::from_secs(10))
             .user_agent("opencode-rust/0.1")
             .redirect(reqwest::redirect::Policy::none())
+            // An HTTP(S)_PROXY from the environment would connect to the
+            // proxy instead of the checked addresses (and the proxy can
+            // reach the private network): always connect directly.
+            .no_proxy()
             .resolve_to_addrs(&host, &addrs)
             .build()?;
         let mut resp = http
@@ -1641,7 +1785,7 @@ mod tests {
     }
 
     /// Tests that start background jobs run one at a time (see `stop_all`).
-    static JOB_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(super) static JOB_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A dev server the agent started in the background must not outlive
     /// Habi: `stop_all` (run on exit) ends it and what it started.
@@ -2334,5 +2478,173 @@ mod b43_tests {
         let text = html_to_text(&"a<".repeat(100_000));
         assert_eq!(text.len(), 200_000);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    use super::*;
+
+    fn ws(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let p = std::env::temp_dir().join(format!("ocrs-rf-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// `.opencode/skills/<rest>` only reads plain names below a skills
+    /// folder: `..`, a root or a drive in `<rest>` led to the config file
+    /// (with the API key) or anywhere on disk.
+    #[test]
+    fn skill_paths_cannot_climb_out_of_the_skills_folder() {
+        for bad in [
+            ".opencode/skills/../config.toml",
+            ".opencode/skills/../Cargo.toml",
+            ".opencode/skills/x/../../Cargo.toml",
+            ".opencode/skills//etc/passwd",
+            ".opencode/skills/C:/Windows/win.ini",
+            ".opencode/skills/",
+        ] {
+            assert!(user_skill_file(bad).is_none(), "{bad}");
+        }
+        let ws = ws("skill-escape");
+        let read = read_file(&ws, ".opencode/skills/../Cargo.toml", 0, 5);
+        assert!(read.is_err() || !read.unwrap().contains("[package]"), "Cargo.toml next to the skills folder");
+        // A relative path that left the workspace is not tried in a skills folder.
+        assert!(confine_read_path(&ws, "../skills/x/SKILL.md").is_err());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Windows: `.env::$DATA` is `.env` under a name no deny rule matches.
+    #[cfg(windows)]
+    #[test]
+    fn data_stream_names_are_refused() {
+        let ws = ws("ads");
+        std::fs::write(ws.join(".env"), "KEY=1").unwrap();
+        for bad in [".env::$DATA", "secret.txt:hidden", "src/a.rs:x"] {
+            assert!(confine_path(&ws, bad).unwrap_err().to_string().contains("data stream"), "{bad}");
+        }
+        assert!(read_file(&ws, ".env::$DATA", 0, 5).is_err());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// `grep . .` must not show what `read secrets/*` denies, and glob does
+    /// not list it.
+    #[test]
+    fn grep_and_glob_skip_files_a_read_rule_denies() {
+        let ws = ws("filter");
+        std::fs::create_dir_all(ws.join("secrets")).unwrap();
+        std::fs::write(ws.join("secrets/key.pem"), "TOKEN=abc").unwrap();
+        std::fs::write(ws.join("app.txt"), "TOKEN=public").unwrap();
+        let cfg = crate::config::PermissionsCfg {
+            rules: vec![crate::config::RuleCfg { tool: "read".into(), pattern: "secrets/*".into(), action: "deny".into() }],
+            ..Default::default()
+        };
+        let filter = crate::permissions::Engine::new(&cfg).read_filter("grep");
+        let out = grep_files_with(&ws, "TOKEN", None, false, &filter).unwrap();
+        assert!(out.contains("app.txt") && !out.contains("key.pem") && !out.contains("abc"), "{out}");
+        let out = grep_files_with(&ws, "TOKEN", Some("secrets/key.pem"), false, &filter).unwrap();
+        assert!(!out.contains("abc"), "naming the file itself: {out}");
+        let out = glob_files_with(&ws, "**/*", None, &filter).unwrap();
+        assert!(out.contains("app.txt") && !out.contains("key.pem"), "{out}");
+        // Without rules everything is found.
+        assert!(grep_files(&ws, "TOKEN", None, false).unwrap().contains("key.pem"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A symlink in the workspace to a file outside: grep did read it.
+    #[cfg(unix)]
+    #[test]
+    fn grep_does_not_follow_symlinks_out() {
+        let ws = ws("grep-link");
+        let other = super::review_fix_tests::ws("grep-link-target");
+        std::fs::write(other.join("secret.txt"), "TOKEN=outside").unwrap();
+        std::os::unix::fs::symlink(other.join("secret.txt"), ws.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(&other, ws.join("dir")).unwrap();
+        let out = grep_files(&ws, "TOKEN", None, false).unwrap();
+        assert!(!out.contains("outside"), "{out}");
+        assert!(!glob_files(&ws, "**/*", None).unwrap().contains("link.txt"));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// Loose edits: an NBSP indentation cut panicked (release aborts), and
+    /// a file with mixed line endings got every ending rewritten.
+    #[test]
+    fn loose_edits_are_char_safe_and_keep_each_line_ending() {
+        // delta -1 and a new line that starts with NBSP (2 bytes).
+        let (out, _, loose) = apply_edit("a\nb\n", " a", "\u{a0}z", false).unwrap();
+        assert!(loose);
+        assert_eq!(out, "\u{a0}z\nb\n");
+        let (out, _, loose) = apply_edit("a\r\nb\nc\n", "  b", "B", false).unwrap();
+        assert!(loose);
+        assert_eq!(out, "a\r\nB\nc\n", "only the edited line changes");
+        let (out, _, _) = apply_edit("a\r\n  b\r\nc", "b\nc", "B\nC\nD", false).unwrap();
+        assert_eq!(out, "a\r\n  B\r\n  C\r\n  D", "no CR added at a last line that had none");
+    }
+
+    /// Exponential backtracking: `*a*a*…b` against a long run of `a`.
+    #[test]
+    fn glob_matching_is_not_exponential() {
+        let started = std::time::Instant::now();
+        let text = "a".repeat(200);
+        let pattern = format!("{}b", "*a".repeat(30));
+        assert!(!match_glob(&pattern, &text));
+        assert!(!match_glob(&format!("{}b", "**/a".repeat(20)), &"a/".repeat(100)));
+        assert!(!crate::permissions::glob_match(&pattern, &text));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        // The documented semantics still hold.
+        assert!(match_glob("src/**/*.rs", "src/lib.rs"));
+        assert!(match_glob("a?c", "abc") && !match_glob("a?c", "a/c"));
+        assert!(match_glob("**", "a/b/c"));
+    }
+
+    #[test]
+    fn teredo_addresses_are_refused() {
+        let ip: std::net::IpAddr = "2001:0:4136:e378:8000:63bf:3fff:fdd2".parse().unwrap();
+        assert!(!is_public_ip(ip));
+        assert!(is_public_ip("2001:4860:4860::8888".parse().unwrap()), "other 2001:: space stays");
+    }
+
+    /// `server &` keeps the pipes open after the shell exits: the command
+    /// still ends at once (with a note), not after the whole timeout.
+    #[tokio::test]
+    async fn bash_returns_when_the_shell_exits_despite_a_background_child() {
+        if shell_kind() != crate::permissions::Shell::Posix {
+            return;
+        }
+        let dir = ws("bash-bg");
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        let t0 = std::time::Instant::now();
+        let out = bash("sleep 6 & echo started", &dir, Duration::from_secs(30), &abort).await.unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert!(out.contains("started") && out.contains("exit code: 0"), "{out}");
+        assert!(out.contains("still runs"), "{out}");
+        // A plain command has no note.
+        assert!(!bash("echo hi", &dir, Duration::from_secs(10), &abort).await.unwrap().contains("still runs"));
+    }
+
+    /// Ended agent jobs are forgotten beyond a limit.
+    #[tokio::test]
+    async fn ended_jobs_are_pruned() {
+        let _turn = super::tests::JOB_TESTS.lock().await;
+        let dir = ws("jobs-prune");
+        for _ in 0..30 {
+            let id = jobs::spawn("exit 0", &dir, false).unwrap();
+            for _ in 0..100 {
+                if jobs::output(&id).unwrap().contains("exited") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        assert!(jobs::count() <= 22, "{}", jobs::count());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncate_keeps_the_start_and_says_how_much_was_cut() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate(&"é".repeat(10), 5), "éé\n… [truncated 16 bytes]");
     }
 }

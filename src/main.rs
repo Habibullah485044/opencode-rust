@@ -430,7 +430,7 @@ async fn headless_run(
                 }
                 let abort = Arc::new(AtomicBool::new(false));
                 let proposal =
-                    match opencode_rust::inline_edit::propose(&state, &path, &instruction, &abort)
+                    match opencode_rust::inline_edit::propose(&state, &session.id, &path, &instruction, &abort)
                         .await
                     {
                         Ok(p) => p,
@@ -1240,7 +1240,7 @@ async fn tui_run(
                                 return;
                             }
                             let result =
-                                opencode_rust::inline_edit::propose(&st2, &path, &instruction, &abort)
+                                opencode_rust::inline_edit::propose(&st2, &sid2, &path, &instruction, &abort)
                                     .await;
                             // A newer run took the slot: this edit was cancelled,
                             // and its events must not end that run's busy state.
@@ -1272,12 +1272,12 @@ async fn tui_run(
                     tui::InputAction::ApplyEdit { path, old, new, line } => {
                         let st2 = st.clone();
                         let sid2 = sid.clone();
-                        let ws = st2.workspace.clone();
+                        let ws = st2.workspace_for(&sid2);
                         let path_c = path.clone();
                         // Same contract as an agent run: snapshot before we
                         // mutate, so /undo can revert an accepted inline edit.
                         if let Err(e) = opencode_rust::gitsnap::record_before_run(
-                            &st2.workspace,
+                            &ws,
                             &st2.state_dir,
                             "pre-edit",
                         ) {
