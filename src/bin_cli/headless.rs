@@ -171,7 +171,7 @@ async fn run_command(state: &State, sid: &str, cmd: Cmd) -> Outcome {
                 state.kick_mission(sid.to_string(), None).await;
                 return Outcome::RunStarted;
             }
-            "status" => println!("{}", server::mission_report(state, sid)),
+            "status" => println!("{}", server::mission_report(state, sid).await),
             _ => println!("a headless run has no mission running to stop"),
         },
         Cmd::Turbo { prompt } => {

@@ -128,7 +128,7 @@ async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
                 let text = if stopped { "mission: stopping — /mission resume carries on" } else { "no mission is running" };
                 note(st, sid, text.into());
             }
-            _ => note(st, sid, server::mission_report(st, sid)),
+            _ => note(st, sid, server::mission_report(st, sid).await),
         },
         tui::InputAction::Turbo(prompt) => {
             // Core is the authority: toggle on bare /turbo, force

@@ -653,8 +653,10 @@ async fn apply_verdict(
 }
 
 /// `/mission status`: the plan with each step's state and receipt line.
-pub fn mission_report(st: &AppState, session_id: &str) -> String {
-    match st.db.mission(session_id) {
+/// T-147: read off the async threads.
+pub async fn mission_report(st: &AppState, session_id: &str) -> String {
+    let sid = session_id.to_string();
+    match st.db.run(move |db| db.mission(&sid)).await {
         Ok(Some(m)) => format!(
             "Mission ({}{}): {}\n{}\n\nReceipts:\n{}",
             m.status,
@@ -780,7 +782,7 @@ mod tests {
         }).collect();
         assert!(chat.iter().any(|t| t.starts_with("**Mission plan**")));
         assert!(chat.iter().any(|t| t.contains("Added next: Write c.txt")));
-        assert!(mission_report(&st, &s.id).contains("Mission (done)"));
+        assert!(mission_report(&st, &s.id).await.contains("Mission (done)"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
