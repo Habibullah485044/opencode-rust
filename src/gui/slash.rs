@@ -120,15 +120,9 @@ pub(super) fn gui_command(gs: &mut GuiState, st: &Arc<server::AppState>, rt: &to
                     let _ = st.db.set_session_title(&sid, &clip(&mission.goal, 40));
                     refresh_sessions(gs, st);
                 }
+                // T-143: started the way the TUI and headless runs start it.
                 let (st2, sid2) = (st.clone(), sid.clone());
-                if mission.kind.read_only() {
-                    st.set_mode(&sid, crate::agents::AgentMode::Plan);
-                    let brief = mission.briefing();
-                    rt.spawn(async move { st2.kick_run(sid2, brief).await });
-                } else {
-                    let goal = mission.goal_for_mission_mode();
-                    rt.spawn(async move { st2.kick_mission(sid2, Some(goal)).await });
-                }
+                rt.spawn(async move { crate::frontend::start_mission(&st2, sid2, mission, false).await });
                 gs.busy = true;
             }
             _ => say(gs, "Usage: /mission <goal>, or /mission status | stop | resume.".into()),
@@ -147,19 +141,19 @@ pub(super) fn gui_command(gs: &mut GuiState, st: &Arc<server::AppState>, rt: &to
             _ => say(gs, "Usage: /deep [n] <task>, with n from 1 to 5 (default 3).".into()),
         },
         "undo" | "redo" => {
-            let res = if name == "undo" && arg == "force" {
-                crate::gitsnap::undo_anyway(&root, &st.state_dir)
-            } else if name == "undo" {
-                crate::gitsnap::undo(&root, &st.state_dir)
-            } else {
-                crate::gitsnap::redo(&root, &st.state_dir)
-            };
-            let text = match res {
-                Ok(Some(m)) => format!("{} done: files are back as of snapshot {}.", if name == "undo" { "Undo" } else { "Redo" }, m.id),
-                Ok(None) => format!("Nothing to {name} (or this project is not a git repository)."),
-                Err(e) => format!("{name} failed: {e:#}"),
-            };
-            say(gs, text);
+            // T-143: the shared snapshot step (git runs off this thread);
+            // the outcome comes back as a note.
+            let (redo, force) = (name == "redo", name == "undo" && arg == "force");
+            let (st2, sid2, name) = (st.clone(), sid.clone(), name.to_string());
+            rt.spawn(async move {
+                let text = match crate::frontend::run_snapshot(root, st2.state_dir.clone(), redo, force).await {
+                    Ok(Ok(Some(m))) => format!("{} done: files are back as of snapshot {}.", if redo { "Redo" } else { "Undo" }, m.id),
+                    Ok(Ok(None)) => format!("Nothing to {name} (or this project is not a git repository)."),
+                    Ok(Err(e)) => format!("{name} failed: {e:#}"),
+                    Err(e) => format!("{name} failed: {e}"),
+                };
+                let _ = st2.events.send(ServerEvent::Note { session_id: sid2, text });
+            });
         }
         "init" => {
             let text = match crate::skills::init_agents_md(&root) {
@@ -234,6 +228,18 @@ mod tests {
         .await
         .expect("the mission note arrived");
         assert!(note.contains("This chat has no mission"), "{note}");
+        // T-143: /undo runs the shared snapshot step; no snapshot here.
+        assert!(gui_command(&mut gs, &st, &rt, "/undo"));
+        let note = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Ok(ServerEvent::Note { text, .. }) = events.recv().await {
+                    break text;
+                }
+            }
+        })
+        .await
+        .expect("the undo note arrived");
+        assert!(note.starts_with("Nothing to undo") || note.starts_with("undo failed"), "{note}");
         assert!(!gui_command(&mut gs, &st, &rt, "/deploy staging"), "a project command goes to the core");
         assert!(!gui_command(&mut gs, &st, &rt, "fix the bug"));
         assert_eq!(find_project_files(&dir, "APP", 5), vec!["src/app.js".to_string()]);

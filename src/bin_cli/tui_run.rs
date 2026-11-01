@@ -1,7 +1,7 @@
 //! The terminal UI runner: bridges the core's event bus to the TUI and
 //! carries out the TUI's actions against the core, like an API client.
 
-use super::shared;
+use opencode_rust::frontend;
 use anyhow::Result;
 use opencode_rust::{agents::AgentMode, server, tui};
 use std::sync::Arc;
@@ -119,7 +119,7 @@ async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
             st.kick_run(sid.clone(), content).await;
         }
         tui::InputAction::Mission(mission) => {
-            shared::start_mission(st, sid.clone(), mission, true).await;
+            frontend::start_mission(st, sid.clone(), mission, true).await;
         }
         tui::InputAction::MissionCtl(what) => match what.as_str() {
             "resume" => st.kick_mission(sid.clone(), None).await,
@@ -133,7 +133,7 @@ async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
         tui::InputAction::Turbo(prompt) => {
             // Core is the authority: toggle on bare /turbo, force
             // ON when a prompt comes with it.
-            let on = shared::switch_turbo(st, prompt.is_some());
+            let on = frontend::switch_turbo(st, prompt.is_some());
             note(
                 st,
                 sid,
@@ -148,7 +148,7 @@ async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
             }
         }
         tui::InputAction::SkillInstall(src) => skill_install(st, sid, src).await,
-        tui::InputAction::Team(goal) => shared::kick_team(st, sid.clone(), goal).await,
+        tui::InputAction::Team(goal) => frontend::kick_team(st, sid.clone(), goal).await,
         tui::InputAction::SetMode(m) => {
             // Core is the authority; the TUI already flipped its display.
             st.set_mode(sid, m);
@@ -310,7 +310,7 @@ async fn snapshot_command(st: State, sid: String, redo: bool, force: bool) {
     // The chat's own folder: that is where its runs took their undo points.
     let ws = st.workspace_for(&sid);
     let sd = st.state_dir.clone();
-    let res = shared::run_snapshot(ws, sd, redo, force).await;
+    let res = frontend::run_snapshot(ws, sd, redo, force).await;
     let verb = if redo { "redo" } else { "undo" };
     let text = match res {
         Ok(Ok(Some(m))) => format!(

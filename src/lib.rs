@@ -6,6 +6,7 @@ pub mod commands;
 pub mod compact;
 pub mod config;
 pub mod db;
+pub mod frontend;
 pub mod gitsnap;
 pub mod hash;
 #[cfg(feature = "gui")]
