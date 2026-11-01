@@ -192,6 +192,7 @@ pub async fn run(
     }
 
     eprintln!("[gui] entering the event loop");
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Done>();
     let mut app = App {
         gs,
         st: state.clone(),
@@ -207,6 +208,9 @@ pub async fn run(
         evt_rx,
         ui_rx,
         cmd_rx,
+        done_tx,
+        done_rx,
+        proxy: event_loop.create_proxy(),
     };
     event_loop.run(move |event, _, control_flow| app.on_loop_event(event, control_flow))
 }

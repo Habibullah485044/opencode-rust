@@ -28,6 +28,30 @@ pub(super) struct App {
     pub(super) ui_rx: std::sync::mpsc::Receiver<UiMsg>,
     /// Goal B: requests from agent browser tools.
     pub(super) cmd_rx: tokio::sync::mpsc::UnboundedReceiver<crate::browser::Request>,
+    /// Results of work done off this thread (`off_thread`), and its waker.
+    pub(super) done_tx: std::sync::mpsc::Sender<Done>,
+    pub(super) done_rx: std::sync::mpsc::Receiver<Done>,
+    pub(super) proxy: tao::event_loop::EventLoopProxy<AppEvent>,
+}
+
+/// Work finished on the blocking pool, applied on the event loop. True = repaint.
+pub(super) type Done = Box<dyn FnOnce(&mut GuiState, &server::AppState) -> bool + Send>;
+
+/// Run `work` on the blocking pool (git, disk scans), then hand `apply` its
+/// result through `tx` and `wake` the loop, which never waits for it.
+pub(super) fn off_thread<T: Send + 'static>(
+    rt: &tokio::runtime::Handle,
+    tx: std::sync::mpsc::Sender<Done>,
+    wake: impl FnOnce() + Send + 'static,
+    work: impl FnOnce() -> T + Send + 'static,
+    apply: impl FnOnce(&mut GuiState, &server::AppState, T) -> bool + Send + 'static,
+) {
+    rt.spawn_blocking(move || {
+        let out = work();
+        let done: Done = Box::new(move |gs, st| apply(gs, st, out));
+        let _ = tx.send(done);
+        wake();
+    });
 }
 
 impl App {
@@ -65,6 +89,19 @@ impl App {
         }
     }
 
+    /// [`off_thread`] with this loop's channel and waker.
+    pub(super) fn off_thread<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+        apply: impl FnOnce(&mut GuiState, &server::AppState, T) -> bool + Send + 'static,
+    ) {
+        let proxy = self.proxy.clone();
+        let wake = move || {
+            let _ = proxy.send_event(AppEvent::Wake);
+        };
+        off_thread(&self.rt, self.done_tx.clone(), wake, work, apply);
+    }
+
     /// Exit, after asking first while a run is going (closing stops it).
     pub(super) fn close(&self, control_flow: &mut ControlFlow) {
         if confirm_close(&self.window, &self.gs) {
@@ -91,6 +128,9 @@ impl App {
         }
         while let Ok(msg) = self.ui_rx.try_recv() {
             changed |= self.dispatch(msg, control_flow);
+        }
+        while let Ok(done) = self.done_rx.try_recv() {
+            changed |= done(&mut self.gs, &self.st);
         }
         // Goal B: agent tools ask this loop to act on the webview.
         while let Ok(req) = self.cmd_rx.try_recv() {
@@ -150,5 +190,35 @@ impl App {
             changed = true;
         }
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-019: the work runs on the blocking pool, not the caller's thread,
+    /// and its result is applied by whoever drains the channel (the loop).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn off_thread_runs_the_work_elsewhere_and_posts_the_result() {
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let (tx, rx) = std::sync::mpsc::channel::<Done>();
+        let (woke_tx, woke_rx) = std::sync::mpsc::channel();
+        let here = std::thread::current().id();
+        off_thread(
+            &tokio::runtime::Handle::current(),
+            tx,
+            move || woke_tx.send(()).unwrap(),
+            || std::thread::current().id(),
+            move |gs, _, ran_on| {
+                gs.push(EntryKind::System, format!("elsewhere={}", ran_on != here));
+                true
+            },
+        );
+        woke_rx.recv_timeout(Duration::from_secs(10)).expect("the loop was woken");
+        let done = rx.try_recv().expect("a result was posted");
+        let mut gs = GuiState::new();
+        assert!(done(&mut gs, &st));
+        assert_eq!(gs.entries.last().unwrap().1, "elsewhere=true");
     }
 }

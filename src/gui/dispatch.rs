@@ -276,27 +276,40 @@ impl App {
     /// the composer.
     fn on_rewind(&mut self, text: String, skip: usize) -> bool {
         let sid = self.gs.session.clone().unwrap_or_default();
-        let note = if self.gs.busy || self.gs.running.contains(&sid) {
-            "Stop the run first, then rewind.".to_string()
-        } else {
-            match server::rewind_chat(&self.st, &sid, &text, skip) {
-                Ok(r) => {
-                    load_session(&mut self.gs, &self.st, &sid);
-                    let shown = text.trim().trim_start_matches('\u{203a}').trim().to_string();
-                    self.gs.compose = (self.gs.compose.0 + 1, shown);
-                    let files = match (r.undone, &r.problem) {
-                        (0, _) => "no file changes to put back".to_string(),
-                        (n, None) => format!("files put back to before it ({n} undo step(s); /redo brings them back)"),
-                        (n, Some(p)) => format!("{n} undo step(s), but: {p}"),
-                    };
-                    format!("Rewound: {} message(s) removed, {files}. Your message is back in the box to edit.", r.messages)
+        if self.gs.busy || self.gs.running.contains(&sid) {
+            self.gs.push(EntryKind::System, "Stop the run first, then rewind.".to_string());
+            return true;
+        }
+        // T-019: up to 50 `git` undo runs — off the GUI thread.
+        let (st, sid2, text2) = (self.st.clone(), sid.clone(), text.clone());
+        self.off_thread(
+            move || server::rewind_chat(&st, &sid2, &text2, skip),
+            move |gs, st, res| {
+                gs.git_stale = true;
+                // The user moved to another chat meanwhile: it reloads from
+                // the database when they come back.
+                if !gs.is_current(&sid) {
+                    return true;
                 }
-                Err(e) => format!("Could not rewind: {e:#}"),
-            }
-        };
-        self.gs.push(EntryKind::System, note);
-        self.gs.git_stale = true;
-        true
+                let note = match res {
+                    Ok(r) => {
+                        load_session(gs, st, &sid);
+                        let shown = text.trim().trim_start_matches('\u{203a}').trim().to_string();
+                        gs.compose = (gs.compose.0 + 1, shown);
+                        let files = match (r.undone, &r.problem) {
+                            (0, _) => "no file changes to put back".to_string(),
+                            (n, None) => format!("files put back to before it ({n} undo step(s); /redo brings them back)"),
+                            (n, Some(p)) => format!("{n} undo step(s), but: {p}"),
+                        };
+                        format!("Rewound: {} message(s) removed, {files}. Your message is back in the box to edit.", r.messages)
+                    }
+                    Err(e) => format!("Could not rewind: {e:#}"),
+                };
+                gs.push(EntryKind::System, note);
+                true
+            },
+        );
+        false
     }
 
     /// Make a new git branch in the chat's project and switch to it.
