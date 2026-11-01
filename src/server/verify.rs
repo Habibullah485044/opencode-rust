@@ -210,7 +210,7 @@ pub async fn run_review(
     // What to review goes into the request: the review runs read-only (no
     // git, no shell), and a model told to "find the changes" without them
     // spent its steps saying tools were blocked.
-    let ws = st.workspace_for(session_id);
+    let ws = st.workspace_for_async(session_id).await;
     // git diff and file reads: off the async threads.
     let changes = {
         let ws = ws.clone();
@@ -231,7 +231,7 @@ pub async fn run_review(
                  the workspace really is empty, say so in one line."
             .to_string(),
     };
-    st.db.add_message(session_id, "user", &[Part::Text { text: prompt }])?;
+    save_message(st, session_id, "user", vec![Part::Text { text: prompt }]).await?;
     let system = format!(
         "{}\n\nWorkspace: {}. The changes are in the user's message. You have NO bash and NO git — \
          calling them gets you 'tool blocked' and wastes your steps. Your tools are exactly: \
@@ -248,7 +248,7 @@ pub async fn run_review(
         emit_activity: true,
         allow: Some(vec!["list".to_string(), "read".to_string(), "glob".to_string(), "grep".to_string()]),
         can_spawn: false,
-        workspace: st.run_workspace(session_id),
+        workspace: (ws != st.workspace).then(|| ws.clone()),
         agent: None,
     };
     tagged("review", session_id, run_loop(st, session_id, &opts, abort)).await
@@ -283,7 +283,7 @@ pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abor
     if request.starts_with(TURBO_CONTINUE_PREFIX) {
         return None;
     }
-    let ws = st.workspace_for(session_id);
+    let ws = st.workspace_for_async(session_id).await;
     let mut files: Vec<String> = std::fs::read_dir(&ws)
         .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !n.starts_with('.')).collect())
         .unwrap_or_default();
@@ -399,7 +399,7 @@ pub(crate) async fn design_review(
     if !st.cfg.agent.design_review || st.own_prompt_only() {
         return None;
     }
-    let ws = st.workspace_for(session_id);
+    let ws = st.workspace_for_async(session_id).await;
     let pages = changed_web_pages(&ws, since, bash_used, true);
     if pages.is_empty() {
         return None;
@@ -451,7 +451,7 @@ pub(super) async fn check_after_run(
     let note = |text: String| {
         let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
     };
-    let ws = st.workspace_for(session_id);
+    let ws = st.workspace_for_async(session_id).await;
     let cmd = match verify_command_for(st, &ws, &note) {
         Some(c) if verify_permitted(st, session_id, &c, &note, abort).await => Some(c),
         _ => None,

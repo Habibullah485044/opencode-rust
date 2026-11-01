@@ -3565,3 +3565,22 @@ async fn auto_approval_reads_the_parent_chain_at_once() {
     drop(grant);
     assert_eq!(st.perm_mode_for_async(&agent.id).await, PermissionMode::Default);
 }
+
+/// T-148: the async folder lookup shares the cache with the sync one.
+#[tokio::test]
+async fn async_folder_lookup_uses_the_same_cache() {
+    let base = std::env::temp_dir().join(format!("ocrs-ws-async-{}", std::process::id()));
+    let (start, other) = (base.join("start"), base.join("other"));
+    std::fs::create_dir_all(&start).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let st = build_state_ephemeral(crate::config::Config::default(), start.clone()).await;
+    let project = st.db.upsert_project(&other).unwrap();
+    let s = st.db.create_session_in("cached", None, Some(&project.id)).unwrap();
+    assert_eq!(st.workspace_for_async(&s.id).await, other);
+    st.db.set_session_project(&s.id, None).unwrap();
+    assert_eq!(st.workspace_for(&s.id), other, "the async lookup filled the cache");
+    assert_eq!(st.workspace_for_async(&s.id).await, other, "answered from the cache");
+    assert_eq!(st.workspace_for_async("ses_unknown").await, start);
+    assert!(!st.workspaces.lock().unwrap().contains_key("ses_unknown"), "an unknown chat is not cached");
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -228,6 +228,9 @@ pub struct Rewound {
 /// (`skip` = how many later messages with the same text to pass over):
 /// the project's files go back to the undo points taken since the message
 /// before it, and that message and everything after it are deleted.
+/// Blocking (database, up to 50 `git` undo runs): call it on a blocking
+/// thread, as the GUI does (T-148: it is the only caller; the TUI and the
+/// HTTP API have no rewind).
 pub fn rewind_chat(st: &AppState, session_id: &str, text: &str, skip: usize) -> Result<Rewound> {
     let key = rewind_key(text);
     let msgs = st.db.messages(session_id)?;

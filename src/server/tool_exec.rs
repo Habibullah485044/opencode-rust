@@ -107,7 +107,10 @@ pub(super) async fn execute_for(
     abort: &AtomicBool,
 ) -> (String, bool) {
     if name == "check_page" {
-        let root = opts.workspace.clone().unwrap_or_else(|| st.workspace_for(session_id));
+        let root = match &opts.workspace {
+            Some(ws) => ws.clone(),
+            None => st.workspace_for_async(session_id).await,
+        };
         return check_page_tool(st, &root, input).await;
     }
     if let Some(ws) = &opts.workspace {

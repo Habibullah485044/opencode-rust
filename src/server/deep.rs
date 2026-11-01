@@ -130,7 +130,7 @@ pub(super) async fn run_deep(
     let note = |text: String| {
         let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
     };
-    let ws = st.workspace_for(session_id);
+    let ws = st.workspace_for_async(session_id).await;
     save_message(st, session_id, "user", vec![Part::Text { text: format!("[deep mode, {n} attempts] {task}") }]).await?;
     let started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
 
@@ -305,13 +305,15 @@ async fn run_attempt(
     let worker = build_state_ephemeral(cfg, workspace).await;
     let _ = worker.set_perm_mode(mode);
     let fwd = forward_activity(st, &worker, info);
-    let res = match worker.db.create_session(&info.name, None) {
+    // T-148: the worker's database calls go through the blocking pool too.
+    let name = info.name.clone();
+    let res = match worker.db.run(move |db| db.create_session(&name, None)).await {
         Ok(s) => agent_inner(&worker, &s.id, &prompt, abort).await.map_err(|e| format!("{e:#}")),
         Err(e) => Err(format!("{e:#}")),
     };
     fwd.abort();
     // The attempt's tokens count for this chat too (`/usage`).
-    let u = worker.db.usage_totals(None, None).unwrap_or_default();
+    let u = worker.db.run(|db| db.usage_totals(None, None)).await.unwrap_or_default();
     if u.input + u.output > 0 {
         let usage = crate::provider::Usage {
             input: u.input,
