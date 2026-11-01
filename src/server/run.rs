@@ -9,6 +9,9 @@ pub const TURBO_CONTINUE_PREFIX: &str = "TURBO-CONTINUE:";
 /// Safety cap: how many back-to-back turbo continuations may run without a
 /// real user message. Bounds runaway loops while still being "non-stop".
 pub const TURBO_MAX_CONTINUATIONS: u32 = 8;
+/// Stop a turbo run after this many back-to-back continuations that change
+/// neither a file nor the open-todo set: it is spinning, not progressing.
+pub const TURBO_STALL_LIMIT: u32 = 2;
 /// New (B-24): start of the prompt that `run_review` stores as a "user"
 /// message. It is not the user talking, so `turbo_streak` skips it.
 pub(super) const AUTO_REVIEW_PROMPT_START: &str = "Review the current uncommitted changes";
@@ -155,12 +158,49 @@ pub(super) async fn turbo_continuation(st: &Shared, session_id: &str, result: &R
         });
         return None;
     }
-    let open: Vec<String> = match st.todo_store.exec(session_id, crate::todo::TodoOp::List) {
-        crate::todo::TodoResult::Listed { items } => {
-            items.iter().filter(|i| !i.completed).map(|i| format!("{} ({})", i.content, i.id)).collect()
+    let (open, mut open_ids): (Vec<String>, Vec<String>) =
+        match st.todo_store.exec(session_id, crate::todo::TodoOp::List) {
+            crate::todo::TodoResult::Listed { items } => items
+                .iter()
+                .filter(|i| !i.completed)
+                .map(|i| (format!("{} ({})", i.content, i.id), i.id.to_string()))
+                .unzip(),
+            _ => (Vec::new(), Vec::new()),
+        };
+    open_ids.sort();
+    // Stall check: did the last round change anything durable — a tracked
+    // file (content-hashed, so a rewrite of the same bytes does not count) or
+    // the set of open todos? If neither moved for TURBO_STALL_LIMIT rounds in
+    // a row, the run is spinning; stop and hand back to the user instead of
+    // looping on to the continuation cap for nothing. Outside a git repo
+    // there is no fingerprint, so only the todo set is watched there.
+    let fp = st.workspace_fingerprint(session_id).await;
+    let stalled = {
+        let mut map = st.turbo_progress.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = map.entry(session_id.to_string()).or_default();
+        let file_changed = fp.is_some() && fp != prev.fingerprint;
+        let todos_changed = open_ids != prev.open_todos;
+        if file_changed || todos_changed {
+            prev.stalled = 0;
+        } else {
+            prev.stalled += 1;
         }
-        _ => Vec::new(),
+        prev.fingerprint = fp.or(prev.fingerprint);
+        prev.open_todos = open_ids;
+        prev.stalled
     };
+    if stalled >= TURBO_STALL_LIMIT {
+        let _ = st.events.send(ServerEvent::Note {
+            session_id: session_id.to_string(),
+            text: format!(
+                "turbo: stopping — the last {stalled} rounds changed no files and finished no \
+                 todo, so the run is not getting anywhere. See my notes above for what I found. \
+                 Still open: {}. Tell me how to go on, or mark a todo done if it already is.",
+                open.join("; ")
+            ),
+        });
+        return None;
+    }
     Some(format!(
         "{TURBO_CONTINUE_PREFIX} you have full access and must not ask the \
          user anything. Make the most reasonable decision yourself, keep \
@@ -231,6 +271,13 @@ pub(super) async fn run_agent_in(
     abort: Arc<AtomicBool>,
     chain: Option<Chain>,
 ) {
+    // A fresh user prompt (not a turbo continuation) is new intent: forget
+    // the previous run's stall record so an old streak can't stop this one.
+    if chain.is_none() {
+        if let Ok(mut m) = st.turbo_progress.lock() {
+            m.remove(session_id);
+        }
+    }
     // Safety net before anything mutates the workspace. Failure is not
     // fatal — snapshotting is a convenience, the run must still work.
     record_snapshot_before_run(st, session_id).await;

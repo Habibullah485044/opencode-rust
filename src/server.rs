@@ -285,6 +285,18 @@ pub struct ApprovalEntry {
     pub request: ServerEvent,
 }
 
+/// Turbo stall detection: what the last turbo round left behind, so a run
+/// that keeps changing nothing can be stopped instead of looping to the cap.
+#[derive(Default, Clone)]
+pub struct TurboProgress {
+    /// Git working-tree fingerprint after the round (`None` outside a repo).
+    pub fingerprint: Option<u64>,
+    /// The open todo ids after the round, sorted.
+    pub open_todos: Vec<String>,
+    /// Back-to-back rounds that changed neither files nor the open todos.
+    pub stalled: u32,
+}
+
 pub struct AppState {
     pub cfg: Config,
     pub db: Db,
@@ -339,6 +351,9 @@ pub struct AppState {
     /// changes, so the auto-approval walk reads each link from the database
     /// once.
     pub parents: Mutex<HashMap<String, Option<String>>>,
+    /// Turbo stall detection, per chat (see [`TurboProgress`]). Reset when a
+    /// real user prompt starts; dropped per chat by `forget_session`.
+    pub turbo_progress: Mutex<HashMap<String, TurboProgress>>,
 }
 
 /// `system_delivery`: not probed yet — the prompt travels as a user note,
@@ -408,6 +423,7 @@ pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
         auto_approve: Mutex::new(HashMap::new()),
         workspaces: Mutex::new(HashMap::new()),
         parents: Mutex::new(HashMap::new()),
+        turbo_progress: Mutex::new(HashMap::new()),
     }))
 }
 
@@ -469,6 +485,7 @@ pub async fn build_state_ephemeral_db(cfg: Config, workspace: PathBuf, skill_bas
         auto_approve: Mutex::new(HashMap::new()),
         workspaces: Mutex::new(HashMap::new()),
         parents: Mutex::new(HashMap::new()),
+        turbo_progress: Mutex::new(HashMap::new()),
     })
 }
 
@@ -684,6 +701,9 @@ impl AppState {
             m.remove(session_id);
         }
         if let Ok(mut m) = self.parents.lock() {
+            m.remove(session_id);
+        }
+        if let Ok(mut m) = self.turbo_progress.lock() {
             m.remove(session_id);
         }
         if let Some(Ok(mut m)) = FROZEN_LESSONS.get().map(|c| c.lock()) {

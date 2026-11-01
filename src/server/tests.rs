@@ -2962,6 +2962,46 @@ async fn turbo_streak_caps_and_resets() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A turbo run that keeps changing nothing — no file written, no todo
+/// finished — is stopped instead of looping to the continuation cap. A real
+/// change (a new todo, or an edited file) clears the stall and lets it go on.
+#[tokio::test]
+async fn turbo_stops_when_a_run_stops_changing_anything() {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("ocrs-turbostall-{}-{stamp}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A real git repo so the workspace fingerprint is meaningful.
+    crate::gitsnap::git(&dir, &["init"]).unwrap();
+    crate::gitsnap::git(&dir, &["config", "user.email", "t@t"]).unwrap();
+    crate::gitsnap::git(&dir, &["config", "user.name", "t"]).unwrap();
+
+    let st = build_state_ephemeral(crate::config::Config::default(), dir.clone()).await;
+    st.set_perm_mode(PermissionMode::Turbo);
+    let s = st.db.create_session("stall", None).unwrap();
+    st.todo_store.exec(&s.id, crate::todo::TodoOp::Add { content: "task one".into() });
+    let done: Result<LoopEnd> = Ok(LoopEnd::Done("still working".into()));
+
+    // First call sets the baseline and continues; the next is one stalled
+    // round and still continues; the second stalled round in a row stops.
+    assert!(turbo_continuation(&st, &s.id, &done).await.is_some(), "baseline round continues");
+    assert!(turbo_continuation(&st, &s.id, &done).await.is_some(), "one stalled round still continues");
+    assert!(turbo_continuation(&st, &s.id, &done).await.is_none(), "two stalled rounds in a row stop it");
+
+    // A new open todo is real progress: the stall clears.
+    st.todo_store.exec(&s.id, crate::todo::TodoOp::Add { content: "task two".into() });
+    assert!(turbo_continuation(&st, &s.id, &done).await.is_some(), "a todo change resets the stall");
+    assert!(turbo_continuation(&st, &s.id, &done).await.is_some(), "one stalled round again");
+
+    // Writing a file is progress too: it resets the stall again.
+    std::fs::write(dir.join("new.txt"), "hello").unwrap();
+    assert!(turbo_continuation(&st, &s.id, &done).await.is_some(), "a file change resets the stall");
+    assert!(turbo_continuation(&st, &s.id, &done).await.is_some(), "one stalled round once more");
+    assert!(turbo_continuation(&st, &s.id, &done).await.is_none(), "stops again once nothing changes");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// /skill install: a worthy skill is vetted, installed and baked in — its
 /// body lands in the system prompt; an unworthy one is refused.
 #[tokio::test]
