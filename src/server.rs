@@ -647,10 +647,10 @@ impl AppState {
                 let latency_ms = t0.elapsed().as_millis() as u64;
                 let detail = format!("GET {base}/models → {got} ({latency_ms} ms)");
                 // Say it once per change, so a failing check is never silent.
+                // To the log only: this runs while the TUI owns the terminal,
+                // and the event's `detail` already shows the reason there.
                 if last_ok != Some(ok) {
-                    let line = format!("[api] {} — {detail}", if ok { "online" } else { "offline" });
-                    eprintln!("{line}");
-                    core_log(&line);
+                    core_log(&format!("[api] {} — {detail}", if ok { "online" } else { "offline" }));
                     last_ok = Some(ok);
                 }
                 let _ = st.events.send(ServerEvent::Heartbeat { ok, latency_ms, detail });
@@ -700,14 +700,22 @@ impl AppState {
     /// (seen 2026-10-26 against a 16384-token model).
     pub fn start_context_probe(self: &Shared) {
         let st = self.clone();
-        tokio::spawn(async move { st.run_startup_probes().await });
+        // In the background of a TUI/GUI run: findings go to the log only.
+        tokio::spawn(async move { st.startup_probes(false).await });
     }
 
     /// The two questions worth asking a server before using it: how big the
     /// model's context window is, and whether it delivers `system` messages.
     /// An interactive run asks in the background; a headless run asks first,
     /// so its very first request is already packed for the server it has.
+    /// Headless calls this before its first request; nothing else owns the
+    /// terminal then, so the findings are printed too.
     pub async fn run_startup_probes(self: &Shared) {
+        self.startup_probes(true).await
+    }
+
+    /// The probes; `echo` also prints each finding to stderr (headless only).
+    async fn startup_probes(self: &Shared, echo: bool) {
         let Ok(base) = self.cfg.effective_base_url() else { return };
         let key = self.cfg.provider.api_key.clone();
         let Ok(http) = reqwest::Client::builder()
@@ -727,9 +735,9 @@ impl AppState {
             _ => None,
         };
         if let Some(n) = self.note_context(body.as_ref(), &http, &base, &key).await {
-            eprintln!("[api] model context window: {n} tokens");
+            probe_note(echo, &format!("[api] model context window: {n} tokens"));
         }
-        self.probe_system_delivery(&base, &key).await;
+        self.probe_system_delivery(&base, &key, echo).await;
     }
 
     /// One tiny question: does this server pass a `system` message on to the
@@ -744,7 +752,7 @@ impl AppState {
     /// `None` = could not tell (offline, timeout, refused). The state then
     /// stays [`SYSTEM_UNKNOWN`] and the prompt keeps travelling as a trailing
     /// user note, which every server passes on.
-    async fn probe_system_delivery(&self, base: &str, key: &str) -> Option<()> {
+    async fn probe_system_delivery(&self, base: &str, key: &str, echo: bool) -> Option<()> {
         // Anthropic's protocol has its own top-level `system` field, filled in
         // by the API itself: there is no role in the message list to lose.
         if self.cfg.provider.api != crate::config::ProviderApi::OpenAi {
@@ -780,16 +788,23 @@ impl AppState {
         let delivers = text.to_ascii_uppercase().contains("ARCHITECT");
         self.system_delivery
             .store(if delivers { SYSTEM_DELIVERS } else { SYSTEM_DROPS }, Ordering::Relaxed);
-        eprintln!(
-            "[api] {}",
-            if delivers {
-                "system messages reach the model"
-            } else {
-                "this server drops system messages — the prompt travels as a user note"
-            }
-        );
+        let found = if delivers {
+            "system messages reach the model"
+        } else {
+            "this server drops system messages — the prompt travels as a user note"
+        };
+        probe_note(echo, &format!("[api] {found}"));
         Some(())
     }
+}
+
+/// T-054: a startup probe's finding, to core.log always and to stderr only
+/// when nothing else draws on the terminal (headless).
+fn probe_note(echo: bool, line: &str) {
+    if echo {
+        eprintln!("{line}");
+    }
+    core_log(line);
 }
 
 /// A failed status check in plain words (the cause chain, not just the
