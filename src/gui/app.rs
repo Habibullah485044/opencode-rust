@@ -122,9 +122,16 @@ impl App {
         send_term(&self.webview, &self.gs);
         if self.gs.git_stale {
             self.gs.git_stale = false;
-            *self.gs.term_root.borrow_mut() = chat_root(&self.gs, &self.st);
-            self.gs.git = git_state(&chat_root(&self.gs, &self.st));
-            changed = true;
+            let root = chat_root(&self.gs, &self.st);
+            *self.gs.term_root.borrow_mut() = root.clone();
+            // T-066: two git processes — on the blocking pool, not here.
+            self.off_thread(
+                move || git_state(&root),
+                |gs, _, git| {
+                    gs.git = git;
+                    true
+                },
+            );
         }
         while let Ok(msg) = self.ui_rx.try_recv() {
             changed |= self.dispatch(msg, control_flow);
