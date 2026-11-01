@@ -61,9 +61,9 @@ pub(super) fn preview_smoke(gs: &mut GuiState, wv: &wry::WebView, allow_remote: 
             let _ = wv.set_bounds(rect.to_wry());
             let _ = wv.set_visible(true);
             let _ = wv.load_url(&url);
-            eprintln!("[preview-smoke] loading {url}");
+            gui_log(&format!("[preview-smoke] loading {url}"));
         }
-        Err(e) => eprintln!("[preview-smoke] refused: {e}"),
+        Err(e) => gui_log(&format!("[preview-smoke] refused: {e}")),
     }
 }
 
@@ -188,7 +188,7 @@ impl App {
     /// A callback from the preview webview (navigation, title, load state).
     pub(super) fn on_preview_event(&mut self, ev: BrowserEvt) -> bool {
         if std::env::var_os("OPENCODE_RUST_PREVIEW_SMOKE").is_some() {
-            eprintln!("[preview-smoke] {ev:?}");
+            gui_log(&format!("[preview-smoke] {ev:?}"));
         }
         let loaded = matches!(ev, BrowserEvt::Loading(false));
         // B-36: track the start of a load, and refusals.

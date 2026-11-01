@@ -186,7 +186,7 @@ impl GuiState {
             }
             ServerEvent::Note { text, .. } => self.push(EntryKind::System, text),
             ServerEvent::RunFinished { session_id, ok, message } => {
-                eprintln!("[gui] run finished ok={ok}");
+                gui_log(&format!("[gui] run finished ok={ok}"));
                 self.running.remove(&session_id);
                 // A finished run cannot still be waiting on an approval — but
                 // only ITS approvals end; another chat's run may still wait.

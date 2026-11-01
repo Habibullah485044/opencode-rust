@@ -130,6 +130,7 @@ impl GuiState {
                 "has_key": self.settings.has_key,
                 "needs_setup": self.settings.needs_setup,
                 "models": self.settings.models,
+                "models_error": { "seq": self.settings.models_error.0, "text": self.settings.models_error.1 },
                 "config_path": self.settings.config_path,
                 "system_prompt": self.settings.system_prompt,
                 "prompt_replaces": self.settings.prompt_replaces,

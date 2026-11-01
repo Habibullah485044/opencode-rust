@@ -43,6 +43,31 @@ pub(super) fn git_state(root: &std::path::Path) -> Option<(String, usize)> {
     Some((branch, changed))
 }
 
+/// T-042: why `name` cannot be a new branch, following git's ref-format
+/// rules (`git check-ref-format --branch`; `@`, `~`, `^`, `:`, spaces and
+/// the like fail the character check), so the user gets our message
+/// instead of git's stderr. `None` = usable.
+pub(super) fn branch_name_problem(name: &str) -> Option<String> {
+    let why = if name.is_empty() {
+        "it is empty"
+    } else if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.')) {
+        "use only letters, digits, - _ / ."
+    } else if name.starts_with('-') {
+        "it cannot start with -"
+    } else if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+        "it cannot start or end with /, or have // in it"
+    } else if name.contains("..") {
+        "it cannot contain .."
+    } else if name.ends_with('.') {
+        "it cannot end with ."
+    } else if name.split('/').any(|part| part.starts_with('.') || part.ends_with(".lock")) {
+        "no part between / may start with . or end with .lock"
+    } else {
+        return None;
+    };
+    Some(format!("\"{name}\" is not a usable branch name: {why}."))
+}
+
 /// Files of the project whose path contains `query` (case-insensitive),
 /// shortest paths first; `.gitignore` is respected.
 pub(super) fn find_project_files(root: &std::path::Path, query: &str, max: usize) -> Vec<String> {
@@ -127,5 +152,17 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         assert_eq!(chat_home(&project), project, "a normal folder is the project");
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// T-042: names git refuses get our own message, not git's stderr.
+    #[test]
+    fn branch_names_follow_gits_rules() {
+        for ok in ["feature/login", "fix-1.2", "v1.0_rc", "a/b/c"] {
+            assert_eq!(branch_name_problem(ok), None, "{ok}");
+        }
+        for bad in ["", "a..b", "x.lock", "a/x.lock/b", ".hidden", "a/.b", "/lead", "trail/", "a//b", "a@{1}", "-x", "end.", "has space", "a~1", "a:b"] {
+            let why = branch_name_problem(bad).unwrap_or_else(|| panic!("{bad:?} accepted"));
+            assert!(why.contains("is not a usable branch name"), "{why}");
+        }
     }
 }

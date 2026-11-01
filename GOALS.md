@@ -375,21 +375,15 @@ Ordered by value per unit of work; each is independently shippable.
 
 ---
 
-## Appendix A — IPC schema (target state)
+## Appendix A — IPC schema
 
-Page → Rust (`window.ipc.postMessage`, JSON):
-
-| `type` | Fields | Meaning |
-|---|---|---|
-| `send` | `text` | composer submit (exists) |
-| `new` / `load` | `id?` | session ops (exist) |
-| `ready` | — | page loaded, send first paint (exists) |
-| `min` / `max` / `close` | — | window controls (exist) |
-| `browse` | `url` | navigate the panel (new) |
-| `nav_back` / `nav_fwd` / `nav_reload` | — | history (new) |
-| `panel_rect` | `x,y,w,h` (CSS px) | position the child view (new) |
-| `panel_visible` | `visible: bool` | show/hide the child view (new) |
-| `open_dev_server` | `url?` | CTA / detected localhost (new) |
+Page → Rust (`window.ipc.postMessage`, JSON with a `type` field): the
+authoritative list is `parse_ipc` in `src/gui/ipc.rs`, which turns each
+`type` (`send`, `browse`, `panel_rect`, `rewind`, `new_branch`,
+`load_changes`, `set_price`, `term_run`, …) into an `IpcMsg` variant; the
+variants are documented on the enum, and the `ipc_*` tests in that file
+pin the field names. `App::dispatch` in `src/gui/dispatch.rs` has one arm
+per variant. This appendix no longer copies the list, so it cannot drift.
 
 Rust → page: unchanged — one `window.render(payload)` call; the payload grows
 `browser: { url, title, can_back, can_forward, loading, error }`.

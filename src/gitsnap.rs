@@ -112,6 +112,9 @@ pub fn git(cwd: &Path, args: &[&str]) -> Result<String> {
 fn git_env(cwd: &Path, args: &[&str], envs: &[(&str, &std::ffi::OsStr)]) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.args(args).current_dir(cwd);
+    // T-046: background `git status`/`diff` never take index.lock, so they
+    // cannot make the user's own git command fail while they run.
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     for (k, v) in envs {
         cmd.env(k, v);
     }

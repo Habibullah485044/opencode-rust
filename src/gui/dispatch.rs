@@ -45,10 +45,7 @@ impl App {
                 true
             }
             UiMsg::Ipc(IpcMsg::MoveChat { id, project }) => {
-                if !self.gs.running.contains(&id) {
-                    let _ = self.st.db.set_session_project(&id, project.as_deref());
-                }
-                refresh_sessions(&mut self.gs, &self.st);
+                move_chat(&mut self.gs, &self.st, &id, project.as_deref());
                 true
             }
             UiMsg::Ipc(IpcMsg::AdoptUnfiled(project)) => {
@@ -73,7 +70,7 @@ impl App {
                 true
             }
             UiMsg::Ipc(IpcMsg::PageError(msg)) => {
-                eprintln!("[gui] page error: {msg}");
+                gui_log(&format!("[gui] page error: {msg}"));
                 false
             }
             UiMsg::Ipc(IpcMsg::Minimize) => {
@@ -122,14 +119,20 @@ impl App {
                 true
             }
             UiMsg::Ipc(IpcMsg::NewBranch(name)) => self.on_new_branch(name),
+            // T-067: the whole tree's git diff runs on the blocking pool.
             UiMsg::Ipc(IpcMsg::LoadChanges) => {
                 let root = chat_root(&self.gs, &self.st);
-                let json = match crate::changes::collect(&root) {
-                    Ok(files) => serde_json::json!({ "files": files, "root": root.display().to_string() }),
-                    Err(e) => serde_json::json!({ "error": format!("{e:#}"), "files": [] }),
-                };
-                *self.gs.changes_out.borrow_mut() = Some(json.to_string());
-                true
+                self.off_thread(
+                    move || match crate::changes::collect(&root) {
+                        Ok(files) => serde_json::json!({ "files": files, "root": root.display().to_string() }),
+                        Err(e) => serde_json::json!({ "error": format!("{e:#}"), "files": [] }),
+                    },
+                    |gs, _, json| {
+                        *gs.changes_out.borrow_mut() = Some(json.to_string());
+                        true
+                    },
+                );
+                false
             }
             UiMsg::Ipc(IpcMsg::LoadUsage(days)) => {
                 self.gs.usage_days = days;
@@ -200,7 +203,7 @@ impl App {
         let Some(content) = submit_and_name(&mut self.gs, &self.st) else {
             return false;
         };
-        eprintln!("[gui] run start: {}", clip(&content, 80));
+        gui_log(&format!("[gui] run start: {}", clip(&content, 80)));
         let sid = self.gs.session.clone().unwrap_or_default();
         let st = self.st.clone();
         self.rt.spawn(async move {
@@ -244,16 +247,7 @@ impl App {
     }
 
     fn on_delete_chat(&mut self, id: &str) -> bool {
-        if !self.gs.running.contains(id) {
-            if let Err(e) = self.st.db.delete_session(id) {
-                self.gs.push(EntryKind::Error, format!("delete failed: {e}"));
-            } else if self.gs.is_current(id) {
-                self.gs.session = None;
-                let project = self.gs.default_project.clone();
-                open_new_chat(&mut self.gs, &self.st, project);
-            }
-        }
-        refresh_sessions(&mut self.gs, &self.st);
+        delete_chat(&mut self.gs, &self.st, id);
         true
     }
 
@@ -266,7 +260,7 @@ impl App {
         let st = self.st.clone();
         self.rt.spawn(async move {
             if !request_stop(&st, &sid).await {
-                eprintln!("[gui] stop: no run found for {sid}");
+                gui_log(&format!("[gui] stop: no run found for {sid}"));
             }
         });
         true
@@ -276,46 +270,62 @@ impl App {
     /// the composer.
     fn on_rewind(&mut self, text: String, skip: usize) -> bool {
         let sid = self.gs.session.clone().unwrap_or_default();
-        let note = if self.gs.busy || self.gs.running.contains(&sid) {
-            "Stop the run first, then rewind.".to_string()
-        } else {
-            match server::rewind_chat(&self.st, &sid, &text, skip) {
-                Ok(r) => {
-                    load_session(&mut self.gs, &self.st, &sid);
-                    let shown = text.trim().trim_start_matches('\u{203a}').trim().to_string();
-                    self.gs.compose = (self.gs.compose.0 + 1, shown);
-                    let files = match (r.undone, &r.problem) {
-                        (0, _) => "no file changes to put back".to_string(),
-                        (n, None) => format!("files put back to before it ({n} undo step(s); /redo brings them back)"),
-                        (n, Some(p)) => format!("{n} undo step(s), but: {p}"),
-                    };
-                    format!("Rewound: {} message(s) removed, {files}. Your message is back in the box to edit.", r.messages)
+        if self.gs.busy || self.gs.running.contains(&sid) {
+            self.gs.push(EntryKind::System, "Stop the run first, then rewind.".to_string());
+            return true;
+        }
+        // T-019: up to 50 `git` undo runs — off the GUI thread.
+        let (st, sid2, text2) = (self.st.clone(), sid.clone(), text.clone());
+        self.off_thread(
+            move || server::rewind_chat(&st, &sid2, &text2, skip),
+            move |gs, st, res| {
+                gs.git_stale = true;
+                // The user moved to another chat meanwhile: it reloads from
+                // the database when they come back.
+                if !gs.is_current(&sid) {
+                    return true;
                 }
-                Err(e) => format!("Could not rewind: {e:#}"),
-            }
-        };
-        self.gs.push(EntryKind::System, note);
-        self.gs.git_stale = true;
-        true
+                let note = match res {
+                    Ok(r) => {
+                        load_session(gs, st, &sid);
+                        let shown = text.trim().trim_start_matches('\u{203a}').trim().to_string();
+                        gs.compose = (gs.compose.0 + 1, shown);
+                        let files = match (r.undone, &r.problem) {
+                            (0, _) => "no file changes to put back".to_string(),
+                            (n, None) => format!("files put back to before it ({n} undo step(s); /redo brings them back)"),
+                            (n, Some(p)) => format!("{n} undo step(s), but: {p}"),
+                        };
+                        format!("Rewound: {} message(s) removed, {files}. Your message is back in the box to edit.", r.messages)
+                    }
+                    Err(e) => format!("Could not rewind: {e:#}"),
+                };
+                gs.push(EntryKind::System, note);
+                true
+            },
+        );
+        false
     }
 
     /// Make a new git branch in the chat's project and switch to it.
     fn on_new_branch(&mut self, name: String) -> bool {
+        if let Some(why) = branch_name_problem(&name) {
+            self.gs.push(EntryKind::System, why);
+            return true;
+        }
         let root = chat_root(&self.gs, &self.st);
-        let valid = !name.is_empty()
-            && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'))
-            && !name.starts_with('-');
-        let text = if !valid {
-            format!("\"{name}\" is not a usable branch name (letters, digits, - _ / . only)")
-        } else {
-            match crate::gitsnap::git(&root, &["switch", "-c", &name]) {
-                Ok(_) => format!("Now on a new branch: {name}"),
-                Err(e) => format!("Could not make the branch: {e:#}"),
-            }
-        };
-        self.gs.push(EntryKind::System, text);
-        self.gs.git_stale = true;
-        true
+        self.off_thread(
+            move || crate::gitsnap::git(&root, &["switch", "-c", &name]).map(|_| name),
+            |gs, _, res| {
+                let text = match res {
+                    Ok(name) => format!("Now on a new branch: {name}"),
+                    Err(e) => format!("Could not make the branch: {e:#}"),
+                };
+                gs.push(EntryKind::System, text);
+                gs.git_stale = true;
+                true
+            },
+        );
+        false
     }
 
     /// Line comments from the Changes view, sent to the agent.
