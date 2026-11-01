@@ -119,14 +119,20 @@ impl App {
                 true
             }
             UiMsg::Ipc(IpcMsg::NewBranch(name)) => self.on_new_branch(name),
+            // T-067: the whole tree's git diff runs on the blocking pool.
             UiMsg::Ipc(IpcMsg::LoadChanges) => {
                 let root = chat_root(&self.gs, &self.st);
-                let json = match crate::changes::collect(&root) {
-                    Ok(files) => serde_json::json!({ "files": files, "root": root.display().to_string() }),
-                    Err(e) => serde_json::json!({ "error": format!("{e:#}"), "files": [] }),
-                };
-                *self.gs.changes_out.borrow_mut() = Some(json.to_string());
-                true
+                self.off_thread(
+                    move || match crate::changes::collect(&root) {
+                        Ok(files) => serde_json::json!({ "files": files, "root": root.display().to_string() }),
+                        Err(e) => serde_json::json!({ "error": format!("{e:#}"), "files": [] }),
+                    },
+                    |gs, _, json| {
+                        *gs.changes_out.borrow_mut() = Some(json.to_string());
+                        true
+                    },
+                );
+                false
             }
             UiMsg::Ipc(IpcMsg::LoadUsage(days)) => {
                 self.gs.usage_days = days;
