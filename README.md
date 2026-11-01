@@ -92,7 +92,28 @@ Run `opencode-rust --help` for all options. Common ones:
 | `--gui` | Desktop app instead of the terminal UI |
 | `--model NAME` / `--base-url URL` | Override the provider for this run |
 | `--port N` | Port of the local API (default: random, loopback only) |
-| `preview <url>` | Open a standalone preview window |
+| `--timeout N` | Headless only: give up after N seconds with exit code 124 (default 7200, 0 = none; also `OPENCODE_RUST_HEADLESS_TIMEOUT`) |
+| `preview <url> [--title T] [--exit-after-ms N]` | Open a standalone preview window (title default `preview`; `--exit-after-ms` closes it after N ms) |
+
+A missing or malformed option value (`--port abc`, `--model` at the end)
+stops with exit code 2 and says which option is wrong.
+
+### Environment variables
+
+| Variable | Meaning |
+|---|---|
+| `OPENCODE_RUST_CONFIG` | Path of the config file to use (it must exist) |
+| `OPENCODE_RUST_API_KEY` | Provider API key (overrides the file; never saved) |
+| `OPENCODE_RUST_BASE_URL` | Provider base URL (overrides the file) |
+| `OPENCODE_RUST_MODEL` | Model id (overrides the file) |
+| `OPENCODE_RUST_API_TOKEN` | Bearer token of the local HTTP API (else a random one per start) |
+| `OPENCODE_RUST_AUTO_APPROVE` | `1`: headless runs approve tool calls, like `--yes` |
+| `OPENCODE_RUST_AUTO_DENY` | `1`: headless runs deny every approval; wins over `--yes` |
+| `OPENCODE_RUST_HEADLESS_TIMEOUT` | Headless time limit in seconds when `--timeout` is not given (default 7200, 0 = none) |
+| `OPENCODE_RUST_SHELL` | Windows: `cmd` runs `bash` tool commands in `cmd.exe`; a path to a `bash.exe` picks that Git Bash (default: Git Bash when found) |
+| `OPENCODE_RUST_BROWSER` | Path of the Edge or Chrome that `check_page` and screenshots use |
+| `XDG_CONFIG_HOME` | Default config file becomes `$XDG_CONFIG_HOME/opencode-rust/config.toml` |
+| `XDG_DATA_HOME` | Linux/macOS: state folder becomes `$XDG_DATA_HOME/opencode-rust` |
 
 The local HTTP API needs a bearer token (`Authorization: Bearer <token>`); the
 token comes from `$OPENCODE_RUST_API_TOKEN` or from a fresh random file printed
