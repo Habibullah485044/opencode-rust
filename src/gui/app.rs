@@ -62,7 +62,7 @@ impl App {
         // Never overwrite `Exit`: every callback starts here, so resetting it
         // would strand a windowless process after the user closes the window.
         if !matches!(*control_flow, ControlFlow::Exit) {
-            let term_live = self.gs.term_open && crate::tools::jobs::list(0).iter().any(|j| j.exit.is_none());
+            let term_live = self.gs.term_open && crate::tools::jobs::any_running();
             *control_flow = if self.gs.approval.is_some() || self.bridge.busy() || term_live {
                 ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(500))
             } else {

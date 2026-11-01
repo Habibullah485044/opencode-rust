@@ -190,6 +190,13 @@ pub fn list(max: usize) -> Vec<JobView> {
     v
 }
 
+/// True while any job is still running. Cheap: no output is copied (the
+/// GUI asks on every event-loop wake).
+pub fn any_running() -> bool {
+    let map = jobs().lock().unwrap_or_else(|e| e.into_inner());
+    map.values().any(|j| j.exit.lock().unwrap_or_else(|e| e.into_inner()).is_none())
+}
+
 /// Forget the ended commands the user typed (the terminal's Clear).
 pub fn clear_user_jobs() {
     let mut map = jobs().lock().unwrap_or_else(|e| e.into_inner());
