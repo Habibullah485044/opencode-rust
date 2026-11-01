@@ -183,7 +183,9 @@ pub(super) fn log_cache(st: &AppState, session_id: &str, usage: Option<&crate::p
     // T-152: opened once and kept, as core_log does (this runs for every
     // model request, on an async thread). Another state folder (tests)
     // opens its own file.
-    static LOG: Mutex<Option<(PathBuf, Option<(std::fs::File, u64)>)>> = Mutex::new(None);
+    /// The log's path and its kept file (with its size).
+    type Kept = Option<(PathBuf, Option<(std::fs::File, u64)>)>;
+    static LOG: Mutex<Kept> = Mutex::new(None);
     let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     let path = st.state_dir.join("cache.log");
     if log.as_ref().is_none_or(|(open, _)| *open != path) {
