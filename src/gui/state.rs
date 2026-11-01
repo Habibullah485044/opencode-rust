@@ -102,6 +102,9 @@ pub struct GuiSettings {
     pub needs_setup: bool,
     /// Models the provider lists (after "Load models").
     pub models: Vec<String>,
+    /// T-052: why the last "Load models" got none, and a counter so the
+    /// page tells a new answer from the one it already showed.
+    pub models_error: (u64, String),
     pub config_path: String,
     /// The user's own prompt, and whether it replaces Habi's base
     /// instructions (else it is added after them).

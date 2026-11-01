@@ -43,6 +43,18 @@ pub(super) fn save_settings(
     Ok((path, client, !p.api_key.is_empty()))
 }
 
+/// T-052: what to show under Load models when no list came back (`None` =
+/// models arrived). The provider's own error text is kept (a 401 says so).
+pub(super) fn models_error(listed: &Result<Vec<String>>, base_url: &str) -> Option<String> {
+    match listed {
+        Ok(ids) if !ids.is_empty() => None,
+        Ok(_) => Some(format!(
+            "{base_url}/models listed no models. Check the saved address and key (Save first), then try again."
+        )),
+        Err(e) => Some(format!("Could not load models: {e:#}")),
+    }
+}
+
 impl App {
     /// Settings page: save the provider and switch the live client to it.
     pub(super) fn on_save_settings(
@@ -118,12 +130,23 @@ impl App {
     }
 
     /// Settings page: ask the provider which models it has (the answer comes
-    /// back as a `ModelInfo` event).
+    /// back as a `ModelInfo` event). T-052: when none come back, say why
+    /// under Load models instead of a generic text after a timeout.
     pub(super) fn on_list_models(&self) {
-        let st2 = self.st.clone();
+        let (st2, tx, proxy) = (self.st.clone(), self.done_tx.clone(), self.proxy.clone());
+        let base_url = self.gs.settings.base_url.trim_end_matches('/').to_string();
         self.rt.spawn(async move {
             let client = st2.client.lock().await.clone();
-            let available = client.list_models().await.unwrap_or_default();
+            let listed = client.list_models().await;
+            if let Some(why) = models_error(&listed, &base_url) {
+                let done: Done = Box::new(move |gs, _| {
+                    gs.settings.models_error = (gs.settings.models_error.0 + 1, why);
+                    true
+                });
+                let _ = tx.send(done);
+                let _ = proxy.send_event(AppEvent::Wake);
+            }
+            let available = listed.unwrap_or_default();
             let _ = st2.events.send(ServerEvent::ModelInfo { current: client.model.clone(), available });
         });
     }
@@ -144,5 +167,22 @@ impl App {
         );
         self.gs.push(EntryKind::System, mode.note());
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-052: when no models come back, the page is told why, with the
+    /// provider's own error text.
+    #[test]
+    fn load_models_says_why_none_came_back() {
+        let url = "http://127.0.0.1:9/v1";
+        assert_eq!(models_error(&Ok(vec!["m1".into()]), url), None);
+        let err = models_error(&Err(anyhow::anyhow!("GET /models: 401 Unauthorized: invalid api key")), url).unwrap();
+        assert!(err.contains("401 Unauthorized: invalid api key"), "{err}");
+        let empty = models_error(&Ok(Vec::new()), url).unwrap();
+        assert!(empty.contains("http://127.0.0.1:9/v1/models listed no models"), "{empty}");
     }
 }

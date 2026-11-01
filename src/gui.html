@@ -4680,6 +4680,7 @@
     var wired = false;
     var loading = false;
     var loadTimer = 0;
+    var errSeq = 0; // T-052: the last models_error shown
     function el(id) { return document.getElementById(id); }
     function normUrl(u) { return String(u || "").trim().replace(/\/+$/, "").toLowerCase(); }
     function markPreset() {
@@ -4840,6 +4841,13 @@
       btn.title = on ? "Hide the key" : "Show the key";
     }
     return {
+      // T-052: the app says why "Load models" got none (a 401 says so).
+      showError: function (e) {
+        if (!e || !e.seq || e.seq <= errSeq) return;
+        errSeq = e.seq;
+        if (loading) setLoading(false);
+        el("mdl-status").textContent = e.text;
+      },
       load: function (s) {
         wire();
         el("set-url").value = s.base_url || "";
@@ -5087,6 +5095,7 @@
         list.setAttribute("data-n", String(models.length));
       }
     }
+    modelsPage.showError(settingsData.models_error);
     // No provider yet: open once by itself.
     if (settingsData.needs_setup && !setupShown) {
       setupShown = true;

@@ -267,6 +267,7 @@ fn initial_state(state: &server::AppState, session: &crate::db::Session) -> GuiS
             has_key: !p.api_key.is_empty(),
             needs_setup: placeholder || p.model.trim().is_empty(),
             models: Vec::new(),
+            models_error: (0, String::new()),
             config_path: crate::config::default_config_path().display().to_string(),
             system_prompt: String::new(),
             prompt_replaces: true,
