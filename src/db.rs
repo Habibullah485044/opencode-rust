@@ -823,6 +823,24 @@ impl Db {
         Ok(s)
     }
 
+    /// T-151: chat `id` and the chats above it, as (chat, its parent), from
+    /// `id` upwards, at most `max` rows, in one query. Empty for an
+    /// unknown chat; a parent that is not saved ends the chain.
+    pub fn parent_chain(&self, id: &str, max: usize) -> Result<Vec<(String, Option<String>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE chain(id, parent_id, depth) AS (
+                 SELECT id, parent_id, 1 FROM sessions WHERE id=?1
+                 UNION ALL
+                 SELECT s.id, s.parent_id, c.depth + 1 FROM sessions s JOIN chain c ON s.id = c.parent_id
+                 WHERE c.depth < ?2
+             )
+             SELECT id, parent_id FROM chain ORDER BY depth",
+        )?;
+        let rows = stmt.query_map(params![id, max as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn add_message(&self, session_id: &str, role: &str, parts: &[Part]) -> Result<Message> {
         self.insert_message(session_id, role, parts, now_ms())
     }
@@ -1012,6 +1030,8 @@ impl Db {
     /// True when this workspace has an "always allow" for (tool, pattern).
     /// Approvals saved for other workspaces never count.
     pub fn has_approval(&self, workspace: &str, tool: &str, pattern: &str) -> Result<bool> {
+        #[cfg(test)]
+        APPROVAL_QUERIES.with(|n| n.set(n.get() + 1));
         let conn = self.conn();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM approvals WHERE workspace=?1 AND tool=?2 AND pattern=?3",
@@ -1020,6 +1040,23 @@ impl Db {
         )?;
         Ok(n > 0)
     }
+
+    /// T-146: every "always allow" (tool, pattern) of one workspace, for a
+    /// permission check that matches several pairs with one query.
+    pub fn approvals(&self, workspace: &str) -> Result<std::collections::HashSet<(String, String)>> {
+        #[cfg(test)]
+        APPROVAL_QUERIES.with(|n| n.set(n.get() + 1));
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT tool, pattern FROM approvals WHERE workspace=?1")?;
+        let rows = stmt.query_map(params![workspace], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Approval queries on this thread (T-146 tests count them).
+    pub static APPROVAL_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

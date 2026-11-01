@@ -125,7 +125,7 @@ pub(super) fn spawn_claimed_run(st: Shared, session_id: String, user_content: St
 /// work: asking is the one thing turbo must respect. The model is blocked
 /// on the user, and pushing it to "decide for yourself" produces guesses.
 pub(super) async fn turbo_continuation(st: &Shared, session_id: &str, result: &Result<LoopEnd>) -> Option<String> {
-    if st.perm_mode_for(session_id) != PermissionMode::Turbo || !matches!(result, Ok(LoopEnd::Done(_))) {
+    if st.perm_mode_for_async(session_id).await != PermissionMode::Turbo || !matches!(result, Ok(LoopEnd::Done(_))) {
         return None;
     }
     if !todos_open(st, session_id) {
@@ -225,7 +225,7 @@ pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &s
     record_snapshot_before_run(st, session_id).await;
     let (budget, scratch) = match chain {
         Some(c) => (c.budget, c.scratch),
-        None => (PassBudget::new(), ScratchGuard::acquire(st.workspace_for(session_id)).await),
+        None => (PassBudget::new(), ScratchGuard::acquire(st.workspace_for_async(session_id).await).await),
     };
     let before = snapshot_stats(st, session_id);
     // New (P-02): fingerprint the git working tree first, so a run that only
@@ -274,7 +274,7 @@ pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &s
     scratch.release().await;
     // What the run left, so a later undo can tell its changes from work
     // done outside Habi afterwards (and refuse to overwrite that).
-    let (ws, sd) = (st.workspace_for(session_id), st.state_dir.clone());
+    let (ws, sd) = (st.workspace_for_async(session_id).await, st.state_dir.clone());
     if let Ok(Err(e)) = tokio::task::spawn_blocking(move || crate::gitsnap::record_after_run(&ws, &sd)).await {
         core_log(&format!("[snapshot] after run: {e:#}"));
     }
@@ -288,7 +288,7 @@ pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &s
 /// The git snapshot `/undo` rolls a run back to.
 /// New (B-48): git runs off the async threads; errors go to core.log.
 async fn record_snapshot_before_run(st: &Shared, session_id: &str) {
-    let (ws, sd) = (st.workspace_for(session_id), st.state_dir.clone());
+    let (ws, sd) = (st.workspace_for_async(session_id).await, st.state_dir.clone());
     let snap = tokio::task::spawn_blocking(move || {
         crate::gitsnap::record_before_run(&ws, &sd, "pre-run")
     })
@@ -319,12 +319,12 @@ async fn workspace_touched(
             Some(_) => st.workspace_fingerprint(session_id).await != tree_before,
             None => {
                 // A walk of the whole project: off the async threads.
-                let ws = st.workspace_for(session_id);
+                let ws = st.workspace_for_async(session_id).await;
                 tokio::task::spawn_blocking(move || files_changed_since(&ws, started_at)).await.unwrap_or(true)
             }
         };
     // Files written by this run's subagents count too.
-    let by_agents = !crate::keepbest::written_since(&st.workspace_for(session_id), started_at).is_empty();
+    let by_agents = !crate::keepbest::written_since(&st.workspace_for_async(session_id).await, started_at).is_empty();
     (after.writes > before.writes || after.edits > before.edits || bash_changed || by_agents, bash_used)
 }
 
@@ -497,7 +497,7 @@ impl AppState {
     /// or None when the workspace is not a git repository. Git runs off the
     /// async threads.
     pub(crate) async fn workspace_fingerprint(&self, session_id: &str) -> Option<u64> {
-        let ws = self.workspace_for(session_id);
+        let ws = self.workspace_for_async(session_id).await;
         tokio::task::spawn_blocking(move || {
             use std::hash::{Hash, Hasher};
             let status = crate::gitsnap::git(&ws, &["status", "--porcelain=v1", "-uall"]).ok()?;
@@ -626,7 +626,8 @@ impl AppState {
         let (ok, message) = match outcome {
             Ok(text) => {
                 if let Some(text) = text {
-                    let _ = self.db.add_message(session_id, "assistant", &[Part::Text { text: text.clone() }]);
+                    // T-148: saved off the async threads, before the reply is streamed.
+                    let _ = save_message(self, session_id, "assistant", vec![Part::Text { text: text.clone() }]).await;
                     let _ = self.events.send(ServerEvent::AssistantDelta { session_id: session_id.to_string(), text });
                 }
                 (true, None)

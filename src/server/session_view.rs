@@ -3,33 +3,58 @@
 
 use super::*;
 
+/// Chat `session_id`'s project folder from the database: `None` = could
+/// not tell (unknown chat, failed read), `Some(None)` = no project.
+fn project_root(db: &Db, session_id: &str) -> Option<Option<PathBuf>> {
+    let session = db.get_session(session_id).ok()??;
+    let Some(project) = session.project_id else { return Some(None) };
+    Some(db.get_project(&project).ok()?.map(|p| PathBuf::from(p.root)))
+}
+
 impl AppState {
     /// The folder chat `session_id` works in: its project's folder, or the
     /// folder the app started in (no project, or the folder is gone).
     /// The project folder comes from the [`AppState::workspaces`] cache
     /// after the first lookup (T-011: this runs on async threads, often).
+    /// A cache miss reads the database: async code uses
+    /// [`AppState::workspace_for_async`].
     pub fn workspace_for(&self, session_id: &str) -> PathBuf {
-        let cached = self.workspaces.lock().ok().and_then(|m| m.get(session_id).cloned());
-        let root = match cached {
+        let root = match self.cached_root(session_id) {
             Some(root) => root,
-            None => {
-                let looked = self.project_root(session_id);
-                // Not cached when the chat is unknown or the read failed.
-                if let (Some(root), Ok(mut m)) = (&looked, self.workspaces.lock()) {
-                    m.insert(session_id.to_string(), root.clone());
-                }
-                looked.flatten()
-            }
+            None => self.remember_root(session_id, project_root(&self.db, session_id)),
         };
-        root.filter(|root| root.is_dir()).unwrap_or_else(|| self.workspace.clone())
+        self.folder_or_start(root)
     }
 
-    /// Chat `session_id`'s project folder from the database: `None` = could
-    /// not tell (unknown chat, failed read), `Some(None)` = no project.
-    fn project_root(&self, session_id: &str) -> Option<Option<PathBuf>> {
-        let session = self.db.get_session(session_id).ok()??;
-        let Some(project) = session.project_id else { return Some(None) };
-        Some(self.db.get_project(&project).ok()?.map(|p| PathBuf::from(p.root)))
+    /// T-148: [`AppState::workspace_for`] for async code: a cache miss is
+    /// read in one trip to the blocking pool.
+    pub async fn workspace_for_async(&self, session_id: &str) -> PathBuf {
+        let root = match self.cached_root(session_id) {
+            Some(root) => root,
+            None => {
+                let sid = session_id.to_string();
+                let looked = self.db.run(move |db| Ok(project_root(db, &sid))).await.ok().flatten();
+                self.remember_root(session_id, looked)
+            }
+        };
+        self.folder_or_start(root)
+    }
+
+    fn cached_root(&self, session_id: &str) -> Option<Option<PathBuf>> {
+        self.workspaces.lock().ok().and_then(|m| m.get(session_id).cloned())
+    }
+
+    /// Cache what [`project_root`] found. Not cached when the chat is
+    /// unknown or the read failed.
+    fn remember_root(&self, session_id: &str, looked: Option<Option<PathBuf>>) -> Option<PathBuf> {
+        if let (Some(root), Ok(mut m)) = (&looked, self.workspaces.lock()) {
+            m.insert(session_id.to_string(), root.clone());
+        }
+        looked.flatten()
+    }
+
+    fn folder_or_start(&self, root: Option<PathBuf>) -> PathBuf {
+        root.filter(|root| root.is_dir()).unwrap_or_else(|| self.workspace.clone())
     }
 
     /// T-011: forget every cached chat folder. Call it after chats change
@@ -50,39 +75,15 @@ impl AppState {
     /// Save one reply's token counts (`/usage`, the usage dashboard) and tell
     /// the UIs. What it was for comes from the [`USAGE_TAG`] scope it runs
     /// in; a call outside a chat (planning, edits) takes the scope's chat.
-    pub fn record_usage(&self, session_id: &str, model: &str, u: &crate::provider::Usage) {
-        let tag = usage_tag();
-        let session_id = if session_id.is_empty() { tag.1.as_deref().unwrap_or("") } else { session_id };
-        self.record_usage_as(tag.0, session_id, model, u);
-    }
-
-    /// [`AppState::record_usage`] with the purpose given.
-    pub fn record_usage_as(&self, purpose: &str, session_id: &str, model: &str, u: &crate::provider::Usage) {
-        if let Err(e) = self.db.add_usage_entry(session_id, model, purpose, u) {
-            core_log(&format!("[core] saving token usage failed: {e}"));
-            return;
-        }
-        if session_id.is_empty() {
-            return;
-        }
-        let session = self.db.usage_totals(Some(session_id), None).unwrap_or_default();
-        let _ = self.events.send(ServerEvent::Usage {
-            session_id: session_id.to_string(),
-            last: *u,
-            session,
-        });
-    }
-
-    /// T-007: [`AppState::record_usage`] for async code: the save and the
-    /// totals in one trip to the blocking pool, then the event.
+    /// T-007: the save and the totals in one trip to the blocking pool,
+    /// then the event.
     pub async fn record_usage_async(&self, session_id: &str, model: &str, u: &crate::provider::Usage) {
         let tag = usage_tag();
         let session_id = if session_id.is_empty() { tag.1.as_deref().unwrap_or("") } else { session_id };
         self.record_usage_as_async(tag.0, session_id, model, u).await;
     }
 
-    /// T-007: [`AppState::record_usage_as`] for async code (see above). The
-    /// sync one stays for the callers that are not async yet.
+    /// [`AppState::record_usage_async`] with the purpose given.
     pub async fn record_usage_as_async(&self, purpose: &str, session_id: &str, model: &str, u: &crate::provider::Usage) {
         let (purpose, sid, model, usage) = (purpose.to_string(), session_id.to_string(), model.to_string(), *u);
         let saved = self

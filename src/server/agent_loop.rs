@@ -171,24 +171,29 @@ pub(super) fn log_cache(st: &AppState, session_id: &str, usage: Option<&crate::p
         .unwrap_or(0);
     let line = match usage {
         Some(u) => format!(
-            "{secs} {} in={} cached={} ({}%) out={} {prefix}\n",
+            "{secs} {} in={} cached={} ({}%) out={} {prefix}",
             short_id(session_id),
             u.input,
             u.cached,
             (u.cached * 100).checked_div(u.input).unwrap_or(0),
             u.output
         ),
-        None => format!("{secs} {} no usage reported {prefix}\n", short_id(session_id)),
+        None => format!("{secs} {} no usage reported {prefix}", short_id(session_id)),
     };
-    let _ = std::fs::create_dir_all(&st.state_dir);
+    // T-152: opened once and kept, as core_log does (this runs for every
+    // model request, on an async thread). Another state folder (tests)
+    // opens its own file.
+    /// The log's path and its kept file (with its size).
+    type Kept = Option<(PathBuf, Option<(std::fs::File, u64)>)>;
+    static LOG: Mutex<Kept> = Mutex::new(None);
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     let path = st.state_dir.join("cache.log");
-    // Keep it small: start over past 2 MB.
-    if std::fs::metadata(&path).map(|m| m.len() > 2_000_000).unwrap_or(false) {
-        let _ = std::fs::remove_file(&path);
+    if log.as_ref().is_none_or(|(open, _)| *open != path) {
+        *log = Some((path.clone(), None));
     }
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = f.write_all(line.as_bytes());
+    if let Some((_, slot)) = log.as_mut() {
+        // Kept small: moved to cache.log.1 past 2 MB.
+        append_log(slot, &path, 2_000_000, &line);
     }
 }
 
@@ -228,6 +233,9 @@ pub struct Rewound {
 /// (`skip` = how many later messages with the same text to pass over):
 /// the project's files go back to the undo points taken since the message
 /// before it, and that message and everything after it are deleted.
+/// Blocking (database, up to 50 `git` undo runs): call it on a blocking
+/// thread, as the GUI does (T-148: it is the only caller; the TUI and the
+/// HTTP API have no rewind).
 pub fn rewind_chat(st: &AppState, session_id: &str, text: &str, skip: usize) -> Result<Rewound> {
     let key = rewind_key(text);
     let msgs = st.db.messages(session_id)?;
@@ -467,7 +475,7 @@ pub(crate) async fn run_loop_inner(
 ) -> Result<LoopEnd> {
     let mode = st.mode_for(session_id);
     // A mission's chats run like turbo without the user's mode being turbo.
-    let turbo = st.perm_mode_for(session_id) == PermissionMode::Turbo;
+    let turbo = st.perm_mode_for_async(session_id).await == PermissionMode::Turbo;
     // F-09: one loop guard per run (a spawned subagent has its own).
     let mut loop_guard = LoopGuard::default();
     // Replies that only said what the model would do next (see `announces_work`).
@@ -779,7 +787,7 @@ async fn read_reply(
                 }
             }
             StreamEvent::Usage(u) => {
-                st.record_usage_as(if opts.agent.is_some() { "subagent" } else { usage_tag().0 }, session_id, model, u);
+                st.record_usage_as_async(if opts.agent.is_some() { "subagent" } else { usage_tag().0 }, session_id, model, u).await;
                 request_usage = Some(*u);
             }
             StreamEvent::Done { finish_reason: fr } => {

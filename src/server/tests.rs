@@ -581,7 +581,7 @@ async fn forget_session_clears_every_per_chat_map() {
     FROZEN_LESSONS.get_or_init(Default::default).lock().unwrap().insert(id.clone(), None);
     COMPACT_FAILED_AT.get_or_init(Default::default).lock().unwrap().insert(id.clone(), 3);
     let _ = st.workspace_for(&id);
-    let _ = st.parent_of(&id);
+    st.load_parents(&id);
     assert!(st.workspaces.lock().unwrap().contains_key(&id));
     assert_eq!(st.parents.lock().unwrap().get(&id), Some(&Some(parent.id.clone())));
 
@@ -3526,4 +3526,76 @@ async fn auto_compaction_runs_near_the_context_limit() {
     }
     assert!(noted, "the user is told about the compaction");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T-146: one tool call reads the workspace's approvals once, however many
+/// (tool, pattern) pairs the rules ask about.
+#[tokio::test]
+async fn permission_check_reads_approvals_once_per_call() {
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    st.set_perm_mode(PermissionMode::Manual);
+    let ws = crate::db::workspace_key(&st.workspace_for("s1"));
+    st.db.add_approval(&ws, "bash", "ls && pwd && whoami", "session").unwrap();
+    crate::db::APPROVAL_QUERIES.with(|n| n.set(0));
+    let decided = super::tool_exec::decided_without_prompt(&st, &st.db, "s1", "bash", "ls && pwd && whoami");
+    assert_eq!(crate::db::APPROVAL_QUERIES.with(|n| n.get()), 1, "one approvals query per tool call");
+    assert_eq!(decided, Some(true), "the saved approval still counts");
+}
+
+/// T-151: a chat's parents are read in one query and cached, so a grant on
+/// a grandparent counts and the next check needs no database.
+#[tokio::test]
+async fn auto_approval_reads_the_parent_chain_at_once() {
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    let top = st.db.create_session("mission", None).unwrap();
+    let step = st.db.create_session("step", Some(&top.id)).unwrap();
+    let agent = st.db.create_session("agent", Some(&step.id)).unwrap();
+    let other = st.db.create_session("other", None).unwrap();
+    let grant = st.auto_approve_session(&top.id);
+    assert_eq!(st.perm_mode_for_async(&agent.id).await, PermissionMode::Turbo);
+    {
+        let parents = st.parents.lock().unwrap();
+        assert_eq!(parents.get(&agent.id), Some(&Some(step.id.clone())));
+        assert_eq!(parents.get(&step.id), Some(&Some(top.id.clone())), "the whole chain is cached");
+        assert_eq!(parents.get(&top.id), Some(&None));
+    }
+    assert_eq!(st.perm_mode_for_async(&other.id).await, PermissionMode::Default);
+    assert_eq!(st.perm_mode_for_async("ses_unknown").await, PermissionMode::Default);
+    assert!(!st.parents.lock().unwrap().contains_key("ses_unknown"), "an unknown chat is not cached");
+    drop(grant);
+    assert_eq!(st.perm_mode_for_async(&agent.id).await, PermissionMode::Default);
+}
+
+/// T-148: the async folder lookup shares the cache with the sync one.
+#[tokio::test]
+async fn async_folder_lookup_uses_the_same_cache() {
+    let base = std::env::temp_dir().join(format!("ocrs-ws-async-{}", std::process::id()));
+    let (start, other) = (base.join("start"), base.join("other"));
+    std::fs::create_dir_all(&start).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let st = build_state_ephemeral(crate::config::Config::default(), start.clone()).await;
+    let project = st.db.upsert_project(&other).unwrap();
+    let s = st.db.create_session_in("cached", None, Some(&project.id)).unwrap();
+    assert_eq!(st.workspace_for_async(&s.id).await, other);
+    st.db.set_session_project(&s.id, None).unwrap();
+    assert_eq!(st.workspace_for(&s.id), other, "the async lookup filled the cache");
+    assert_eq!(st.workspace_for_async(&s.id).await, other, "answered from the cache");
+    assert_eq!(st.workspace_for_async("ses_unknown").await, start);
+    assert!(!st.workspaces.lock().unwrap().contains_key("ses_unknown"), "an unknown chat is not cached");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// T-152: cache.log lines go through one kept handle and keep their format.
+#[tokio::test]
+async fn cache_log_lines_keep_their_format() {
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    let sid = format!("ses_cachelog{}", crate::db::now_ms_for_tests() % 100_000_000);
+    let u = crate::provider::Usage { input: 200, cached: 50, cache_write: 0, output: 7 };
+    log_cache(&st, &sid, Some(&u), "same start");
+    log_cache(&st, &sid, None, "system prompt changed");
+    let log = std::fs::read_to_string(st.state_dir.join("cache.log")).unwrap();
+    let ours: Vec<&str> = log.lines().filter(|l| l.contains(short_id(&sid))).collect();
+    assert_eq!(ours.len(), 2, "{log}");
+    assert!(ours[0].ends_with(" in=200 cached=50 (25%) out=7 same start"), "{}", ours[0]);
+    assert!(ours[1].ends_with(" no usage reported system prompt changed"), "{}", ours[1]);
 }
