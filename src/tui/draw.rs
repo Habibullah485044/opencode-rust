@@ -797,12 +797,16 @@ mod t100_tests {
         app.model = Some("qwen3-coder".into());
         app.api = Some((true, 42));
         app.stats = Some((12, 3, 1));
-        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let header: String = (0..80).map(|x| buf[(x, 0)].symbol().to_string()).collect();
-        assert!(header.contains("api ok 42ms"), "{header}");
-        assert!(header.contains("session ses_01234567"), "{header}");
-        assert!(!header.contains("89abcdef"), "the id is shortened: {header}");
+        let header = |width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..width).map(|x| buf[(x, 0)].symbol().to_string()).collect::<String>()
+        };
+        let narrow = header(80);
+        assert!(narrow.contains("api ok 42ms"), "{narrow}");
+        let wide = header(160);
+        assert!(wide.contains("session ses_01234567 "), "{wide}");
+        assert!(!wide.contains("89abcdef"), "the id is shortened: {wide}");
     }
 }
