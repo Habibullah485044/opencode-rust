@@ -3584,3 +3584,18 @@ async fn async_folder_lookup_uses_the_same_cache() {
     assert!(!st.workspaces.lock().unwrap().contains_key("ses_unknown"), "an unknown chat is not cached");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// T-152: cache.log lines go through one kept handle and keep their format.
+#[tokio::test]
+async fn cache_log_lines_keep_their_format() {
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    let sid = format!("ses_cachelog{}", crate::db::now_ms_for_tests() % 100_000_000);
+    let u = crate::provider::Usage { input: 200, cached: 50, cache_write: 0, output: 7 };
+    log_cache(&st, &sid, Some(&u), "same start");
+    log_cache(&st, &sid, None, "system prompt changed");
+    let log = std::fs::read_to_string(st.state_dir.join("cache.log")).unwrap();
+    let ours: Vec<&str> = log.lines().filter(|l| l.contains(short_id(&sid))).collect();
+    assert_eq!(ours.len(), 2, "{log}");
+    assert!(ours[0].ends_with(" in=200 cached=50 (25%) out=7 same start"), "{}", ours[0]);
+    assert!(ours[1].ends_with(" no usage reported system prompt changed"), "{}", ours[1]);
+}

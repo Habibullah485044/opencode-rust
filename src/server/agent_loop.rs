@@ -171,24 +171,27 @@ pub(super) fn log_cache(st: &AppState, session_id: &str, usage: Option<&crate::p
         .unwrap_or(0);
     let line = match usage {
         Some(u) => format!(
-            "{secs} {} in={} cached={} ({}%) out={} {prefix}\n",
+            "{secs} {} in={} cached={} ({}%) out={} {prefix}",
             short_id(session_id),
             u.input,
             u.cached,
             (u.cached * 100).checked_div(u.input).unwrap_or(0),
             u.output
         ),
-        None => format!("{secs} {} no usage reported {prefix}\n", short_id(session_id)),
+        None => format!("{secs} {} no usage reported {prefix}", short_id(session_id)),
     };
-    let _ = std::fs::create_dir_all(&st.state_dir);
+    // T-152: opened once and kept, as core_log does (this runs for every
+    // model request, on an async thread). Another state folder (tests)
+    // opens its own file.
+    static LOG: Mutex<Option<(PathBuf, Option<(std::fs::File, u64)>)>> = Mutex::new(None);
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     let path = st.state_dir.join("cache.log");
-    // Keep it small: start over past 2 MB.
-    if std::fs::metadata(&path).map(|m| m.len() > 2_000_000).unwrap_or(false) {
-        let _ = std::fs::remove_file(&path);
+    if log.as_ref().is_none_or(|(open, _)| *open != path) {
+        *log = Some((path.clone(), None));
     }
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = f.write_all(line.as_bytes());
+    if let Some((_, slot)) = log.as_mut() {
+        // Kept small: moved to cache.log.1 past 2 MB.
+        append_log(slot, &path, 2_000_000, &line);
     }
 }
 
