@@ -131,10 +131,10 @@ pub(super) async fn run_deep(
         let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
     };
     let ws = st.workspace_for(session_id);
-    st.db.add_message(session_id, "user", &[Part::Text { text: format!("[deep mode, {n} attempts] {task}") }])?;
+    save_message(st, session_id, "user", vec![Part::Text { text: format!("[deep mode, {n} attempts] {task}") }]).await?;
     let started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
 
-    let trees = Trees(Some(Arc::new(create_worktrees(st, &ws, n).await?)));
+    let trees = Trees(Some(Arc::new(create_worktrees(&ws, &st.state_dir, n).await?)));
     let wts = trees.get();
 
     // The chat's mode: a mission's step runs as turbo.
@@ -217,7 +217,7 @@ pub(super) async fn run_deep(
     drop(wts);
     trees.remove().await;
     if winner.problems > 0 {
-        st.db.add_message(session_id, "assistant", &[Part::Text { text: out.clone() }])?;
+        save_message(st, session_id, "assistant", vec![Part::Text { text: out.clone() }]).await?;
         let _ = st.events.send(ServerEvent::AssistantDelta { session_id: session_id.to_string(), text: out.clone() });
         check_after_run(st, session_id, task, started_at, true, abort, None).await;
         return Ok(String::new());
@@ -226,16 +226,21 @@ pub(super) async fn run_deep(
 }
 
 /// The worktrees, one after the other (git locks the repository).
-async fn create_worktrees(st: &Shared, ws: &std::path::Path, n: usize) -> Result<Vec<Worktree>> {
-    let mut wts = Vec::new();
-    for i in 1..=n {
-        let (w, sd) = (ws.to_path_buf(), st.state_dir.clone());
-        let made = tokio::task::spawn_blocking(move || Worktree::create(&w, &sd, &format!("deep{i}")))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        wts.push(made.map_err(|e| anyhow::anyhow!("Deep mode needs a git repository with at least one commit: {e:#}"))?);
-    }
-    Ok(wts)
+/// T-023: the whole loop runs on one blocking thread, so when worktree `i`
+/// fails, the ones made before it are removed (git, in `Worktree::drop`)
+/// there too, never on a tokio worker.
+async fn create_worktrees(ws: &std::path::Path, state_dir: &std::path::Path, n: usize) -> Result<Vec<Worktree>> {
+    let (w, sd) = (ws.to_path_buf(), state_dir.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        (1..=n)
+            .map(|i| {
+                Worktree::create(&w, &sd, &format!("deep{i}"))
+                    .map_err(|e| anyhow::anyhow!("Deep mode needs a git repository with at least one commit: {e:#}"))
+            })
+            .collect::<Result<Vec<_>>>()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?
 }
 
 /// Attempt settings: no reviews inside an attempt, the model the chat
@@ -443,5 +448,18 @@ mod tests {
         assert!(s(false, 1, 0, 5).rank() < s(false, 1, 0, 50).rank(), "then the smaller change");
         assert!(s(false, 1, 3, 5).rank() < s(true, 1, 0, 5).rank(), "a failed run is last");
         assert!(s(false, 1, 3, 5).rank() < s(false, 0, 0, 0).rank(), "no change is last");
+    }
+
+    /// T-023: a folder that is not a git repository fails on the first
+    /// worktree with the hint (the loop and its clean-up run off the async
+    /// threads).
+    #[tokio::test]
+    async fn worktrees_need_a_git_repository() {
+        let base = std::env::temp_dir().join(format!("ocrs-deep-nogit-{}", std::process::id()));
+        let (ws, sd) = (base.join("ws"), base.join("state"));
+        std::fs::create_dir_all(&ws).unwrap();
+        let err = create_worktrees(&ws, &sd, 3).await.err().expect("no git, no worktrees");
+        assert!(format!("{err:#}").contains("needs a git repository"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
