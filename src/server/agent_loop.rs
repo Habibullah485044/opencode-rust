@@ -99,7 +99,7 @@ pub(super) fn canonical_json(v: &Value) -> String {
 /// F-09: run one batch of calls past the loop guard, in call order. A
 /// refused call gets its error result right away (started/finished events,
 /// stats, saved tool message) and is left out; the rest come back in order.
-pub(super) fn apply_loop_guard(
+pub(super) async fn apply_loop_guard(
     st: &Shared,
     opts: &LoopOpts,
     session_id: &str,
@@ -120,7 +120,7 @@ pub(super) fn apply_loop_guard(
                 text: format!("loop guard: stopped a repeated `{name}` call"),
             });
         }
-        finish_tool_call(st, opts, session_id, &id, &name, &input, msg, false)?;
+        finish_tool_call(st, opts, session_id, &id, &name, &input, msg, false).await?;
     }
     Ok(keep)
 }
@@ -490,13 +490,13 @@ pub(crate) async fn run_loop_inner(
         // A3: messages for a subagent from its parent, or finished
         // background reports for a parent, arrive before the next step.
         if let Some(text) = crate::subagent::take_mail(session_id) {
-            st.db.add_message(session_id, "user", &[Part::Text { text }])?;
+            save_message(st, session_id, "user", vec![Part::Text { text }]).await?;
         }
         // F-07: compact first when the context is nearly full. The request
         // is built once per step, and again only when compaction changed it.
-        let mut msgs = build_chat_messages(st, session_id, &opts.system)?;
+        let mut msgs = load_chat_messages(st, session_id, &opts.system).await?;
         if auto_compact_if_needed(st, session_id, &msgs, &specs, abort).await {
-            msgs = build_chat_messages(st, session_id, &opts.system)?;
+            msgs = load_chat_messages(st, session_id, &opts.system).await?;
         }
         let prefix_note = prefix_change(session_id, &msgs, &specs);
         // B-29: copy the client out of the lock; never hold it while waiting.
@@ -576,13 +576,13 @@ pub(crate) async fn run_loop_inner(
         note_cut_reply(st, session_id, truncated, broke_off, stream_drops, calls.is_empty(), &mut text);
         let cut_off = |v: &Value| v.as_object().map(|o| o.len() == 1 && o.contains_key("raw")).unwrap_or(false);
         if (truncated || broke_off) && calls.iter().any(|(_, _, input)| cut_off(input)) {
-            save_cut_off_calls(st, session_id, &reasoning, &text, &calls)?;
+            save_cut_off_calls(st, session_id, &reasoning, &text, &calls).await?;
             continue;
         }
-        save_assistant_reply(st, session_id, reasoning, &text, &calls)?;
+        save_assistant_reply(st, session_id, reasoning, &text, &calls).await?;
 
         if calls.is_empty() {
-            if nudge_on_empty_reply(st, session_id, opts, mode, truncated, &specs, &text, &mut nudges)? {
+            if nudge_on_empty_reply(st, session_id, opts, mode, truncated, &specs, &text, &mut nudges).await? {
                 continue;
             }
             final_text = text;
@@ -590,7 +590,7 @@ pub(crate) async fn run_loop_inner(
             break;
         }
 
-        let calls = normalize_calls(st, opts, session_id, &specs, &mut loop_guard, calls)?;
+        let calls = normalize_calls(st, opts, session_id, &specs, &mut loop_guard, calls).await?;
         // A step that only ticks off todos next to a final answer needs no
         // further model call (Freebuff's bookkeeping tools): one request saved.
         let bookkeeping_only = calls.iter().all(|(_, n, i)| {
@@ -640,7 +640,12 @@ async fn run_specs(
     }
     specs.extend(mcp_specs_for_prompt(st.mcp.lock().await.specs()));
     if opts.can_spawn {
-        let roles = agents::load_subagents(&st.workspace_for(session_id));
+        // Once per run (T-063), and off the async threads: it reads up to
+        // three folders (and the chat's project from the DB).
+        let roles = {
+            let (st, sid) = (st.clone(), session_id.to_string());
+            tokio::task::spawn_blocking(move || agents::load_subagents(&st.workspace_for(&sid))).await.unwrap_or_default()
+        };
         specs.push(crate::subagent::spawn_spec(&roles));
         specs.extend(crate::subagent::agent_tool_specs());
     }
@@ -859,7 +864,7 @@ fn note_cut_reply(
 
 /// Save a cut-off reply whose tool calls lost their arguments, each call
 /// answered with an error asking for smaller pieces.
-fn save_cut_off_calls(
+async fn save_cut_off_calls(
     st: &Shared,
     session_id: &str,
     reasoning: &str,
@@ -876,23 +881,26 @@ fn save_cut_off_calls(
     for (id, name, input) in calls {
         parts.push(Part::ToolCall { id: id.clone(), name: name.clone(), input: input.clone() });
     }
-    st.db.add_message(session_id, "assistant", &parts)?;
-    for (id, _, _) in calls {
-        let output = "not run: your reply hit the output token limit before this call's \
-                      arguments were complete. Send it again in smaller pieces (for \
-                      example write a big file in several steps)."
-            .to_string();
-        st.db.add_message(
-            session_id,
-            "tool",
-            &[Part::ToolResult { tool_id: id.clone(), output, is_error: true }],
-        )?;
-    }
-    Ok(())
+    let ids: Vec<String> = calls.iter().map(|(id, _, _)| id.clone()).collect();
+    let sid = session_id.to_string();
+    // One trip off the async threads; the calls go in before their results.
+    st.db
+        .run(move |db| {
+            db.add_message(&sid, "assistant", &parts)?;
+            for id in ids {
+                let output = "not run: your reply hit the output token limit before this call's \
+                              arguments were complete. Send it again in smaller pieces (for \
+                              example write a big file in several steps)."
+                    .to_string();
+                db.add_message(&sid, "tool", &[Part::ToolResult { tool_id: id, output, is_error: true }])?;
+            }
+            Ok(())
+        })
+        .await
 }
 
 /// Save the assistant's reply: reasoning, text and tool calls.
-fn save_assistant_reply(
+async fn save_assistant_reply(
     st: &Shared,
     session_id: &str,
     reasoning: String,
@@ -914,7 +922,7 @@ fn save_assistant_reply(
         });
     }
     if !assistant_parts.is_empty() {
-        st.db.add_message(session_id, "assistant", &assistant_parts)?;
+        save_message(st, session_id, "assistant", assistant_parts).await?;
     }
     Ok(())
 }
@@ -923,7 +931,7 @@ fn save_assistant_reply(
 /// output limit, only a plan, or "I can't see your files"): add a message
 /// asking for more and return `true`.
 #[allow(clippy::too_many_arguments)]
-fn nudge_on_empty_reply(
+async fn nudge_on_empty_reply(
     st: &Shared,
     session_id: &str,
     opts: &LoopOpts,
@@ -941,8 +949,7 @@ fn nudge_on_empty_reply(
             session_id: session_id.to_string(),
             text: "the reply hit its output limit mid-way — asking the model to continue".into(),
         });
-        st.db
-            .add_message(session_id, "user", &[Part::Text { text: CONTINUE_TEXT.to_string() }])?;
+        save_message(st, session_id, "user", vec![Part::Text { text: CONTINUE_TEXT.to_string() }]).await?;
         return Ok(true);
     }
     // "I'll build it now." and no tool call: weak models end their
@@ -954,7 +961,7 @@ fn nudge_on_empty_reply(
             session_id: session_id.to_string(),
             text: "the model said what it will do but did not do it — asking it to go ahead".into(),
         });
-        st.db.add_message(session_id, "user", &[Part::Text { text: NUDGE_TEXT.to_string() }])?;
+        save_message(st, session_id, "user", vec![Part::Text { text: NUDGE_TEXT.to_string() }]).await?;
         return Ok(true);
     }
     // "I can't see your files, please paste them": the model forgot
@@ -965,14 +972,19 @@ fn nudge_on_empty_reply(
             session_id: session_id.to_string(),
             text: "the model said it cannot see the files — reminding it that it has tools".into(),
         });
-        let folder = opts.workspace.clone().unwrap_or_else(|| st.workspace_for(session_id));
-        let reminder = format!(
-            "[app] You can see the files: you have tools (list, glob, grep, read) that work in the project \
-             folder {}. Do not ask the user to paste or upload anything. Use the tools now to do what \
-             was asked.",
-            folder.display()
-        );
-        st.db.add_message(session_id, "user", &[Part::Text { text: reminder }])?;
+        let (st2, sid, folder) = (st.clone(), session_id.to_string(), opts.workspace.clone());
+        st.db
+            .run(move |db| {
+                let folder = folder.unwrap_or_else(|| st2.workspace_for(&sid));
+                let reminder = format!(
+                    "[app] You can see the files: you have tools (list, glob, grep, read) that work in the project \
+                     folder {}. Do not ask the user to paste or upload anything. Use the tools now to do what \
+                     was asked.",
+                    folder.display()
+                );
+                db.add_message(&sid, "user", &[Part::Text { text: reminder }]).map(drop)
+            })
+            .await?;
         return Ok(true);
     }
     Ok(false)
@@ -980,7 +992,7 @@ fn nudge_on_empty_reply(
 
 /// The step's tool calls as they will run: other agents' tool names mapped
 /// to ours, the loop guard applied, and `mcp_call` unwrapped.
-fn normalize_calls(
+async fn normalize_calls(
     st: &Shared,
     opts: &LoopOpts,
     session_id: &str,
@@ -1001,7 +1013,7 @@ fn normalize_calls(
     // F-09 loop guard: an identical call repeated LOOP_GUARD_LIMIT times
     // in a row is answered with an error and never runs (no approval
     // prompt either). Every requested call counts, spawns included.
-    let calls = apply_loop_guard(st, opts, session_id, loop_guard, calls)?;
+    let calls = apply_loop_guard(st, opts, session_id, loop_guard, calls).await?;
     // `mcp_call` runs as the MCP tool it names: permissions, role and
     // mode rules and the activity view all see the real tool.
     Ok(calls
@@ -1047,14 +1059,14 @@ async fn run_tool_calls(
             Some(m) => (m, false),
             None => execute_for(st, session_id, opts, &name, &input, abort).await,
         };
-        finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
+        finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok).await?;
     }
     // Join the parallel spawns; results are recorded in call order.
     let (meta, futs): (Vec<_>, Vec<_>) = spawns.into_iter().unzip();
     for ((id, name, input, _detail), (output, ok)) in
         meta.into_iter().zip(futures::future::join_all(futs).await)
     {
-        finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok)?;
+        finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok).await?;
     }
     Ok(())
 }
@@ -1181,7 +1193,7 @@ pub(super) fn tool_started(st: &Shared, opts: &LoopOpts, session_id: &str, id: &
 /// enforcement, not decoration), stats, the finish event, and the persisted
 /// tool message.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn finish_tool_call(
+pub(super) async fn finish_tool_call(
     st: &Shared,
     opts: &LoopOpts,
     session_id: &str,
@@ -1235,12 +1247,16 @@ pub(super) fn finish_tool_call(
             ok,
         });
     }
-    st.db.add_message(
-        session_id,
-        "tool",
-        &[Part::ToolResult { tool_id: id.to_string(), output, is_error: !ok }],
-    )?;
-    Ok(())
+    // T-006: off the async threads, awaited before the next call's result.
+    save_message(st, session_id, "tool", vec![Part::ToolResult { tool_id: id.to_string(), output, is_error: !ok }]).await
+}
+
+/// Save one message off the async threads (`Db::run`) and wait for it: the
+/// next step reads the history back, and a tool call's result must follow
+/// the call (T-005).
+pub(super) async fn save_message(st: &AppState, session_id: &str, role: &str, parts: Vec<Part>) -> Result<()> {
+    let (sid, role) = (session_id.to_string(), role.to_string());
+    st.db.run(move |db| db.add_message(&sid, &role, &parts).map(drop)).await
 }
 
 /// M7: subagent status for the TUI's agents panel.

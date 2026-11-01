@@ -294,14 +294,29 @@ pub(crate) fn deliver_system_prompt(msgs: &mut Vec<ChatMsg>, st: &Shared) {
     });
 }
 
+/// The request for the next step. T-006: the history (the whole chat, read
+/// on every step) comes off the async threads.
+pub(super) async fn load_chat_messages(st: &Shared, session_id: &str, system: &str) -> Result<Vec<ChatMsg>> {
+    let sid = session_id.to_string();
+    let history = st.db.run(move |db| db.messages(&sid)).await?;
+    chat_messages_from(st, history, system)
+}
+
+/// [`load_chat_messages`] read inline, for tests.
+#[cfg(test)]
 pub(super) fn build_chat_messages(st: &Shared, session_id: &str, system: &str) -> Result<Vec<ChatMsg>> {
+    chat_messages_from(st, st.db.messages(session_id)?, system)
+}
+
+/// The request built from a chat's saved `history`.
+pub(super) fn chat_messages_from(st: &Shared, history: Vec<Message>, system: &str) -> Result<Vec<ChatMsg>> {
     let mut out = vec![ChatMsg {
         role: "system".into(),
         content: Some(system.to_string()),
         tool_calls: None,
         tool_call_id: None,
     }];
-    for msg in st.db.messages(session_id)? {
+    for msg in history {
         match msg.role.as_str() {
             "user" => {
                 let mut text = String::new();

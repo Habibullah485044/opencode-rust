@@ -124,15 +124,16 @@ pub(super) fn spawn_claimed_run(st: Shared, session_id: String, user_content: St
 /// the cap), else None. A trailing "?" in the answer does NOT count as more
 /// work: asking is the one thing turbo must respect. The model is blocked
 /// on the user, and pushing it to "decide for yourself" produces guesses.
-pub(super) fn turbo_continuation(st: &Shared, session_id: &str, result: &Result<LoopEnd>) -> Option<String> {
+pub(super) async fn turbo_continuation(st: &Shared, session_id: &str, result: &Result<LoopEnd>) -> Option<String> {
     if st.perm_mode_for(session_id) != PermissionMode::Turbo || !matches!(result, Ok(LoopEnd::Done(_))) {
         return None;
     }
     if !todos_open(st, session_id) {
         return None;
     }
-    // One read of the chat for both checks below.
-    let msgs = st.db.messages(session_id).unwrap_or_default();
+    // One read of the chat for both checks below (T-008: off the async threads).
+    let sid = session_id.to_string();
+    let msgs = st.db.run(move |db| db.messages(&sid)).await.unwrap_or_default();
     if turbo_streak_in(&msgs) >= TURBO_MAX_CONTINUATIONS {
         return None;
     }
@@ -258,7 +259,7 @@ pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &s
     // it BEFORE this run returns and announce no RunFinished in between:
     // every client (headless, TUI, GUI) sees one run that ends when the
     // last continuation ends.
-    if let Some(next) = turbo_continuation(st, session_id, &result).filter(|_| budget.take(st, session_id, "another turbo round")) {
+    if let Some(next) = turbo_continuation(st, session_id, &result).await.filter(|_| budget.take(st, session_id, "another turbo round")) {
         let _ = st.events.send(ServerEvent::Note {
             session_id: session_id.to_string(),
             text: "turbo: continuing on my own — no questions, no waiting".into(),
@@ -801,26 +802,33 @@ pub(super) async fn agent_inner_with(
     note: Option<String>,
     abort: &AtomicBool,
 ) -> Result<LoopEnd> {
-    st.db.add_message(session_id, "user", &[Part::Text { text: user_content.to_string() }])?;
-    if let Some(note) = note {
-        st.db.add_message(session_id, "system", &[Part::Text { text: note }])?;
-    }
-    // M2: expand slash-command templates (`.opencode/commands/*.md`);
-    // the raw input stays visible to the user, the expansion is a system note.
-    if let Some((rendered, doc)) = skills::resolve_command(&st.workspace_for(session_id), user_content) {
-        st.db.add_message(
-            session_id,
-            "system",
-            &[Part::Text {
-                text: format!("[slash command `/{}` expanded]\n{}", doc.name, rendered),
-            }],
-        )?;
-    }
-    // Reads AGENTS.md, skills and lessons and builds the project map: file
-    // work, so off the async threads.
-    let system = {
-        let (st, sid) = (st.clone(), session_id.to_string());
-        tokio::task::spawn_blocking(move || st.composed_system(&sid)).await.context("composing the system prompt")?
+    // T-004: the request, its notes and the system prompt in one trip off
+    // the async threads (DB writes, command templates, AGENTS.md, skills,
+    // lessons and the project map are all disk work). In this order: the
+    // prompt reads the first request back.
+    let (system, workspace) = {
+        let (st2, sid, content) = (st.clone(), session_id.to_string(), user_content.to_string());
+        st.db
+            .run(move |db| {
+                db.add_message(&sid, "user", &[Part::Text { text: content.clone() }])?;
+                if let Some(note) = note {
+                    db.add_message(&sid, "system", &[Part::Text { text: note }])?;
+                }
+                // M2: expand slash-command templates (`.opencode/commands/*.md`);
+                // the raw input stays visible to the user, the expansion is a system note.
+                if let Some((rendered, doc)) = skills::resolve_command(&st2.workspace_for(&sid), &content) {
+                    db.add_message(
+                        &sid,
+                        "system",
+                        &[Part::Text {
+                            text: format!("[slash command `/{}` expanded]\n{}", doc.name, rendered),
+                        }],
+                    )?;
+                }
+                Ok((st2.composed_system(&sid), st2.run_workspace(&sid)))
+            })
+            .await
+            .context("saving the request and composing the system prompt")?
     };
     let opts = LoopOpts {
         model: None,
@@ -829,7 +837,7 @@ pub(super) async fn agent_inner_with(
         emit_activity: true,
         allow: None,
         can_spawn: true,
-        workspace: st.run_workspace(session_id),
+        workspace,
         agent: None,
     };
     run_loop_inner(st, session_id, &opts, abort).await
