@@ -172,8 +172,12 @@ impl AppState {
         // file) inside the workspace would carry the write outside it.
         Self::export_stays_inside(&workspace, &path)?;
         if path.exists() && !force {
-            let existing = std::fs::read_to_string(&path).unwrap_or_default();
-            if !existing.starts_with(Self::EXPORT_MARKER) {
+            // Only the start is compared: no need to read a whole file (T-071).
+            let mut head = vec![0u8; Self::EXPORT_MARKER.len()];
+            let earlier = std::fs::File::open(&path)
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+                .is_ok_and(|()| head == Self::EXPORT_MARKER.as_bytes());
+            if !earlier {
                 anyhow::bail!(
                     "{} already exists and is not an earlier export; pick another name or use /export --force {name}",
                     path.display()
