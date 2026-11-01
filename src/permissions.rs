@@ -228,7 +228,8 @@ impl ReadFilter {
 /// Arguments that make an otherwise harmless command run other code or
 /// delete files. A command with one of them is not covered by a wildcard
 /// allow rule (`git *`, `find *`): it asks. A small list on purpose:
-/// - git: `-c`/`--config-env` (`core.pager`, `alias.x=!sh`), `--exec-path`,
+/// - git: `-c`/`--config-env` (`core.pager`, `alias.x=!sh`), `--exec-path`
+///   (these three only before the subcommand),
 ///   `--upload-pack`/`--receive-pack`, `rebase --exec`/`-x`;
 /// - find: `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`;
 /// - any command: `--exec`.
@@ -240,12 +241,29 @@ pub fn runs_code(command: &str) -> bool {
     let first = words.first().map(|w| w.rsplit(['/', '\\']).next().unwrap_or(w)).unwrap_or("");
     let first = first.strip_suffix(".exe").unwrap_or(first);
     let flag = |w: &str, f: &str| w == f || w.starts_with(&format!("{f}="));
-    words.iter().skip(1).any(|w| {
+    // git's `-c`/`--config-env`/`--exec-path` are global options: they count
+    // only before the subcommand. After it `-c` is harmless (`commit -c
+    // <rev>`, `log -c`). The subcommand is the first word that is neither an
+    // option nor the separate value of one (`-C sub`, `--git-dir x`).
+    let git_sub = if first == "git" {
+        let takes_value =
+            ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix", "--attr-source"];
+        let mut i = 1;
+        while i < words.len() && words[i].starts_with('-') {
+            i += if takes_value.contains(&words[i]) { 2 } else { 1 };
+        }
+        i
+    } else {
+        0
+    };
+    words.iter().enumerate().skip(1).any(|(i, w)| {
         flag(w, "--exec")
             || match first {
                 "git" => {
-                    (w.starts_with("-c") && !w.starts_with("--"))
-                        || ["--config-env", "--exec-path", "--upload-pack", "--receive-pack"].iter().any(|f| flag(w, f))
+                    (i < git_sub
+                        && ((w.starts_with("-c") && !w.starts_with("--"))
+                            || ["--config-env", "--exec-path"].iter().any(|f| flag(w, f))))
+                        || ["--upload-pack", "--receive-pack"].iter().any(|f| flag(w, f))
                         || (*w == "-x" && words.contains(&"rebase"))
                 }
                 "find" => ["-exec", "-execdir", "-ok", "-okdir", "-delete"].contains(w),
@@ -926,13 +944,57 @@ mod tests {
         ] {
             assert_eq!(e.evaluate("bash", cmd, deny_all()).action, Action::Ask, "{cmd}");
         }
-        for cmd in ["git status", "git log --color", "git commit -m 'x'", "git -C sub log", "find . -name '*.rs'"] {
+        for cmd in [
+            "git status",
+            "git log --color",
+            "git commit -m 'x'",
+            "git -C sub log",
+            "find . -name '*.rs'",
+            // `-c` after the subcommand is the subcommand's own option.
+            "git commit -c HEAD",
+            "git log -c",
+            "git -C sub log -c",
+        ] {
             assert_eq!(e.evaluate("bash", cmd, deny_all()).action, Action::Allow, "{cmd}");
         }
         // An exact rule, or an exact earlier approval, still allows it.
         assert_eq!(e.evaluate("bash", "git -c color.ui=always log", deny_all()).action, Action::Allow);
         let yes = |_: &str, d: &str| d == "git -c core.pager=cat log";
         assert_eq!(e.evaluate("bash", "git -c core.pager=cat log", yes).action, Action::Allow);
+    }
+
+    /// The function itself, not through the rule engine.
+    #[test]
+    fn runs_code_table() {
+        for (cmd, want) in [
+            ("git.exe -c core.pager=sh log", true),
+            ("/usr/bin/git -c core.pager=sh log", true),
+            ("C:\\Git\\bin\\git.exe -c x=y log", true),
+            ("git '-c' core.pager=sh log", true),
+            ("git \"-c\" core.pager=sh log", true),
+            ("git -C sub -c core.pager=sh log", true),
+            ("git --git-dir x --exec-path=/tmp log", true),
+            ("git --config-env core.pager=X log", true),
+            ("make --exec=x", true),
+            ("npm run --exec x", true),
+            ("find . -okdir rm {} ;", true),
+            ("find . -ok rm {} ;", true),
+            ("git clone --upload-pack=evil url", true),
+            ("git rebase -x make main", true),
+            // `-c` is a git global option only before the subcommand.
+            ("git commit -c HEAD", false),
+            ("git log -c", false),
+            ("git -C sub log -c", false),
+            // Not git: this function leaves other commands' `-c` alone.
+            ("bash -c id", false),
+            ("sh -c 'rm -rf x'", false),
+            ("python -c 'print(1)'", false),
+            ("find . -name x", false),
+            ("ls -x", false),
+            ("", false),
+        ] {
+            assert_eq!(runs_code(cmd), want, "{cmd}");
+        }
     }
 
     /// One resolver: the detail names the file the tool opens.
