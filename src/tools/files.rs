@@ -131,7 +131,12 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = dir.join(format!(".{name}.ocrs-{}-{n}.tmp", std::process::id()));
-    std::fs::write(&tmp, data)?;
+    // A write that fails partway (disk full, quota) must not leave the
+    // temporary file behind.
+    if let Err(e) = std::fs::write(&tmp, data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if let Some(perms) = old_perms {
         let _ = std::fs::set_permissions(&tmp, perms);
     }
@@ -166,7 +171,55 @@ pub(super) fn list_dir(workspace: &Path, path: &str) -> Result<String> {
     if lines.is_empty() {
         return Ok("(empty directory)".into());
     }
+    // A folder with 100k files would flood the context.
+    let more = lines.len().saturating_sub(LIST_MAX_ENTRIES);
+    lines.truncate(LIST_MAX_ENTRIES);
+    if more > 0 {
+        lines.push(format!("… and {more} more (use glob to narrow)"));
+    }
     Ok(lines.join("\n"))
+}
+
+/// Most entries one `list` call shows.
+const LIST_MAX_ENTRIES: usize = 1000;
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    fn ws(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("ocrs-list-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn folders_first_then_sorted_files_with_sizes() {
+        let ws = ws("order");
+        std::fs::create_dir_all(ws.join("zdir")).unwrap();
+        std::fs::create_dir_all(ws.join("adir")).unwrap();
+        std::fs::write(ws.join("b.txt"), "12345").unwrap();
+        std::fs::write(ws.join("a.txt"), "").unwrap();
+        assert_eq!(list_dir(&ws, ".").unwrap(), "adir/\nzdir/\na.txt (0 B)\nb.txt (5 B)");
+        assert_eq!(list_dir(&ws, "adir").unwrap(), "(empty directory)");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn a_huge_folder_is_capped() {
+        let ws = ws("cap");
+        for i in 0..1100 {
+            std::fs::write(ws.join(format!("f{i:04}.txt")), "").unwrap();
+        }
+        let out = list_dir(&ws, ".").unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 1001);
+        assert_eq!(lines[0], "f0000.txt (0 B)");
+        assert_eq!(lines[999], "f0999.txt (0 B)");
+        assert_eq!(lines[1000], "… and 100 more (use glob to narrow)");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }
 
 #[cfg(test)]
@@ -214,6 +267,22 @@ mod b30_tests {
         assert!(out.len() < 3000, "{}", out.len());
         let _ = std::fs::remove_dir_all(&ws);
     }
+
+    #[test]
+    fn cap_line_counts_chars_not_bytes() {
+        let exact = "x".repeat(READ_MAX_LINE_CHARS);
+        assert!(matches!(cap_line(&exact), std::borrow::Cow::Borrowed(_)));
+        let over = "x".repeat(READ_MAX_LINE_CHARS + 1);
+        let cut = cap_line(&over);
+        assert_eq!(cut, format!("{exact}… [line cut at {READ_MAX_LINE_CHARS} characters]"));
+        // 2000 three-byte characters are 6000 bytes but not too long.
+        let wide = "é€".repeat(READ_MAX_LINE_CHARS / 2);
+        assert_eq!(cap_line(&wide), wide.as_str());
+        let wide_over = format!("{wide}€");
+        let cut = cap_line(&wide_over);
+        assert!(cut.starts_with(&wide) && cut.ends_with("characters]"), "{cut}");
+        assert_eq!(cut.chars().filter(|c| *c == '€').count(), READ_MAX_LINE_CHARS / 2);
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +322,51 @@ mod b31_tests {
             .filter(|n| n.contains(".ocrs-"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    fn leftovers(ws: &Path) -> Vec<String> {
+        std::fs::read_dir(ws)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".ocrs-") && n.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn write_atomic_replaces_refuses_read_only_and_cleans_up() {
+        let ws = ws("atomic");
+        let f = ws.join("a.txt");
+        write_atomic(&f, b"first").unwrap();
+        write_atomic(&f, b"second, longer").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"second, longer");
+        let mut perms = std::fs::metadata(&f).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&f, perms.clone()).unwrap();
+        let err = write_atomic(&f, b"third").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&f).unwrap(), b"second, longer");
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&f, perms).unwrap();
+        // A failed temp write (here: the folder is gone) leaves nothing.
+        assert!(write_atomic(&ws.join("missing").join("b.txt"), b"x").is_err());
+        assert!(leftovers(&ws).is_empty(), "{:?}", leftovers(&ws));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = ws("atomic-mode");
+        let f = ws.join("key");
+        std::fs::write(&f, "old").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomic(&f, b"new").unwrap();
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o640);
+        assert!(leftovers(&ws).is_empty());
         let _ = std::fs::remove_dir_all(&ws);
     }
 

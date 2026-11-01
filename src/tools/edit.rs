@@ -176,7 +176,7 @@ fn end_like_block(fixed: Vec<String>, inner_cr: bool, last_cr: bool) -> impl Ite
     })
 }
 
-/// " — closest match at lines N-M: ..." for a failed edit, or "" when
+/// ". Closest match at lines N-M ...:" for a failed edit, or "" when
 /// nothing is close.
 fn closest_region(lines: &[&str], want: &[&str]) -> String {
     let first = want.iter().find(|l| !l.trim().is_empty()).map(|l| l.trim()).unwrap_or("");
@@ -218,5 +218,27 @@ mod b01_tests {
         }
         assert_eq!(std::fs::read_to_string(ws.join("f.txt")).unwrap(), "abc", "file untouched");
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn closest_region_points_at_the_nearest_block() {
+        let file = ["fn a() {", "    let x = 1;", "    let y = 2;", "}", "fn b() {", "    other();", "}"];
+        // Exact region.
+        let out = closest_region(&file, &["    let x = 1;", "    let y = 2;"]);
+        assert!(out.starts_with(". Closest match at lines 2-3"), "{out}");
+        assert!(out.contains("    2\t    let x = 1;\n    3\t    let y = 2;"), "{out}");
+        // Only the indentation differs: same lines found.
+        let out = closest_region(&file, &["let x = 1;", "\tlet y = 2;"]);
+        assert!(out.starts_with(". Closest match at lines 2-3"), "{out}");
+        // Nothing close.
+        assert_eq!(closest_region(&file, &["nothing like this", "at all"]), "");
+        assert_eq!(closest_region(&file, &[]), "");
+        // A long old_str shows at most 12 lines of the region.
+        let long: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
+        let long: Vec<&str> = long.iter().map(String::as_str).collect();
+        let out = closest_region(&long, &long[4..24]);
+        assert!(out.starts_with(". Closest match at lines 5-24"), "{out}");
+        assert_eq!(out.lines().count(), 1 + 12, "{out}");
+        assert!(out.ends_with("   16\tline 16"), "{out}");
     }
 }

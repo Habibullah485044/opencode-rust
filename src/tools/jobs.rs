@@ -267,3 +267,44 @@ pub fn stop_all_now() {
         let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
 }
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    fn job(by_user: bool, ended: bool) -> Job {
+        Job {
+            command: "x".into(),
+            by_user,
+            cwd: PathBuf::from("."),
+            pid: None,
+            out: Default::default(),
+            dropped: Default::default(),
+            read_to: 0,
+            exit: Arc::new(Mutex::new(ended.then(|| "exited with code 0".to_string()))),
+        }
+    }
+
+    #[test]
+    fn prune_keeps_running_user_and_the_newest_ended_jobs() {
+        let mut map = HashMap::new();
+        // job1..job25 ended, job26 still running, term27 the user's.
+        for n in 1..=25 {
+            map.insert(format!("job{n}"), job(false, true));
+        }
+        map.insert("job26".into(), job(false, false));
+        map.insert("term27".into(), job(true, true));
+        prune(&mut map);
+        assert_eq!(map.len(), 22);
+        assert!(map.contains_key("job26") && map.contains_key("term27"));
+        for n in 1..=5 {
+            assert!(!map.contains_key(&format!("job{n}")), "job{n} is among the oldest");
+        }
+        for n in 6..=25 {
+            assert!(map.contains_key(&format!("job{n}")), "job{n} is among the newest {KEEP_ENDED}");
+        }
+        // Already within the limit: nothing goes.
+        prune(&mut map);
+        assert_eq!(map.len(), 22);
+    }
+}
