@@ -679,7 +679,7 @@ impl AppState {
                         }
                         (ok, status)
                     }
-                    Err(e) => (false, heartbeat_error(&e)),
+                    Err(e) => (false, crate::provider::send_error_text(&e)),
                 };
                 let mut got = got;
                 if ok && st.client.lock().await.key_rejected.load(Ordering::Relaxed) {
@@ -847,25 +847,6 @@ fn probe_note(echo: bool, line: &str) {
         eprintln!("{line}");
     }
     core_log(line);
-}
-
-/// A failed status check in plain words (the cause chain, not just the
-/// outermost "error sending request").
-fn heartbeat_error(e: &reqwest::Error) -> String {
-    let kind = if e.is_timeout() {
-        "timed out"
-    } else if e.is_connect() {
-        "could not connect"
-    } else {
-        "request failed"
-    };
-    let mut cause = String::new();
-    let mut src = std::error::Error::source(e);
-    while let Some(s) = src {
-        cause = s.to_string();
-        src = s.source();
-    }
-    if cause.is_empty() { kind.to_string() } else { format!("{kind}: {cause}") }
 }
 
 /// Where [`core_log`] writes: `<state_dir>/core.log`. Unit tests get a

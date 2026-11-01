@@ -377,8 +377,9 @@ impl Client {
                 }
                 Some(Err(e)) => {
                     let msg = format!(
-                        "provider request to {url} failed: {e:?} \
-                         (tunnel down or endpoint unreachable — check the base URL / heartbeat in the header)"
+                        "provider request to {url} failed: {} \
+                         (tunnel down or endpoint unreachable — check the base URL / heartbeat in the header)",
+                        send_error_text(&e)
                     );
                     (msg, is_retryable_send_error(&e), None, false)
                 }
@@ -1026,6 +1027,27 @@ async fn error_body(resp: reqwest::Response, limit: std::time::Duration) -> Stri
     }
     buf.truncate(ERROR_BODY_MAX);
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// A failed request in plain words: what happened and the innermost cause
+/// ("could not connect: No connection could be made…"), not reqwest's
+/// Debug dump or just its outermost "error sending request". Used for the
+/// heartbeat and for chat requests (T-049).
+pub fn send_error_text(e: &reqwest::Error) -> String {
+    let kind = if e.is_timeout() {
+        "timed out"
+    } else if e.is_connect() {
+        "could not connect"
+    } else {
+        "request failed"
+    };
+    let mut cause = String::new();
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        cause = s.to_string();
+        src = s.source();
+    }
+    if cause.is_empty() { kind.to_string() } else { format!("{kind}: {cause}") }
 }
 
 /// The connection failed or broke before the response headers. Not
@@ -2108,6 +2130,31 @@ mod f01_tests {
         let (base, _) = scripted_provider(vec![(404, None)]).await;
         let err = fast_client(&base, 3).stream("stub", &[], &[]).await.err().expect("fails").to_string();
         assert!(err.contains("check provider.model and that base_url ends in /v1"), "{err}");
+    }
+
+    /// T-049: a chat request to a closed port says so in plain words.
+    #[tokio::test]
+    async fn a_refused_request_is_reported_in_plain_words() {
+        let err = fast_client("http://127.0.0.1:9", 0).stream("stub", &[], &[]).await.err().expect("fails");
+        let err = format!("{err:#}");
+        assert!(err.contains("could not connect"), "{err}");
+        assert!(!err.contains("reqwest::Error {"), "no Debug dump: {err}");
+    }
+
+    /// T-091: a refused connection and a timeout, each with its cause.
+    #[tokio::test]
+    async fn send_errors_read_as_plain_words() {
+        let refused = reqwest::Client::new().get("http://127.0.0.1:9/").send().await.unwrap_err();
+        let text = send_error_text(&refused);
+        assert!(text.starts_with("could not connect: "), "{text}");
+        // Accepted by the OS but never answered: the client gives up.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", silent.local_addr().unwrap());
+        let http = reqwest::Client::builder().timeout(Duration::from_millis(200)).build().unwrap();
+        let timed_out = http.get(url).send().await.unwrap_err();
+        let text = send_error_text(&timed_out);
+        assert!(text.starts_with("timed out"), "{text}");
+        assert!(!text.contains("reqwest::Error {"), "{text}");
     }
 
     /// T-093: a refused connection is retried, a body that does not decode
