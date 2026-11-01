@@ -108,6 +108,12 @@ impl TodoStore {
         let conn = self.conn();
         list_sql(&conn, session_id).unwrap_or_default()
     }
+
+    /// T-028: drop a deleted chat's todos (the table has no foreign key to
+    /// the sessions, so nothing cascades).
+    pub fn forget(&self, session_id: &str) -> anyhow::Result<usize> {
+        Ok(self.conn().execute("DELETE FROM todos WHERE session_id=?1", params![session_id])?)
+    }
 }
 
 fn row_item(r: &rusqlite::Row) -> rusqlite::Result<TodoItem> {
@@ -308,6 +314,18 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    /// T-028: forgetting a chat drops its todos and no other chat's.
+    #[test]
+    fn forget_drops_only_that_chats_todos() {
+        let store = TodoStore::new();
+        store.exec("a", TodoOp::Add { content: "a1".into() });
+        store.exec("a", TodoOp::Add { content: "a2".into() });
+        store.exec("b", TodoOp::Add { content: "b1".into() });
+        assert_eq!(store.forget("a").unwrap(), 2);
+        assert!(store.list_all("a").is_empty());
+        assert_eq!(store.list_all("b").len(), 1);
     }
 
     /// A panic while the connection was held does not break later calls.

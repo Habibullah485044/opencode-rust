@@ -6,16 +6,38 @@ use super::*;
 impl AppState {
     /// The folder chat `session_id` works in: its project's folder, or the
     /// folder the app started in (no project, or the folder is gone).
+    /// The project folder comes from the [`AppState::workspaces`] cache
+    /// after the first lookup (T-011: this runs on async threads, often).
     pub fn workspace_for(&self, session_id: &str) -> PathBuf {
-        self.db
-            .get_session(session_id)
-            .ok()
-            .flatten()
-            .and_then(|s| s.project_id)
-            .and_then(|p| self.db.get_project(&p).ok().flatten())
-            .map(|p| PathBuf::from(p.root))
-            .filter(|root| root.is_dir())
-            .unwrap_or_else(|| self.workspace.clone())
+        let cached = self.workspaces.lock().ok().and_then(|m| m.get(session_id).cloned());
+        let root = match cached {
+            Some(root) => root,
+            None => {
+                let looked = self.project_root(session_id);
+                // Not cached when the chat is unknown or the read failed.
+                if let (Some(root), Ok(mut m)) = (&looked, self.workspaces.lock()) {
+                    m.insert(session_id.to_string(), root.clone());
+                }
+                looked.flatten()
+            }
+        };
+        root.filter(|root| root.is_dir()).unwrap_or_else(|| self.workspace.clone())
+    }
+
+    /// Chat `session_id`'s project folder from the database: `None` = could
+    /// not tell (unknown chat, failed read), `Some(None)` = no project.
+    fn project_root(&self, session_id: &str) -> Option<Option<PathBuf>> {
+        let session = self.db.get_session(session_id).ok()??;
+        let Some(project) = session.project_id else { return Some(None) };
+        Some(self.db.get_project(&project).ok()?.map(|p| PathBuf::from(p.root)))
+    }
+
+    /// T-011: forget every cached chat folder. Call it after chats change
+    /// project (moved, adopted, or their project removed).
+    pub fn forget_workspaces(&self) {
+        if let Ok(mut m) = self.workspaces.lock() {
+            m.clear();
+        }
     }
 
     /// The folder a run of chat `session_id` overrides the start folder
@@ -51,6 +73,37 @@ impl AppState {
         });
     }
 
+    /// T-007: [`AppState::record_usage`] for async code: the save and the
+    /// totals in one trip to the blocking pool, then the event.
+    pub async fn record_usage_async(&self, session_id: &str, model: &str, u: &crate::provider::Usage) {
+        let tag = usage_tag();
+        let session_id = if session_id.is_empty() { tag.1.as_deref().unwrap_or("") } else { session_id };
+        self.record_usage_as_async(tag.0, session_id, model, u).await;
+    }
+
+    /// T-007: [`AppState::record_usage_as`] for async code (see above). The
+    /// sync one stays for the callers that are not async yet.
+    pub async fn record_usage_as_async(&self, purpose: &str, session_id: &str, model: &str, u: &crate::provider::Usage) {
+        let (purpose, sid, model, usage) = (purpose.to_string(), session_id.to_string(), model.to_string(), *u);
+        let saved = self
+            .db
+            .run(move |db| {
+                db.add_usage_entry(&sid, &model, &purpose, &usage)?;
+                Ok((!sid.is_empty()).then(|| db.usage_totals(Some(&sid), None).unwrap_or_default()))
+            })
+            .await;
+        match saved {
+            Err(e) => core_log(&format!("[core] saving token usage failed: {e}")),
+            Ok(None) => {}
+            Ok(Some(session)) => {
+                let _ = self.events.send(ServerEvent::Usage {
+                    session_id: session_id.to_string(),
+                    last: *u,
+                    session,
+                });
+            }
+        }
+    }
 }
 
 impl AppState {
@@ -150,8 +203,12 @@ impl AppState {
         // file) inside the workspace would carry the write outside it.
         Self::export_stays_inside(&workspace, &path)?;
         if path.exists() && !force {
-            let existing = std::fs::read_to_string(&path).unwrap_or_default();
-            if !existing.starts_with(Self::EXPORT_MARKER) {
+            // Only the start is compared: no need to read a whole file (T-071).
+            let mut head = vec![0u8; Self::EXPORT_MARKER.len()];
+            let earlier = std::fs::File::open(&path)
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+                .is_ok_and(|()| head == Self::EXPORT_MARKER.as_bytes());
+            if !earlier {
                 anyhow::bail!(
                     "{} already exists and is not an earlier export; pick another name or use /export --force {name}",
                     path.display()

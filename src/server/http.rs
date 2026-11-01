@@ -30,9 +30,9 @@ pub(super) struct CreateSessionReq {
 pub(super) async fn create_session(
     State(st): State<Shared>,
     Json(req): Json<CreateSessionReq>,
-) -> Result<Json<Session>, StatusCode> {
+) -> Result<Json<Session>, ApiError> {
     let title = if req.title.is_empty() { "new session".to_string() } else { req.title };
-    let s = st.db.create_session(&title, None).map_err(internal)?;
+    let s = st.db.run(move |db| db.create_session(&title, None)).await.map_err(internal)?;
     let _ = st.events.send(ServerEvent::SessionCreated {
         session_id: s.id.clone(),
         title: s.title.clone(),
@@ -40,16 +40,30 @@ pub(super) async fn create_session(
     Ok(Json(s))
 }
 
-pub(super) async fn list_sessions(State(st): State<Shared>) -> Result<Json<Vec<Session>>, StatusCode> {
-    Ok(Json(st.db.list_sessions().map_err(internal)?))
+pub(super) async fn list_sessions(State(st): State<Shared>) -> Result<Json<Vec<Session>>, ApiError> {
+    Ok(Json(st.db.run(|db| db.list_sessions()).await.map_err(internal)?))
+}
+
+/// T-001: does chat `id` exist? Asked on the blocking pool, like every
+/// database call of a handler (SQLite blocks; a tokio worker must not).
+pub(super) async fn session_exists(st: &Shared, id: &str) -> Result<bool, ApiError> {
+    let id = id.to_string();
+    st.db.run(move |db| Ok(db.get_session(&id)?.is_some())).await.map_err(internal)
 }
 
 pub(super) async fn get_messages(
     State(st): State<Shared>,
     AxPath(id): AxPath<String>,
-) -> Result<Json<Vec<Message>>, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(st.db.messages(&id).map_err(internal)?))
+) -> Result<Json<Vec<Message>>, ApiError> {
+    let messages = st
+        .db
+        .run(move |db| Ok(match db.get_session(&id)? {
+            Some(_) => Some(db.messages(&id)?),
+            None => None,
+        }))
+        .await
+        .map_err(internal)?;
+    messages.map(Json).ok_or_else(session_not_found)
 }
 
 #[derive(Deserialize)]
@@ -63,10 +77,12 @@ pub(super) async fn prompt(
     State(st): State<Shared>,
     AxPath(id): AxPath<String>,
     Json(req): Json<PromptReq>,
-) -> Result<StatusCode, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<StatusCode, ApiError> {
+    if !session_exists(&st, &id).await? {
+        return Err(session_not_found());
+    }
     if req.content.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::bad_request("content is empty"));
     }
     // Replaces (aborts) any run already active on this session.
     st.kick_run(id, req.content).await;
@@ -76,13 +92,13 @@ pub(super) async fn prompt(
 pub(super) async fn abort_session(
     State(st): State<Shared>,
     AxPath(id): AxPath<String>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, ApiError> {
     let busy = st.busy.read().await;
     if let Some(flag) = busy.get(&id) {
         signal_abort(flag);
         Ok(StatusCode::ACCEPTED)
     } else {
-        Err(StatusCode::NOT_FOUND)
+        Err(ApiError::not_found("no run is active in this session"))
     }
 }
 
@@ -97,11 +113,11 @@ pub(super) async fn decide_approval(
     State(st): State<Shared>,
     AxPath(id): AxPath<String>,
     Json(req): Json<DecideReq>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, ApiError> {
     if st.decide(&id, req.allow, req.always) {
         Ok(StatusCode::OK)
     } else {
-        Err(StatusCode::NOT_FOUND)
+        Err(ApiError::not_found("approval not found (already answered or timed out)"))
     }
 }
 
@@ -114,8 +130,10 @@ pub(super) struct ModeReq {
 pub(super) async fn get_mode_route(
     State(st): State<Shared>,
     AxPath(id): AxPath<String>,
-) -> Result<Json<Value>, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<Value>, ApiError> {
+    if !session_exists(&st, &id).await? {
+        return Err(session_not_found());
+    }
     Ok(Json(json!({ "mode": st.mode_for(&id).as_str() })))
 }
 
@@ -124,9 +142,11 @@ pub(super) async fn put_mode_route(
     State(st): State<Shared>,
     AxPath(id): AxPath<String>,
     Json(req): Json<ModeReq>,
-) -> Result<Json<Value>, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
-    let mode = AgentMode::parse(&req.mode).ok_or(StatusCode::BAD_REQUEST)?;
+) -> Result<Json<Value>, ApiError> {
+    if !session_exists(&st, &id).await? {
+        return Err(session_not_found());
+    }
+    let mode = AgentMode::parse(&req.mode).ok_or_else(|| ApiError::bad_request("unknown mode: use plan or build"))?;
     st.set_mode(&id, mode);
     Ok(Json(json!({ "mode": mode.as_str() })))
 }
@@ -149,10 +169,10 @@ pub(super) async fn get_model_route(State(st): State<Shared>) -> Json<Value> {
 pub(super) async fn put_model_route(
     State(st): State<Shared>,
     Json(req): Json<ModelReq>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, ApiError> {
     let model = req.model.trim();
     if model.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::bad_request("model is empty"));
     }
     st.set_model(model).await;
     Ok(Json(json!({ "current": st.current_model().await })))
@@ -168,8 +188,9 @@ pub(super) async fn get_perm_mode_route(State(st): State<Shared>) -> Json<Value>
 pub(super) async fn put_perm_mode_route(
     State(st): State<Shared>,
     Json(req): Json<ModeReq>,
-) -> Result<Json<Value>, StatusCode> {
-    let mode = PermissionMode::parse(&req.mode).ok_or(StatusCode::BAD_REQUEST)?;
+) -> Result<Json<Value>, ApiError> {
+    let mode = PermissionMode::parse(&req.mode)
+        .ok_or_else(|| ApiError::bad_request("unknown permission mode: use default, manual or turbo"))?;
     let released = st.set_perm_mode(mode);
     Ok(Json(json!({ "mode": mode.as_str(), "released": released })))
 }
@@ -190,25 +211,37 @@ pub(super) async fn patch_session_route(
     State(st): State<Shared>,
     AxPath(id): AxPath<String>,
     Json(req): Json<RenameReq>,
-) -> Result<Json<Session>, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
-    let title = req.title.trim();
+) -> Result<Json<Session>, ApiError> {
+    let title = req.title.trim().to_string();
     if title.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::bad_request("title is empty"));
     }
-    st.db.set_session_title(&id, title).map_err(internal)?;
-    let s = st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(s))
+    // Check, rename and read back in one trip to the blocking pool.
+    let renamed = st
+        .db
+        .run(move |db| {
+            if db.get_session(&id)?.is_none() {
+                return Ok(None);
+            }
+            db.set_session_title(&id, &title)?;
+            db.get_session(&id)
+        })
+        .await
+        .map_err(internal)?;
+    renamed.map(Json).ok_or_else(session_not_found)
 }
 
 /// New (F-12): `DELETE /api/sessions/{id}`. A running run is stopped first,
 /// and the session is deleted only once that run has ended, so nothing is
-/// written to a deleted session. 409 when the run does not end in 10 s.
+/// written to a deleted session. 409 when the run does not end in time
+/// ([`RUN_STOP_WAIT_SECS`]).
 pub(super) async fn delete_session_route(
     State(st): State<Shared>,
     AxPath(id): AxPath<String>,
-) -> Result<StatusCode, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<StatusCode, ApiError> {
+    if !session_exists(&st, &id).await? {
+        return Err(session_not_found());
+    }
     if st.abort_run(&id).await {
         // Woken when a run lets go of its slot (no polling).
         let wait = async {
@@ -222,15 +255,25 @@ pub(super) async fn delete_session_route(
                 released.await;
             }
         };
-        if tokio::time::timeout(std::time::Duration::from_secs(10), wait).await.is_err() {
-            return Err(StatusCode::CONFLICT);
+        if tokio::time::timeout(std::time::Duration::from_secs(RUN_STOP_WAIT_SECS), wait).await.is_err() {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!("the run did not stop within {RUN_STOP_WAIT_SECS} s; try again"),
+            ));
         }
     }
-    if st.db.delete_session(&id).map_err(internal)? {
+    let sid = id.clone();
+    if st.db.run(move |db| db.delete_session(&sid)).await.map_err(internal)? {
         st.forget_session(&id);
+        // T-028: todos live in their own table with no foreign key.
+        let (todos, sid) = (st.clone(), id.clone());
+        let forgot = tokio::task::spawn_blocking(move || todos.todo_store.forget(&sid)).await;
+        if let Ok(Err(e)) = forgot {
+            core_log(&format!("[core] deleting the todos of {id} failed: {e:#}"));
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(StatusCode::NOT_FOUND)
+        Err(session_not_found())
     }
 }
 
@@ -269,10 +312,40 @@ pub(super) async fn events_sse(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-pub(super) fn internal<E: std::fmt::Display>(e: E) -> StatusCode {
+pub(super) fn internal<E: std::fmt::Display>(e: E) -> ApiError {
     // New (B-48): to the log file, not stderr (stderr draws over the TUI).
     core_log(&format!("[core] internal error: {e}"));
-    StatusCode::INTERNAL_SERVER_ERROR
+    // The details stay in the log: they can name files and queries.
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+}
+
+/// How long DELETE waits for a session's run to stop before it answers 409
+/// (a short wait under test, so the 409 test does not take 10 s).
+pub(super) const RUN_STOP_WAIT_SECS: u64 = if cfg!(test) { 3 } else { 10 };
+
+/// T-051: a failed API request: its status, and `{"error": "..."}` saying
+/// why, so a client can show more than a bare code.
+#[derive(Debug)]
+pub struct ApiError(pub StatusCode, pub String);
+
+impl ApiError {
+    pub(super) fn not_found(why: &str) -> Self {
+        Self(StatusCode::NOT_FOUND, why.into())
+    }
+
+    pub(super) fn bad_request(why: &str) -> Self {
+        Self(StatusCode::BAD_REQUEST, why.into())
+    }
+}
+
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        (self.0, Json(json!({ "error": self.1 }))).into_response()
+    }
+}
+
+pub(super) fn session_not_found() -> ApiError {
+    ApiError::not_found("session not found")
 }
 
 /// Health endpoint for readiness checks + startup timing.

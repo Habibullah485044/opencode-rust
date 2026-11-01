@@ -277,6 +277,14 @@ pub struct AppState {
     /// many grants hold each. Their child chats count too. Per chat, unlike
     /// `perm_mode`: a mission must not auto-approve the user's other chats.
     pub auto_approve: Mutex<HashMap<String, u32>>,
+    /// T-011: chat → its project's folder (`None` = no project), so
+    /// `workspace_for` asks the database once per chat. Dropped per chat by
+    /// `forget_session`, and wholly by `forget_workspaces` when chats move.
+    pub workspaces: Mutex<HashMap<String, Option<PathBuf>>>,
+    /// T-010: chat → the chat it was started from. A chat's parent never
+    /// changes, so the auto-approval walk reads each link from the database
+    /// once.
+    pub parents: Mutex<HashMap<String, Option<String>>>,
 }
 
 /// `system_delivery`: not probed yet — the prompt travels as a user note,
@@ -344,6 +352,8 @@ pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
         system_delivery: std::sync::atomic::AtomicU8::new(SYSTEM_UNKNOWN),
         user_prompt: std::sync::RwLock::new((cfg_prompt.0, cfg_prompt.1)),
         auto_approve: Mutex::new(HashMap::new()),
+        workspaces: Mutex::new(HashMap::new()),
+        parents: Mutex::new(HashMap::new()),
     }))
 }
 
@@ -363,6 +373,15 @@ pub async fn build_state_ephemeral_skills(
     workspace: PathBuf,
     skill_base: PathBuf,
 ) -> Shared {
+    let db = Db::open_in_memory().expect("in-memory db");
+    if let Ok(p) = db.upsert_project(&workspace) {
+        db.set_default_project(Some(&p.id));
+    }
+    build_state_ephemeral_db(cfg, workspace, skill_base, db).await
+}
+
+/// Ephemeral state on a database you give (tests that need a file DB).
+pub async fn build_state_ephemeral_db(cfg: Config, workspace: PathBuf, skill_base: PathBuf, db: Db) -> Shared {
     let engine = Engine::new(&cfg.permissions);
     let (events, _) = broadcast::channel(EVENT_BUFFER);
     let client = Client::from_cfg(cfg.provider.base_url.trim().trim_end_matches('/'), &cfg.provider)
@@ -376,13 +395,7 @@ pub async fn build_state_ephemeral_skills(
         approvals: Mutex::new(HashMap::new()),
         busy: RwLock::new(HashMap::new()),
         stats: Mutex::new(HashMap::new()),
-        db: {
-            let db = Db::open_in_memory().expect("in-memory db");
-            if let Ok(p) = db.upsert_project(&workspace) {
-                db.set_default_project(Some(&p.id));
-            }
-            db
-        },
+        db,
         cfg,
         workspace,
         // New (B-25): unit tests must not write snapshots or worktrees into
@@ -404,6 +417,8 @@ pub async fn build_state_ephemeral_skills(
         system_delivery: std::sync::atomic::AtomicU8::new(SYSTEM_UNKNOWN),
         user_prompt: std::sync::RwLock::new((cfg_prompt.0, cfg_prompt.1)),
         auto_approve: Mutex::new(HashMap::new()),
+        workspaces: Mutex::new(HashMap::new()),
+        parents: Mutex::new(HashMap::new()),
     })
 }
 
@@ -425,7 +440,14 @@ impl AppState {
                 _ => self.workspace.clone(),
             };
             let ws = crate::db::workspace_key(&folder);
-            let _ = self.db.add_approval(&ws, &entry.tool, &entry.detail, "session");
+            // T-058: the run is still allowed, but the user must be able to
+            // see why the next one asks again.
+            if let Err(e) = self.db.add_approval(&ws, &entry.tool, &entry.detail, "session") {
+                core_log(&format!(
+                    "[core] saving \"always allow\" for {} `{}` in {ws} failed: {e:#}",
+                    entry.tool, entry.detail
+                ));
+            }
         }
         let reason = if allow && always { "always" } else { "user" };
         entry.tx.send(Resolution { allowed: allow, reason }).is_ok()
@@ -522,12 +544,26 @@ impl AppState {
             if granted.contains(&id) {
                 return true;
             }
-            match self.db.get_session(&id).ok().flatten().and_then(|s| s.parent_id) {
+            match self.parent_of(&id) {
                 Some(parent) => id = parent,
                 None => return false,
             }
         }
         false
+    }
+
+    /// The chat `session_id` was started from, from the [`AppState::parents`]
+    /// cache; a miss asks the database once. An unknown chat or a failed
+    /// read is not cached (the chat may not be written yet).
+    fn parent_of(&self, session_id: &str) -> Option<String> {
+        if let Some(known) = self.parents.lock().ok().and_then(|m| m.get(session_id).cloned()) {
+            return known;
+        }
+        let parent = self.db.get_session(session_id).ok().flatten()?.parent_id;
+        if let Ok(mut m) = self.parents.lock() {
+            m.insert(session_id.to_string(), parent.clone());
+        }
+        parent
     }
 
     /// Automatic approvals for chat `session_id` and its child chats until
@@ -553,6 +589,12 @@ impl AppState {
             m.remove(session_id);
         }
         if let Ok(mut m) = self.auto_approve.lock() {
+            m.remove(session_id);
+        }
+        if let Ok(mut m) = self.workspaces.lock() {
+            m.remove(session_id);
+        }
+        if let Ok(mut m) = self.parents.lock() {
             m.remove(session_id);
         }
         if let Some(Ok(mut m)) = FROZEN_LESSONS.get().map(|c| c.lock()) {
@@ -637,7 +679,7 @@ impl AppState {
                         }
                         (ok, status)
                     }
-                    Err(e) => (false, heartbeat_error(&e)),
+                    Err(e) => (false, crate::provider::send_error_text(&e)),
                 };
                 let mut got = got;
                 if ok && st.client.lock().await.key_rejected.load(Ordering::Relaxed) {
@@ -647,10 +689,10 @@ impl AppState {
                 let latency_ms = t0.elapsed().as_millis() as u64;
                 let detail = format!("GET {base}/models → {got} ({latency_ms} ms)");
                 // Say it once per change, so a failing check is never silent.
+                // To the log only: this runs while the TUI owns the terminal,
+                // and the event's `detail` already shows the reason there.
                 if last_ok != Some(ok) {
-                    let line = format!("[api] {} — {detail}", if ok { "online" } else { "offline" });
-                    eprintln!("{line}");
-                    core_log(&line);
+                    core_log(&format!("[api] {} — {detail}", if ok { "online" } else { "offline" }));
                     last_ok = Some(ok);
                 }
                 let _ = st.events.send(ServerEvent::Heartbeat { ok, latency_ms, detail });
@@ -700,14 +742,22 @@ impl AppState {
     /// (seen 2026-10-26 against a 16384-token model).
     pub fn start_context_probe(self: &Shared) {
         let st = self.clone();
-        tokio::spawn(async move { st.run_startup_probes().await });
+        // In the background of a TUI/GUI run: findings go to the log only.
+        tokio::spawn(async move { st.startup_probes(false).await });
     }
 
     /// The two questions worth asking a server before using it: how big the
     /// model's context window is, and whether it delivers `system` messages.
     /// An interactive run asks in the background; a headless run asks first,
     /// so its very first request is already packed for the server it has.
+    /// Headless calls this before its first request; nothing else owns the
+    /// terminal then, so the findings are printed too.
     pub async fn run_startup_probes(self: &Shared) {
+        self.startup_probes(true).await
+    }
+
+    /// The probes; `echo` also prints each finding to stderr (headless only).
+    async fn startup_probes(self: &Shared, echo: bool) {
         let Ok(base) = self.cfg.effective_base_url() else { return };
         let key = self.cfg.provider.api_key.clone();
         let Ok(http) = reqwest::Client::builder()
@@ -727,9 +777,9 @@ impl AppState {
             _ => None,
         };
         if let Some(n) = self.note_context(body.as_ref(), &http, &base, &key).await {
-            eprintln!("[api] model context window: {n} tokens");
+            probe_note(echo, &format!("[api] model context window: {n} tokens"));
         }
-        self.probe_system_delivery(&base, &key).await;
+        self.probe_system_delivery(&base, &key, echo).await;
     }
 
     /// One tiny question: does this server pass a `system` message on to the
@@ -744,7 +794,7 @@ impl AppState {
     /// `None` = could not tell (offline, timeout, refused). The state then
     /// stays [`SYSTEM_UNKNOWN`] and the prompt keeps travelling as a trailing
     /// user note, which every server passes on.
-    async fn probe_system_delivery(&self, base: &str, key: &str) -> Option<()> {
+    async fn probe_system_delivery(&self, base: &str, key: &str, echo: bool) -> Option<()> {
         // Anthropic's protocol has its own top-level `system` field, filled in
         // by the API itself: there is no role in the message list to lose.
         if self.cfg.provider.api != crate::config::ProviderApi::OpenAi {
@@ -780,60 +830,87 @@ impl AppState {
         let delivers = text.to_ascii_uppercase().contains("ARCHITECT");
         self.system_delivery
             .store(if delivers { SYSTEM_DELIVERS } else { SYSTEM_DROPS }, Ordering::Relaxed);
-        eprintln!(
-            "[api] {}",
-            if delivers {
-                "system messages reach the model"
-            } else {
-                "this server drops system messages — the prompt travels as a user note"
-            }
-        );
+        let found = if delivers {
+            "system messages reach the model"
+        } else {
+            "this server drops system messages — the prompt travels as a user note"
+        };
+        probe_note(echo, &format!("[api] {found}"));
         Some(())
     }
 }
 
-/// A failed status check in plain words (the cause chain, not just the
-/// outermost "error sending request").
-fn heartbeat_error(e: &reqwest::Error) -> String {
-    let kind = if e.is_timeout() {
-        "timed out"
-    } else if e.is_connect() {
-        "could not connect"
-    } else {
-        "request failed"
-    };
-    let mut cause = String::new();
-    let mut src = std::error::Error::source(e);
-    while let Some(s) = src {
-        cause = s.to_string();
-        src = s.source();
+/// T-054: a startup probe's finding, to core.log always and to stderr only
+/// when nothing else draws on the terminal (headless).
+fn probe_note(echo: bool, line: &str) {
+    if echo {
+        eprintln!("{line}");
     }
-    if cause.is_empty() { kind.to_string() } else { format!("{kind}: {cause}") }
+    core_log(line);
 }
+
+/// Where [`core_log`] writes: `<state_dir>/core.log`. Unit tests get a
+/// temp folder of their own, so they never touch the user's log (T-145).
+pub fn core_log_path() -> PathBuf {
+    let dir = if cfg!(test) {
+        std::env::temp_dir().join(format!("ocrs-test-state-{}", std::process::id()))
+    } else {
+        crate::config::default_state_dir()
+    };
+    dir.join("core.log")
+}
+
+/// T-055: core.log is moved to core.log.1 (replacing the older one) once it
+/// passes this size, so a long-lived install does not grow it forever.
+const CORE_LOG_MAX: u64 = 2 * 1024 * 1024;
 
 /// New (B-48): append one line to `<state_dir>/core.log`. Use this instead
 /// of `eprintln!` in code that can run while the TUI owns the terminal.
 pub fn core_log(msg: &str) {
-    use std::io::Write;
     // Opened once and kept: this runs on async threads, and reopening the
     // file (plus create_dir_all) on every line was a blocking call each time.
-    static LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+    static LOG: Mutex<Option<(std::fs::File, u64)>> = Mutex::new(None);
     let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
-    if log.is_none() {
-        let path = crate::config::default_state_dir().join("core.log");
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        *log = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if let Some(f) = log.as_mut() {
+    append_log(&mut log, &core_log_path(), CORE_LOG_MAX, &format!("[{stamp}] {msg}"));
+}
+
+/// One line to the log at `path` through the kept handle in `slot` (file and
+/// its size), opening it when needed and rotating it to `<path>.1` once it
+/// has reached `max` bytes.
+fn append_log(slot: &mut Option<(std::fs::File, u64)>, path: &std::path::Path, max: u64, line: &str) {
+    use std::io::Write;
+    if slot.is_none() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        *slot = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(|f| {
+                let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                (f, size)
+            });
+    }
+    if slot.as_ref().is_some_and(|(_, size)| *size >= max) {
+        // Closed first: Windows cannot rename a file that is open.
+        *slot = None;
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(path, &old);
+        *slot = std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(|f| (f, 0));
+    }
+    if let Some((f, size)) = slot.as_mut() {
         // A failed write (file deleted, disk full) reopens next time.
-        if writeln!(f, "[{stamp}] {msg}").is_err() {
-            *log = None;
+        match writeln!(f, "{line}") {
+            Ok(()) => *size += line.len() as u64 + 1,
+            Err(_) => *slot = None,
         }
     }
 }
@@ -896,7 +973,7 @@ pub async fn one_shot(
         }
         match ev? {
             StreamEvent::Text(t) => text.push_str(&t),
-            StreamEvent::Usage(u) => st.record_usage("", &model, &u),
+            StreamEvent::Usage(u) => st.record_usage_async("", &model, &u).await,
             StreamEvent::Done { finish_reason } => {
                 // B-03: half an answer must not be used as a whole one.
                 if finish_reason.as_deref() == Some("length") {

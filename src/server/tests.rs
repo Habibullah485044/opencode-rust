@@ -450,6 +450,152 @@ async fn f12_rename_and_delete_sessions() {
     assert_eq!(r.status().as_u16(), 404, "already deleted");
 }
 
+/// T-028: deleting a chat through the route deletes its todos too.
+#[tokio::test]
+async fn deleting_a_chat_deletes_its_todos() {
+    let (st, base, http) = f12_server().await;
+    let s = st.db.create_session("todos", None).unwrap();
+    st.todo_store.exec(&s.id, TodoOp::Add { content: "write tests".into() });
+    assert_eq!(st.todo_store.list_all(&s.id).len(), 1);
+    let r = http.delete(format!("{base}/api/sessions/{}", s.id)).bearer_auth("t").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 204);
+    assert!(st.todo_store.list_all(&s.id).is_empty(), "the chat's todos went with it");
+}
+
+/// T-051: a refused request says why in a JSON body.
+#[tokio::test]
+async fn api_errors_say_why() {
+    let (st, base, http) = f12_server().await;
+    let r = http.get(format!("{base}/api/sessions/ses_nope/messages")).bearer_auth("t").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v, json!({"error": "session not found"}));
+
+    // A run that ignores the abort until the test lets it go.
+    let s = st.db.create_session("stuck", None).unwrap();
+    let release = Arc::new(AtomicBool::new(false));
+    let held = release.clone();
+    st.kick_task(s.id.clone(), move |_st, _sid, _abort| async move {
+        while !held.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let r = http.delete(format!("{base}/api/sessions/{}", s.id)).bearer_auth("t").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 409);
+    let v: Value = r.json().await.unwrap();
+    assert!(v["error"].as_str().unwrap().contains("did not stop within"), "{v}");
+    release.store(true, Ordering::SeqCst);
+    assert!(st.db.get_session(&s.id).unwrap().is_some(), "not deleted");
+}
+
+/// T-011: a chat's folder is read from the database once; `forget_session`
+/// and `forget_workspaces` drop the cached answer.
+#[tokio::test]
+async fn a_chats_folder_is_looked_up_once() {
+    let base = std::env::temp_dir().join(format!("ocrs-ws-cache-{}", std::process::id()));
+    let (start, other) = (base.join("start"), base.join("other"));
+    std::fs::create_dir_all(&start).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let st = build_state_ephemeral(crate::config::Config::default(), start.clone()).await;
+    let project = st.db.upsert_project(&other).unwrap();
+    let s = st.db.create_session_in("cached", None, Some(&project.id)).unwrap();
+    assert_eq!(st.workspace_for(&s.id), other);
+    // Changed behind the cache's back: the second lookup does not see it,
+    // so it did not ask the database.
+    st.db.set_session_project(&s.id, None).unwrap();
+    assert_eq!(st.workspace_for(&s.id), other, "answered from the cache");
+    st.forget_session(&s.id);
+    assert!(!st.workspaces.lock().unwrap().contains_key(&s.id), "forget_session drops the entry");
+    assert_eq!(st.workspace_for(&s.id), start, "read again after forgetting");
+    st.db.set_session_project(&s.id, Some(&project.id)).unwrap();
+    st.forget_workspaces();
+    assert_eq!(st.workspace_for(&s.id), other);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// T-055: past the size limit the log moves to `.1` and a new one starts.
+#[test]
+fn the_log_rotates_past_its_size_limit() {
+    let dir = std::env::temp_dir().join(format!("ocrs-log-rotate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("core.log");
+    let mut slot = None;
+    for i in 0..5 {
+        append_log(&mut slot, &path, 30, &format!("line {i} 0123456789"));
+    }
+    drop(slot);
+    let old = std::fs::read_to_string(dir.join("core.log.1")).unwrap();
+    let new = std::fs::read_to_string(&path).unwrap();
+    assert!(old.contains("line 3") && !old.contains("line 0"), "the older .1 was replaced: {old}");
+    assert_eq!(new.trim(), "line 4 0123456789", "a new log started");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T-058: a failed "always allow" save is written to core.log.
+#[tokio::test]
+async fn a_failed_always_allow_is_logged() {
+    let dir = std::env::temp_dir().join(format!("ocrs-always-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("broken.db");
+    let db = crate::db::Db::open(&path).unwrap();
+    // Force every approval save to fail.
+    rusqlite::Connection::open(&path).unwrap().execute_batch("DROP TABLE approvals").unwrap();
+    let st = build_state_ephemeral_db(crate::config::Config::default(), dir.clone(), dir.join("skills"), db).await;
+    let (tx, rx) = oneshot::channel();
+    let detail = format!("always-fail-{}", std::process::id());
+    let request = ServerEvent::ApprovalNeeded {
+        session_id: "s".into(),
+        approval_id: "apr_x".into(),
+        tool: "bash".into(),
+        detail: detail.clone(),
+        preview: String::new(),
+    };
+    st.approvals.lock().unwrap().insert(
+        "apr_x".into(),
+        ApprovalEntry { tx, tool: "bash".into(), detail: detail.clone(), request },
+    );
+    assert!(st.decide("apr_x", true, true));
+    assert!(rx.await.unwrap().allowed, "the call itself is still allowed");
+    let log = std::fs::read_to_string(core_log_path()).unwrap_or_default();
+    assert!(
+        log.lines().any(|l| l.contains("saving \"always allow\" for bash") && l.contains(&detail)),
+        "core.log has the failure"
+    );
+    drop(st);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T-094: `forget_session` clears every per-chat map.
+#[tokio::test]
+async fn forget_session_clears_every_per_chat_map() {
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    let parent = st.db.create_session("parent", None).unwrap();
+    let s = st.db.create_session("child", Some(&parent.id)).unwrap();
+    let id = s.id.clone();
+    st.stats.lock().unwrap().insert(id.clone(), RunStats::default());
+    st.set_mode(&id, AgentMode::Plan);
+    st.set_ponytail_level(&id, agents::PonytailLevel::Off);
+    std::mem::forget(st.auto_approve_session(&id));
+    FROZEN_LESSONS.get_or_init(Default::default).lock().unwrap().insert(id.clone(), None);
+    COMPACT_FAILED_AT.get_or_init(Default::default).lock().unwrap().insert(id.clone(), 3);
+    let _ = st.workspace_for(&id);
+    let _ = st.parent_of(&id);
+    assert!(st.workspaces.lock().unwrap().contains_key(&id));
+    assert_eq!(st.parents.lock().unwrap().get(&id), Some(&Some(parent.id.clone())));
+
+    st.forget_session(&id);
+    assert!(!st.stats.lock().unwrap().contains_key(&id), "stats");
+    assert!(!st.modes.lock().unwrap().contains_key(&id), "modes");
+    assert!(!st.ponytail_levels.lock().unwrap().contains_key(&id), "ponytail levels");
+    assert!(!st.auto_approve.lock().unwrap().contains_key(&id), "auto_approve");
+    assert!(!FROZEN_LESSONS.get().unwrap().lock().unwrap().contains_key(&id), "FROZEN_LESSONS");
+    assert!(!COMPACT_FAILED_AT.get().unwrap().lock().unwrap().contains_key(&id), "COMPACT_FAILED_AT");
+    assert!(!st.workspaces.lock().unwrap().contains_key(&id), "workspaces");
+    assert!(!st.parents.lock().unwrap().contains_key(&id), "parents");
+}
+
 /// P-04: common names, methods and mere mentions give no reuse hint.
 #[test]
 fn reuse_gate_ignores_common_names_and_mentions() {
@@ -1699,19 +1845,26 @@ data: [DONE]
 /// B-10: every way an approval ends is announced once, with its reason.
 #[tokio::test]
 async fn approval_resolved_reports_every_outcome() {
+    // T-144: the waits the test answers itself get a timeout no busy
+    // machine reaches; only the timeout case runs on a 1 s one.
     let mut cfg = crate::config::Config::default();
     cfg.provider.base_url = "http://127.0.0.1:9".into();
     cfg.provider.model = "stub".into();
-    cfg.permissions.approval_timeout_secs = 1;
-    let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+    cfg.permissions.approval_timeout_secs = 600;
+    let st = build_state_ephemeral(cfg.clone(), std::env::temp_dir()).await;
     st.set_perm_mode(PermissionMode::Manual);
+    cfg.permissions.approval_timeout_secs = 1;
+    let quick = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+    quick.set_perm_mode(PermissionMode::Manual);
     let mut rx = st.events.subscribe();
+    let mut quick_rx = quick.events.subscribe();
 
     // Start one approval wait; `abort` lets the test cancel it.
-    let wait = |detail: &'static str, abort: Arc<AtomicBool>| {
+    let wait_on = |st: &Shared, detail: &'static str, abort: Arc<AtomicBool>| {
         let st2 = st.clone();
         tokio::spawn(async move { check_permission(&st2, "s1", "read", detail, &abort).await })
     };
+    let wait = |detail: &'static str, abort: Arc<AtomicBool>| wait_on(&st, detail, abort);
     let no_abort = || Arc::new(AtomicBool::new(false));
 
     // 1. The user says yes.
@@ -1725,7 +1878,7 @@ async fn approval_resolved_reports_every_outcome() {
     assert!(st.decide(&id, true, true));
     assert!(h.await.unwrap());
     // 3. Nobody answers (1 s timeout).
-    assert!(!wait("c.txt", no_abort()).await.unwrap());
+    assert!(!wait_on(&quick, "c.txt", no_abort()).await.unwrap());
     // 4. The run is aborted while it waits.
     let abort = no_abort();
     let h = wait("d.txt", abort.clone());
@@ -1738,21 +1891,24 @@ async fn approval_resolved_reports_every_outcome() {
     st.set_perm_mode(PermissionMode::Turbo);
     assert!(h.await.unwrap());
 
-    let mut seen = Vec::new();
-    while let Ok(ev) = rx.try_recv() {
-        if let ServerEvent::ApprovalResolved { session_id, reason, allowed, .. } = ev {
-            assert_eq!(session_id, "s1");
-            seen.push((reason, allowed));
+    let resolved = |rx: &mut broadcast::Receiver<ServerEvent>| {
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::ApprovalResolved { session_id, reason, allowed, .. } = ev {
+                assert_eq!(session_id, "s1");
+                seen.push((reason, allowed));
+            }
         }
-    }
+        seen
+    };
     let expected: Vec<(String, bool)> = vec![
         ("user".into(), true),
         ("always".into(), true),
-        ("timeout".into(), false),
         ("abort".into(), false),
         ("turbo".into(), true),
     ];
-    assert_eq!(seen, expected);
+    assert_eq!(resolved(&mut rx), expected);
+    assert_eq!(resolved(&mut quick_rx), vec![("timeout".to_string(), false)]);
 }
 
 // B-04 helpers: build chat messages in a few words.
@@ -2711,7 +2867,8 @@ async fn write_run_accounts_and_auto_reviews() {
 /// its id. A mode that should gate blocks here; a mode that should not gate
 /// never registers one.
 async fn pending_approval_id(st: &Shared) -> String {
-    for _ in 0..100 {
+    // Up to 30 s: a busy machine can be slow to start the waiting task.
+    for _ in 0..3000 {
         if let Ok(map) = st.approvals.lock() {
             if let Some(id) = map.keys().next() {
                 return id.clone();

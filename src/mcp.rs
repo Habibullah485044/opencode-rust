@@ -940,7 +940,7 @@ mod tests {
         assert!(err.contains(r#"command = "cmd", args = ["/c", "ocrs-no-such-command-xyz", ...]"#), "{err}");
         let mut reg = Registry::default();
         reg.start_all(&[cfg]).await;
-        let log = std::fs::read_to_string(crate::config::default_state_dir().join("core.log")).unwrap_or_default();
+        let log = std::fs::read_to_string(crate::server::core_log_path()).unwrap_or_default();
         assert!(log.contains(&format!("[mcp] failed to start `{name}`")), "core.log has the failure");
     }
 
@@ -1137,11 +1137,11 @@ mod b19_startup_tests {
         let _ = silent.await;
     }
 
-    /// Two servers that each take 1.5 s to answer `initialize` are started
-    /// together: the second gets its `initialize` before the first has
-    /// answered (one after another, it would come >= 1.5 s later). Comparing
-    /// those two moments, not the total time, keeps the test steady on a
-    /// busy machine where node itself starts slowly.
+    /// Two servers are started together. Each answers `initialize` only
+    /// once the OTHER has received its own `initialize`: started one after
+    /// another, the first would wait for the second forever (and fail at
+    /// INIT_TIMEOUT). No clock is compared, so a busy machine where node
+    /// starts slowly cannot fail it (T-144).
     /// Each lists `echo` twice; one is dropped.
     #[tokio::test]
     async fn servers_start_at_the_same_time() {
@@ -1153,43 +1153,44 @@ mod b19_startup_tests {
             return;
         };
         let script = r#"
-const delay = Number(process.argv[2] || 0);
-const stamp = process.argv[3];
+const stamp = process.argv[2];
+const peer = process.argv[3];
+const fs = require('fs');
 const rl = require('readline').createInterface({ input: process.stdin });
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 rl.on('line', (line) => {
   let m; try { m = JSON.parse(line); } catch { return; }
   if (m.id === undefined) return;
-  if (m.method === 'initialize' && stamp) require('fs').writeFileSync(stamp, String(Date.now()));
-  if (m.method === 'initialize') setTimeout(() => send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'slow',version:'0'}}}), delay);
+  if (m.method === 'initialize') {
+    fs.writeFileSync(stamp, 'got initialize');
+    const answer = () => send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'slow',version:'0'}}});
+    const wait = () => fs.existsSync(peer) ? answer() : setTimeout(wait, 20);
+    wait();
+  }
   else if (m.method === 'tools/list') send({jsonrpc:'2.0',id:m.id,result:{tools:[{name:'echo',inputSchema:{type:'object'}},{name:'echo',inputSchema:{type:'object'}}]}});
   else send({jsonrpc:'2.0',id:m.id,result:{content:[{type:'text',text:'ok'}]}});
 });
 "#;
         let dir = std::env::temp_dir().join(format!("ocrs-b19-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("slow_mcp.js");
         std::fs::write(&path, script).unwrap();
-        let cfg = |name: &str| McpServerCfg {
+        let cfg = |name: &str, peer: &str| McpServerCfg {
             name: name.into(),
             command: node.to_string(),
             args: vec![
                 path.to_string_lossy().into_owned(),
-                "1500".into(),
                 dir.join(format!("{name}.stamp")).to_string_lossy().into_owned(),
+                dir.join(format!("{peer}.stamp")).to_string_lossy().into_owned(),
             ],
             ..Default::default() // keeps compiling when McpServerCfg gets more fields (F-03)
         };
         let mut reg = Registry::default();
-        reg.start_all(&[cfg("a"), cfg("b")]).await;
+        reg.start_all(&[cfg("a", "b"), cfg("b", "a")]).await;
         let mut names = reg.connected();
         names.sort();
-        assert_eq!(names, vec!["a", "b"]);
-        let stamp = |n: &str| -> i64 {
-            std::fs::read_to_string(dir.join(format!("{n}.stamp"))).unwrap().trim().parse().unwrap()
-        };
-        let gap = (stamp("a") - stamp("b")).abs();
-        assert!(gap < 1500, "the second server waited for the first: initialize {gap} ms apart");
+        assert_eq!(names, vec!["a", "b"], "both started: neither waited for the other to finish");
         assert_eq!(reg.specs().len(), 2, "the duplicate `echo` is dropped on each server");
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
