@@ -32,7 +32,7 @@ pub(super) async fn create_session(
     Json(req): Json<CreateSessionReq>,
 ) -> Result<Json<Session>, StatusCode> {
     let title = if req.title.is_empty() { "new session".to_string() } else { req.title };
-    let s = st.db.create_session(&title, None).map_err(internal)?;
+    let s = st.db.run(move |db| db.create_session(&title, None)).await.map_err(internal)?;
     let _ = st.events.send(ServerEvent::SessionCreated {
         session_id: s.id.clone(),
         title: s.title.clone(),
@@ -41,15 +41,29 @@ pub(super) async fn create_session(
 }
 
 pub(super) async fn list_sessions(State(st): State<Shared>) -> Result<Json<Vec<Session>>, StatusCode> {
-    Ok(Json(st.db.list_sessions().map_err(internal)?))
+    Ok(Json(st.db.run(|db| db.list_sessions()).await.map_err(internal)?))
+}
+
+/// T-001: does chat `id` exist? Asked on the blocking pool, like every
+/// database call of a handler (SQLite blocks; a tokio worker must not).
+pub(super) async fn session_exists(st: &Shared, id: &str) -> Result<bool, StatusCode> {
+    let id = id.to_string();
+    st.db.run(move |db| Ok(db.get_session(&id)?.is_some())).await.map_err(internal)
 }
 
 pub(super) async fn get_messages(
     State(st): State<Shared>,
     AxPath(id): AxPath<String>,
 ) -> Result<Json<Vec<Message>>, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(st.db.messages(&id).map_err(internal)?))
+    let messages = st
+        .db
+        .run(move |db| Ok(match db.get_session(&id)? {
+            Some(_) => Some(db.messages(&id)?),
+            None => None,
+        }))
+        .await
+        .map_err(internal)?;
+    messages.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 #[derive(Deserialize)]
@@ -64,7 +78,9 @@ pub(super) async fn prompt(
     AxPath(id): AxPath<String>,
     Json(req): Json<PromptReq>,
 ) -> Result<StatusCode, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    if !session_exists(&st, &id).await? {
+        return Err(StatusCode::NOT_FOUND);
+    }
     if req.content.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -115,7 +131,9 @@ pub(super) async fn get_mode_route(
     State(st): State<Shared>,
     AxPath(id): AxPath<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    if !session_exists(&st, &id).await? {
+        return Err(StatusCode::NOT_FOUND);
+    }
     Ok(Json(json!({ "mode": st.mode_for(&id).as_str() })))
 }
 
@@ -125,7 +143,9 @@ pub(super) async fn put_mode_route(
     AxPath(id): AxPath<String>,
     Json(req): Json<ModeReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    if !session_exists(&st, &id).await? {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let mode = AgentMode::parse(&req.mode).ok_or(StatusCode::BAD_REQUEST)?;
     st.set_mode(&id, mode);
     Ok(Json(json!({ "mode": mode.as_str() })))
@@ -191,14 +211,23 @@ pub(super) async fn patch_session_route(
     AxPath(id): AxPath<String>,
     Json(req): Json<RenameReq>,
 ) -> Result<Json<Session>, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
-    let title = req.title.trim();
+    let title = req.title.trim().to_string();
     if title.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    st.db.set_session_title(&id, title).map_err(internal)?;
-    let s = st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(s))
+    // Check, rename and read back in one trip to the blocking pool.
+    let renamed = st
+        .db
+        .run(move |db| {
+            if db.get_session(&id)?.is_none() {
+                return Ok(None);
+            }
+            db.set_session_title(&id, &title)?;
+            db.get_session(&id)
+        })
+        .await
+        .map_err(internal)?;
+    renamed.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 /// New (F-12): `DELETE /api/sessions/{id}`. A running run is stopped first,
@@ -208,7 +237,9 @@ pub(super) async fn delete_session_route(
     State(st): State<Shared>,
     AxPath(id): AxPath<String>,
 ) -> Result<StatusCode, StatusCode> {
-    st.db.get_session(&id).map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    if !session_exists(&st, &id).await? {
+        return Err(StatusCode::NOT_FOUND);
+    }
     if st.abort_run(&id).await {
         // Woken when a run lets go of its slot (no polling).
         let wait = async {
@@ -226,7 +257,8 @@ pub(super) async fn delete_session_route(
             return Err(StatusCode::CONFLICT);
         }
     }
-    if st.db.delete_session(&id).map_err(internal)? {
+    let sid = id.clone();
+    if st.db.run(move |db| db.delete_session(&sid)).await.map_err(internal)? {
         st.forget_session(&id);
         Ok(StatusCode::NO_CONTENT)
     } else {
