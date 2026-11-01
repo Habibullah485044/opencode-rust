@@ -513,9 +513,18 @@ impl Client {
     pub async fn list_models(&self) -> Result<Vec<String>> {
         let req = with_auth(self.http.get(format!("{}/models", self.base_url)), self.api, &self.api_key)
             .timeout(self.request_timeout);
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            return Ok(Vec::new());
+        let url = format!("{}/models", self.base_url);
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("listing models at {url}: {}", send_error_text(&e)))?;
+        // T-052: say why (a 401 or 404 with the server's words), instead of
+        // an empty list that looks like "this server has no models".
+        let status = resp.status();
+        if !status.is_success() {
+            let text = error_body(resp, self.request_timeout).await;
+            let excerpt: String = text.trim().chars().take(200).collect();
+            anyhow::bail!("listing models at {url}: the provider returned {status}: {excerpt}");
         }
         let body: Value = resp.json().await.unwrap_or(Value::Null);
         // OpenAI shape: { data: [{ id }] }. Ollama-ish: { models: [{ name }] }.
@@ -2130,6 +2139,23 @@ mod f01_tests {
         let (base, _) = scripted_provider(vec![(404, None)]).await;
         let err = fast_client(&base, 3).stream("stub", &[], &[]).await.err().expect("fails").to_string();
         assert!(err.contains("check provider.model and that base_url ends in /v1"), "{err}");
+    }
+
+    /// T-052: a refused model listing is an error with the status and the
+    /// server's words, not an empty list.
+    #[tokio::test]
+    async fn a_refused_model_listing_says_why() {
+        use axum::{http::StatusCode, routing::get, Router};
+        let app = Router::new()
+            .route("/v1/models", get(|| async { (StatusCode::UNAUTHORIZED, "invalid api key") }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let err = fast_client(&format!("http://{addr}/v1"), 0).list_models().await.unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("401") && err.contains("invalid api key"), "{err}");
     }
 
     /// T-049: a chat request to a closed port says so in plain words.
