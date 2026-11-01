@@ -44,6 +44,10 @@ pub(super) fn delete_chat(gs: &mut GuiState, st: &server::AppState, id: &str) {
     } else {
         // T-026: drop its in-memory state too, as the HTTP route does.
         st.forget_session(id);
+        // T-028: todos live in their own table with no foreign key.
+        if let Err(e) = st.todo_store.forget(id) {
+            gui_log(&format!("[gui] deleting the todos of {id} failed: {e:#}"));
+        }
         if gs.is_current(id) {
             gs.session = None;
             let project = gs.default_project.clone();
@@ -285,6 +289,19 @@ mod tests {
         move_chat(&mut g, &st, &s.id, None);
         assert_eq!(st.workspace_for(&s.id), start);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// T-028: deleting a chat from the GUI deletes its todos too.
+    #[tokio::test]
+    async fn deleting_a_chat_drops_its_todos() {
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
+            .await;
+        let s = st.db.create_session("todos", None).unwrap();
+        st.todo_store.exec(&s.id, crate::todo::TodoOp::Add { content: "write tests".into() });
+        assert_eq!(st.todo_store.list_all(&s.id).len(), 1);
+        let mut g = GuiState::new();
+        delete_chat(&mut g, &st, &s.id);
+        assert!(st.todo_store.list_all(&s.id).is_empty(), "the chat's todos went with it");
     }
 
     /// T-044: a move the database refuses shows an error line.
