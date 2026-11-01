@@ -1845,19 +1845,26 @@ data: [DONE]
 /// B-10: every way an approval ends is announced once, with its reason.
 #[tokio::test]
 async fn approval_resolved_reports_every_outcome() {
+    // T-144: the waits the test answers itself get a timeout no busy
+    // machine reaches; only the timeout case runs on a 1 s one.
     let mut cfg = crate::config::Config::default();
     cfg.provider.base_url = "http://127.0.0.1:9".into();
     cfg.provider.model = "stub".into();
-    cfg.permissions.approval_timeout_secs = 1;
-    let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+    cfg.permissions.approval_timeout_secs = 600;
+    let st = build_state_ephemeral(cfg.clone(), std::env::temp_dir()).await;
     st.set_perm_mode(PermissionMode::Manual);
+    cfg.permissions.approval_timeout_secs = 1;
+    let quick = build_state_ephemeral(cfg, std::env::temp_dir()).await;
+    quick.set_perm_mode(PermissionMode::Manual);
     let mut rx = st.events.subscribe();
+    let mut quick_rx = quick.events.subscribe();
 
     // Start one approval wait; `abort` lets the test cancel it.
-    let wait = |detail: &'static str, abort: Arc<AtomicBool>| {
+    let wait_on = |st: &Shared, detail: &'static str, abort: Arc<AtomicBool>| {
         let st2 = st.clone();
         tokio::spawn(async move { check_permission(&st2, "s1", "read", detail, &abort).await })
     };
+    let wait = |detail: &'static str, abort: Arc<AtomicBool>| wait_on(&st, detail, abort);
     let no_abort = || Arc::new(AtomicBool::new(false));
 
     // 1. The user says yes.
@@ -1871,7 +1878,7 @@ async fn approval_resolved_reports_every_outcome() {
     assert!(st.decide(&id, true, true));
     assert!(h.await.unwrap());
     // 3. Nobody answers (1 s timeout).
-    assert!(!wait("c.txt", no_abort()).await.unwrap());
+    assert!(!wait_on(&quick, "c.txt", no_abort()).await.unwrap());
     // 4. The run is aborted while it waits.
     let abort = no_abort();
     let h = wait("d.txt", abort.clone());
@@ -1884,21 +1891,24 @@ async fn approval_resolved_reports_every_outcome() {
     st.set_perm_mode(PermissionMode::Turbo);
     assert!(h.await.unwrap());
 
-    let mut seen = Vec::new();
-    while let Ok(ev) = rx.try_recv() {
-        if let ServerEvent::ApprovalResolved { session_id, reason, allowed, .. } = ev {
-            assert_eq!(session_id, "s1");
-            seen.push((reason, allowed));
+    let resolved = |rx: &mut broadcast::Receiver<ServerEvent>| {
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::ApprovalResolved { session_id, reason, allowed, .. } = ev {
+                assert_eq!(session_id, "s1");
+                seen.push((reason, allowed));
+            }
         }
-    }
+        seen
+    };
     let expected: Vec<(String, bool)> = vec![
         ("user".into(), true),
         ("always".into(), true),
-        ("timeout".into(), false),
         ("abort".into(), false),
         ("turbo".into(), true),
     ];
-    assert_eq!(seen, expected);
+    assert_eq!(resolved(&mut rx), expected);
+    assert_eq!(resolved(&mut quick_rx), vec![("timeout".to_string(), false)]);
 }
 
 // B-04 helpers: build chat messages in a few words.
@@ -2857,7 +2867,8 @@ async fn write_run_accounts_and_auto_reviews() {
 /// its id. A mode that should gate blocks here; a mode that should not gate
 /// never registers one.
 async fn pending_approval_id(st: &Shared) -> String {
-    for _ in 0..100 {
+    // Up to 30 s: a busy machine can be slow to start the waiting task.
+    for _ in 0..3000 {
         if let Ok(map) = st.approvals.lock() {
             if let Some(id) = map.keys().next() {
                 return id.clone();
