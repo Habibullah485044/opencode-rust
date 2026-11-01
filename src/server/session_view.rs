@@ -73,6 +73,37 @@ impl AppState {
         });
     }
 
+    /// T-007: [`AppState::record_usage`] for async code: the save and the
+    /// totals in one trip to the blocking pool, then the event.
+    pub async fn record_usage_async(&self, session_id: &str, model: &str, u: &crate::provider::Usage) {
+        let tag = usage_tag();
+        let session_id = if session_id.is_empty() { tag.1.as_deref().unwrap_or("") } else { session_id };
+        self.record_usage_as_async(tag.0, session_id, model, u).await;
+    }
+
+    /// T-007: [`AppState::record_usage_as`] for async code (see above). The
+    /// sync one stays for the callers that are not async yet.
+    pub async fn record_usage_as_async(&self, purpose: &str, session_id: &str, model: &str, u: &crate::provider::Usage) {
+        let (purpose, sid, model, usage) = (purpose.to_string(), session_id.to_string(), model.to_string(), *u);
+        let saved = self
+            .db
+            .run(move |db| {
+                db.add_usage_entry(&sid, &model, &purpose, &usage)?;
+                Ok((!sid.is_empty()).then(|| db.usage_totals(Some(&sid), None).unwrap_or_default()))
+            })
+            .await;
+        match saved {
+            Err(e) => core_log(&format!("[core] saving token usage failed: {e}")),
+            Ok(None) => {}
+            Ok(Some(session)) => {
+                let _ = self.events.send(ServerEvent::Usage {
+                    session_id: session_id.to_string(),
+                    last: *u,
+                    session,
+                });
+            }
+        }
+    }
 }
 
 impl AppState {

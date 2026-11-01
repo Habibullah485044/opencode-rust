@@ -973,7 +973,7 @@ pub async fn one_shot(
         }
         match ev? {
             StreamEvent::Text(t) => text.push_str(&t),
-            StreamEvent::Usage(u) => st.record_usage("", &model, &u),
+            StreamEvent::Usage(u) => st.record_usage_async("", &model, &u).await,
             StreamEvent::Done { finish_reason } => {
                 // B-03: half an answer must not be used as a whole one.
                 if finish_reason.as_deref() == Some("length") {
