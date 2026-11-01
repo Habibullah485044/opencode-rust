@@ -132,7 +132,8 @@ pub(super) fn submit_and_name(gs: &mut GuiState, st: &server::AppState) -> Optio
 pub(super) async fn request_stop(st: &server::AppState, session_id: &str) -> bool {
     for _ in 0..10 {
         if let Some(flag) = st.busy.read().await.get(session_id) {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            // T-024: wakes `server::aborted` at once, not on its recheck.
+            server::signal_abort(flag);
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -222,6 +223,26 @@ mod tests {
         st.busy.write().await.insert("ses_run".into(), flag.clone());
         assert!(request_stop(&st, "ses_run").await);
         assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// T-024: a GUI stop wakes a run waiting in `server::aborted` at once,
+    /// well before its 500 ms recheck.
+    #[tokio::test]
+    async fn stop_wakes_an_aborted_waiter_at_once() {
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
+            .await;
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        st.busy.write().await.insert("ses_wake".into(), flag.clone());
+        let f2 = flag.clone();
+        let waiter = tokio::spawn(async move {
+            server::aborted(&f2).await;
+            Instant::now()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await; // let it start waiting
+        let t0 = Instant::now();
+        assert!(request_stop(&st, "ses_wake").await);
+        let woke = waiter.await.unwrap();
+        assert!(woke.duration_since(t0) < Duration::from_millis(250), "{:?}", woke.duration_since(t0));
     }
 
     /// T-026, T-043: deleting a chat forgets its in-memory state; a running
