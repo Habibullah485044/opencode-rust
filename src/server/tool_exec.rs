@@ -294,17 +294,17 @@ pub(super) async fn check_permission_preview(
 
 /// The answer the rules and the permission mode give without asking the
 /// user, or `None` when the user must be asked.
-fn decided_without_prompt(st: &AppState, db: &Db, session_id: &str, tool: &str, detail: &str) -> Option<bool> {
+pub(super) fn decided_without_prompt(st: &AppState, db: &Db, session_id: &str, tool: &str, detail: &str) -> Option<bool> {
     // "Always allow" answers belong to this chat's workspace only (S-07).
     let ws_key = crate::db::workspace_key(&st.workspace_for(session_id));
-    // Each (tool, pattern) is looked up once per call: the engine asks for
-    // the same pair again (every rule, then the whole command).
-    let seen = std::cell::RefCell::new(HashMap::<(String, String), bool>::new());
+    // T-146: the workspace's approvals are read once per call, when first
+    // needed, and matched in memory: the engine asks for several pairs
+    // (every rule, then the whole command).
+    let approvals = std::cell::OnceCell::new();
     let remembered = |t: &str, d: &str| {
-        *seen
-            .borrow_mut()
-            .entry((t.to_string(), d.to_string()))
-            .or_insert_with(|| db.has_approval(&ws_key, t, d).unwrap_or(false))
+        approvals
+            .get_or_init(|| db.approvals(&ws_key).unwrap_or_default())
+            .contains(&(t.to_string(), d.to_string()))
     };
     let decision = st.engine.evaluate(tool, detail, remembered);
     // Hard `deny` rules are policy, not prompts: they survive every mode.

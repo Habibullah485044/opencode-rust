@@ -1012,6 +1012,8 @@ impl Db {
     /// True when this workspace has an "always allow" for (tool, pattern).
     /// Approvals saved for other workspaces never count.
     pub fn has_approval(&self, workspace: &str, tool: &str, pattern: &str) -> Result<bool> {
+        #[cfg(test)]
+        APPROVAL_QUERIES.with(|n| n.set(n.get() + 1));
         let conn = self.conn();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM approvals WHERE workspace=?1 AND tool=?2 AND pattern=?3",
@@ -1020,6 +1022,23 @@ impl Db {
         )?;
         Ok(n > 0)
     }
+
+    /// T-146: every "always allow" (tool, pattern) of one workspace, for a
+    /// permission check that matches several pairs with one query.
+    pub fn approvals(&self, workspace: &str) -> Result<std::collections::HashSet<(String, String)>> {
+        #[cfg(test)]
+        APPROVAL_QUERIES.with(|n| n.set(n.get() + 1));
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT tool, pattern FROM approvals WHERE workspace=?1")?;
+        let rows = stmt.query_map(params![workspace], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Approval queries on this thread (T-146 tests count them).
+    pub static APPROVAL_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

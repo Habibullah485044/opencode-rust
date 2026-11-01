@@ -3527,3 +3527,17 @@ async fn auto_compaction_runs_near_the_context_limit() {
     assert!(noted, "the user is told about the compaction");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// T-146: one tool call reads the workspace's approvals once, however many
+/// (tool, pattern) pairs the rules ask about.
+#[tokio::test]
+async fn permission_check_reads_approvals_once_per_call() {
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    st.set_perm_mode(PermissionMode::Manual);
+    let ws = crate::db::workspace_key(&st.workspace_for("s1"));
+    st.db.add_approval(&ws, "bash", "ls && pwd && whoami", "session").unwrap();
+    crate::db::APPROVAL_QUERIES.with(|n| n.set(0));
+    let decided = super::tool_exec::decided_without_prompt(&st, &st.db, "s1", "bash", "ls && pwd && whoami");
+    assert_eq!(crate::db::APPROVAL_QUERIES.with(|n| n.get()), 1, "one approvals query per tool call");
+    assert_eq!(decided, Some(true), "the saved approval still counts");
+}
