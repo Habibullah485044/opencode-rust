@@ -74,6 +74,13 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
+/// T-057: a diagnostic line to stderr and to core.log: a shortcut launch
+/// has no console, so stderr alone is lost.
+fn gui_log(msg: &str) {
+    eprintln!("{msg}");
+    server::core_log(msg);
+}
+
 /// Wake-up sent by the SSE forwarder so the event loop drains promptly.
 #[derive(Debug, Clone, Copy)]
 enum AppEvent {
@@ -124,7 +131,7 @@ pub async fn run(
     // Breadcrumbs: a window that dies between these lines used to leave no
     // trace at all (exit code 1, empty stderr). Now the last line printed says
     // how far it got.
-    eprintln!("[gui] window created");
+    gui_log("[gui] window created");
 
     // Page -> Rust, plus preview-webview callbacks. One channel means one
     // drain site in the event loop, so state never updates twice per frame.
@@ -150,13 +157,13 @@ pub async fn run(
             Ok(wv) => Some(wv),
             Err(e) => {
                 // The chat must still work when the preview cannot be created.
-                eprintln!("[gui] preview panel unavailable: {e}");
+                gui_log(&format!("[gui] preview panel unavailable: {e}"));
                 gs.browser.fail(format!("Preview panel unavailable: {e}"));
                 None
             }
         }
     } else {
-        eprintln!("[gui] preview panel disabled in config ([browser] enabled = false)");
+        gui_log("[gui] preview panel disabled in config ([browser] enabled = false)");
         None
     };
 
@@ -182,7 +189,7 @@ pub async fn run(
     // then an optional prefilled prompt from the CLI.
     paint(&webview, &gs);
     if let Some(content) = submit_and_name(&mut gs, &state) {
-        eprintln!("[gui] run start (prefill): {}", clip(&content, 80));
+        gui_log(&format!("[gui] run start (prefill): {}", clip(&content, 80)));
         let sid = gs.session.clone().unwrap_or_default();
         paint(&webview, &gs);
         let st0 = state.clone();
@@ -191,7 +198,7 @@ pub async fn run(
         });
     }
 
-    eprintln!("[gui] entering the event loop");
+    gui_log("[gui] entering the event loop");
     let (done_tx, done_rx) = std::sync::mpsc::channel::<Done>();
     let mut app = App {
         gs,
@@ -309,7 +316,7 @@ fn forward_server_events(
 }
 
 fn tracing_boot(boot_ms: u128, addr: std::net::SocketAddr, session: &str) {
-    eprintln!("[habi] ready in {boot_ms}ms \u{b7} core at http://{addr} \u{b7} session {session}");
+    gui_log(&format!("[habi] ready in {boot_ms}ms \u{b7} core at http://{addr} \u{b7} session {session}"));
 }
 
 #[cfg(test)]
@@ -321,5 +328,14 @@ mod tests {
         assert_eq!(clip("short", 10), "short");
         assert_eq!(clip("hello world", 5), "hello\u{2026}");
         assert_eq!(clip("\u{1f512}abc", 2), "\u{1f512}a\u{2026}");
+    }
+
+    /// T-057: GUI diagnostics (a page error here) reach core.log.
+    #[test]
+    fn gui_diagnostics_reach_core_log() {
+        let marker = format!("[gui] page error: t057-{}-{}", std::process::id(), dispatch::epoch_ms());
+        gui_log(&marker);
+        let log = std::fs::read_to_string(crate::config::default_state_dir().join("core.log")).unwrap_or_default();
+        assert!(log.contains(&marker), "core.log has the line");
     }
 }

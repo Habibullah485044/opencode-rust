@@ -70,7 +70,7 @@ impl App {
                 true
             }
             UiMsg::Ipc(IpcMsg::PageError(msg)) => {
-                eprintln!("[gui] page error: {msg}");
+                gui_log(&format!("[gui] page error: {msg}"));
                 false
             }
             UiMsg::Ipc(IpcMsg::Minimize) => {
@@ -203,7 +203,7 @@ impl App {
         let Some(content) = submit_and_name(&mut self.gs, &self.st) else {
             return false;
         };
-        eprintln!("[gui] run start: {}", clip(&content, 80));
+        gui_log(&format!("[gui] run start: {}", clip(&content, 80)));
         let sid = self.gs.session.clone().unwrap_or_default();
         let st = self.st.clone();
         self.rt.spawn(async move {
@@ -260,7 +260,7 @@ impl App {
         let st = self.st.clone();
         self.rt.spawn(async move {
             if !request_stop(&st, &sid).await {
-                eprintln!("[gui] stop: no run found for {sid}");
+                gui_log(&format!("[gui] stop: no run found for {sid}"));
             }
         });
         true

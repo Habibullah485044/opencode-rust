@@ -47,7 +47,7 @@ pub(super) fn build_main_webview(
                 let _ = ipc_proxy.send_event(AppEvent::Wake);
             } else {
                 // Only the type and size: a body (Settings) may hold the API key.
-                eprintln!("[gui] IPC not understood: {}", ipc_summary(req.body()));
+                gui_log(&format!("[gui] IPC not understood: {}", ipc_summary(req.body())));
             }
         })
         .build(window)
@@ -165,7 +165,7 @@ pub(super) fn main_window_navigation_guard() -> impl Fn(String) -> bool + 'stati
         if first.swap(false, std::sync::atomic::Ordering::SeqCst) || main_window_may_navigate(&uri) {
             return true;
         }
-        eprintln!("[gui] blocked a navigation of the main window to {uri}");
+        gui_log(&format!("[gui] blocked a navigation of the main window to {uri}"));
         false
     }
 }

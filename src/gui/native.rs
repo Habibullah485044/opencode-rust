@@ -197,7 +197,7 @@ pub(super) fn single_instance_lock(state_dir: &std::path::Path) -> std::result::
 
 /// New (F-13): show a fatal error to a user who may have no console window.
 pub fn show_fatal_dialog(title: &str, msg: &str) {
-    eprintln!("[gui] {title}: {msg}");
+    gui_log(&format!("[gui] {title}: {msg}"));
     #[cfg(windows)]
     {
         use windows::core::HSTRING;

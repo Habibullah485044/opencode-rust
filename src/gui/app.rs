@@ -72,13 +72,13 @@ impl App {
         match event {
             Event::UserEvent(AppEvent::Wake) | Event::MainEventsCleared => self.tick(control_flow),
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
-                eprintln!("[gui] close requested");
+                gui_log("[gui] close requested");
                 self.close(control_flow);
             }
             // tao/winit signal a dead message loop this way; without it a
             // closed window can leave the process running invisibly.
             Event::LoopDestroyed => {
-                eprintln!("[gui] window closed — exiting");
+                gui_log("[gui] window closed — exiting");
                 notify_cleanup(&self.window);
                 // The event loop never returns, so main's stop_all is never
                 // reached: dev servers the agent started would outlive the window.
