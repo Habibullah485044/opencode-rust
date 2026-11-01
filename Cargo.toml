@@ -2,6 +2,9 @@
 name = "opencode-rust"
 version = "0.1.0"
 edition = "2021"
+# The oldest Rust that builds this: std::fs::File::try_lock (gui single-
+# instance lock, pagecheck) is stable since 1.89; dependencies need 1.88.
+rust-version = "1.89"
 description = "Lightweight terminal AI coding agent — sessions, tools, permissions, team mode"
 license = "MIT"
 
