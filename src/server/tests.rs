@@ -455,11 +455,65 @@ async fn f12_rename_and_delete_sessions() {
 async fn deleting_a_chat_deletes_its_todos() {
     let (st, base, http) = f12_server().await;
     let s = st.db.create_session("todos", None).unwrap();
-    st.todo_store.exec(&s.id, crate::todo::TodoOp::Add { content: "write tests".into() });
+    st.todo_store.exec(&s.id, TodoOp::Add { content: "write tests".into() });
     assert_eq!(st.todo_store.list_all(&s.id).len(), 1);
     let r = http.delete(format!("{base}/api/sessions/{}", s.id)).bearer_auth("t").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 204);
     assert!(st.todo_store.list_all(&s.id).is_empty(), "the chat's todos went with it");
+}
+
+/// T-011: a chat's folder is read from the database once; `forget_session`
+/// and `forget_workspaces` drop the cached answer.
+#[tokio::test]
+async fn a_chats_folder_is_looked_up_once() {
+    let base = std::env::temp_dir().join(format!("ocrs-ws-cache-{}", std::process::id()));
+    let (start, other) = (base.join("start"), base.join("other"));
+    std::fs::create_dir_all(&start).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let st = build_state_ephemeral(crate::config::Config::default(), start.clone()).await;
+    let project = st.db.upsert_project(&other).unwrap();
+    let s = st.db.create_session_in("cached", None, Some(&project.id)).unwrap();
+    assert_eq!(st.workspace_for(&s.id), other);
+    // Changed behind the cache's back: the second lookup does not see it,
+    // so it did not ask the database.
+    st.db.set_session_project(&s.id, None).unwrap();
+    assert_eq!(st.workspace_for(&s.id), other, "answered from the cache");
+    st.forget_session(&s.id);
+    assert!(!st.workspaces.lock().unwrap().contains_key(&s.id), "forget_session drops the entry");
+    assert_eq!(st.workspace_for(&s.id), start, "read again after forgetting");
+    st.db.set_session_project(&s.id, Some(&project.id)).unwrap();
+    st.forget_workspaces();
+    assert_eq!(st.workspace_for(&s.id), other);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// T-094: `forget_session` clears every per-chat map.
+#[tokio::test]
+async fn forget_session_clears_every_per_chat_map() {
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    let parent = st.db.create_session("parent", None).unwrap();
+    let s = st.db.create_session("child", Some(&parent.id)).unwrap();
+    let id = s.id.clone();
+    st.stats.lock().unwrap().insert(id.clone(), RunStats::default());
+    st.set_mode(&id, AgentMode::Plan);
+    st.set_ponytail_level(&id, agents::PonytailLevel::Off);
+    std::mem::forget(st.auto_approve_session(&id));
+    FROZEN_LESSONS.get_or_init(Default::default).lock().unwrap().insert(id.clone(), None);
+    COMPACT_FAILED_AT.get_or_init(Default::default).lock().unwrap().insert(id.clone(), 3);
+    let _ = st.workspace_for(&id);
+    let _ = st.parent_of(&id);
+    assert!(st.workspaces.lock().unwrap().contains_key(&id));
+    assert_eq!(st.parents.lock().unwrap().get(&id), Some(&Some(parent.id.clone())));
+
+    st.forget_session(&id);
+    assert!(!st.stats.lock().unwrap().contains_key(&id), "stats");
+    assert!(!st.modes.lock().unwrap().contains_key(&id), "modes");
+    assert!(!st.ponytail_levels.lock().unwrap().contains_key(&id), "ponytail levels");
+    assert!(!st.auto_approve.lock().unwrap().contains_key(&id), "auto_approve");
+    assert!(!FROZEN_LESSONS.get().unwrap().lock().unwrap().contains_key(&id), "FROZEN_LESSONS");
+    assert!(!COMPACT_FAILED_AT.get().unwrap().lock().unwrap().contains_key(&id), "COMPACT_FAILED_AT");
+    assert!(!st.workspaces.lock().unwrap().contains_key(&id), "workspaces");
+    assert!(!st.parents.lock().unwrap().contains_key(&id), "parents");
 }
 
 /// P-04: common names, methods and mere mentions give no reuse hint.

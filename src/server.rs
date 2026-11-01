@@ -277,6 +277,14 @@ pub struct AppState {
     /// many grants hold each. Their child chats count too. Per chat, unlike
     /// `perm_mode`: a mission must not auto-approve the user's other chats.
     pub auto_approve: Mutex<HashMap<String, u32>>,
+    /// T-011: chat → its project's folder (`None` = no project), so
+    /// `workspace_for` asks the database once per chat. Dropped per chat by
+    /// `forget_session`, and wholly by `forget_workspaces` when chats move.
+    pub workspaces: Mutex<HashMap<String, Option<PathBuf>>>,
+    /// T-010: chat → the chat it was started from. A chat's parent never
+    /// changes, so the auto-approval walk reads each link from the database
+    /// once.
+    pub parents: Mutex<HashMap<String, Option<String>>>,
 }
 
 /// `system_delivery`: not probed yet — the prompt travels as a user note,
@@ -344,6 +352,8 @@ pub async fn build_state(cfg: Config, workspace: PathBuf) -> Result<Shared> {
         system_delivery: std::sync::atomic::AtomicU8::new(SYSTEM_UNKNOWN),
         user_prompt: std::sync::RwLock::new((cfg_prompt.0, cfg_prompt.1)),
         auto_approve: Mutex::new(HashMap::new()),
+        workspaces: Mutex::new(HashMap::new()),
+        parents: Mutex::new(HashMap::new()),
     }))
 }
 
@@ -404,6 +414,8 @@ pub async fn build_state_ephemeral_skills(
         system_delivery: std::sync::atomic::AtomicU8::new(SYSTEM_UNKNOWN),
         user_prompt: std::sync::RwLock::new((cfg_prompt.0, cfg_prompt.1)),
         auto_approve: Mutex::new(HashMap::new()),
+        workspaces: Mutex::new(HashMap::new()),
+        parents: Mutex::new(HashMap::new()),
     })
 }
 
@@ -522,12 +534,26 @@ impl AppState {
             if granted.contains(&id) {
                 return true;
             }
-            match self.db.get_session(&id).ok().flatten().and_then(|s| s.parent_id) {
+            match self.parent_of(&id) {
                 Some(parent) => id = parent,
                 None => return false,
             }
         }
         false
+    }
+
+    /// The chat `session_id` was started from, from the [`AppState::parents`]
+    /// cache; a miss asks the database once. An unknown chat or a failed
+    /// read is not cached (the chat may not be written yet).
+    fn parent_of(&self, session_id: &str) -> Option<String> {
+        if let Some(known) = self.parents.lock().ok().and_then(|m| m.get(session_id).cloned()) {
+            return known;
+        }
+        let parent = self.db.get_session(session_id).ok().flatten()?.parent_id;
+        if let Ok(mut m) = self.parents.lock() {
+            m.insert(session_id.to_string(), parent.clone());
+        }
+        parent
     }
 
     /// Automatic approvals for chat `session_id` and its child chats until
@@ -553,6 +579,12 @@ impl AppState {
             m.remove(session_id);
         }
         if let Ok(mut m) = self.auto_approve.lock() {
+            m.remove(session_id);
+        }
+        if let Ok(mut m) = self.workspaces.lock() {
+            m.remove(session_id);
+        }
+        if let Ok(mut m) = self.parents.lock() {
             m.remove(session_id);
         }
         if let Some(Ok(mut m)) = FROZEN_LESSONS.get().map(|c| c.lock()) {

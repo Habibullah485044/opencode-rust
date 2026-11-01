@@ -6,16 +6,38 @@ use super::*;
 impl AppState {
     /// The folder chat `session_id` works in: its project's folder, or the
     /// folder the app started in (no project, or the folder is gone).
+    /// The project folder comes from the [`AppState::workspaces`] cache
+    /// after the first lookup (T-011: this runs on async threads, often).
     pub fn workspace_for(&self, session_id: &str) -> PathBuf {
-        self.db
-            .get_session(session_id)
-            .ok()
-            .flatten()
-            .and_then(|s| s.project_id)
-            .and_then(|p| self.db.get_project(&p).ok().flatten())
-            .map(|p| PathBuf::from(p.root))
-            .filter(|root| root.is_dir())
-            .unwrap_or_else(|| self.workspace.clone())
+        let cached = self.workspaces.lock().ok().and_then(|m| m.get(session_id).cloned());
+        let root = match cached {
+            Some(root) => root,
+            None => {
+                let looked = self.project_root(session_id);
+                // Not cached when the chat is unknown or the read failed.
+                if let (Some(root), Ok(mut m)) = (&looked, self.workspaces.lock()) {
+                    m.insert(session_id.to_string(), root.clone());
+                }
+                looked.flatten()
+            }
+        };
+        root.filter(|root| root.is_dir()).unwrap_or_else(|| self.workspace.clone())
+    }
+
+    /// Chat `session_id`'s project folder from the database: `None` = could
+    /// not tell (unknown chat, failed read), `Some(None)` = no project.
+    fn project_root(&self, session_id: &str) -> Option<Option<PathBuf>> {
+        let session = self.db.get_session(session_id).ok()??;
+        let Some(project) = session.project_id else { return Some(None) };
+        Some(self.db.get_project(&project).ok()?.map(|p| PathBuf::from(p.root)))
+    }
+
+    /// T-011: forget every cached chat folder. Call it after chats change
+    /// project (moved, adopted, or their project removed).
+    pub fn forget_workspaces(&self) {
+        if let Ok(mut m) = self.workspaces.lock() {
+            m.clear();
+        }
     }
 
     /// The folder a run of chat `session_id` overrides the start folder
