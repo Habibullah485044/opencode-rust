@@ -45,10 +45,7 @@ impl App {
                 true
             }
             UiMsg::Ipc(IpcMsg::MoveChat { id, project }) => {
-                if !self.gs.running.contains(&id) {
-                    let _ = self.st.db.set_session_project(&id, project.as_deref());
-                }
-                refresh_sessions(&mut self.gs, &self.st);
+                move_chat(&mut self.gs, &self.st, &id, project.as_deref());
                 true
             }
             UiMsg::Ipc(IpcMsg::AdoptUnfiled(project)) => {
@@ -244,16 +241,7 @@ impl App {
     }
 
     fn on_delete_chat(&mut self, id: &str) -> bool {
-        if !self.gs.running.contains(id) {
-            if let Err(e) = self.st.db.delete_session(id) {
-                self.gs.push(EntryKind::Error, format!("delete failed: {e}"));
-            } else if self.gs.is_current(id) {
-                self.gs.session = None;
-                let project = self.gs.default_project.clone();
-                open_new_chat(&mut self.gs, &self.st, project);
-            }
-        }
-        refresh_sessions(&mut self.gs, &self.st);
+        delete_chat(&mut self.gs, &self.st, id);
         true
     }
 

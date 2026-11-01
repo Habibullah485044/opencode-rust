@@ -35,6 +35,34 @@ pub(super) fn open_new_chat(gs: &mut GuiState, st: &server::AppState, project: O
     }
 }
 
+/// History → Delete: remove chat `id` for good (not while it runs).
+pub(super) fn delete_chat(gs: &mut GuiState, st: &server::AppState, id: &str) {
+    if gs.running.contains(id) {
+        gs.push(EntryKind::System, "Stop the run first, then delete this chat.".to_string());
+    } else if let Err(e) = st.db.delete_session(id) {
+        gs.push(EntryKind::Error, format!("delete failed: {e}"));
+    } else {
+        // T-026: drop its in-memory state too, as the HTTP route does.
+        st.forget_session(id);
+        if gs.is_current(id) {
+            gs.session = None;
+            let project = gs.default_project.clone();
+            open_new_chat(gs, st, project);
+        }
+    }
+    refresh_sessions(gs, st);
+}
+
+/// Move chat `id` to `project` (`None` = no project); not while it runs.
+pub(super) fn move_chat(gs: &mut GuiState, st: &server::AppState, id: &str, project: Option<&str>) {
+    if gs.running.contains(id) {
+        gs.push(EntryKind::System, "Stop the run first, then move this chat.".to_string());
+    } else if let Err(e) = st.db.set_session_project(id, project) {
+        gs.push(EntryKind::Error, format!("move chat failed: {e}"));
+    }
+    refresh_sessions(gs, st);
+}
+
 /// Refresh the sidebar chat list from the database.
 pub(super) fn refresh_sessions(gs: &mut GuiState, st: &server::AppState) {
     if let Ok(rows) = st.db.list_session_rows() {
@@ -194,6 +222,53 @@ mod tests {
         st.busy.write().await.insert("ses_run".into(), flag.clone());
         assert!(request_stop(&st, "ses_run").await);
         assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// T-026, T-043: deleting a chat forgets its in-memory state; a running
+    /// chat is neither deleted nor moved, and the user is told why.
+    #[tokio::test]
+    async fn delete_and_move_chat() {
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
+            .await;
+        let a = st.db.create_session("a", None).unwrap();
+        st.set_mode(&a.id, crate::agents::AgentMode::Plan);
+        let mut g = GuiState::new();
+        g.running.insert(a.id.clone());
+        delete_chat(&mut g, &st, &a.id);
+        assert!(g.entries.last().unwrap().1.contains("Stop the run first, then delete"));
+        move_chat(&mut g, &st, &a.id, None);
+        assert!(g.entries.last().unwrap().1.contains("Stop the run first, then move"));
+        assert!(st.db.get_session(&a.id).unwrap().is_some(), "a running chat stays");
+        g.running.clear();
+        delete_chat(&mut g, &st, &a.id);
+        assert!(st.db.get_session(&a.id).unwrap().is_none());
+        assert_eq!(st.mode_for(&a.id), crate::agents::AgentMode::default(), "forget_session ran");
+    }
+
+    /// T-044: a move the database refuses shows an error line.
+    #[tokio::test]
+    async fn a_failed_move_shows_an_error() {
+        let dir = std::env::temp_dir().join(format!("habi-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.db");
+        let mut st = server::build_state_ephemeral(crate::config::Config::default(), dir.clone()).await;
+        Arc::get_mut(&mut st).expect("sole owner").db = crate::db::Db::open(&file).unwrap();
+        let s = st.db.create_session("s", None).unwrap();
+        rusqlite::Connection::open(&file)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER no_move BEFORE UPDATE OF project_id ON sessions \
+                 BEGIN SELECT RAISE(ABORT, 'moves refused'); END;",
+            )
+            .unwrap();
+        let mut g = GuiState::new();
+        move_chat(&mut g, &st, &s.id, Some("p"));
+        let (kind, text) = g.entries.last().unwrap();
+        assert_eq!(*kind, EntryKind::Error);
+        assert!(text.contains("moves refused"), "{text}");
+        drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
