@@ -450,6 +450,18 @@ async fn f12_rename_and_delete_sessions() {
     assert_eq!(r.status().as_u16(), 404, "already deleted");
 }
 
+/// T-028: deleting a chat through the route deletes its todos too.
+#[tokio::test]
+async fn deleting_a_chat_deletes_its_todos() {
+    let (st, base, http) = f12_server().await;
+    let s = st.db.create_session("todos", None).unwrap();
+    st.todo_store.exec(&s.id, crate::todo::TodoOp::Add { content: "write tests".into() });
+    assert_eq!(st.todo_store.list_all(&s.id).len(), 1);
+    let r = http.delete(format!("{base}/api/sessions/{}", s.id)).bearer_auth("t").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 204);
+    assert!(st.todo_store.list_all(&s.id).is_empty(), "the chat's todos went with it");
+}
+
 /// P-04: common names, methods and mere mentions give no reuse hint.
 #[test]
 fn reuse_gate_ignores_common_names_and_mentions() {

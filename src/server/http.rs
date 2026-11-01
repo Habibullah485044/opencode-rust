@@ -260,6 +260,12 @@ pub(super) async fn delete_session_route(
     let sid = id.clone();
     if st.db.run(move |db| db.delete_session(&sid)).await.map_err(internal)? {
         st.forget_session(&id);
+        // T-028: todos live in their own table with no foreign key.
+        let (todos, sid) = (st.clone(), id.clone());
+        let forgot = tokio::task::spawn_blocking(move || todos.todo_store.forget(&sid)).await;
+        if let Ok(Err(e)) = forgot {
+            core_log(&format!("[core] deleting the todos of {id} failed: {e:#}"));
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(StatusCode::NOT_FOUND)
