@@ -74,7 +74,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 /// Header — Freebuff style: dark surface bar, green brand chip, muted details.
-/// Busy spinner: the loop redraws ~20×/s so the frame keeps moving.
+/// Busy spinner: while busy the loop ticks and redraws every 100 ms (T-062).
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     const SPIN: [&str; 4] = ["◐", "◓", "◑", "◒"];
     let status = if app.busy {
@@ -682,7 +682,7 @@ fn draw_agent_card(
 
 /// Cut `s` to at most `max` terminal columns and add `…` when something was
 /// cut (B-35: display width, so wide characters count double).
-fn truncate_str(s: &str, max: usize) -> String {
+pub(super) fn truncate_str(s: &str, max: usize) -> String {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     if s.width() <= max {
         return s.to_string();
@@ -739,14 +739,22 @@ fn draw_approval(f: &mut Frame, app: &App) {
         n => format!(" approval · {n} more waiting "),
     };
     let keys = " [y] allow once  [a] always (this workspace)  [n/Esc] deny  [↑↓] scroll ";
-    let scroll = app.approval_scroll.min(text.len().min(u16::MAX as usize) as u16);
+    // T-099: the furthest useful scroll is wrapped rows minus visible rows
+    // (as help does), so scrolling never runs into blank space.
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    let end = paragraph
+        .line_count(area.width.saturating_sub(2))
+        .saturating_sub(area.height.saturating_sub(2) as usize)
+        .min(u16::MAX as usize) as u16;
+    app.approval_scroll_max.set(end);
+    let scroll = app.approval_scroll.min(end);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(FB_BORDER))
         .title(title)
         .title_bottom(Line::from(keys).style(Style::default().fg(FB_GREEN)));
-    let widget = Paragraph::new(text).block(block).wrap(Wrap { trim: false }).scroll((scroll, 0));
+    let widget = paragraph.block(block).scroll((scroll, 0));
     f.render_widget(widget, area);
 }
 

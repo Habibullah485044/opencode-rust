@@ -484,11 +484,13 @@ impl App {
             self.should_quit = true;
             return None;
         }
+        // T-099: ↓ stops once the last line is at the bottom (draw sets the max).
+        let max = self.approval_scroll_max.get();
         match key.code {
             KeyCode::Up => self.approval_scroll = self.approval_scroll.saturating_sub(1),
-            KeyCode::Down => self.approval_scroll = self.approval_scroll.saturating_add(1),
+            KeyCode::Down => self.approval_scroll = self.approval_scroll.saturating_add(1).min(max),
             KeyCode::PageUp => self.approval_scroll = self.approval_scroll.saturating_sub(10),
-            KeyCode::PageDown => self.approval_scroll = self.approval_scroll.saturating_add(10),
+            KeyCode::PageDown => self.approval_scroll = self.approval_scroll.saturating_add(10).min(max),
             _ => {}
         }
         // Never answer on Ctrl/Alt combinations (Ctrl+A must not mean
@@ -513,6 +515,8 @@ impl App {
     pub(super) fn show_approval(&mut self, ap: PendingApproval) {
         self.approval = Some(ap);
         self.approval_scroll = 0;
+        // T-099: unknown until this one is drawn — no cap yet.
+        self.approval_scroll_max.set(u16::MAX);
         self.approval_since = Some(std::time::Instant::now());
     }
 
@@ -545,36 +549,37 @@ impl App {
         None
     }
 
-    /// M6: `/sessions` picker — ↑/↓ select, Enter switches, Esc closes.
+    /// M6: `/sessions` picker — ↑/↓ PgUp/PgDn Home/End select, Enter
+    /// switches, Esc closes.
     fn on_sessions_key(&mut self, key: KeyEvent) -> Option<InputAction> {
-        let len = self.sessions.as_ref().map(|o| o.items.len()).unwrap_or(0);
+        /// T-097: rows one PgUp/PgDn moves.
+        const PAGE: usize = 10;
+        let last = self.sessions.as_ref().map(|o| o.items.len()).unwrap_or(0).saturating_sub(1);
+        let move_to = |app: &mut Self, f: &dyn Fn(usize) -> usize| {
+            if let Some(o) = app.sessions.as_mut() {
+                o.sel = f(o.sel).min(last);
+            }
+        };
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
-                None
             }
-            KeyCode::Up => {
-                if let Some(o) = self.sessions.as_mut() {
-                    o.sel = o.sel.saturating_sub(1);
-                }
-                None
-            }
-            KeyCode::Down => {
-                if let Some(o) = self.sessions.as_mut() {
-                    o.sel = (o.sel + 1).min(len.saturating_sub(1));
-                }
-                None
-            }
+            KeyCode::Up => move_to(self, &|s| s.saturating_sub(1)),
+            KeyCode::Down => move_to(self, &|s| s + 1),
+            KeyCode::PageUp => move_to(self, &|s| s.saturating_sub(PAGE)),
+            KeyCode::PageDown => move_to(self, &|s| s + PAGE),
+            KeyCode::Home => move_to(self, &|_| 0),
+            KeyCode::End => move_to(self, &|_| last),
             KeyCode::Enter => {
                 let ov = self.sessions.take()?;
                 let item = ov.items.get(ov.sel)?;
-                Some(InputAction::SwitchSession(item.id.clone()))
+                return Some(InputAction::SwitchSession(item.id.clone()));
             }
-            _ => {
-                self.sessions = None;
-                None
-            }
+            KeyCode::Esc => self.sessions = None,
+            // T-098: a stray letter must not close the picker (and get lost).
+            _ => {}
         }
+        None
     }
 
     /// M6: complete the highlighted palette entry into the input line.

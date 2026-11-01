@@ -52,28 +52,12 @@ pub(crate) async fn tui_run(
 /// SSE forwarder task: core events → the TUI's channel.
 fn spawn_event_forwarder(
     st_fwd: State,
-    mut rx: tokio::sync::broadcast::Receiver<server::ServerEvent>,
+    rx: tokio::sync::broadcast::Receiver<server::ServerEvent>,
     evt_tx: tokio::sync::mpsc::UnboundedSender<server::ServerEvent>,
 ) {
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    if evt_tx.send(ev).is_err() {
-                        break;
-                    }
-                }
-                // New (B-09): the TUI fell behind and lost events. Re-send
-                // every pending approval so no prompt is silently lost.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    for ev in st_fwd.pending_approvals() {
-                        let _ = evt_tx.send(ev);
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    // New (B-09): after a lag every pending approval is re-sent; T-102 adds
+    // a note that streamed text was skipped.
+    tokio::spawn(tui::forward_events(rx, evt_tx, move || st_fwd.pending_approvals()));
 }
 
 /// Action handler task: talks to the local core exactly like an API client.
@@ -104,6 +88,16 @@ fn note(st: &State, sid: &str, text: String) {
         session_id: sid.to_string(),
         text,
     });
+}
+
+/// T-018: run `f` on a blocking thread — DB and file calls must not hold
+/// up the async worker the action handler runs on.
+async fn blocking<T: Send + 'static>(
+    st: &State,
+    f: impl FnOnce(&server::AppState) -> T + Send + 'static,
+) -> Result<T> {
+    let st = st.clone();
+    Ok(tokio::task::spawn_blocking(move || f(&st)).await?)
 }
 
 /// Make `id` the TUI's session and show its transcript.
@@ -171,14 +165,25 @@ async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
         }
         tui::InputAction::Fork => fork(st, sid).await,
         tui::InputAction::Resume(arg) => {
-            let resolved = opencode_rust::sessions::resolve_session(&st.db, &arg)
-                .and_then(|id| st.transcript(&id).map(|t| (id, t)));
+            // T-018: session lookup + transcript read are DB calls.
+            let resolved = blocking(st, move |st| {
+                opencode_rust::sessions::resolve_session(&st.db, &arg)
+                    .and_then(|id| st.transcript(&id).map(|t| (id, t)))
+            })
+            .await
+            .and_then(|r| r);
             match resolved {
                 Ok((id, transcript)) => show_session(st, sid, id, transcript),
                 Err(e) => say(st, sid, format!("[error] resume: {e:#}\n")),
             }
         }
-        tui::InputAction::Diff(arg) => diff(st, sid, arg),
+        tui::InputAction::Diff(arg) => {
+            let me = sid.clone();
+            let text = blocking(st, move |st| diff(st, &me, arg))
+                .await
+                .unwrap_or_else(|e| format!("[error] diff: {e:#}"));
+            say(st, sid, format!("{text}\n"));
+        }
         tui::InputAction::Skills => {
             let skills = opencode_rust::skills::load_skills(&st.workspace);
             let text = if skills.is_empty() {
@@ -251,14 +256,25 @@ async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
         }
         tui::InputAction::Export(arg) => {
             // New (S-16): inside the workspace only, no silent overwrite.
-            let text = match st.export_transcript(sid, arg.as_deref()) {
+            // T-018: reads the DB and writes a file, so off the async task.
+            let me = sid.clone();
+            let res = blocking(st, move |st| st.export_transcript(&me, arg.as_deref()))
+                .await
+                .and_then(|r| r);
+            let text = match res {
                 Ok(path) => format!("[export] wrote transcript to {}\n", path.display()),
                 Err(e) => format!("[export] failed: {e:#}\n"),
             };
             say(st, sid, text);
         }
         tui::InputAction::Todos => say(st, sid, format!("{}\n", st.todos_report(sid))),
-        tui::InputAction::Usage => say(st, sid, format!("{}\n", st.usage_report(sid))),
+        tui::InputAction::Usage => {
+            let me = sid.clone();
+            let text = blocking(st, move |st| st.usage_report(&me))
+                .await
+                .unwrap_or_else(|e| format!("[error] usage: {e:#}"));
+            say(st, sid, format!("{text}\n"));
+        }
         tui::InputAction::Init => {
             let ws = st.workspace.clone();
             let text = match opencode_rust::skills::init_agents_md(&ws) {
@@ -383,7 +399,8 @@ async fn fork(st: &State, sid: &mut String) {
 }
 
 /// `/diff [id|n]`: this session against its parent or another session.
-fn diff(st: &State, sid: &str, arg: Option<String>) {
+/// Blocking (DB reads): called through [`blocking`].
+fn diff(st: &server::AppState, sid: &str, arg: Option<String>) -> String {
     let target = match arg {
         Some(a) => opencode_rust::sessions::resolve_session(&st.db, &a),
         None => st
@@ -396,13 +413,12 @@ fn diff(st: &State, sid: &str, arg: Option<String>) {
                 anyhow::anyhow!("no parent session - pass one: /diff <id|index>")
             }),
     };
-    let text = match target.and_then(|t| {
+    match target.and_then(|t| {
         opencode_rust::sessions::diff_sessions(&st.db, sid, &t)
     }) {
         Ok(d) => d,
         Err(e) => format!("[error] diff: {e:#}"),
-    };
-    say(st, sid, format!("{text}\n"));
+    }
 }
 
 /// `/edit <file> <what>`: propose the edit and show its preview.
