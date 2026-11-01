@@ -302,21 +302,24 @@ impl App {
 
     /// Make a new git branch in the chat's project and switch to it.
     fn on_new_branch(&mut self, name: String) -> bool {
+        if let Some(why) = branch_name_problem(&name) {
+            self.gs.push(EntryKind::System, why);
+            return true;
+        }
         let root = chat_root(&self.gs, &self.st);
-        let valid = !name.is_empty()
-            && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'))
-            && !name.starts_with('-');
-        let text = if !valid {
-            format!("\"{name}\" is not a usable branch name (letters, digits, - _ / . only)")
-        } else {
-            match crate::gitsnap::git(&root, &["switch", "-c", &name]) {
-                Ok(_) => format!("Now on a new branch: {name}"),
-                Err(e) => format!("Could not make the branch: {e:#}"),
-            }
-        };
-        self.gs.push(EntryKind::System, text);
-        self.gs.git_stale = true;
-        true
+        self.off_thread(
+            move || crate::gitsnap::git(&root, &["switch", "-c", &name]).map(|_| name),
+            |gs, _, res| {
+                let text = match res {
+                    Ok(name) => format!("Now on a new branch: {name}"),
+                    Err(e) => format!("Could not make the branch: {e:#}"),
+                };
+                gs.push(EntryKind::System, text);
+                gs.git_stale = true;
+                true
+            },
+        );
+        false
     }
 
     /// Line comments from the Changes view, sent to the agent.
