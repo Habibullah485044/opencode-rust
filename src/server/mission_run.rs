@@ -842,7 +842,7 @@ mod tests {
         let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
         let gone = format!("ses_gone_{}_{}", std::process::id(), crate::db::now_ms_for_tests());
         say(&st, &gone, "step 1 done".into()).await;
-        let log = std::fs::read_to_string(crate::config::default_state_dir().join("core.log")).unwrap_or_default();
+        let log = std::fs::read_to_string(core_log_path()).unwrap_or_default();
         assert!(log.lines().any(|l| l.contains("[mission]") && l.contains(&gone)), "no core.log line for the lost note");
     }
 

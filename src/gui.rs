@@ -336,7 +336,7 @@ mod tests {
     fn gui_diagnostics_reach_core_log() {
         let marker = format!("[gui] page error: t057-{}-{}", std::process::id(), dispatch::epoch_ms());
         gui_log(&marker);
-        let log = std::fs::read_to_string(crate::config::default_state_dir().join("core.log")).unwrap_or_default();
+        let log = std::fs::read_to_string(server::core_log_path()).unwrap_or_default();
         assert!(log.contains(&marker), "core.log has the line");
     }
 }
