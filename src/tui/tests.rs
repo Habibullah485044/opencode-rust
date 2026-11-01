@@ -1146,3 +1146,262 @@
         app.on_key(key(KeyCode::Enter));
         assert!(app.agents.is_empty(), "/clear drops old cards");
     }
+
+    /// The screen of a `TestBackend` as one string per row.
+    fn screen_rows(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buf = terminal.backend().buffer();
+        let w = buf.area.width as usize;
+        buf.content().chunks(w).map(|row| row.iter().map(|c| c.symbol()).collect()).collect()
+    }
+
+    #[test]
+    fn truncate_str_counts_columns_and_keeps_the_exact_limit() {
+        use super::draw::truncate_str;
+        // Exactly at the limit: untouched, no ellipsis.
+        assert_eq!(truncate_str("abcd", 4), "abcd");
+        assert_eq!(truncate_str("abcde", 4), "abcd…");
+        assert_eq!(truncate_str("", 0), "");
+        // Wide characters count two columns; one never gets split in half.
+        assert_eq!(truncate_str("日本語", 6), "日本語");
+        assert_eq!(truncate_str("日本語", 5), "日本…");
+        assert_eq!(truncate_str("a日本", 2), "a…");
+    }
+
+    #[test]
+    fn approval_detail_lines_show_tabs_and_control_chars() {
+        let lines = super::draw::approval_detail_lines("a\tb\n\u{7}c\u{1b}[0m\n");
+        assert_eq!(lines, vec!["a    b", "\\u{7}c\\u{1b}[0m", ""]);
+        assert_eq!(super::draw::approval_detail_lines("plain"), vec!["plain"]);
+    }
+
+    #[test]
+    fn palette_matches_all_prefix_and_none() {
+        // `/` alone lists every builtin, in order.
+        let all: Vec<usize> = (0..builtins().len()).collect();
+        assert_eq!(palette_matches("/"), all);
+        // A prefix keeps only the verbs that start with it (any case).
+        let se = palette_matches("/SE");
+        assert!(!se.is_empty() && se.len() < all.len());
+        assert!(se.iter().all(|&i| builtins()[i].name.starts_with("se")));
+        assert!(se.iter().any(|&i| builtins()[i].name == "sessions"));
+        // No match, not a command, or arguments already started: nothing.
+        assert!(palette_matches("/zzzz").is_empty());
+        assert!(palette_matches("hello").is_empty());
+        assert!(palette_matches("/sessions x").is_empty());
+    }
+
+    #[test]
+    fn team_line_parsers_take_good_lines_and_skip_junk() {
+        use super::state::{parse_plan_item, parse_worker_line};
+        let a = parse_plan_item("2. Builder — create the modules").expect("a plan item");
+        assert_eq!((a.title.as_str(), a.task.as_str()), ("Builder", "create the modules"));
+        assert_eq!(a.status, TeamStatus::Working);
+        for junk in ["Builder — x", "x. A — b", "2. Builder - hyphen only", "2. — task", "2. Builder —", ""] {
+            assert!(parse_plan_item(junk).is_none(), "{junk:?}");
+        }
+        assert_eq!(parse_worker_line("0 (sub) done"), Some((0, TeamStatus::Done)));
+        assert_eq!(parse_worker_line("1 (sub) failed: boom (exit 1) here"), Some((1, TeamStatus::Failed)));
+        assert_eq!(parse_worker_line("3 (sub) failed"), Some((3, TeamStatus::Failed)));
+        for junk in ["x (sub) done", "2 (sub) working", "3 done", ""] {
+            assert!(parse_worker_line(junk).is_none(), "{junk:?}");
+        }
+        // Numbering gaps: items are kept in order; a worker index past the
+        // end is ignored instead of panicking.
+        let mut team = TeamState::default();
+        team.feed("[team] decomposing goal: g\n[team] plan:\n  1. A — a\n  3. B — b\n");
+        team.feed("[team] worker 5 (s) done\n[team] worker 1 (s) failed: x\n");
+        let got: Vec<_> = team.agents.iter().map(|a| (a.title.as_str(), a.status.clone())).collect();
+        assert_eq!(got, vec![("A", TeamStatus::Working), ("B", TeamStatus::Failed)]);
+    }
+
+    fn open_sessions(app: &mut App, n: usize) {
+        let sessions = (0..n)
+            .map(|i| SessionInfo { id: format!("ses_{i}"), title: format!("s{i}"), parent_id: None, updated_at: i as i64 })
+            .collect();
+        app.on_event(ServerEvent::SessionList { sessions });
+    }
+
+    fn sel(app: &App) -> usize {
+        app.sessions.as_ref().expect("picker open").sel
+    }
+
+    #[test]
+    fn sessions_picker_clamps_and_moves_by_ends_and_pages() {
+        let mut app = App::new();
+        open_sessions(&mut app, 25);
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(sel(&app), 0, "Up at the top stays there");
+        app.on_key(key(KeyCode::End));
+        assert_eq!(sel(&app), 24);
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(sel(&app), 24, "Down is clamped to the end");
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(sel(&app), 0);
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(sel(&app), 10);
+        app.on_key(key(KeyCode::PageDown));
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(sel(&app), 24, "PageDown stops at the end");
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(sel(&app), 14);
+        app.on_key(key(KeyCode::PageUp));
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(sel(&app), 0, "PageUp stops at the top");
+        // T-098: a typed letter leaves the picker open; only Esc closes it.
+        assert!(app.on_key(key(KeyCode::Char('q'))).is_none());
+        assert!(app.sessions.is_some(), "a letter is ignored");
+        assert!(app.input.is_empty(), "and not typed into the prompt");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.sessions.is_none());
+        // Enter on an empty list does nothing (and closes the picker).
+        open_sessions(&mut app, 0);
+        app.on_key(key(KeyCode::Down));
+        assert!(app.on_key(key(KeyCode::Enter)).is_none());
+        assert!(app.sessions.is_none());
+        // Ctrl+C still quits from the picker.
+        open_sessions(&mut app, 2);
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn help_keys_scroll_within_bounds_and_others_close() {
+        let mut app = App::new();
+        app.on_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(app.help);
+        app.help_scroll_max.set(3);
+        for _ in 0..5 {
+            app.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.help_scroll, 3, "Down stops at help_scroll_max");
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.help_scroll, 3, "PageDown too");
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.help_scroll, 0, "PageUp stops at 0");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.help_scroll, 0);
+        assert!(app.help, "scroll keys keep it open");
+        assert!(app.on_key(key(KeyCode::Char('z'))).is_none());
+        assert!(!app.help, "any other key closes it");
+    }
+
+    #[test]
+    fn approval_scroll_stops_with_the_last_line_at_the_bottom() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        let detail = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        app.approval = Some(PendingApproval { id: "a".into(), tool: "bash".into(), detail });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        for _ in 0..30 {
+            app.on_key(key(KeyCode::PageDown));
+        }
+        assert_eq!(app.approval_scroll, app.approval_scroll_max.get(), "clamped to the max");
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let rows = screen_rows(&terminal);
+        let last = rows.iter().position(|r| r.contains("line 99")).expect("last line on screen");
+        assert!(rows[last + 1].contains("allow once"), "the bottom border follows it: {rows:#?}");
+        // Back up one row: line 99 moves below the bottom border.
+        app.on_key(key(KeyCode::Up));
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(!screen_rows(&terminal).iter().any(|r| r.contains("line 99")));
+    }
+
+    #[test]
+    fn heartbeat_changes_add_one_line_each() {
+        let mut app = App::new();
+        let beat = |ok: bool, detail: &str| ServerEvent::Heartbeat { ok, latency_ms: 5, detail: detail.into() };
+        let api_lines = |app: &App| -> Vec<String> {
+            app.entries.iter().filter(|e| e.text.starts_with("[api]")).map(|e| e.text.clone()).collect()
+        };
+        app.on_event(beat(true, "GET /v1/models → 200"));
+        app.on_event(beat(true, "GET /v1/models → 200"));
+        assert!(api_lines(&app).is_empty(), "online from the start: no line");
+        app.on_event(beat(false, "GET /v1/models → 404"));
+        app.on_event(beat(false, "GET /v1/models → 404"));
+        app.on_event(beat(true, "GET /v1/models → 200"));
+        app.on_event(beat(true, ""));
+        let lines = api_lines(&app);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("unreachable") && lines[0].contains("→ 404"), "{}", lines[0]);
+        assert!(lines[1].contains("back online"), "{}", lines[1]);
+        // Offline at the very first beat says why too.
+        let mut app = App::new();
+        app.on_event(beat(false, "connection refused"));
+        assert_eq!(api_lines(&app).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lagging_forwarder_tells_the_user() {
+        let note = |t: &str| ServerEvent::Note { session_id: "s".into(), text: t.into() };
+        let (tx, rx) = tokio::sync::broadcast::channel(2);
+        for i in 0..5 {
+            tx.send(note(&format!("ev {i}"))).unwrap();
+        }
+        drop(tx);
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        forward_events(rx, evt_tx, || vec![ServerEvent::Note { session_id: "s".into(), text: "pending".into() }]).await;
+        let mut got = Vec::new();
+        while let Ok(ServerEvent::Note { text, .. }) = evt_rx.try_recv() {
+            got.push(text);
+        }
+        assert_eq!(
+            got,
+            vec!["[3 events skipped — /resume to reload this chat]", "pending", "ev 3", "ev 4"]
+        );
+    }
+
+    type KeyTx = futures::channel::mpsc::UnboundedSender<std::io::Result<crossterm::event::Event>>;
+
+    /// Run the TUI loop on a `TestBackend` while `drive` feeds it input;
+    /// the loop ends when `drive` drops the key sender. Returns frames drawn.
+    async fn run_driven<F: std::future::Future<Output = ()>>(
+        app: &mut App,
+        drive: impl FnOnce(KeyTx, tokio::sync::mpsc::UnboundedSender<ServerEvent>) -> F,
+    ) -> u64 {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (key_tx, key_rx) = futures::channel::mpsc::unbounded();
+        let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (act_tx, _act_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (draws, ()) =
+            tokio::join!(run_loop(app, &mut terminal, key_rx, evt_rx, act_tx), drive(key_tx, evt_tx));
+        draws.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_idle_tui_draws_only_after_input() {
+        use crossterm::event::Event;
+        let idle = || tokio::time::sleep(std::time::Duration::from_millis(300));
+        let mut app = App::new();
+        let draws = run_driven(&mut app, |keys, events| async move {
+            idle().await;
+            keys.unbounded_send(Ok(Event::Key(key(KeyCode::Char('x'))))).unwrap();
+            idle().await;
+            keys.unbounded_send(Ok(Event::Paste("a\nb".into()))).unwrap();
+            idle().await;
+            events.send(ServerEvent::Note { session_id: String::new(), text: "hi".into() }).unwrap();
+            idle().await;
+            keys.unbounded_send(Ok(Event::Resize(80, 24))).unwrap();
+            idle().await;
+        })
+        .await;
+        // The first frame, then one per key, paste, event and resize —
+        // nothing while idle (the old loop drew ~20 frames a second).
+        assert_eq!(draws, 5);
+        assert_eq!(app.input, "xa\nb", "keys and paste still reach the input");
+        assert!(app.entries.iter().any(|e| e.text == "hi"));
+    }
+
+    #[tokio::test]
+    async fn a_busy_tui_keeps_the_spinner_moving() {
+        let mut app = App::new();
+        app.busy = true;
+        let draws = run_driven(&mut app, |keys, _events| async move {
+            let _keys = keys; // held open until the sleep ends
+            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        })
+        .await;
+        assert!(draws >= 3, "redrawn on the timer while busy: {draws}");
+        assert!(app.tick >= 2, "spinner frame advanced: {}", app.tick);
+    }

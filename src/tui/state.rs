@@ -214,7 +214,7 @@ pub struct AgentCard {
 
 /// `2. Builder — create the modules…` → agent (title, task). Strict enough
 /// that model prose won't accidentally match: leading `N. ` + em-dash.
-fn parse_plan_item(line: &str) -> Option<TeamAgent> {
+pub(super) fn parse_plan_item(line: &str) -> Option<TeamAgent> {
     let (num, rest) = line.split_once(". ")?;
     if num.trim().parse::<usize>().is_err() {
         return None;
@@ -229,7 +229,7 @@ fn parse_plan_item(line: &str) -> Option<TeamAgent> {
 }
 
 /// `0 (sub) done` / `1 (sub) failed: …` → (index, status).
-fn parse_worker_line(rest: &str) -> Option<(usize, TeamStatus)> {
+pub(super) fn parse_worker_line(rest: &str) -> Option<(usize, TeamStatus)> {
     let (idx, tail) = rest.split_once(" (")?;
     let idx = idx.trim().parse::<usize>().ok()?;
     // B-34: the error text after `failed:` may contain ") " itself.
@@ -351,6 +351,8 @@ pub struct App {
     pub approval_queue: std::collections::VecDeque<PendingApproval>,
     /// B-15: rows the approval detail is scrolled down.
     pub approval_scroll: u16,
+    /// T-099: the furthest useful `approval_scroll`; `draw` sets it each frame.
+    pub approval_scroll_max: std::cell::Cell<u16>,
     /// B-15: when the current approval appeared (decision keys wait a moment).
     pub approval_since: Option<std::time::Instant>,
     pub should_quit: bool,
@@ -415,6 +417,7 @@ impl App {
             busy: false,
             approval_queue: std::collections::VecDeque::new(),
             approval_scroll: 0,
+            approval_scroll_max: std::cell::Cell::new(u16::MAX),
             approval_since: None,
             should_quit: false,
             session_id: None,
@@ -532,7 +535,21 @@ impl App {
             ServerEvent::SessionCreated { session_id, .. } => {
                 self.session_id = Some(session_id);
             }
-            ServerEvent::Heartbeat { ok, latency_ms, .. } => {
+            ServerEvent::Heartbeat { ok, latency_ms, detail } => {
+                // T-101: say why once when the provider goes down (or is down
+                // from the start) and once when it is back — not every beat.
+                let was = self.api.map(|(ok, _)| ok);
+                if was.map_or(!ok, |was| was != ok) {
+                    let mut text = if ok {
+                        format!("[api] back online ({latency_ms}ms)")
+                    } else {
+                        "[api] provider unreachable".to_string()
+                    };
+                    if !detail.is_empty() {
+                        text.push_str(&format!(" — {detail}"));
+                    }
+                    self.push(EntryKind::System, text);
+                }
                 self.api = Some((ok, latency_ms));
             }
             ServerEvent::DevServer { url, .. } => {
