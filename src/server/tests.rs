@@ -462,6 +462,33 @@ async fn deleting_a_chat_deletes_its_todos() {
     assert!(st.todo_store.list_all(&s.id).is_empty(), "the chat's todos went with it");
 }
 
+/// T-051: a refused request says why in a JSON body.
+#[tokio::test]
+async fn api_errors_say_why() {
+    let (st, base, http) = f12_server().await;
+    let r = http.get(format!("{base}/api/sessions/ses_nope/messages")).bearer_auth("t").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v, json!({"error": "session not found"}));
+
+    // A run that ignores the abort until the test lets it go.
+    let s = st.db.create_session("stuck", None).unwrap();
+    let release = Arc::new(AtomicBool::new(false));
+    let held = release.clone();
+    st.kick_task(s.id.clone(), move |_st, _sid, _abort| async move {
+        while !held.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let r = http.delete(format!("{base}/api/sessions/{}", s.id)).bearer_auth("t").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 409);
+    let v: Value = r.json().await.unwrap();
+    assert!(v["error"].as_str().unwrap().contains("did not stop within"), "{v}");
+    release.store(true, Ordering::SeqCst);
+    assert!(st.db.get_session(&s.id).unwrap().is_some(), "not deleted");
+}
+
 /// T-011: a chat's folder is read from the database once; `forget_session`
 /// and `forget_workspaces` drop the cached answer.
 #[tokio::test]
