@@ -18,6 +18,7 @@ mod winjob;
 pub mod jobs;
 
 pub(crate) use files::write_atomic;
+#[cfg(any(feature = "gui", test))] // the desktop terminal and the tests; the core build has no other user
 pub(crate) use paths::msys_to_windows;
 pub use paths::{confine_path, confine_read_path};
 pub(crate) use process::{adopt_into_job, kill_tree};
