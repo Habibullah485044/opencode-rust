@@ -248,6 +248,7 @@ fn initial_state(state: &server::AppState, session: &crate::db::Session) -> GuiS
     if session.project_id.is_none() {
         if let Some(p) = &gs.default_project {
             let _ = state.db.set_session_project(&session.id, Some(p));
+            state.forget_workspaces(); // T-149
         }
     }
     gs.editors = find_editors().into_iter().map(|(n, _)| n.to_string()).collect();

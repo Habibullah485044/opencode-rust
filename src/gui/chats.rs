@@ -60,6 +60,8 @@ pub(super) fn move_chat(gs: &mut GuiState, st: &server::AppState, id: &str, proj
     } else if let Err(e) = st.db.set_session_project(id, project) {
         gs.push(EntryKind::Error, format!("move chat failed: {e}"));
     }
+    // T-149: else its next run would use the old folder from the cache.
+    st.forget_workspaces();
     refresh_sessions(gs, st);
 }
 
@@ -264,6 +266,25 @@ mod tests {
         delete_chat(&mut g, &st, &a.id);
         assert!(st.db.get_session(&a.id).unwrap().is_none());
         assert_eq!(st.mode_for(&a.id), crate::agents::AgentMode::default(), "forget_session ran");
+    }
+
+    /// T-149: a moved chat runs in its new folder, not the cached old one.
+    #[tokio::test]
+    async fn a_moved_chat_works_in_its_new_folder() {
+        let base = std::env::temp_dir().join(format!("habi-move-ws-{}", std::process::id()));
+        let (start, other) = (base.join("start"), base.join("other"));
+        std::fs::create_dir_all(&start).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let st = server::build_state_ephemeral(crate::config::Config::default(), start.clone()).await;
+        let project = st.db.upsert_project(&other).unwrap();
+        let s = st.db.create_session("s", None).unwrap();
+        assert_eq!(st.workspace_for(&s.id), start, "cached: no project");
+        let mut g = GuiState::new();
+        move_chat(&mut g, &st, &s.id, Some(&project.id));
+        assert_eq!(st.workspace_for(&s.id), other);
+        move_chat(&mut g, &st, &s.id, None);
+        assert_eq!(st.workspace_for(&s.id), start);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// T-044: a move the database refuses shows an error line.

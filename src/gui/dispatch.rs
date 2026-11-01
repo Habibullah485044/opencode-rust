@@ -30,6 +30,8 @@ impl App {
                 if let Err(e) = self.st.db.remove_project(&id) {
                     self.gs.push(EntryKind::Error, format!("remove project failed: {e}"));
                 }
+                // T-149: its chats lose their folder.
+                self.st.forget_workspaces();
                 refresh_sessions(&mut self.gs, &self.st);
                 true
             }
@@ -52,6 +54,8 @@ impl App {
                 if let Err(e) = self.st.db.adopt_unfiled_sessions(&project) {
                     self.gs.push(EntryKind::Error, format!("move chats failed: {e}"));
                 }
+                // T-149: the adopted chats now work in the project's folder.
+                self.st.forget_workspaces();
                 refresh_sessions(&mut self.gs, &self.st);
                 true
             }
