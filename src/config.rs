@@ -515,7 +515,7 @@ impl Config {
         cfg.permissions
             .validate()
             .with_context(|| format!("checking [permissions] in {}", path.display()))?;
-        let _ = workspace; // reserved: project-level .opencode-rust.toml in M2
+        let _ = workspace; // unused: there is no project-level config file yet
         Ok(cfg)
     }
 
