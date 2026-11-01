@@ -79,10 +79,7 @@ pub(super) fn user_skill_file(raw: &str) -> Option<PathBuf> {
         return Some(direct);
     }
     let mut found = roots.iter().flat_map(|r| {
-        std::fs::read_dir(r)
-            .into_iter()
-            .flat_map(|d| d.flatten())
-            .filter_map(move |e| inside(r, e.path().join(rest)))
+        std::fs::read_dir(r).into_iter().flat_map(|d| d.flatten()).filter_map(move |e| inside(r, e.path().join(rest)))
     });
     let one = found.next()?;
     found.next().is_none().then_some(one)
@@ -120,9 +117,8 @@ pub fn confine_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
     let raw_owned = msys_to_windows(raw).unwrap_or_else(|| raw.to_string()).replace('/', "\\");
     #[cfg(windows)]
     let raw: &str = &raw_owned;
-    let root = workspace
-        .canonicalize()
-        .with_context(|| format!("workspace {} is not accessible", workspace.display()))?;
+    let root =
+        workspace.canonicalize().with_context(|| format!("workspace {} is not accessible", workspace.display()))?;
     let base = std::path::absolute(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let given = Path::new(raw);
     let joined = if given.is_absolute() { given.to_path_buf() } else { base.join(given) };
@@ -155,9 +151,8 @@ pub fn confine_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
             None => break,
         }
     }
-    let mut real = existing
-        .canonicalize()
-        .map_err(|_| anyhow!("cannot resolve `{raw}` (broken symlink or unreadable folder)"))?;
+    let mut real =
+        existing.canonicalize().map_err(|_| anyhow!("cannot resolve `{raw}` (broken symlink or unreadable folder)"))?;
     for name in missing.iter().rev() {
         real.push(name);
     }

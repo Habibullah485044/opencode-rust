@@ -11,9 +11,7 @@ pub fn check_navigation(url: &str, allow_remote: bool) -> Result<(), String> {
         return Err(format!("Blocked: `{url}` — the panel only loads http(s) pages."));
     }
     if !allow_remote && !is_local_url(url) {
-        return Err(format!(
-            "`{url}` is blocked: this panel is dev-server-only ([browser] allow_remote = false)."
-        ));
+        return Err(format!("`{url}` is blocked: this panel is dev-server-only ([browser] allow_remote = false)."));
     }
     Ok(())
 }
@@ -168,12 +166,9 @@ mod tests {
         ] {
             assert!(is_local_url(u), "{u} should count as local");
         }
-        for u in [
-            "https://example.com",
-            "http://192.168.1.5:3000",
-            "https://localhost.evil.example",
-            "file:///etc/passwd",
-        ] {
+        for u in
+            ["https://example.com", "http://192.168.1.5:3000", "https://localhost.evil.example", "file:///etc/passwd"]
+        {
             assert!(!is_local_url(u), "{u} should not count as local");
         }
     }

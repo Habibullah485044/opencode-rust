@@ -44,10 +44,20 @@ pub(super) async fn execute_routed(
         let options: Vec<String> = input
             .get("options")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).take(6).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .take(6)
+                    .collect()
+            })
             .unwrap_or_default();
         let _ = st.events.send(ServerEvent::Question { session_id: session_id.to_string(), question, options });
-        return ("The question is on the user's screen. Stop now; their answer comes as the next message.".into(), true);
+        return (
+            "The question is on the user's screen. Stop now; their answer comes as the next message.".into(),
+            true,
+        );
     }
     if name == "mcp_search" {
         let query = input.get("query").and_then(Value::as_str).unwrap_or("");
@@ -55,7 +65,10 @@ pub(super) async fn execute_routed(
         return (crate::mcp::search(&specs, query, 6), true);
     }
     if name == "mcp_call" {
-        return ("error: mcp_call needs the `name` of an MCP tool (mcp__<server>__<tool>) from mcp_search".into(), false);
+        return (
+            "error: mcp_call needs the `name` of an MCP tool (mcp__<server>__<tool>) from mcp_search".into(),
+            false,
+        );
     }
     if crate::subagent::is_agent_tool(name) {
         return crate::subagent::agent_tool(st, session_id, input, abort).await;
@@ -74,8 +87,7 @@ pub(super) async fn execute_routed(
         let handle = st.browser.lock().ok().and_then(|g| g.clone());
         let Some(handle) = handle else {
             return (
-                "error: no preview panel is open — run the desktop app (--gui) and open Preview"
-                    .to_string(),
+                "error: no preview panel is open — run the desktop app (--gui) and open Preview".to_string(),
                 false,
             );
         };
@@ -156,9 +168,7 @@ pub(super) fn tool_detail_for(st: &Shared, opts: &LoopOpts, tool: &str, input: &
             let p = input.get("path").and_then(Value::as_str).unwrap_or("");
             normalize_path_detail(ws, p)
         }
-        (Some(ws), "list") => {
-            normalize_path_detail(ws, input.get("path").and_then(Value::as_str).unwrap_or("."))
-        }
+        (Some(ws), "list") => normalize_path_detail(ws, input.get("path").and_then(Value::as_str).unwrap_or(".")),
         _ => tool_detail(st, tool, input),
     }
 }
@@ -195,10 +205,7 @@ pub(super) fn tool_detail(st: &Shared, tool: &str, input: &Value) -> String {
             Some(q) => format!("search: {q}"),
             None => input.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
         },
-        "list" => normalize_path_detail(
-            &st.workspace,
-            input.get("path").and_then(Value::as_str).unwrap_or("."),
-        ),
+        "list" => normalize_path_detail(&st.workspace, input.get("path").and_then(Value::as_str).unwrap_or(".")),
         _ => serde_json::to_string(input).unwrap_or_default(),
     }
 }
@@ -297,7 +304,13 @@ pub(super) async fn check_permission_preview(
 
 /// The answer the rules and the permission mode give without asking the
 /// user, or `None` when the user must be asked.
-pub(super) fn decided_without_prompt(st: &AppState, db: &Db, session_id: &str, tool: &str, detail: &str) -> Option<bool> {
+pub(super) fn decided_without_prompt(
+    st: &AppState,
+    db: &Db,
+    session_id: &str,
+    tool: &str,
+    detail: &str,
+) -> Option<bool> {
     // "Always allow" answers belong to this chat's workspace only (S-07).
     let ws_key = crate::db::workspace_key(&st.workspace_for(session_id));
     // T-146: the workspace's approvals are read once per call, when first
@@ -305,9 +318,7 @@ pub(super) fn decided_without_prompt(st: &AppState, db: &Db, session_id: &str, t
     // (every rule, then the whole command).
     let approvals = std::cell::OnceCell::new();
     let remembered = |t: &str, d: &str| {
-        approvals
-            .get_or_init(|| db.approvals(&ws_key).unwrap_or_default())
-            .contains(&(t.to_string(), d.to_string()))
+        approvals.get_or_init(|| db.approvals(&ws_key).unwrap_or_default()).contains(&(t.to_string(), d.to_string()))
     };
     let decision = st.engine.evaluate(tool, detail, remembered);
     // Hard `deny` rules are policy, not prompts: they survive every mode.
@@ -367,12 +378,7 @@ async fn ask_for_approval(
         };
         map.insert(
             approval_id.clone(),
-            ApprovalEntry {
-                tx,
-                tool: tool.to_string(),
-                detail: detail.to_string(),
-                request: request.clone(),
-            },
+            ApprovalEntry { tx, tool: tool.to_string(), detail: detail.to_string(), request: request.clone() },
         );
     }
     let _ = st.events.send(request);

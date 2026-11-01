@@ -273,8 +273,10 @@ impl HttpClient {
                 // and names the versions it supports.
                 let text = format!("{e:#}");
                 if text.contains("2026-07-28") {
-                    bail!("{text} (this server only speaks MCP 2026-07-28, which has no `initialize`; \
-                           opencode-rust's HTTP client speaks {HTTP_PROTOCOL_VERSION})");
+                    bail!(
+                        "{text} (this server only speaks MCP 2026-07-28, which has no `initialize`; \
+                           opencode-rust's HTTP client speaks {HTTP_PROTOCOL_VERSION})"
+                    );
                 }
                 return Err(e);
             }
@@ -321,8 +323,8 @@ impl HttpClient {
                 // T-038: tell the server, or it keeps working on a call
                 // nobody waits for. Best effort: the error stands anyway.
                 let cancel = json!({ "requestId": self.next_id - 1, "reason": "timed out" });
-                let _ = tokio::time::timeout(Duration::from_secs(5), self.notify("notifications/cancelled", cancel))
-                    .await;
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), self.notify("notifications/cancelled", cancel)).await;
                 return Err(anyhow::Error::new(elapsed).context("mcp tools/call timed out"));
             }
         };
@@ -345,13 +347,13 @@ mod tests {
     /// What the fake MCP server remembers. `pub(super)`: Stage 3 reuses it.
     #[derive(Default)]
     pub(super) struct Fake {
-        sse: bool,          // answer with SSE streams instead of JSON bodies
-        session: String,    // current session id: "s1", then "s2", …
-        sessions: u32,      // how many sessions were started
-        expire_once: bool,  // answer the next request with 404 once
-        ping_answers: u32,  // how many of our pings the client answered
-        stall_calls: bool,  // never answer tools/call
-        cancels: Vec<Value>, // params of each notifications/cancelled
+        sse: bool,               // answer with SSE streams instead of JSON bodies
+        session: String,         // current session id: "s1", then "s2", …
+        sessions: u32,           // how many sessions were started
+        expire_once: bool,       // answer the next request with 404 once
+        ping_answers: u32,       // how many of our pings the client answered
+        stall_calls: bool,       // never answer tools/call
+        cancels: Vec<Value>,     // params of each notifications/cancelled
         pub(super) deletes: u32, // DELETEs that ended the current session
     }
 

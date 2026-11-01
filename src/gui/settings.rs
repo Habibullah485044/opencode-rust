@@ -160,11 +160,7 @@ impl App {
         for id in &granted {
             self.gs.finish_approval(id);
         }
-        gui_log(&format!(
-            "[gui] permission mode -> {} ({} prompt(s) released)",
-            mode.as_str(),
-            granted.len()
-        ));
+        gui_log(&format!("[gui] permission mode -> {} ({} prompt(s) released)", mode.as_str(), granted.len()));
         self.gs.push(EntryKind::System, mode.note());
         true
     }

@@ -17,8 +17,7 @@ pub fn resolve_session(db: &Db, arg: &str) -> Result<String> {
         return Ok(s.id);
     }
     let all = db.list_sessions()?;
-    let by_prefix: Vec<&String> =
-        all.iter().filter(|s| s.id.starts_with(arg)).map(|s| &s.id).collect();
+    let by_prefix: Vec<&String> = all.iter().filter(|s| s.id.starts_with(arg)).map(|s| &s.id).collect();
     match by_prefix.len() {
         1 => return Ok(by_prefix[0].clone()),
         0 => {}
@@ -45,9 +44,7 @@ fn collapse(text: &str, max: usize) -> String {
 /// One diffable line per message: `role: joined text parts`, newlines
 /// collapsed and long tool output truncated so diffs stay readable.
 pub fn flatten(msgs: &[Message]) -> Vec<String> {
-    msgs.iter()
-        .map(|m| format!("{}: {}", m.role, flatten_msg(m)))
-        .collect()
+    msgs.iter().map(|m| format!("{}: {}", m.role, flatten_msg(m))).collect()
 }
 
 /// The diffable display text for a single message (no role prefix).
@@ -66,8 +63,7 @@ pub struct FlattenLimits {
 }
 
 /// The short limits `/diff` uses, so diffs stay readable.
-pub const DIFF_LIMITS: FlattenLimits =
-    FlattenLimits { text: 400, reasoning: 300, tool_args: 200, tool_result: 300 };
+pub const DIFF_LIMITS: FlattenLimits = FlattenLimits { text: 400, reasoning: 300, tool_args: 200, tool_result: 300 };
 
 /// [`flatten_msg`] with explicit limits.
 pub fn flatten_msg_with(m: &Message, lim: FlattenLimits) -> String {
@@ -117,11 +113,7 @@ pub fn diff_lines(a: &[String], b: &[String]) -> Vec<String> {
         let mut dp = vec![vec![0u32; m + 1]; n + 1];
         for i in (0..n).rev() {
             for j in (0..m).rev() {
-                dp[i][j] = if mid_a[i] == mid_b[j] {
-                    dp[i + 1][j + 1] + 1
-                } else {
-                    dp[i + 1][j].max(dp[i][j + 1])
-                };
+                dp[i][j] = if mid_a[i] == mid_b[j] { dp[i + 1][j + 1] + 1 } else { dp[i + 1][j].max(dp[i][j + 1]) };
             }
         }
         let (mut i, mut j) = (0usize, 0usize);
@@ -157,13 +149,7 @@ pub fn diff_sessions(db: &Db, a: &str, b: &str) -> Result<String> {
     let mb = db.get_session(b)?.with_context(|| format!("no session `{b}`"))?;
     let ta = flatten(&db.messages(&ma.id)?);
     let tb = flatten(&db.messages(&mb.id)?);
-    let mut out = format!(
-        "--- {} ({})\n+++ {} ({})\n",
-        ma.id,
-        ta.len(),
-        mb.id,
-        tb.len()
-    );
+    let mut out = format!("--- {} ({})\n+++ {} ({})\n", ma.id, ta.len(), mb.id, tb.len());
     if ta == tb {
         out.push_str(&format!("identical ({} messages)\n", ta.len()));
         return Ok(out);
@@ -234,10 +220,7 @@ mod tests {
 
     #[test]
     fn diff_identical_and_changed() {
-        let a: Vec<String> = ["user: hi", "assistant: hello", "user: bye"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let a: Vec<String> = ["user: hi", "assistant: hello", "user: bye"].iter().map(|s| s.to_string()).collect();
         let same = diff_lines(&a, &a);
         assert!(same.iter().all(|l| l.starts_with(' ')));
         assert_eq!(same.len(), 3);

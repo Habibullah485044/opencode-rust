@@ -35,16 +35,10 @@ pub struct Doc {
 
 /// Parse one markdown file (frontmatter optional).
 pub fn parse_md(path: &Path, text: &str) -> Doc {
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "doc".into());
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "doc".into());
     // `skills/<name>/SKILL.md` keeps the directory name, not "SKILL".
     let fallback_name = if stem.eq_ignore_ascii_case("SKILL") {
-        path.parent()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or(stem)
+        path.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or(stem)
     } else {
         stem
     };
@@ -183,15 +177,10 @@ pub fn command_dirs(workspace: &Path) -> Vec<PathBuf> {
 }
 
 fn user_config_dir_inner() -> Option<PathBuf> {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            let home = std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .ok()?;
-            Some(PathBuf::from(home).join(".config"))
-        })?;
+    let base = std::env::var("XDG_CONFIG_HOME").map(PathBuf::from).ok().or_else(|| {
+        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
+        Some(PathBuf::from(home).join(".config"))
+    })?;
     Some(base.join("opencode-rust"))
 }
 
@@ -305,10 +294,11 @@ pub fn load_agents_md(workspace: &Path) -> Option<String> {
     let text = match read(&workspace.join("AGENTS.md")) {
         Some(t) => t,
         None => {
-            let mut files: Vec<(String, std::path::PathBuf)> = ["CLAUDE.md", "GEMINI.md", ".github/copilot-instructions.md", ".cursorrules"]
-                .iter()
-                .map(|n| (n.to_string(), workspace.join(n)))
-                .collect();
+            let mut files: Vec<(String, std::path::PathBuf)> =
+                ["CLAUDE.md", "GEMINI.md", ".github/copilot-instructions.md", ".cursorrules"]
+                    .iter()
+                    .map(|n| (n.to_string(), workspace.join(n)))
+                    .collect();
             if let Ok(entries) = std::fs::read_dir(workspace.join(".cursor").join("rules")) {
                 let mut rules: Vec<_> = entries
                     .flatten()
@@ -373,8 +363,7 @@ pub fn init_agents_md(workspace: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let path = workspace.join("AGENTS.md");
-    std::fs::write(&path, STARTER_AGENTS_MD)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, STARTER_AGENTS_MD).with_context(|| format!("writing {}", path.display()))?;
     Ok(Some(path))
 }
 
@@ -403,10 +392,7 @@ pub fn vet_static(doc: &Doc) -> std::result::Result<(), String> {
     }
     let body = doc.body.trim();
     if body.chars().count() < 120 {
-        return Err(format!(
-            "skill body too thin ({} chars) — nothing worth baking in",
-            body.chars().count()
-        ));
+        return Err(format!("skill body too thin ({} chars) — nothing worth baking in", body.chars().count()));
     }
     let lower = body.to_ascii_lowercase();
     for bad in [
@@ -431,19 +417,9 @@ pub fn vet_static(doc: &Doc) -> std::result::Result<(), String> {
 /// (and the baked-in loader) find it.
 pub fn install_skill(base: &Path, doc: &Doc) -> Result<PathBuf> {
     let dir = base.join("skills");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
-    let safe: String = doc
-        .name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let safe: String =
+        doc.name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
     let path = dir.join(format!("{safe}.md"));
     // "my skill" and "my-skill" share one file name. Updating the same
     // skill is fine; silently replacing a different one is not.
@@ -510,10 +486,7 @@ pub fn skill_base(state_dir: &Path) -> PathBuf {
 
 /// Convenience for callers that want a Result-shaped read of one skill.
 pub fn find_skill(workspace: &Path, name: &str) -> Result<Doc> {
-    load_skills(workspace)
-        .into_iter()
-        .find(|d| d.name == name)
-        .with_context(|| format!("no skill named `{name}`"))
+    load_skills(workspace).into_iter().find(|d| d.name == name).with_context(|| format!("no skill named `{name}`"))
 }
 
 #[cfg(test)]
@@ -524,10 +497,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!(
             "ocrs-skills-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -613,7 +583,8 @@ mod tests {
         assert_eq!(skill_index(&own), "- alpha: Does alpha");
         assert!(skill_menu(&all).lines().any(|l| l == "- alpha: Does alpha"));
         // Many skills: names only (their descriptions would cost every request).
-        let many: Vec<Doc> = (0..=SKILLS_LISTED_IN_FULL).map(|i| Doc { name: format!("s{i}"), ..own[0].clone() }).collect();
+        let many: Vec<Doc> =
+            (0..=SKILLS_LISTED_IN_FULL).map(|i| Doc { name: format!("s{i}"), ..own[0].clone() }).collect();
         let short = skill_index(&many);
         assert!(short.starts_with("- s0, s1") && !short.contains("Does alpha"), "{short}");
         assert!(find_skill(&ws, "alpha").is_ok());
@@ -651,7 +622,8 @@ mod tests {
             description: "Ship it".into(),
             body: "Do the deploy. Run the checks first, then verify the rollout and \
                    roll back on failure. Check the dashboards for error rate and \
-                   latency before declaring the deploy healthy.".into(),
+                   latency before declaring the deploy healthy."
+                .into(),
             path: "deploy.md".into(),
         };
         assert!(vet_static(&doc).is_ok(), "substantive skill passes");
@@ -676,7 +648,8 @@ mod tests {
             name: "my skill".into(),
             description: "Does things".into(),
             body: "A substantial body with real instructions for the agent to \
-                   follow when doing the things.".into(),
+                   follow when doing the things."
+                .into(),
             path: "x.md".into(),
         };
         let path = install_skill(&base, &doc).unwrap();
@@ -713,10 +686,17 @@ mod tests {
         let ws = tmp("claude-md");
         std::fs::write(ws.join("CLAUDE.md"), "Use pnpm.\n").unwrap();
         std::fs::create_dir_all(ws.join(".cursor").join("rules")).unwrap();
-        std::fs::write(ws.join(".cursor/rules/style.mdc"), "---\ndescription: style\nglobs: *.ts\n---\nNo default exports.\n").unwrap();
+        std::fs::write(
+            ws.join(".cursor/rules/style.mdc"),
+            "---\ndescription: style\nglobs: *.ts\n---\nNo default exports.\n",
+        )
+        .unwrap();
         let text = load_agents_md(&ws).unwrap();
         assert!(text.contains("From CLAUDE.md:\nUse pnpm."), "{text}");
-        assert!(text.contains("From .cursor/rules/style.mdc:\nNo default exports.") && !text.contains("globs"), "{text}");
+        assert!(
+            text.contains("From .cursor/rules/style.mdc:\nNo default exports.") && !text.contains("globs"),
+            "{text}"
+        );
         std::fs::write(ws.join("AGENTS.md"), "Agents file wins.").unwrap();
         assert_eq!(load_agents_md(&ws).as_deref(), Some("Agents file wins."));
         std::fs::write(ws.join("AGENTS.md"), "x".repeat(MAX_INSTRUCTION_CHARS + 50)).unwrap();

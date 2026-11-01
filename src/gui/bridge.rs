@@ -21,10 +21,7 @@ pub(super) fn unguessable_id(counter: u64) -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u64(counter);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     h.write_u128(nanos);
     (h.finish() & ((1u64 << 53) - 1)).max(1)
 }
@@ -99,8 +96,7 @@ impl Bridge {
             "navigate" => {
                 let raw = req.input.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 // S-11: the same rule as every other way of opening a page.
-                let checked = normalize_url(raw)
-                    .and_then(|url| check_navigation(&url, allow_remote).map(|()| url));
+                let checked = normalize_url(raw).and_then(|url| check_navigation(&url, allow_remote).map(|()| url));
                 match checked {
                     Ok(url) => {
                         view.open(&url);
@@ -127,12 +123,7 @@ impl Bridge {
                 let text = req.input.get("text").and_then(|v| v.as_str());
                 if selector.is_none() && text.is_none() {
                     // Plain delay: no page interaction, no blocked UI thread.
-                    let ms = req
-                        .input
-                        .get("ms")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(500)
-                        .clamp(1, MAX_WAIT_MS);
+                    let ms = req.input.get("ms").and_then(|v| v.as_u64()).unwrap_or(500).clamp(1, MAX_WAIT_MS);
                     let js = format!(
                         "setTimeout(function(){{window.__habi.reply({id},true,{{\"slept_ms\":{ms}}});}}, {ms});"
                     );
@@ -142,12 +133,7 @@ impl Bridge {
                 }
                 self.pending.insert(id, (req.reply, deadline));
                 // B-36: `ms` (when given) is how long to wait for the condition.
-                let budget = req
-                    .input
-                    .get("ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(8_000)
-                    .clamp(250, MAX_WAIT_MS);
+                let budget = req.input.get("ms").and_then(|v| v.as_u64()).unwrap_or(8_000).clamp(250, MAX_WAIT_MS);
                 let js = crate::browser::wait_script(id, selector, text, budget);
                 let _ = wv.evaluate_script(&js);
             }
@@ -156,9 +142,7 @@ impl Bridge {
                 #[cfg(windows)]
                 capture_screenshot(wv, req.reply);
                 #[cfg(not(windows))]
-                let _ = req.reply.send(Err(
-                    "browser_screenshot needs the Windows desktop app (WebView2)".into(),
-                ));
+                let _ = req.reply.send(Err("browser_screenshot needs the Windows desktop app (WebView2)".into()));
             }
             method => {
                 let Some(js) = crate::browser::eval_wrapper(method, &req.input, id) else {
@@ -223,12 +207,7 @@ impl Bridge {
     /// Fail anything past its deadline (called every timed wake).
     pub(super) fn expire(&mut self) {
         let now = Instant::now();
-        let stale: Vec<u64> = self
-            .pending
-            .iter()
-            .filter(|(_, (_, d))| *d <= now)
-            .map(|(id, _)| *id)
-            .collect();
+        let stale: Vec<u64> = self.pending.iter().filter(|(_, (_, d))| *d <= now).map(|(id, _)| *id).collect();
         for id in stale {
             if let Some((tx, _)) = self.pending.remove(&id) {
                 let _ = tx.send(Err("the page did not answer in time".into()));
@@ -246,10 +225,7 @@ impl Bridge {
 /// its path. Windows only: WebView2's own `CapturePreview` (no DevTools
 /// protocol needed).
 #[cfg(windows)]
-pub(super) fn capture_screenshot(
-    wv: &wry::WebView,
-    reply: tokio::sync::oneshot::Sender<Result<String, String>>,
-) {
+pub(super) fn capture_screenshot(wv: &wry::WebView, reply: tokio::sync::oneshot::Sender<Result<String, String>>) {
     use std::cell::RefCell;
     use std::rc::Rc;
     use webview2_com::CapturePreviewCompletedHandler;
@@ -280,10 +256,8 @@ pub(super) fn capture_screenshot(
     }));
     // SAFETY: the webview, `stream` and `handler` are valid COM objects;
     // WebView2 calls `handler` once, on this (the UI) thread.
-    let started = unsafe {
-        wv.webview()
-            .CapturePreview(COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, &stream, &handler)
-    };
+    let started =
+        unsafe { wv.webview().CapturePreview(COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, &stream, &handler) };
     if let Err(e) = started {
         if let Some(tx) = slot.borrow_mut().take() {
             let _ = tx.send(Err(format!("capture failed: {e}")));
@@ -301,9 +275,7 @@ pub(super) fn read_stream(stream: &windows::Win32::System::Com::IStream) -> Resu
         stream
             .Seek(0, STREAM_SEEK_END, Some(&mut size as *mut u64))
             .map_err(|e| format!("reading the capture: {e}"))?;
-        stream
-            .Seek(0, STREAM_SEEK_SET, None)
-            .map_err(|e| format!("reading the capture: {e}"))?;
+        stream.Seek(0, STREAM_SEEK_SET, None).map_err(|e| format!("reading the capture: {e}"))?;
         let mut buf = vec![0u8; size as usize];
         let mut read = 0u32;
         stream
@@ -328,10 +300,7 @@ pub(super) fn save_screenshot(png: &[u8]) -> Result<String, String> {
     let height = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
     let dir = std::env::temp_dir().join("opencode-rust-screenshots");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let path = dir.join(format!("shot-{stamp}.png"));
     std::fs::write(&path, png).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(serde_json::json!({
@@ -391,11 +360,7 @@ mod tests {
     fn waiting_navigation() -> (Bridge, tokio::sync::oneshot::Receiver<Result<String, String>>) {
         let mut bridge = Bridge::new();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        bridge.nav = Some(NavWait {
-            reply: tx,
-            deadline: Instant::now() + Duration::from_secs(25),
-            started: false,
-        });
+        bridge.nav = Some(NavWait { reply: tx, deadline: Instant::now() + Duration::from_secs(25), started: false });
         (bridge, rx)
     }
 

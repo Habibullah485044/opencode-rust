@@ -70,7 +70,6 @@ pub struct Client {
     key_withheld_for: Option<String>,
 }
 
-
 /// Token counts of one reply, normalised across providers. `input` is the
 /// whole prompt (cached part included); `cached` of it was read from the
 /// provider's prompt cache (cheap), `cache_write` was newly stored there.
@@ -146,8 +145,15 @@ pub enum StreamEvent {
     /// Chain-of-thought (`delta.reasoning_content` — Ollama/vLLM/OpenRouter
     /// style). Displayed to the user but never sent back to the provider.
     Reasoning(String),
-    ToolCallDelta { index: usize, id: Option<String>, name: Option<String>, args_delta: String },
-    Done { finish_reason: Option<String> },
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        args_delta: String,
+    },
+    Done {
+        finish_reason: Option<String>,
+    },
     /// Token counts for this reply. Always sent before `Done`, which is
     /// where every reader stops.
     Usage(Usage),
@@ -357,10 +363,7 @@ impl Client {
                     }
                     let retry_after = retry_after_secs(resp.headers());
                     let text = error_body(resp, self.request_timeout).await;
-                    let mut msg = format!(
-                        "provider returned {status}: {}",
-                        text.chars().take(400).collect::<String>()
-                    );
+                    let mut msg = format!("provider returned {status}: {}", text.chars().take(400).collect::<String>());
                     if status.as_u16() == 404 {
                         msg.push_str(" (check provider.model and that base_url ends in /v1)");
                     }
@@ -514,10 +517,7 @@ impl Client {
         let req = with_auth(self.http.get(format!("{}/models", self.base_url)), self.api, &self.api_key)
             .timeout(self.request_timeout);
         let url = format!("{}/models", self.base_url);
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("listing models at {url}: {}", send_error_text(&e)))?;
+        let resp = req.send().await.map_err(|e| anyhow::anyhow!("listing models at {url}: {}", send_error_text(&e)))?;
         // T-052: say why (a 401 or 404 with the server's words), instead of
         // an empty list that looks like "this server has no models".
         let status = resp.status();
@@ -537,10 +537,7 @@ impl Client {
             }
         } else if let Some(arr) = body.get("models").and_then(Value::as_array) {
             for m in arr {
-                let id = m
-                    .get("id")
-                    .or_else(|| m.get("name"))
-                    .and_then(Value::as_str);
+                let id = m.get("id").or_else(|| m.get("name")).and_then(Value::as_str);
                 if let Some(id) = id {
                     ids.push(id.to_string());
                 }
@@ -784,11 +781,7 @@ fn sse_error_message(line: &str) -> Option<String> {
     }
     let v: Value = serde_json::from_str(data).ok()?;
     let err = v.get("error").filter(|e| !e.is_null())?;
-    let msg = err
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| err.to_string());
+    let msg = err.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| err.to_string());
     Some(msg.chars().take(400).collect())
 }
 
@@ -813,11 +806,7 @@ fn parse_sse_line(line: &str) -> Option<(Vec<StreamEvent>, bool)> {
     for choice in &chunk.choices {
         // Thinking first: reasoning precedes content within a turn, and on the
         // rare line carrying both, the order must stay reasoning → text.
-        let reasoning = choice
-            .delta
-            .reasoning_content
-            .as_ref()
-            .or(choice.delta.reasoning.as_ref());
+        let reasoning = choice.delta.reasoning_content.as_ref().or(choice.delta.reasoning.as_ref());
         if let Some(text) = reasoning {
             if !text.is_empty() {
                 events.push(StreamEvent::Reasoning(text.clone()));
@@ -834,12 +823,7 @@ fn parse_sse_line(line: &str) -> Option<(Vec<StreamEvent>, bool)> {
                 .as_ref()
                 .map(|f| (f.name.clone(), f.arguments.clone().unwrap_or_default()))
                 .unwrap_or((None, String::new()));
-            events.push(StreamEvent::ToolCallDelta {
-                index: tc.index,
-                id: tc.id.clone(),
-                name,
-                args_delta,
-            });
+            events.push(StreamEvent::ToolCallDelta { index: tc.index, id: tc.id.clone(), name, args_delta });
         }
         if let Some(fr) = choice.finish_reason.as_ref().filter(|f| !f.is_empty()) {
             // Emitted AFTER any deltas on this same line so nothing is lost.
@@ -874,7 +858,11 @@ impl ToolCallAccumulator {
                 Some(s) => {
                     let known = self.calls.get(&s).map(|c| c.0.as_str()).unwrap_or("");
                     let other_call = matches!(new_id, Some(n) if !known.is_empty() && known != n);
-                    if other_call { self.new_slot(*index) } else { s }
+                    if other_call {
+                        self.new_slot(*index)
+                    } else {
+                        s
+                    }
                 }
                 None => self.new_slot(*index),
             };
@@ -1056,7 +1044,11 @@ pub fn send_error_text(e: &reqwest::Error) -> String {
         cause = s.to_string();
         src = s.source();
     }
-    if cause.is_empty() { kind.to_string() } else { format!("{kind}: {cause}") }
+    if cause.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind}: {cause}")
+    }
 }
 
 /// The connection failed or broke before the response headers. Not
@@ -1067,13 +1059,7 @@ fn is_retryable_send_error(e: &reqwest::Error) -> bool {
 
 /// `Retry-After: <seconds>`. The rare HTTP-date form is ignored.
 fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
+    headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim().parse::<u64>().ok()
 }
 
 /// Wait before retry number `attempt` (1, 2, 3 …): base, 2×base, 4×base …
@@ -1112,7 +1098,6 @@ pub fn with_auth(req: reqwest::RequestBuilder, api: ProviderApi, api_key: &str) 
         }
     }
 }
-
 
 /// Tool calls a model wrote into its reply text instead of the API's
 /// `tool_calls` field (Qwen and Hermes-style chat templates served without
@@ -1171,12 +1156,7 @@ pub fn calls_in_text(text: &str) -> (String, Vec<(String, String, Value)>) {
 /// saved session).
 fn text_call_id(index: usize) -> String {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    format!(
-        "txt_{}_{}_{}",
-        std::process::id(),
-        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        index
-    )
+    format!("txt_{}_{}_{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed), index)
 }
 
 /// A call written without any `<tool_call> …` wrapper: the `CALL {…}` line
@@ -1253,10 +1233,7 @@ fn parse_one_text_call(body: &str) -> Option<(String, Value)> {
     // not read leaves the turn ending with the XML as the answer.
     if b.starts_with('{') {
         let v: Value = serde_json::from_str(b).ok()?;
-        let name = ["name", "tool", "function"]
-            .iter()
-            .find_map(|k| v.get(*k)?.as_str())?
-            .to_string();
+        let name = ["name", "tool", "function"].iter().find_map(|k| v.get(*k)?.as_str())?.to_string();
         let args = match v.get("arguments").or_else(|| v.get("parameters")) {
             Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({ "raw": s })),
             Some(a) => a.clone(),
@@ -1316,7 +1293,8 @@ mod text_call_tests {
 
     #[test]
     fn qwen_xml_calls_in_text_are_read() {
-        let t = "Let me look.\n<tool_call>\n<function=list>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+        let t =
+            "Let me look.\n<tool_call>\n<function=list>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
         let (rest, calls) = calls_in_text(t);
         assert_eq!(rest, "Let me look.");
         assert_eq!(calls.len(), 1);
@@ -1390,7 +1368,8 @@ mod text_call_tests {
 
     #[test]
     fn json_calls_in_text_are_read_and_plain_text_is_left_alone() {
-        let (rest, calls) = calls_in_text("<tool_call>{\"name\": \"glob\", \"arguments\": {\"pattern\": \"**/*.rs\"}}</tool_call>");
+        let (rest, calls) =
+            calls_in_text("<tool_call>{\"name\": \"glob\", \"arguments\": {\"pattern\": \"**/*.rs\"}}</tool_call>");
         assert_eq!((rest.as_str(), calls[0].1.as_str()), ("", "glob"));
         assert_eq!(calls[0].2, serde_json::json!({"pattern": "**/*.rs"}));
         let (rest, calls) = calls_in_text("Plain answer, no calls.");
@@ -1449,12 +1428,8 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         let client = Client::new(&format!("http://{addr}/v1"), "", "stub", 10).unwrap();
-        let msgs = vec![ChatMsg {
-            role: "user".into(),
-            content: Some("hi".into()),
-            tool_calls: None,
-            tool_call_id: None,
-        }];
+        let msgs =
+            vec![ChatMsg { role: "user".into(), content: Some("hi".into()), tool_calls: None, tool_call_id: None }];
 
         // Unknown context: nothing sent.
         let mut s = client.stream("stub", &msgs, &[]).await.unwrap();
@@ -1491,10 +1466,7 @@ mod tests {
 
     #[test]
     fn sse_reasoning_content_parses_as_reasoning() {
-        let line = sse_data(&chunk(
-            json!({"reasoning_content": "let me think…"}),
-            Value::Null,
-        ));
+        let line = sse_data(&chunk(json!({"reasoning_content": "let me think…"}), Value::Null));
         let (events, done) = parse_sse_line(line.trim()).unwrap();
         assert!(!done);
         assert_eq!(events.len(), 1);
@@ -1505,10 +1477,7 @@ mod tests {
     fn sse_openrouter_reasoning_field_and_order() {
         // OpenRouter uses `reasoning`; if one line carries reasoning AND
         // content, reasoning must be emitted first.
-        let line = sse_data(&chunk(
-            json!({"reasoning": "hmm", "content": "answer"}),
-            Value::Null,
-        ));
+        let line = sse_data(&chunk(json!({"reasoning": "hmm", "content": "answer"}), Value::Null));
         let (events, _) = parse_sse_line(line.trim()).unwrap();
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], StreamEvent::Reasoning(t) if t == "hmm"));
@@ -1575,14 +1544,9 @@ mod tests {
             post(move || {
                 let event = event.clone();
                 async move {
-                    let body = futures::stream::once(async move {
-                        Ok::<_, std::io::Error>(bytes::Bytes::from(event))
-                    })
-                    .chain(futures::stream::pending());
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                        Body::from_stream(body),
-                    )
+                    let body = futures::stream::once(async move { Ok::<_, std::io::Error>(bytes::Bytes::from(event)) })
+                        .chain(futures::stream::pending());
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(body))
                 }
             }),
         );
@@ -1719,12 +1683,7 @@ mod tests {
                 name: Some("bash".into()),
                 args_delta: "{\"comm".into(),
             },
-            StreamEvent::ToolCallDelta {
-                index: 0,
-                id: None,
-                name: None,
-                args_delta: "and\":\"ls\"}".into(),
-            },
+            StreamEvent::ToolCallDelta { index: 0, id: None, name: None, args_delta: "and\":\"ls\"}".into() },
         ] {
             acc.push(&ev);
         }
@@ -2083,7 +2042,8 @@ mod f01_tests {
 
     fn hello() -> axum::response::Response {
         use axum::response::IntoResponse;
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body).into_response()
     }
 
@@ -2146,8 +2106,7 @@ mod f01_tests {
     #[tokio::test]
     async fn a_refused_model_listing_says_why() {
         use axum::{http::StatusCode, routing::get, Router};
-        let app = Router::new()
-            .route("/v1/models", get(|| async { (StatusCode::UNAUTHORIZED, "invalid api key") }));
+        let app = Router::new().route("/v1/models", get(|| async { (StatusCode::UNAUTHORIZED, "invalid api key") }));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2247,7 +2206,8 @@ mod cache_tests {
     /// A server that never sends usage or `[DONE]` still ends the reply.
     #[tokio::test]
     async fn finish_without_done_still_ends() {
-        let out = events(vec!["data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n"]).await;
+        let out =
+            events(vec!["data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n"]).await;
         assert!(matches!(out.last(), Some(StreamEvent::Done { .. })), "{out:?}");
     }
 
@@ -2274,10 +2234,12 @@ mod cache_tests {
     #[test]
     fn usage_reads_openai_and_deepseek_shapes() {
         let o = Usage::from_openai(&json!({"prompt_tokens": 50, "completion_tokens": 5,
-            "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 3}})).unwrap();
+            "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 3}}))
+        .unwrap();
         assert_eq!(o, Usage { input: 50, cached: 40, cache_write: 3, output: 5 });
         let d = Usage::from_openai(&json!({"prompt_tokens": 50, "completion_tokens": 5,
-            "prompt_cache_hit_tokens": 30})).unwrap();
+            "prompt_cache_hit_tokens": 30}))
+        .unwrap();
         assert_eq!(d.cached, 30);
         assert!(Usage::from_openai(&json!({})).is_none());
     }

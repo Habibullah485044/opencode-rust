@@ -48,12 +48,7 @@ pub struct BrowserCfg {
 
 impl Default for BrowserCfg {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            home_url: String::new(),
-            allow_remote: true,
-            profile_dir: None,
-        }
+        Self { enabled: true, home_url: String::new(), allow_remote: true, profile_dir: None }
     }
 }
 
@@ -84,7 +79,6 @@ pub struct McpServerCfg {
     /// F-03: extra HTTP headers for `url`, e.g. an Authorization token.
     pub headers: HashMap<String, String>,
 }
-
 
 /// Which wire protocol the provider speaks (`provider.api`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -288,7 +282,14 @@ impl Default for PermissionsCfg {
         }
         // Goal B: reading the page and waiting are safe; clicking and typing
         // can submit forms, so they go through the approval modal (D1).
-        for t in ["browser_navigate", "browser_snapshot", "browser_wait", "browser_screenshot", "browser_scroll", "browser_console"] {
+        for t in [
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_wait",
+            "browser_screenshot",
+            "browser_scroll",
+            "browser_console",
+        ] {
             defaults.insert(t.to_string(), "allow".to_string());
         }
         for t in ["browser_click", "browser_type", "browser_press", "browser_eval"] {
@@ -347,10 +348,7 @@ impl PermissionsCfg {
         if bad.is_empty() {
             Ok(())
         } else {
-            anyhow::bail!(
-                "invalid permission action (use \"allow\", \"ask\" or \"deny\"): {}",
-                bad.join("; ")
-            )
+            anyhow::bail!("invalid permission action (use \"allow\", \"ask\" or \"deny\"): {}", bad.join("; "))
         }
     }
 }
@@ -369,7 +367,6 @@ pub struct ServerCfg {
     /// Loopback only, by design. 0 = ephemeral port (tests).
     pub port: u16,
 }
-
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -472,10 +469,8 @@ impl Config {
             anyhow::bail!("OPENCODE_RUST_CONFIG points to {}, which is not a file", path.display());
         }
         let mut cfg = if path.is_file() {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading config {}", path.display()))?;
-            let cfg: Config =
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            let text = std::fs::read_to_string(&path).with_context(|| format!("reading config {}", path.display()))?;
+            let cfg: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
             for key in unknown_config_keys(&text, &cfg) {
                 eprintln!("warning: {}: unknown key `{key}` (ignored)", path.display());
             }
@@ -493,10 +488,14 @@ impl Config {
         // (A file with no address binds its key to the one in use.)
         let file_base = cfg.provider.base_url.trim().to_string();
         if let Ok(u) = std::env::var("OPENCODE_RUST_BASE_URL") {
-            if !u.is_empty() { cfg.provider.base_url = u; }
+            if !u.is_empty() {
+                cfg.provider.base_url = u;
+            }
         }
         if let Ok(m) = std::env::var("OPENCODE_RUST_MODEL") {
-            if !m.is_empty() { cfg.provider.model = m; }
+            if !m.is_empty() {
+                cfg.provider.model = m;
+            }
         }
         // Key precedence: environment > file > the key saved from the
         // desktop app's Settings (encrypted). File and saved keys only go
@@ -512,9 +511,7 @@ impl Config {
         cfg.provider.api_key = key;
         cfg.provider.api_key_origin = origin;
         cfg.provider.key_withheld_for = withheld;
-        cfg.permissions
-            .validate()
-            .with_context(|| format!("checking [permissions] in {}", path.display()))?;
+        cfg.permissions.validate().with_context(|| format!("checking [permissions] in {}", path.display()))?;
         let _ = workspace; // unused: there is no project-level config file yet
         Ok(cfg)
     }
@@ -650,10 +647,9 @@ mod tests {
         assert!(c.browser.enabled, "the panel is the point of Goal A");
         assert!(c.browser.allow_remote, "general browsing by default, dev-only opt-in");
         assert!(c.browser.home_url.is_empty());
-        let c: Config = toml::from_str(
-            "[browser]\nenabled = false\nhome_url = 'http://localhost:3000'\nallow_remote = false\n",
-        )
-        .unwrap();
+        let c: Config =
+            toml::from_str("[browser]\nenabled = false\nhome_url = 'http://localhost:3000'\nallow_remote = false\n")
+                .unwrap();
         assert!(!c.browser.enabled);
         assert!(!c.browser.allow_remote);
         assert_eq!(c.browser.home_url, "http://localhost:3000");
@@ -707,10 +703,8 @@ mod tests {
         assert!(err.contains("permissions.defaults.write"), "{err}");
         assert!(err.contains("permissions.rules[0]"), "{err}");
         // Letter case does not matter.
-        let c: Config = toml::from_str(
-            "[[permissions.rules]]\ntool = \"bash\"\npattern = \"rm *\"\naction = \"Deny\"\n",
-        )
-        .unwrap();
+        let c: Config =
+            toml::from_str("[[permissions.rules]]\ntool = \"bash\"\npattern = \"rm *\"\naction = \"Deny\"\n").unwrap();
         assert!(c.permissions.validate().is_ok());
     }
 
@@ -880,7 +874,8 @@ mod value_tests {
         let err = c.check_ranges().unwrap_err().to_string();
         assert!(err.contains("provider.temperature"), "{err}");
         for ok in [0.0, 0.7, 2.0] {
-            let c = Config { provider: ProviderCfg { temperature: Some(ok), ..Default::default() }, ..Default::default() };
+            let c =
+                Config { provider: ProviderCfg { temperature: Some(ok), ..Default::default() }, ..Default::default() };
             assert!(c.check_ranges().is_ok(), "{ok}");
         }
         assert!(Config::default().check_ranges().is_ok(), "unset is fine");

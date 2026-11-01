@@ -131,7 +131,8 @@ pub(super) async fn run_deep(
         let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
     };
     let ws = st.workspace_for_async(session_id).await;
-    save_message(st, session_id, "user", vec![Part::Text { text: format!("[deep mode, {n} attempts] {task}") }]).await?;
+    save_message(st, session_id, "user", vec![Part::Text { text: format!("[deep mode, {n} attempts] {task}") }])
+        .await?;
     let started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
 
     let trees = Trees(Some(Arc::new(create_worktrees(&ws, &st.state_dir, n).await?)));
@@ -196,9 +197,7 @@ pub(super) async fn run_deep(
     let _ = tokio::task::spawn_blocking(move || crate::gitsnap::record_before_run(&w, &sd, "pre-deep")).await;
     let to_apply = patch.clone();
     match trees.with(move |wts| wts[best - 1].apply_to_repo(&to_apply)).await? {
-        Ok(()) => out.push_str(&format!(
-            "\nApplied attempt {best} to the project (`/undo` takes it back).\n"
-        )),
+        Ok(()) => out.push_str(&format!("\nApplied attempt {best} to the project (`/undo` takes it back).\n")),
         Err(e) => {
             out.push_str(&format!(
                 "\nCould not apply attempt {best} ({e:#}); the files changed while it ran. \
@@ -258,12 +257,7 @@ async fn attempt_config(st: &Shared, can_run_commands: bool) -> Config {
     // Nobody can answer approval prompts during an attempt: web reads are
     // safe, so they stay allowed (otherwise every web lookup is denied on
     // the spot); questions are denied so attempts decide for themselves.
-    for (tool, action) in [
-        ("write", "allow"),
-        ("edit", "allow"),
-        ("webfetch", "allow"),
-        ("ask_user", "deny"),
-    ] {
+    for (tool, action) in [("write", "allow"), ("edit", "allow"), ("webfetch", "allow"), ("ask_user", "deny")] {
         cfg.permissions.defaults.insert(tool.into(), action.into());
     }
     if !can_run_commands {
@@ -274,10 +268,7 @@ async fn attempt_config(st: &Shared, can_run_commands: bool) -> Config {
 
 /// The attempts' cards in the agents panel.
 fn attempt_infos(session_id: &str, task: &str, n: usize) -> Vec<AgentInfo> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     (1..=n)
         .map(|i| AgentInfo {
             id: format!("deep-{stamp}-{i}"),
@@ -315,12 +306,8 @@ async fn run_attempt(
     // The attempt's tokens count for this chat too (`/usage`).
     let u = worker.db.run(|db| db.usage_totals(None, None)).await.unwrap_or_default();
     if u.input + u.output > 0 {
-        let usage = crate::provider::Usage {
-            input: u.input,
-            cached: u.cached,
-            cache_write: u.cache_write,
-            output: u.output,
-        };
+        let usage =
+            crate::provider::Usage { input: u.input, cached: u.cached, cache_write: u.cache_write, output: u.output };
         st.record_usage_as_async("deep attempt", session_id, &st.current_model().await, &usage).await;
     }
     (res, u.input + u.output)
@@ -360,11 +347,8 @@ impl AttemptChecks {
         agent_status(st, info, "working", "checking the result…".into());
         let n = s.n;
         let prefixed = |t: String| note(format!("attempt {n}: {t}"));
-        let pages = if st.cfg.agent.check_pages {
-            crate::pagecheck::pages_for(attempt_ws, &s.files, 3)
-        } else {
-            Vec::new()
-        };
+        let pages =
+            if st.cfg.agent.check_pages { crate::pagecheck::pages_for(attempt_ws, &s.files, 3) } else { Vec::new() };
         // The check runs the attempt's code: only with the same
         // permission any `bash` call needs (skipped when it is denied).
         let cmd = match verify_command_for(st, attempt_ws, &prefixed) {

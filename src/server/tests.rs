@@ -48,8 +48,15 @@ async fn the_users_own_prompt_is_the_main_one_or_comes_last() {
     let habi = st.composed_system(&s.id);
     *st.user_prompt.write().unwrap() = (Some("You are Crumb's own coding assistant.".into()), None);
     let main = st.composed_system(&s.id);
-    assert_eq!(main, format!("You are Crumb's own coding assistant.{}", crate::agents::TOOL_GUIDE), "only the user's text and the tool guide");
-    assert!(!main.contains("## Skills") && !main.contains("Ponytail") && !main.contains("lazy senior"), "no skills, no ponytail");
+    assert_eq!(
+        main,
+        format!("You are Crumb's own coding assistant.{}", crate::agents::TOOL_GUIDE),
+        "only the user's text and the tool guide"
+    );
+    assert!(
+        !main.contains("## Skills") && !main.contains("Ponytail") && !main.contains("lazy senior"),
+        "no skills, no ponytail"
+    );
     assert!(st.own_prompt_only());
     *st.user_prompt.write().unwrap() = (None, Some("Always answer in Urdu.".into()));
     let added = st.composed_system(&s.id);
@@ -81,7 +88,10 @@ async fn the_users_own_prompt_turns_off_habis_extra_steps() {
     assert!(design_review(&st, &s.id, "build a website", None, since, true, &none, None).await.is_none());
     assert!(seen.lock().unwrap().is_empty(), "no model call of Habi's own");
     *st.user_prompt.write().unwrap() = (None, None);
-    assert!(make_spec(&st, &s.id, "build a website for my bakery please", &none).await.is_some(), "Habi's own mode plans as before");
+    assert!(
+        make_spec(&st, &s.id, "build a website for my bakery please", &none).await.is_some(),
+        "Habi's own mode plans as before"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -177,7 +187,8 @@ async fn the_design_review_shows_the_model_its_page() {
     let dir = std::env::temp_dir().join(format!("ocrs-design-review-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let since = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
-    std::fs::write(dir.join("index.html"), "<!doctype html><title>Crumb</title><h1>A little <em>happiness</em></h1>").unwrap();
+    std::fs::write(dir.join("index.html"), "<!doctype html><title>Crumb</title><h1>A little <em>happiness</em></h1>")
+        .unwrap();
     let mut cfg = crate::config::Config::default();
     cfg.provider.base_url = base;
     cfg.provider.model = "mock".into();
@@ -326,8 +337,7 @@ async fn requests_keep_a_stable_prefix_and_usage_is_recorded() {
 
 /// F-12: a server with the token "t" and a client for it.
 async fn f12_server() -> (Shared, String, reqwest::Client) {
-    let st =
-        build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
     let addr = serve_with_token(st.clone(), 0, "t".into()).await.unwrap();
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
     (st, format!("http://{addr}"), http)
@@ -370,12 +380,7 @@ async fn f12_mode_model_and_permission_routes() {
     assert_eq!(st.mode_for(&s.id), AgentMode::Plan);
     let r = http.put(&mode_url).bearer_auth("t").json(&json!({"mode": "fly"})).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 400, "unknown mode");
-    let r = http
-        .get(format!("{base}/api/sessions/ses_nope/mode"))
-        .bearer_auth("t")
-        .send()
-        .await
-        .unwrap();
+    let r = http.get(format!("{base}/api/sessions/ses_nope/mode")).bearer_auth("t").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 404, "unknown session");
 
     let r = http.put(format!("{base}/api/model")).bearer_auth("t").json(&json!({"model": "m2"})).send().await.unwrap();
@@ -406,7 +411,8 @@ async fn f12_mode_model_and_permission_routes() {
     let r = http.put(&perm_url).bearer_auth("t").json(&json!({"mode": "yolo"})).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 400, "unknown permission mode");
 
-    let v: Value = http.get(format!("{base}/api/approvals")).bearer_auth("t").send().await.unwrap().json().await.unwrap();
+    let v: Value =
+        http.get(format!("{base}/api/approvals")).bearer_auth("t").send().await.unwrap().json().await.unwrap();
     assert_eq!(v, json!([]), "nothing waits");
 }
 
@@ -418,7 +424,8 @@ async fn f12_rename_and_delete_sessions() {
     st.db.add_message(&s.id, "user", &[Part::Text { text: "hi".into() }]).unwrap();
     let url = format!("{base}/api/sessions/{}", s.id);
 
-    let v: Value = http.patch(&url).bearer_auth("t").json(&json!({"title": "new"})).send().await.unwrap().json().await.unwrap();
+    let v: Value =
+        http.patch(&url).bearer_auth("t").json(&json!({"title": "new"})).send().await.unwrap().json().await.unwrap();
     assert_eq!(v["title"], "new");
     let r = http.patch(&url).bearer_auth("t").json(&json!({"title": "  "})).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 400, "empty title");
@@ -552,10 +559,10 @@ async fn a_failed_always_allow_is_logged() {
         detail: detail.clone(),
         preview: String::new(),
     };
-    st.approvals.lock().unwrap().insert(
-        "apr_x".into(),
-        ApprovalEntry { tx, tool: "bash".into(), detail: detail.clone(), request },
-    );
+    st.approvals
+        .lock()
+        .unwrap()
+        .insert("apr_x".into(), ApprovalEntry { tx, tool: "bash".into(), detail: detail.clone(), request });
     assert!(st.decide("apr_x", true, true));
     assert!(rx.await.unwrap().allowed, "the call itself is still allowed");
     let log = std::fs::read_to_string(core_log_path()).unwrap_or_default();
@@ -606,10 +613,7 @@ fn reuse_gate_ignores_common_names_and_mentions() {
         "path": "new.rs",
         "content": "fn main() {}\nfn render_page() {}\nimpl X {\n    fn helper_method() {}\n}\n"
     });
-    assert!(
-        reuse_gate(&dir, "write", &write).is_none(),
-        "main is common; render_page is only mentioned"
-    );
+    assert!(reuse_gate(&dir, "write", &write).is_none(), "main is common; render_page is only mentioned");
     assert!(top_level_symbols("impl X {\n    fn helper_method() {}\n}\n").is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -701,7 +705,9 @@ async fn aborted_run_gets_no_review() {
     }
     let review_prompt = st.db.messages(&s.id).unwrap().iter().any(|m| {
         m.role == "user"
-            && m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.contains("Review the current uncommitted changes")))
+            && m.parts
+                .iter()
+                .any(|p| matches!(p, Part::Text { text } if text.contains("Review the current uncommitted changes")))
     });
     assert!(!review_prompt, "no dangling review prompt");
     let _ = std::fs::remove_dir_all(&dir);
@@ -973,7 +979,8 @@ fn the_context_window_is_read_from_models() {
 /// silently stays off.
 #[test]
 fn ollama_reports_the_context_window_on_api_ps() {
-    let ps = json!({"models":[{"name":"qwen3.8:27b-iq4_xs:latest","model":"qwen3.8:27b-iq4_xs","context_length":8192}]});
+    let ps =
+        json!({"models":[{"name":"qwen3.8:27b-iq4_xs:latest","model":"qwen3.8:27b-iq4_xs","context_length":8192}]});
     assert_eq!(context_from_ollama_ps(&ps, "qwen3.8:27b-iq4_xs"), Some(8192));
     assert_eq!(context_from_ollama_ps(&ps, "elsewhere:latest"), Some(8192), "first entry fallback");
     assert_eq!(context_from_ollama_ps(&json!({"models":[]}), "x"), None);
@@ -982,7 +989,12 @@ fn ollama_reports_the_context_window_on_api_ps() {
 
 #[test]
 fn old_tool_results_shrink_to_fit_a_small_window() {
-    let m = |role: &str, text: String| ChatMsg { role: role.into(), content: Some(text), tool_calls: None, tool_call_id: None };
+    let m = |role: &str, text: String| ChatMsg {
+        role: role.into(),
+        content: Some(text),
+        tool_calls: None,
+        tool_call_id: None,
+    };
     let big = "x".repeat(20_000);
     let mut msgs = vec![m("system", "s".into()), m("user", "u".into())];
     for _ in 0..4 {
@@ -991,7 +1003,9 @@ fn old_tool_results_shrink_to_fit_a_small_window() {
     let cut = fit_tool_results(&mut msgs, 16_384);
     assert!(cut >= 2, "{cut}");
     assert!(estimate_tokens(&msgs, &[]) + 2_500 <= 16_384, "fits now");
-    assert!(msgs[5].content.as_ref().unwrap().len() < 20_000 || msgs[2].content.as_ref().unwrap().contains("shortened"));
+    assert!(
+        msgs[5].content.as_ref().unwrap().len() < 20_000 || msgs[2].content.as_ref().unwrap().contains("shortened")
+    );
     let mut small = vec![m("user", "hi".into()), m("tool", "ok".into())];
     assert_eq!(fit_tool_results(&mut small, 16_384), 0, "a small request is left alone");
     assert_eq!(fit_tool_results(&mut msgs.clone(), 0), 0, "no known limit, nothing cut");
@@ -1027,9 +1041,7 @@ fn context_overflow_errors_are_recognised() {
 async fn a_long_tool_chain_keeps_the_task_near_the_tail() {
     let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
     let s = st.db.create_session("u", None).unwrap();
-    st.db
-        .add_message(&s.id, "user", &[Part::Text { text: "Write SUMMARY.md from notes/.".into() }])
-        .unwrap();
+    st.db.add_message(&s.id, "user", &[Part::Text { text: "Write SUMMARY.md from notes/.".into() }]).unwrap();
     for i in 0..20 {
         st.db
             .add_message(
@@ -1037,11 +1049,7 @@ async fn a_long_tool_chain_keeps_the_task_near_the_tail() {
                 "assistant",
                 &[
                     Part::Text { text: format!("step {i}") },
-                    Part::ToolCall {
-                        id: format!("c{i}"),
-                        name: "list".into(),
-                        input: json!({"path": "."}),
-                    },
+                    Part::ToolCall { id: format!("c{i}"), name: "list".into(), input: json!({"path": "."}) },
                 ],
             )
             .unwrap();
@@ -1070,9 +1078,7 @@ async fn a_long_tool_chain_keeps_the_task_near_the_tail() {
     // A short chat is sent as it is.
     let st2 = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
     let s2 = st2.db.create_session("u", None).unwrap();
-    st2.db
-        .add_message(&s2.id, "user", &[Part::Text { text: "Say hi.".into() }])
-        .unwrap();
+    st2.db.add_message(&s2.id, "user", &[Part::Text { text: "Say hi.".into() }]).unwrap();
     st2.db
         .add_message(
             &s2.id,
@@ -1123,8 +1129,10 @@ async fn the_prompt_follows_what_the_server_does_with_system_messages() {
     st.system_delivery.store(SYSTEM_DELIVERS, Ordering::Relaxed);
     let msgs = build_chat_messages(&st, &s.id, "SYS PROMPT").unwrap();
     assert_eq!(msgs[0].role, "system");
-    assert!(msgs.iter().all(|m| !m.content.as_deref().is_some_and(|c| c.contains("SYS PROMPT")) || m.role == "system"),
-        "nothing appended when the role is delivered");
+    assert!(
+        msgs.iter().all(|m| !m.content.as_deref().is_some_and(|c| c.contains("SYS PROMPT")) || m.role == "system"),
+        "nothing appended when the role is delivered"
+    );
 }
 
 #[test]
@@ -1251,7 +1259,11 @@ async fn questions_and_bookkeeping_end_the_turn_without_more_calls() {
                 let payload = if wants_todo {
                     reply("All done: the page is built.", "todo", serde_json::json!({"op": "list"}))
                 } else {
-                    reply("", "ask_user", serde_json::json!({"question": "Warm or dark theme?", "options": ["Warm", "Dark"]}))
+                    reply(
+                        "",
+                        "ask_user",
+                        serde_json::json!({"question": "Warm or dark theme?", "options": ["Warm", "Dark"]}),
+                    )
                 };
                 ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
             }
@@ -1342,8 +1354,10 @@ async fn a_reply_that_breaks_off_is_asked_again() {
     assert_eq!(out, "whole reply");
     assert_eq!(hits.load(Ordering::SeqCst), 2);
     let saved = st.db.messages(&s.id).unwrap();
-    assert!(!saved.iter().any(|m| m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.contains("half")))),
-        "the broken-off part is not kept");
+    assert!(
+        !saved.iter().any(|m| m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.contains("half")))),
+        "the broken-off part is not kept"
+    );
 }
 
 /// B-26: running out of steps is reported, not a silent empty answer.
@@ -1462,9 +1476,7 @@ async fn deep_mode_keeps_the_attempt_that_passes_the_check() {
     st.set_model("switched").await;
     let s = st.db.create_session("deep", None).unwrap();
 
-    let out = deep::run_deep(&st, &s.id, "write out.txt", 3, &Arc::new(AtomicBool::new(false)))
-        .await
-        .unwrap();
+    let out = deep::run_deep(&st, &s.id, "write out.txt", 3, &Arc::new(AtomicBool::new(false))).await.unwrap();
     assert!(out.contains("attempt 2") && out.contains("← kept"), "{out}");
     assert!(out.contains("Applied attempt 2"), "{out}");
     assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap(), "good\n");
@@ -1493,8 +1505,7 @@ async fn deep_mode_needs_git() {
 /// B-24: the automatic review prompt neither counts nor breaks the streak.
 #[tokio::test]
 async fn turbo_streak_ignores_the_review_prompt() {
-    let st =
-        build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
     let s = st.db.create_session("streak-review", None).unwrap();
     for i in 0..2 {
         let cont = format!("{TURBO_CONTINUE_PREFIX} keep going {i}");
@@ -1539,9 +1550,7 @@ async fn turbo_chain_finishes_once() {
         .iter()
         .filter(|m| {
             m.role == "user"
-                && m.parts.iter().any(
-                    |p| matches!(p, Part::Text { text } if text.starts_with(TURBO_CONTINUE_PREFIX)),
-                )
+                && m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.starts_with(TURBO_CONTINUE_PREFIX)))
         })
         .count();
     // The mock only ever answers in words: after one continuation it has
@@ -1652,9 +1661,7 @@ async fn the_context_window_is_learned_without_a_heartbeat() {
     use axum::{routing::get, Router};
     let app = Router::new().route(
         "/v1/models",
-        get(|| async {
-            "{\"object\":\"list\",\"data\":[{\"id\":\"m\",\"context_window\":16384}]}"
-        }),
+        get(|| async { "{\"object\":\"list\",\"data\":[{\"id\":\"m\",\"context_window\":16384}]}" }),
     );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1687,7 +1694,11 @@ async fn the_context_window_is_learned_without_a_heartbeat() {
 /// instead of "connected".
 #[tokio::test]
 async fn heartbeat_reports_a_rejected_key() {
-    use axum::{http::StatusCode as Code, routing::{get, post}, Router};
+    use axum::{
+        http::StatusCode as Code,
+        routing::{get, post},
+        Router,
+    };
     let app = Router::new()
         .route("/v1/models", get(|| async { (Code::OK, "{\"data\":[]}") }))
         .route("/v1/chat/completions", post(|| async { (Code::UNAUTHORIZED, "{\"error\":\"invalid API token\"}") }));
@@ -1755,8 +1766,7 @@ async fn pending_approvals_lists_waiting_requests() {
 /// its slot is released when it ends.
 #[tokio::test]
 async fn kick_task_registers_and_abort_run_stops_it() {
-    let st =
-        build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
     let sid = "ses_task".to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
     st.kick_task(sid.clone(), move |_st, _sid, abort| async move {
@@ -1768,10 +1778,7 @@ async fn kick_task_registers_and_abort_run_stops_it() {
     .await;
     assert!(st.run_active(&sid).await, "registered while it runs");
     assert!(st.abort_run(&sid).await, "abort reaches the task");
-    tokio::time::timeout(std::time::Duration::from_secs(5), rx)
-        .await
-        .expect("the task saw the abort")
-        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), rx).await.expect("the task saw the abort").unwrap();
     for _ in 0..100 {
         if !st.run_active(&sid).await {
             break;
@@ -1818,10 +1825,7 @@ data: [DONE]
 
     let _ = pending_approval_id(&st).await; // the first call waits
     abort.store(true, Ordering::SeqCst);
-    tokio::time::timeout(std::time::Duration::from_secs(10), run)
-        .await
-        .expect("the run stops")
-        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), run).await.expect("the run stops").unwrap();
 
     let outputs: Vec<String> = st
         .db
@@ -1836,9 +1840,7 @@ data: [DONE]
         .collect();
     assert_eq!(outputs.len(), 2, "both calls got a result: {outputs:?}");
     assert!(outputs[1].contains("not run"), "{outputs:?}");
-    let TodoResult::Listed { items } = st.todo_store.exec(&s.id, TodoOp::List) else {
-        panic!("expected a list")
-    };
+    let TodoResult::Listed { items } = st.todo_store.exec(&s.id, TodoOp::List) else { panic!("expected a list") };
     assert!(items.is_empty(), "no todo was added: {items:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1901,24 +1903,15 @@ async fn approval_resolved_reports_every_outcome() {
         }
         seen
     };
-    let expected: Vec<(String, bool)> = vec![
-        ("user".into(), true),
-        ("always".into(), true),
-        ("abort".into(), false),
-        ("turbo".into(), true),
-    ];
+    let expected: Vec<(String, bool)> =
+        vec![("user".into(), true), ("always".into(), true), ("abort".into(), false), ("turbo".into(), true)];
     assert_eq!(resolved(&mut rx), expected);
     assert_eq!(resolved(&mut quick_rx), vec![("timeout".to_string(), false)]);
 }
 
 // B-04 helpers: build chat messages in a few words.
 fn hmsg(role: &str, content: Option<&str>) -> ChatMsg {
-    ChatMsg {
-        role: role.into(),
-        content: content.map(str::to_string),
-        tool_calls: None,
-        tool_call_id: None,
-    }
+    ChatMsg { role: role.into(), content: content.map(str::to_string), tool_calls: None, tool_call_id: None }
 }
 fn hcalls(ids: &[&str]) -> ChatMsg {
     let calls = ids
@@ -1926,21 +1919,13 @@ fn hcalls(ids: &[&str]) -> ChatMsg {
         .map(|id| crate::provider::ToolCallReq {
             id: id.to_string(),
             kind: "function".into(),
-            function: crate::provider::FunctionCall {
-                name: "bash".into(),
-                arguments: "{}".into(),
-            },
+            function: crate::provider::FunctionCall { name: "bash".into(), arguments: "{}".into() },
         })
         .collect();
     ChatMsg { role: "assistant".into(), content: None, tool_calls: Some(calls), tool_call_id: None }
 }
 fn hresult(id: &str) -> ChatMsg {
-    ChatMsg {
-        role: "tool".into(),
-        content: Some("ok".into()),
-        tool_calls: None,
-        tool_call_id: Some(id.into()),
-    }
+    ChatMsg { role: "tool".into(), content: Some("ok".into()), tool_calls: None, tool_call_id: Some(id.into()) }
 }
 fn hroles(m: &[ChatMsg]) -> Vec<&str> {
     m.iter().map(|x| x.role.as_str()).collect()
@@ -1960,8 +1945,7 @@ fn repair_answers_dangling_tool_calls() {
     assert_eq!(fixed[4].tool_call_id.as_deref(), Some("c2"));
     assert_eq!(fixed[4].content.as_deref(), Some(INTERRUPTED_TOOL_RESULT));
     // The same at the very end of the history.
-    let fixed =
-        repair_history(vec![hmsg("system", Some("S")), hmsg("user", Some("go")), hcalls(&["c9"])]);
+    let fixed = repair_history(vec![hmsg("system", Some("S")), hmsg("user", Some("go")), hcalls(&["c9"])]);
     assert_eq!(hroles(&fixed), vec!["system", "user", "assistant", "tool"]);
 }
 
@@ -1976,9 +1960,14 @@ fn repair_drops_orphans_and_empty_assistant_messages() {
         hmsg("user", Some("b")),
     ]);
     assert_eq!(hroles(&fixed), vec!["system", "user"]);
-    assert_eq!(fixed[1].content.as_deref(), Some("a
+    assert_eq!(
+        fixed[1].content.as_deref(),
+        Some(
+            "a
 
-b"));
+b"
+        )
+    );
 }
 
 /// B-04: one system message at the top; later notes become user text.
@@ -1992,13 +1981,23 @@ fn repair_keeps_one_system_message() {
         hmsg("assistant", Some("done")),
     ]);
     assert_eq!(hroles(&fixed), vec!["system", "user", "assistant"]);
-    assert_eq!(fixed[0].content.as_deref(), Some("S
+    assert_eq!(
+        fixed[0].content.as_deref(),
+        Some(
+            "S
 
-summary"));
-    assert_eq!(fixed[1].content.as_deref(), Some("u
+summary"
+        )
+    );
+    assert_eq!(
+        fixed[1].content.as_deref(),
+        Some(
+            "u
 
 [system note]
-expanded command"));
+expanded command"
+        )
+    );
 }
 
 /// B-04: a healthy history goes through unchanged.
@@ -2031,10 +2030,8 @@ async fn session_with_dangling_tool_call_still_works() {
                     valid = false;
                 }
                 for c in m["tool_calls"].as_array().cloned().unwrap_or_default() {
-                    let answered = msgs[i + 1..]
-                        .iter()
-                        .take_while(|n| n["role"] == "tool")
-                        .any(|n| n["tool_call_id"] == c["id"]);
+                    let answered =
+                        msgs[i + 1..].iter().take_while(|n| n["role"] == "tool").any(|n| n["tool_call_id"] == c["id"]);
                     valid &= answered;
                 }
             }
@@ -2093,8 +2090,7 @@ data: [DONE]
 /// /api/health needs no token.
 #[tokio::test]
 async fn api_requires_token_and_local_host() {
-    let st =
-        build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
     let addr = serve_with_token(st, 0, "test-token".into()).await.unwrap();
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
     let url = |p: &str| format!("http://{addr}{p}");
@@ -2107,13 +2103,8 @@ async fn api_requires_token_and_local_host() {
     assert_eq!(r.status().as_u16(), 401, "wrong token");
     let r = http.get(url("/api/sessions")).bearer_auth("test-token").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 200, "right token");
-    let r = http
-        .get(url("/api/sessions"))
-        .bearer_auth("test-token")
-        .header("Host", "example.test")
-        .send()
-        .await
-        .unwrap();
+    let r =
+        http.get(url("/api/sessions")).bearer_auth("test-token").header("Host", "example.test").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 403, "foreign Host header");
 }
 
@@ -2143,15 +2134,10 @@ fn host_check_and_token_helpers() {
 /// state the TUI renders — verify them against a real (ephemeral) state.
 #[tokio::test]
 async fn session_export_and_todo_reports() {
-    let st =
-        build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
     let s = st.db.create_session("export me", None).unwrap();
-    st.db
-        .add_message(&s.id, "user", &[Part::Text { text: "hello there".into() }])
-        .unwrap();
-    st.db
-        .add_message(&s.id, "assistant", &[Part::Text { text: "hi back".into() }])
-        .unwrap();
+    st.db.add_message(&s.id, "user", &[Part::Text { text: "hello there".into() }]).unwrap();
+    st.db.add_message(&s.id, "assistant", &[Part::Text { text: "hi back".into() }]).unwrap();
 
     // The picker list carries the session, its title and no parent.
     let list = st.session_list();
@@ -2265,10 +2251,7 @@ async fn debt_report_counts_lines_and_hints() {
     bump_hints(&st, "s1");
     let report = st.debt_report("s1");
     assert!(report.contains("+4"), "3 written + 1 edited: {report}");
-    assert!(
-        report.contains("−2") || report.contains("-2"),
-        "edit old=a/b deletes 2 lines: {report}"
-    );
+    assert!(report.contains("−2") || report.contains("-2"), "edit old=a/b deletes 2 lines: {report}");
     assert!(report.contains("1 reuse hint"), "{report}");
 }
 
@@ -2294,9 +2277,7 @@ async fn parallel_runs_in_isolated_worktrees() {
     let st = build_state_ephemeral(cfg, dir.clone()).await;
 
     let s = st.db.create_session("par", None).unwrap();
-    let out = deep::run_deep(&st, &s.id, "say OK", 2, &Arc::new(AtomicBool::new(false)))
-        .await
-        .unwrap();
+    let out = deep::run_deep(&st, &s.id, "say OK", 2, &Arc::new(AtomicBool::new(false))).await.unwrap();
     assert!(out.contains("attempt 1") && out.contains("attempt 2"), "both rows present: {out}");
     assert!(out.contains("nothing was applied"), "{out}");
 }
@@ -2313,15 +2294,10 @@ async fn run_review_streams_findings() {
     let s = st.db.create_session("p", None).unwrap();
     let mut rx = st.events.subscribe();
 
-    let out = run_review(&st, &s.id, None, &Arc::new(AtomicBool::new(false)))
-        .await
-        .unwrap();
+    let out = run_review(&st, &s.id, None, &Arc::new(AtomicBool::new(false))).await.unwrap();
     assert_eq!(out, "Hello", "review streamed its findings");
     while let Ok(ev) = rx.try_recv() {
-        assert!(
-            !matches!(ev, ServerEvent::RunFinished { .. }),
-            "review never ends the turn itself — the caller does"
-        );
+        assert!(!matches!(ev, ServerEvent::RunFinished { .. }), "review never ends the turn itself — the caller does");
     }
 }
 
@@ -2423,10 +2399,7 @@ async fn a_broken_stream_keeps_the_part_that_arrived() {
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     item
                 });
-                (
-                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                    axum::body::Body::from_stream(stream),
-                )
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream))
             }
         }),
     );
@@ -2586,10 +2559,7 @@ async fn mock_text_llm() -> String {
                 "data: [DONE]\n\n"
             )
             .to_string();
-            (
-                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                payload,
-            )
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
         }),
     );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2627,10 +2597,7 @@ async fn run_agent_streams_answer_once_and_finishes_silently() {
     assert_eq!(text, "Hello", "answer streamed exactly once as deltas");
     assert_eq!(finished.len(), 1, "exactly one completion event");
     assert!(finished[0].0, "run succeeded");
-    assert!(
-        finished[0].1.is_none(),
-        "answer must not be re-sent as the completion message"
-    );
+    assert!(finished[0].1.is_none(), "answer must not be re-sent as the completion message");
 }
 
 /// Regression: when a newer run owns the session slot, the replaced run
@@ -2655,10 +2622,7 @@ async fn superseded_run_stays_silent() {
     run_agent(&st, &s.id, "hi", Arc::new(AtomicBool::new(false))).await;
 
     while let Ok(ev) = rx.try_recv() {
-        assert!(
-            !matches!(ev, ServerEvent::RunFinished { .. }),
-            "a replaced run must not announce completion"
-        );
+        assert!(!matches!(ev, ServerEvent::RunFinished { .. }), "a replaced run must not announce completion");
     }
 }
 
@@ -2741,8 +2705,10 @@ data: [DONE]
     crate::server::run_agent(&st, &s.id, "track my work", abort).await;
 
     let msgs = st.db.messages(&s.id).unwrap();
-    assert!(msgs.iter().any(|m| m.role == "assistant"
-        && m.parts.iter().any(|p| matches!(p, Part::ToolCall { name, .. } if name == "todo"))));
+    assert!(msgs
+        .iter()
+        .any(|m| m.role == "assistant"
+            && m.parts.iter().any(|p| matches!(p, Part::ToolCall { name, .. } if name == "todo"))));
     let tool_msg = msgs.iter().find(|m| m.role == "tool").expect("todo result");
     let text = match &tool_msg.parts[0] {
         Part::ToolResult { output, is_error, .. } => {
@@ -2754,9 +2720,7 @@ data: [DONE]
     assert!(text.contains("set up scaffolding"), "tool result: {text}");
 
     // Verify the store holds it for this session.
-    let TodoResult::Listed { items } = st.todo_store.exec(&s.id, TodoOp::List) else {
-        panic!("expected listed")
-    };
+    let TodoResult::Listed { items } = st.todo_store.exec(&s.id, TodoOp::List) else { panic!("expected listed") };
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].content, "set up scaffolding");
 
@@ -2832,20 +2796,14 @@ async fn write_run_accounts_and_auto_reviews() {
         }
     }
     // The write really happened in the workspace.
-    assert_eq!(
-        std::fs::read_to_string(dir.join("made.txt")).unwrap(),
-        "hello\n"
-    );
+    assert_eq!(std::fs::read_to_string(dir.join("made.txt")).unwrap(), "hello\n");
     // Laziness Meter accounted it.
     let debt = st.debt_report(&s.id);
     assert!(debt.contains("+1"), "one written line: {debt}");
     assert!(debt.contains("1 write(s)"), "{debt}");
     assert!(debt.contains("0 reuse hint"), "{debt}");
     // Auto-review fired and streamed its findings before the turn ended.
-    assert!(
-        notes.iter().any(|n| n.contains("ponytail review")),
-        "review note announced: {notes:?}"
-    );
+    assert!(notes.iter().any(|n| n.contains("ponytail review")), "review note announced: {notes:?}");
     let main_at = text.find("main answer").expect("main answer streamed");
     let review_at = text.find("review findings").expect("review streamed");
     assert!(main_at < review_at, "review answers after the run: {text}");
@@ -2899,16 +2857,10 @@ async fn turbo_auto_approves_asks() {
 
     // `write` defaults to "ask": normally this would block on the dialog.
     let abort = AtomicBool::new(false);
-    assert!(
-        check_permission(&st, "s1", "write", "made.txt", &abort).await,
-        "turbo grants asks without prompting"
-    );
+    assert!(check_permission(&st, "s1", "write", "made.txt", &abort).await, "turbo grants asks without prompting");
     assert!(st.approvals.lock().unwrap().is_empty(), "no pending approval left");
 
-    assert!(
-        !check_permission(&st, "s1", "bash", "rm -rf /", &abort).await,
-        "deny rules survive turbo"
-    );
+    assert!(!check_permission(&st, "s1", "bash", "rm -rf /", &abort).await, "deny rules survive turbo");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2947,10 +2899,7 @@ async fn manual_mode_gates_allowed_tools() {
     // "Always allow" is the user's own grant — it survives manual mode.
     st.db.add_approval(&crate::db::workspace_key(&st.workspace), "write", "made.txt", "session").unwrap();
     let abort = AtomicBool::new(false);
-    assert!(
-        check_permission(&st, "s1", "write", "made.txt", &abort).await,
-        "a remembered approval is not re-asked"
-    );
+    assert!(check_permission(&st, "s1", "write", "made.txt", &abort).await, "a remembered approval is not re-asked");
     assert!(st.approvals.lock().unwrap().is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -3002,19 +2951,13 @@ async fn turbo_streak_caps_and_resets() {
 
     for i in 1..=TURBO_MAX_CONTINUATIONS {
         st.db
-            .add_message(
-                &s.id,
-                "user",
-                &[Part::Text { text: format!("{TURBO_CONTINUE_PREFIX} keep going {i}") }],
-            )
+            .add_message(&s.id, "user", &[Part::Text { text: format!("{TURBO_CONTINUE_PREFIX} keep going {i}") }])
             .unwrap();
     }
     assert_eq!(turbo_streak(&st, &s.id), TURBO_MAX_CONTINUATIONS);
 
     // A real user message breaks the streak.
-    st.db
-        .add_message(&s.id, "user", &[Part::Text { text: "actual new request".into() }])
-        .unwrap();
+    st.db.add_message(&s.id, "user", &[Part::Text { text: "actual new request".into() }]).unwrap();
     assert_eq!(turbo_streak(&st, &s.id), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3082,10 +3025,7 @@ async fn skill_install_vets_and_bakes() {
     assert_eq!(baked.len(), 1);
     // …and composed into the system prompt like the ponytail rules.
     let system = st.composed_system("ses_x");
-    assert!(
-        system.contains("## Skill: ship-it — always active"),
-        "baked skill present in system prompt"
-    );
+    assert!(system.contains("## Skill: ship-it — always active"), "baked skill present in system prompt");
     assert!(system.contains("Never deploy on a Friday evening"), "full body baked");
 
     // Second install: the model says SKIP → refused, nothing added.
@@ -3156,9 +3096,7 @@ async fn skill_install_respects_a_webfetch_deny_rule() {
     });
     let st = build_state_ephemeral_skills(cfg, dir.clone(), dir.join("base")).await;
     let abort = AtomicBool::new(false);
-    let err = install_skill_flow(&st, "https://example.com/skill.md", &abort)
-        .await
-        .unwrap_err();
+    let err = install_skill_flow(&st, "https://example.com/skill.md", &abort).await.unwrap_err();
     assert!(err.to_string().contains("blocked by a permissions rule"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3243,9 +3181,7 @@ async fn run_loop_refuses_repeated_identical_calls() {
         .unwrap()
         .iter()
         .filter_map(|m| match m.parts.first() {
-            Some(Part::ToolResult { output, is_error, .. }) => {
-                Some((output.clone(), *is_error))
-            }
+            Some(Part::ToolResult { output, is_error, .. }) => Some((output.clone(), *is_error)),
             _ => None,
         })
         .collect();
@@ -3300,7 +3236,8 @@ fn the_project_check_is_found_without_configuration() {
     assert_eq!(detect_verify_command(&dir), None);
     std::fs::write(dir.join("tests").join("test_app.py"), "").unwrap();
     assert_eq!(detect_verify_command(&dir).as_deref(), Some("python -m pytest -q"));
-    std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#)
+        .unwrap();
     assert_eq!(detect_verify_command(&dir).as_deref(), Some("python -m pytest -q"), "npm's placeholder is not a test");
     std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"vitest run"}}"#).unwrap();
     assert_eq!(detect_verify_command(&dir).as_deref(), Some("npm test --silent"));
@@ -3378,11 +3315,17 @@ async fn a_fix_round_that_makes_things_worse_is_undone() {
     assert!(notes.iter().any(|n| n.contains("passed after 2 fix round(s)")), "{notes:?}");
     // The fixed failure became a lesson that later prompts carry.
     let lessons = load_lessons(&st, &dir).expect("a lesson was saved");
-    assert!(lessons.starts_with("- ") && lessons.contains("failed (exit 1)") && lessons.contains("fixed by: done"), "{lessons}");
+    assert!(
+        lessons.starts_with("- ") && lessons.contains("failed (exit 1)") && lessons.contains("fixed by: done"),
+        "{lessons}"
+    );
     // The next chat carries it; this chat keeps its prompt (prompt cache).
     let next = st.db.create_session("next", None).unwrap();
     assert!(st.composed_system(&next.id).contains("## Lessons from earlier runs in this project"));
-    assert!(!st.composed_system(&s.id).contains("## Lessons from earlier runs"), "same prompt for the rest of this chat");
+    assert!(
+        !st.composed_system(&s.id).contains("## Lessons from earlier runs"),
+        "same prompt for the rest of this chat"
+    );
     record_lesson(&st, &dir, "1. `x` failed (exit 1)", "again");
     assert_eq!(load_lessons(&st, &dir).unwrap().lines().count(), 2, "a new problem adds a line");
     record_lesson(&st, &dir, "1. `x` failed (exit 1)", "third");
@@ -3390,7 +3333,10 @@ async fn a_fix_round_that_makes_things_worse_is_undone() {
     let _ = std::fs::remove_file(lessons_path(&st, &dir));
     assert_eq!(std::fs::read_to_string(dir.join("errors.txt")).unwrap(), "error a\n", "the worse round was undone");
     let msgs = st.db.messages(&s.id).unwrap();
-    assert!(msgs.iter().any(|m| m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.contains("its file changes were undone")))));
+    assert!(msgs.iter().any(|m| m
+        .parts
+        .iter()
+        .any(|p| matches!(p, Part::Text { text } if text.contains("its file changes were undone")))));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3488,12 +3434,8 @@ async fn verify_failure_runs_a_fix_round_until_the_check_passes() {
 /// and measuring low would let requests overflow a small window.
 #[test]
 fn token_estimate_is_about_three_chars_per_token() {
-    let msgs = vec![ChatMsg {
-        role: "user".into(),
-        content: Some("x".repeat(4000)),
-        tool_calls: None,
-        tool_call_id: None,
-    }];
+    let msgs =
+        vec![ChatMsg { role: "user".into(), content: Some("x".repeat(4000)), tool_calls: None, tool_call_id: None }];
     let n = estimate_tokens(&msgs, &[]);
     assert!((1330..1345).contains(&n), "{n}");
 }

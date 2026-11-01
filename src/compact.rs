@@ -2,8 +2,8 @@
 //! system message and keep the recent tail intact (the schema preserves
 //! ordering, so the summary slots in right before the kept messages).
 
-use crate::server::{Shared, ServerEvent};
 use crate::provider::{ChatMsg, StreamEvent};
+use crate::server::{ServerEvent, Shared};
 use anyhow::{bail, Result};
 use futures::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,8 +90,7 @@ pub fn transcript_lines(msgs: &[crate::db::Message]) -> Vec<String> {
                     _ => None,
                 })
                 .collect();
-            let earlier_summary =
-                m.role == "system" && texts.iter().any(|t| t.starts_with(SUMMARY_MARKER));
+            let earlier_summary = m.role == "system" && texts.iter().any(|t| t.starts_with(SUMMARY_MARKER));
             if earlier_summary {
                 format!("system: {}", texts.join("\n"))
             } else {
@@ -116,24 +115,14 @@ async fn summarize(st: &Shared, transcript: &str, abort: &AtomicBool) -> Result<
             tool_calls: None,
             tool_call_id: None,
         },
-        ChatMsg {
-            role: "user".into(),
-            content: Some(transcript.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        },
+        ChatMsg { role: "user".into(), content: Some(transcript.to_string()), tool_calls: None, tool_call_id: None },
     ];
     // A server that drops the `system` role would drop the whole instruction
     // and summarize nothing (see `server::deliver_system_prompt`).
     crate::server::deliver_system_prompt(&mut msgs, st);
     // B-29: copy the client out of the lock; never hold it while waiting.
     let client = st.client.lock().await.clone();
-    let model = st
-        .cfg
-        .provider
-        .small_model
-        .clone()
-        .unwrap_or_else(|| client.model.clone());
+    let model = st.cfg.provider.small_model.clone().unwrap_or_else(|| client.model.clone());
     let mut stream = client.stream(&model, &msgs, &[]).await?;
     let mut text = String::new();
     while let Some(ev) = stream.next().await {
@@ -161,11 +150,7 @@ async fn summarize(st: &Shared, transcript: &str, abort: &AtomicBool) -> Result<
 
 /// Compact a session's history. `Err` when there's too little to compact
 /// or the summarizer call fails (the transcript is left untouched).
-pub async fn compact(
-    st: &Shared,
-    session_id: &str,
-    abort: &AtomicBool,
-) -> Result<CompactOutcome> {
+pub async fn compact(st: &Shared, session_id: &str, abort: &AtomicBool) -> Result<CompactOutcome> {
     // SQLite blocks: keep it off the async worker.
     let sid = session_id.to_string();
     let msgs = st.db.run(move |db| db.messages(&sid)).await?;
@@ -248,13 +233,12 @@ mod tests {
 
     #[test]
     fn transcript_has_roles_and_keeps_an_earlier_summary_whole() {
-        let earlier = format!("{SUMMARY_MARKER} (5 earlier messages summarized)
-{}", "fact ".repeat(200));
-        let msgs = vec![
-            msg("system", &earlier),
-            msg("user", "please refactor the parser"),
-            msg("assistant", "done"),
-        ];
+        let earlier = format!(
+            "{SUMMARY_MARKER} (5 earlier messages summarized)
+{}",
+            "fact ".repeat(200)
+        );
+        let msgs = vec![msg("system", &earlier), msg("user", "please refactor the parser"), msg("assistant", "done")];
         let lines = transcript_lines(&msgs);
         assert!(lines[0].starts_with("system: [context compacted]"), "{}", lines[0]);
         assert!(lines[0].len() > 1000, "earlier summary not cut to 400 characters");
@@ -284,10 +268,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "ocrs-compact-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
 

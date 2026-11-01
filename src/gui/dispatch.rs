@@ -296,10 +296,15 @@ impl App {
                         gs.compose = (gs.compose.0 + 1, shown);
                         let files = match (r.undone, &r.problem) {
                             (0, _) => "no file changes to put back".to_string(),
-                            (n, None) => format!("files put back to before it ({n} undo step(s); /redo brings them back)"),
+                            (n, None) => {
+                                format!("files put back to before it ({n} undo step(s); /redo brings them back)")
+                            }
                             (n, Some(p)) => format!("{n} undo step(s), but: {p}"),
                         };
-                        format!("Rewound: {} message(s) removed, {files}. Your message is back in the box to edit.", r.messages)
+                        format!(
+                            "Rewound: {} message(s) removed, {files}. Your message is back in the box to edit.",
+                            r.messages
+                        )
                     }
                     Err(e) => format!("Could not rewind: {e:#}"),
                 };

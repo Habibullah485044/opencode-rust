@@ -102,7 +102,6 @@ impl TodoStore {
         exec_sql(&conn, session_id, op).unwrap_or_else(|e| TodoResult::Failed { error: e.to_string() })
     }
 
-
     /// Snapshot all todos for a session (used by `/todos` command or display).
     pub fn list_all(&self, session_id: &str) -> Vec<TodoItem> {
         let conn = self.conn();
@@ -121,9 +120,8 @@ fn row_item(r: &rusqlite::Row) -> rusqlite::Result<TodoItem> {
 }
 
 fn list_sql(conn: &Connection, session_id: &str) -> rusqlite::Result<Vec<TodoItem>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, content, completed FROM todos WHERE session_id=?1 ORDER BY created_at, rowid",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, content, completed FROM todos WHERE session_id=?1 ORDER BY created_at, rowid")?;
     let rows = stmt.query_map(params![session_id], row_item)?;
     rows.collect()
 }
@@ -174,10 +172,7 @@ fn exec_sql(conn: &Connection, session_id: &str, op: TodoOp) -> rusqlite::Result
             let Some(id) = resolve_id(conn, session_id, &id)? else {
                 return Ok(TodoResult::NotFound { id });
             };
-            conn.execute(
-                "UPDATE todos SET completed=1 WHERE session_id=?1 AND id=?2",
-                params![session_id, id],
-            )?;
+            conn.execute("UPDATE todos SET completed=1 WHERE session_id=?1 AND id=?2", params![session_id, id])?;
             match find(&id)? {
                 Some(item) => TodoResult::Completed { item },
                 None => TodoResult::NotFound { id },
@@ -188,7 +183,11 @@ fn exec_sql(conn: &Connection, session_id: &str, op: TodoOp) -> rusqlite::Result
                 return Ok(TodoResult::NotFound { id });
             };
             let n = conn.execute("DELETE FROM todos WHERE session_id=?1 AND id=?2", params![session_id, id])?;
-            if n > 0 { TodoResult::Removed { id } } else { TodoResult::NotFound { id } }
+            if n > 0 {
+                TodoResult::Removed { id }
+            } else {
+                TodoResult::NotFound { id }
+            }
         }
     })
 }
@@ -222,8 +221,9 @@ mod tests {
         let store = TodoStore::new();
         let sid = "ses_1";
 
-        let TodoResult::Added { item } = store.exec(sid, TodoOp::Add { content: "write code".into() })
-        else { panic!("expected added") };
+        let TodoResult::Added { item } = store.exec(sid, TodoOp::Add { content: "write code".into() }) else {
+            panic!("expected added")
+        };
         assert!(!item.completed);
         assert_eq!(item.content, "write code");
 

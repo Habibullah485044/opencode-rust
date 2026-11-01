@@ -33,10 +33,7 @@ pub(super) async fn create_session(
 ) -> Result<Json<Session>, ApiError> {
     let title = if req.title.is_empty() { "new session".to_string() } else { req.title };
     let s = st.db.run(move |db| db.create_session(&title, None)).await.map_err(internal)?;
-    let _ = st.events.send(ServerEvent::SessionCreated {
-        session_id: s.id.clone(),
-        title: s.title.clone(),
-    });
+    let _ = st.events.send(ServerEvent::SessionCreated { session_id: s.id.clone(), title: s.title.clone() });
     Ok(Json(s))
 }
 
@@ -57,10 +54,12 @@ pub(super) async fn get_messages(
 ) -> Result<Json<Vec<Message>>, ApiError> {
     let messages = st
         .db
-        .run(move |db| Ok(match db.get_session(&id)? {
-            Some(_) => Some(db.messages(&id)?),
-            None => None,
-        }))
+        .run(move |db| {
+            Ok(match db.get_session(&id)? {
+                Some(_) => Some(db.messages(&id)?),
+                None => None,
+            })
+        })
         .await
         .map_err(internal)?;
     messages.map(Json).ok_or_else(session_not_found)
@@ -277,9 +276,7 @@ pub(super) async fn delete_session_route(
     }
 }
 
-pub(super) async fn events_sse(
-    State(st): State<Shared>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+pub(super) async fn events_sse(State(st): State<Shared>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = st.events.subscribe();
     // New (B-09): events waiting to be sent before the next live one.
     let queue: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
@@ -390,8 +387,7 @@ pub(super) fn resolve_api_token(state_dir: &std::path::Path) -> Result<String> {
         }
     }
     let token = random_token()?;
-    std::fs::create_dir_all(state_dir)
-        .with_context(|| format!("creating {}", state_dir.display()))?;
+    std::fs::create_dir_all(state_dir).with_context(|| format!("creating {}", state_dir.display()))?;
     let path = api_token_path(state_dir);
     // Remove the old file first: on Unix the mode below only applies to a
     // file that is newly created.
@@ -403,9 +399,7 @@ pub(super) fn resolve_api_token(state_dir: &std::path::Path) -> Result<String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut file = opts
-        .open(&path)
-        .with_context(|| format!("writing {}", path.display()))?;
+    let mut file = opts.open(&path).with_context(|| format!("writing {}", path.display()))?;
     // Windows has no mode bits: the file inherits the folder's ACL. Give it
     // its own, with the current user only, before the token goes in.
     #[cfg(windows)]
@@ -414,8 +408,7 @@ pub(super) fn resolve_api_token(state_dir: &std::path::Path) -> Result<String> {
         // (FAT); $OPENCODE_RUST_API_TOKEN avoids the file altogether.
         core_log(&format!("[core] could not restrict {}: {e:#}", path.display()));
     }
-    std::io::Write::write_all(&mut file, token.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::io::Write::write_all(&mut file, token.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
     Ok(token)
 }
 
@@ -480,10 +473,7 @@ pub(super) fn owner_only_acl(path: &std::path::Path) -> Result<()> {
 /// `localhost:<port>`. A web page from another site that points its own
 /// domain name at 127.0.0.1 still sends that domain name, so it is refused.
 pub(super) fn host_allowed(headers: &axum::http::HeaderMap, port: u16) -> bool {
-    let Some(host) = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-    else {
+    let Some(host) = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
     let host = host.trim().to_ascii_lowercase();
@@ -540,11 +530,7 @@ pub async fn serve(state: Shared, port: u16) -> Result<std::net::SocketAddr> {
 }
 
 /// New (S-01): `serve` with a token you choose (tests use this).
-pub async fn serve_with_token(
-    state: Shared,
-    port: u16,
-    token: String,
-) -> Result<std::net::SocketAddr> {
+pub async fn serve_with_token(state: Shared, port: u16, token: String) -> Result<std::net::SocketAddr> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
     let guard = Arc::new(ApiGuard { token, port: addr.port() });

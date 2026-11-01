@@ -139,9 +139,11 @@ pub(super) fn add_cache_markers(body: &mut Value) {
 pub(super) fn system_text(body: &Value) -> String {
     match &body["system"] {
         Value::String(s) => s.clone(),
-        Value::Array(a) => a.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("
+        Value::Array(a) => a.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join(
+            "
 
-"),
+",
+        ),
         _ => String::new(),
     }
 }
@@ -163,10 +165,8 @@ fn turn_key(ids: impl Iterator<Item = String>) -> String {
 /// Anthropic ids must match `^[a-zA-Z0-9_-]+$`; ids made by other
 /// providers may not, so other characters become `_`.
 fn clean_id(id: &str) -> String {
-    let s: String = id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect();
+    let s: String =
+        id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
     if s.is_empty() {
         "toolu_missing".to_string()
     } else {
@@ -220,7 +220,8 @@ mod translate_tests {
             msg("system", Some("[slash command expanded]")),
             msg("user", Some("Now explain it.")),
         ];
-        let read = ToolFnSpec { name: "read".into(), description: "Read".into(), parameters: json!({"type": "object"}) };
+        let read =
+            ToolFnSpec { name: "read".into(), description: "Read".into(), parameters: json!({"type": "object"}) };
         let tools = vec![ToolSpec { kind: "function".into(), function: read }];
         let body = request_body("claude-sonnet-5-5", 1000, &history, &tools, &[]);
         assert_eq!(body["max_tokens"], 1000);
@@ -269,8 +270,14 @@ mod translate_tests {
             r.tool_call_id = Some(id.into());
             r
         };
-        let history =
-            vec![msg("user", Some("one")), with_call("t0"), result("t0"), msg("user", Some("two")), with_call("t1"), result("t1")];
+        let history = vec![
+            msg("user", Some("one")),
+            with_call("t0"),
+            result("t0"),
+            msg("user", Some("two")),
+            with_call("t1"),
+            result("t1"),
+        ];
         let saved = |id: &str| {
             let thinking = json!({ "type": "thinking", "thinking": "", "signature": "sig" });
             (id.to_string(), vec![thinking, json!({ "type": "tool_use", "id": id, "name": "read", "input": {} })])
@@ -518,8 +525,8 @@ pub(super) fn event_stream(
 #[cfg(test)]
 mod sse_tests {
     use super::*;
-    use futures::StreamExt;
     use crate::provider::ToolCallAccumulator;
+    use futures::StreamExt;
 
     /// Tool-use stream recorded from Anthropic's streaming docs (shortened).
     const SAMPLE: &str = r#"event: message_start
@@ -595,7 +602,8 @@ data: {"type":"message_stop"}
 
     #[tokio::test]
     async fn errors_cut_off_streams_and_tools_without_arguments() {
-        let overloaded = "data: {\"type\": \"error\", \"error\": {\"type\": \"overloaded_error\", \"message\": \"Overloaded\"}}\n";
+        let overloaded =
+            "data: {\"type\": \"error\", \"error\": {\"type\": \"overloaded_error\", \"message\": \"Overloaded\"}}\n";
         let err = run(overloaded).await.pop().unwrap().expect_err("error event must surface");
         assert!(err.to_string().contains("overloaded_error"), "{err}");
 
@@ -665,10 +673,10 @@ impl super::Client {
 #[cfg(test)]
 mod e2e_tests {
     use super::*;
-    use futures::StreamExt;
     use crate::provider::{FunctionCall, ToolCallAccumulator, ToolCallReq};
     use axum::http::{header, HeaderMap, StatusCode};
     use axum::{response::IntoResponse, routing::get, routing::post, Json, Router};
+    use futures::StreamExt;
 
     /// Reply 1: thinking + a `read` tool call.
     const FIRST: &str = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
@@ -809,7 +817,9 @@ mod cache_tests {
     fn usage_adds_cached_parts_to_the_prompt_total() {
         let mut st = SseState::default();
         st.line(r#"data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":3000,"cache_creation_input_tokens":200,"output_tokens":1}}}"#).unwrap();
-        let ev = st.line(r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":55}}"#).unwrap();
+        let ev = st
+            .line(r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":55}}"#)
+            .unwrap();
         let want = crate::provider::Usage { input: 3212, cached: 3000, cache_write: 200, output: 55 };
         assert!(matches!(&ev[0], StreamEvent::Usage(u) if *u == want), "{ev:?}");
         assert!(matches!(ev[1], StreamEvent::Done { .. }));

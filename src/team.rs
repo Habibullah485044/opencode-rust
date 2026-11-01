@@ -1,5 +1,5 @@
 use crate::db::Part;
-use crate::server::{one_shot, Shared, ServerEvent};
+use crate::server::{one_shot, ServerEvent, Shared};
 use crate::worktree::Isolation;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -57,12 +57,7 @@ fn say(st: &Shared, session_id: &str, text: String) {
     let _ = st.events.send(ServerEvent::AssistantDelta { session_id: session_id.to_string(), text });
 }
 
-pub async fn run_team(
-    st: &Shared,
-    session_id: &str,
-    goal: &str,
-    abort: Arc<AtomicBool>,
-) -> Result<String> {
+pub async fn run_team(st: &Shared, session_id: &str, goal: &str, abort: Arc<AtomicBool>) -> Result<String> {
     // B-18: plan mode is read-only, and team workers can edit files.
     if st.mode_for(session_id) == crate::agents::AgentMode::Plan {
         anyhow::bail!(
@@ -178,12 +173,7 @@ async fn plan(st: &Shared, goal: &str, abort: &AtomicBool) -> Result<Vec<Subtask
 }
 
 /// Reviewer: one non-streamed call verifying the worker reports.
-async fn review(
-    st: &Shared,
-    goal: &str,
-    reports: &[WorkerReport],
-    abort: &AtomicBool,
-) -> Result<String> {
+async fn review(st: &Shared, goal: &str, reports: &[WorkerReport], abort: &AtomicBool) -> Result<String> {
     let reports_json = serde_json::to_string_pretty(reports)?;
     let user = format!("GOAL: {goal}\n\nWORKER REPORTS:\n{reports_json}");
     let text = one_shot(
@@ -218,9 +208,7 @@ fn parse_subtask_array(text: &str) -> Vec<Subtask> {
     let span = text.char_indices().filter(|&(_, c)| c == '[').find_map(|(s, _)| {
         let mut values = serde_json::Deserializer::from_str(&text[s..]).into_iter::<Value>();
         match values.next() {
-            Some(Ok(Value::Array(items)))
-                if items.iter().any(|v| v.get("title").and_then(Value::as_str).is_some()) =>
-            {
+            Some(Ok(Value::Array(items))) if items.iter().any(|v| v.get("title").and_then(Value::as_str).is_some()) => {
                 Some((s, s + values.byte_offset() - 1))
             }
             _ => None,
@@ -240,11 +228,7 @@ fn parse_subtask_array(text: &str) -> Vec<Subtask> {
                     .filter_map(|v| {
                         Some(Subtask {
                             title: v.get("title")?.as_str()?.to_string(),
-                            instructions: v
-                                .get("instructions")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(), 
+                            instructions: v.get("instructions").and_then(Value::as_str).unwrap_or("").to_string(),
                         })
                     })
                     .collect();
@@ -259,30 +243,16 @@ fn parse_subtask_array(text: &str) -> Vec<Subtask> {
 }
 
 /// Worker: child session with the standard agent loop but scoped tools.
-async fn worker(
-    st: &Shared,
-    parent: &str,
-    task: &Subtask,
-    goal: &str,
-    abort: Arc<AtomicBool>,
-) -> Result<String> {
+async fn worker(st: &Shared, parent: &str, task: &Subtask, goal: &str, abort: Arc<AtomicBool>) -> Result<String> {
     let (title, parent_id) = (task.title.clone(), parent.to_string());
     let session = st.db.run(move |db| db.create_session(&title, Some(&parent_id))).await?;
-    let prompt = format!(
-        "Overall goal: {goal}\n\nYour subtask: {}\n{}",
-        task.title, task.instructions
-    );
+    let prompt = format!("Overall goal: {goal}\n\nYour subtask: {}\n{}", task.title, task.instructions);
     run_worker_agent(st, &session.id, &prompt, &abort).await
 }
 
 /// Worker variant of the agent loop — now the SHARED loop with the worker's
 /// system prompt: no activity events, no spawn tool (M2 dedup).
-async fn run_worker_agent(
-    st: &Shared,
-    session_id: &str,
-    prompt: &str,
-    abort: &AtomicBool,
-) -> Result<String> {
+async fn run_worker_agent(st: &Shared, session_id: &str, prompt: &str, abort: &AtomicBool) -> Result<String> {
     let (sid, text) = (session_id.to_string(), prompt.to_string());
     let parent = st
         .db
@@ -328,10 +298,9 @@ async fn run_worker_agent(
     // cut it off, and the user sees it as a note in the parent session.
     let report = iso.finish_async().await;
     if let Some(parent) = parent {
-        let _ = st.events.send(ServerEvent::Note {
-            session_id: parent,
-            text: format!("team worker {session_id}: {report}"),
-        });
+        let _ = st
+            .events
+            .send(ServerEvent::Note { session_id: parent, text: format!("team worker {session_id}: {report}") });
     }
     match out {
         Ok(text) => Ok(format!("{report}\n\n{text}")),
@@ -341,12 +310,7 @@ async fn run_worker_agent(
 
 /// The team worker's system prompt: its rules, the project instructions,
 /// the parent's ponytail level and the baked-in skills.
-fn worker_system(
-    st: &Shared,
-    session_id: &str,
-    parent: Option<&str>,
-    project_ws: &std::path::Path,
-) -> String {
+fn worker_system(st: &Shared, session_id: &str, parent: Option<&str>, project_ws: &std::path::Path) -> String {
     let mut system = format!(
         "You are a focused worker agent in team mode. Complete only your subtask.\n\n\
          Workspace: {}.\nNobody can answer questions during this run: make reasonable \
@@ -418,8 +382,7 @@ mod tests {
     /// known-good pattern from `examples/mock_llm.rs`. (Hand-written raw
     /// strings used literal `\n` and never produced valid SSE.)
     fn sse(content: &str) -> String {
-        let v =
-            serde_json::json!({"choices": [{"delta": {"content": content}, "finish_reason": null}]});
+        let v = serde_json::json!({"choices": [{"delta": {"content": content}, "finish_reason": null}]});
         format!("data: {}\n\ndata: [DONE]\n\n", v)
     }
 
@@ -443,10 +406,7 @@ mod tests {
                         "subtask complete"
                     };
                     let payload = sse(content);
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                        payload,
-                    )
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
                 }),
             );
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -510,7 +470,8 @@ mod isolation_tests {
                     out.push_str("data: [DONE]\n\n");
                     ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], out).into_response()
                 };
-                let text = |t: &str| serde_json::json!({"choices": [{"delta": {"content": t}, "finish_reason": "stop"}]});
+                let text =
+                    |t: &str| serde_json::json!({"choices": [{"delta": {"content": t}, "finish_reason": "stop"}]});
                 if sys.contains("planning agent") {
                     return sse(vec![text("[{\"title\":\"sub\",\"instructions\":\"write it\"}]")]);
                 }
@@ -588,9 +549,8 @@ mod b18_tests {
         let subs = parse_subtasks(text, "goal");
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].title, "a");
-        let many: Vec<Value> = (0..9)
-            .map(|i| serde_json::json!({"title": format!("t{i}"), "instructions": "x"}))
-            .collect();
+        let many: Vec<Value> =
+            (0..9).map(|i| serde_json::json!({"title": format!("t{i}"), "instructions": "x"})).collect();
         let subs = parse_subtasks(&serde_json::to_string(&many).unwrap(), "goal");
         assert_eq!(subs.len(), MAX_SUBTASKS);
     }
@@ -609,9 +569,7 @@ mod b18_tests {
         let st = crate::server::build_state_ephemeral(cfg, std::env::temp_dir()).await;
         let s = st.db.create_session("team-plan", None).unwrap();
         st.set_mode(&s.id, crate::agents::AgentMode::Plan);
-        let err = run_team(&st, &s.id, "edit things", Arc::new(AtomicBool::new(false)))
-            .await
-            .unwrap_err();
+        let err = run_team(&st, &s.id, "edit things", Arc::new(AtomicBool::new(false))).await.unwrap_err();
         assert!(err.to_string().contains("plan mode"), "{err}");
         assert!(st.db.messages(&s.id).unwrap().is_empty(), "nothing stored");
     }

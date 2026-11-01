@@ -132,8 +132,7 @@ where
     }
 
     pub async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
-        self.write_msg(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
-            .await
+        self.write_msg(&json!({ "jsonrpc": "2.0", "method": method, "params": params })).await
     }
 
     pub async fn initialize(&mut self) -> Result<Value> {
@@ -179,8 +178,7 @@ where
                     Err(e) => eprintln!("[mcp] skipping a tool entry in an unexpected shape: {e}"),
                 }
             }
-            let Some(cursor) = page.get("nextCursor").and_then(Value::as_str).map(str::to_string)
-            else {
+            let Some(cursor) = page.get("nextCursor").and_then(Value::as_str).map(str::to_string) else {
                 break;
             };
             page = tokio::time::timeout(limit, self.request("tools/list", json!({ "cursor": cursor })))
@@ -205,8 +203,8 @@ where
                 // nobody waits for. Best effort: the error stands anyway.
                 let id = self.next_id - 1;
                 let cancel = json!({ "requestId": id, "reason": "timed out" });
-                let _ = tokio::time::timeout(Duration::from_secs(2), self.notify("notifications/cancelled", cancel))
-                    .await;
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(2), self.notify("notifications/cancelled", cancel)).await;
                 return Err(anyhow::Error::new(elapsed).context("mcp tools/call timed out"));
             }
         };
@@ -256,10 +254,7 @@ fn cap_result(text: String) -> String {
 /// rest to `-`, so `mcp__<server>__<tool>` parsing stays unambiguous.
 /// B-19: at most MAX_SERVER_PART characters, so the tool part has room.
 pub fn sanitize_server(name: &str) -> String {
-    name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
-        .take(MAX_SERVER_PART)
-        .collect()
+    name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).take(MAX_SERVER_PART).collect()
 }
 
 /// Short, stable hash (FNV-1a, 32 bit): same input, same output, every run.
@@ -271,10 +266,8 @@ fn short_hash(s: &str) -> String {
 /// `^[a-zA-Z0-9_-]{1,64}$` (B-19). [`resolve_tool_name`] maps it back.
 pub fn tool_fn_name(server: &str, tool: &str) -> String {
     let prefix = format!("mcp__{}__", sanitize_server(server));
-    let clean: String = tool
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect();
+    let clean: String =
+        tool.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
     let full = format!("{prefix}{clean}");
     if clean == tool && !clean.is_empty() && full.len() <= MAX_FN_NAME {
         return full;
@@ -314,11 +307,7 @@ pub fn spec_for(server: &str, t: &McpTool) -> ToolSpec {
     } else if params.get("type").is_none() {
         params["type"] = json!("object");
     }
-    let desc = if t.description.is_empty() {
-        "no description".to_string()
-    } else {
-        t.description.clone()
-    };
+    let desc = if t.description.is_empty() { "no description".to_string() } else { t.description.clone() };
     ToolSpec {
         kind: "function".into(),
         function: ToolFnSpec {
@@ -357,9 +346,7 @@ const STDERR_KEEP: usize = 4_096;
 
 /// Keep the last `STDERR_KEEP` bytes a server writes to stderr. Read to the
 /// end so a chatty server never blocks on a full pipe.
-fn collect_stderr(
-    stderr: tokio::process::ChildStderr,
-) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+fn collect_stderr(stderr: tokio::process::ChildStderr) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
     use tokio::io::AsyncReadExt;
     let tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let keep = tail.clone();
@@ -387,9 +374,11 @@ fn stderr_tail(tail: &std::sync::Mutex<Vec<u8>>) -> String {
     if text.is_empty() {
         String::new()
     } else {
-        format!("
+        format!(
+            "
 --- server stderr (last lines) ---
-{text}")
+{text}"
+        )
     }
 }
 
@@ -598,25 +587,14 @@ impl Registry {
     /// Find the server behind a model-facing MCP name and return a handle
     /// that calls it WITHOUT the registry being locked (B-20).
     pub fn route(&self, fn_name: &str) -> Result<McpRoute> {
-        let (server, tool) =
-            parse_fn_name(fn_name).ok_or_else(|| anyhow!("`{fn_name}` is not an MCP tool"))?;
-        let conn = self
-            .conns
-            .get(&server)
-            .ok_or_else(|| anyhow!("mcp server `{server}` is not connected"))?;
-        Ok(McpRoute {
-            live: conn.live.clone(),
-            tool: resolve_tool_name(&conn.server, &conn.tools, &tool),
-        })
+        let (server, tool) = parse_fn_name(fn_name).ok_or_else(|| anyhow!("`{fn_name}` is not an MCP tool"))?;
+        let conn = self.conns.get(&server).ok_or_else(|| anyhow!("mcp server `{server}` is not connected"))?;
+        Ok(McpRoute { live: conn.live.clone(), tool: resolve_tool_name(&conn.server, &conn.tools, &tool) })
     }
 
     pub async fn call(&mut self, fn_name: &str, args: &Value) -> Result<String> {
-        let (server, tool) =
-            parse_fn_name(fn_name).ok_or_else(|| anyhow!("`{fn_name}` is not an MCP tool"))?;
-        let conn = self
-            .conns
-            .get_mut(&server)
-            .ok_or_else(|| anyhow!("mcp server `{server}` is not connected"))?;
+        let (server, tool) = parse_fn_name(fn_name).ok_or_else(|| anyhow!("`{fn_name}` is not an MCP tool"))?;
+        let conn = self.conns.get_mut(&server).ok_or_else(|| anyhow!("mcp server `{server}` is not connected"))?;
         let real = resolve_tool_name(&conn.server, &conn.tools, &tool);
         conn.call(&real, args).await
     }
@@ -678,13 +656,17 @@ pub fn unwrap_call(name: &str, input: &Value) -> Option<(String, Value)> {
 /// Best matches for `query` among `specs`: name and arguments of each, for
 /// `mcp_call`. Name hits count more than description hits.
 pub fn search(specs: &[ToolSpec], query: &str, limit: usize) -> String {
-    let words: Vec<String> = query.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(String::from).collect();
+    let words: Vec<String> =
+        query.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(String::from).collect();
     let mut ranked: Vec<(usize, &ToolSpec)> = specs
         .iter()
         .map(|s| {
             let name = s.function.name.to_lowercase();
             let desc = s.function.description.to_lowercase();
-            let score = words.iter().map(|w| 3 * usize::from(name.contains(w.as_str())) + usize::from(desc.contains(w.as_str()))).sum();
+            let score = words
+                .iter()
+                .map(|w| 3 * usize::from(name.contains(w.as_str())) + usize::from(desc.contains(w.as_str())))
+                .sum();
             (score, s)
         })
         .filter(|(score, _)| *score > 0)
@@ -733,7 +715,10 @@ mod lazy_tests {
             description: desc.into(),
             input_schema: json!({"type": "object", "properties": {"repo": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["repo"]}),
         };
-        let specs = vec![spec_for("gh", &t("list_issues", "List issues")), spec_for("gh", &t("create_pr", "Open a pull request for issues"))];
+        let specs = vec![
+            spec_for("gh", &t("list_issues", "List issues")),
+            spec_for("gh", &t("create_pr", "Open a pull request for issues")),
+        ];
         let out = search(&specs, "issues", 5);
         assert!(out.find("list_issues").unwrap() < out.find("create_pr").unwrap(), "{out}");
         assert!(out.contains("arguments: {limit?: integer, repo: string}"), "{out}");
@@ -767,16 +752,13 @@ mod tests {
                     continue;
                 };
                 let Some(id) = v.get("id").cloned() else { continue }; // notification
-                let method =
-                    v.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+                let method = v.get("method").and_then(Value::as_str).unwrap_or("").to_string();
                 let result = canned
                     .iter()
                     .find(|(m, _)| *m == method)
                     .map(|(_, r)| r.clone())
                     .unwrap_or(Value::Object(Default::default()));
-                let mut out =
-                    serde_json::to_string(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
-                        .unwrap();
+                let mut out = serde_json::to_string(&json!({ "jsonrpc": "2.0", "id": id, "result": result })).unwrap();
                 out.push('\n');
                 if stream.write_all(out.as_bytes()).await.is_err() {
                     return;
@@ -800,10 +782,7 @@ mod tests {
                     "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
                 }]}),
             ),
-            (
-                "tools/call".into(),
-                json!({"content": [{"type": "text", "text": "echo: hi"}], "isError": false}),
-            ),
+            ("tools/call".into(), json!({"content": [{"type": "text", "text": "echo: hi"}], "isError": false})),
         ]
     }
 
@@ -888,10 +867,7 @@ mod tests {
         let err = client.request("tools/list", json!({})).await.unwrap_err();
         // Whether the write fails or the read hits EOF, the error names the
         // method it was in flight for.
-        assert!(
-            err.to_string().contains("tools/list"),
-            "error names the method: {err}"
-        );
+        assert!(err.to_string().contains("tools/list"), "error names the method: {err}");
     }
 
     /// `npx` on Windows is `npx.cmd`: a bare name is found on PATH with
@@ -962,10 +938,7 @@ mod tests {
     fn fn_name_roundtrip_and_sanitization() {
         assert_eq!(tool_fn_name("my-server", "do_thing"), "mcp__my-server__do_thing");
         assert_eq!(tool_fn_name("we ird!", "t"), "mcp__we-ird-__t");
-        assert_eq!(
-            parse_fn_name("mcp__my-server__do_thing"),
-            Some(("my-server".into(), "do_thing".into()))
-        );
+        assert_eq!(parse_fn_name("mcp__my-server__do_thing"), Some(("my-server".into(), "do_thing".into())));
         // Tool names containing `__` still parse (split at first `__`).
         assert_eq!(parse_fn_name("mcp__srv__a__b"), Some(("srv".into(), "a__b".into())));
         assert_eq!(parse_fn_name("bash"), None);
@@ -975,11 +948,7 @@ mod tests {
 
     #[test]
     fn spec_for_coerces_schema_to_object() {
-        let t = McpTool {
-            name: "echo".into(),
-            description: String::new(),
-            input_schema: json!({"type": "object"}),
-        };
+        let t = McpTool { name: "echo".into(), description: String::new(), input_schema: json!({"type": "object"}) };
         let s = spec_for("srv", &t);
         assert_eq!(s.function.name, "mcp__srv__echo");
         assert!(s.function.description.contains("[mcp:srv] no description"));
@@ -1016,10 +985,7 @@ rl.on('line', (line) => {
         let dir = std::env::temp_dir().join(format!(
             "ocrs-mcp-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("fake_mcp.js");
@@ -1041,8 +1007,7 @@ rl.on('line', (line) => {
         // Registry-level routing by qualified name.
         let mut reg = Registry::default();
         reg.conns.insert("fake".into(), conn);
-        let out =
-            reg.call("mcp__fake__echo", &json!({"text": "via reg"})).await.unwrap();
+        let out = reg.call("mcp__fake__echo", &json!({"text": "via reg"})).await.unwrap();
         assert_eq!(out, "echo: via reg");
         assert!(reg.call("mcp__nope__x", &json!({})).await.is_err());
         assert!(reg.call("bash", &json!({})).await.is_err());
@@ -1080,8 +1045,8 @@ mod b19_names_tests {
         let mut seen = std::collections::HashSet::new();
         for t in &tools {
             let fname = tool_fn_name(server, &t.name);
-            let safe = fname.len() <= MAX_FN_NAME
-                && fname.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            let safe =
+                fname.len() <= MAX_FN_NAME && fname.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
             assert!(safe, "{fname}");
             assert!(seen.insert(fname.clone()), "duplicate name {fname}");
             let (srv, part) = parse_fn_name(&fname).expect("mcp-shaped");
@@ -1203,11 +1168,8 @@ mod b20_tests {
 
     fn node_bin() -> Option<String> {
         ["node", "nodejs"].iter().find_map(|c| {
-            let ok = std::process::Command::new(c)
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            let ok =
+                std::process::Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
             ok.then(|| c.to_string())
         })
     }

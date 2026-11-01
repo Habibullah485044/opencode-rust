@@ -181,18 +181,14 @@ mod tests {
 
     #[tokio::test]
     async fn prefill_names_the_chat_like_typed_sends() {
-        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
-            .await;
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
         let s = st.db.create_session(NEW_CHAT, None).unwrap();
         let mut g = GuiState::new();
         g.session = Some(s.id.clone());
         refresh_sessions(&mut g, &st);
         // The CLI prefill submits the same way a typed message does…
         g.input = "prefill repro marker one".into();
-        assert_eq!(
-            submit_and_name(&mut g, &st).as_deref(),
-            Some("prefill repro marker one")
-        );
+        assert_eq!(submit_and_name(&mut g, &st).as_deref(), Some("prefill repro marker one"));
         // …and names the chat after it, instead of leaving it "New chat".
         assert_eq!(g.title(), "prefill repro marker one");
         // Later messages never rename an already-named chat.
@@ -204,8 +200,7 @@ mod tests {
     /// B-12: switching chats keeps a running chat's transcript.
     #[tokio::test]
     async fn switching_chats_keeps_a_running_chat_live() {
-        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
-            .await;
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
         let a = st.db.create_session("a", None).unwrap();
         let b = st.db.create_session("b", None).unwrap();
         let mut g = GuiState::new();
@@ -223,8 +218,7 @@ mod tests {
     /// F-06: Stop sets the same abort flag as `POST /api/sessions/{id}/abort`.
     #[tokio::test]
     async fn stop_sets_the_runs_abort_flag() {
-        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
-            .await;
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         st.busy.write().await.insert("ses_run".into(), flag.clone());
         assert!(request_stop(&st, "ses_run").await);
@@ -235,8 +229,7 @@ mod tests {
     /// well before its 500 ms recheck.
     #[tokio::test]
     async fn stop_wakes_an_aborted_waiter_at_once() {
-        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
-            .await;
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         st.busy.write().await.insert("ses_wake".into(), flag.clone());
         let f2 = flag.clone();
@@ -255,8 +248,7 @@ mod tests {
     /// chat is neither deleted nor moved, and the user is told why.
     #[tokio::test]
     async fn delete_and_move_chat() {
-        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
-            .await;
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
         let a = st.db.create_session("a", None).unwrap();
         st.set_mode(&a.id, crate::agents::AgentMode::Plan);
         let mut g = GuiState::new();
@@ -294,8 +286,7 @@ mod tests {
     /// T-028: deleting a chat from the GUI deletes its todos too.
     #[tokio::test]
     async fn deleting_a_chat_drops_its_todos() {
-        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
-            .await;
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
         let s = st.db.create_session("todos", None).unwrap();
         st.todo_store.exec(&s.id, crate::todo::TodoOp::Add { content: "write tests".into() });
         assert_eq!(st.todo_store.list_all(&s.id).len(), 1);
@@ -385,8 +376,7 @@ mod tests {
     /// B-42: start-up reuses the newest chat only while it is empty.
     #[tokio::test]
     async fn startup_reuses_an_empty_newest_chat() {
-        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir())
-            .await;
+        let st = server::build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
         let s = st.db.create_session(NEW_CHAT, None).unwrap();
         assert_eq!(newest_empty_session(&st).map(|x| x.id), Some(s.id.clone()));
         st.db.add_message(&s.id, "user", &[Part::Text { text: "hi".into() }]).unwrap();

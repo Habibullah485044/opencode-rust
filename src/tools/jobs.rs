@@ -9,9 +9,9 @@ use super::truncate_middle;
 #[cfg(windows)]
 use super::winjob;
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Most output kept per job (older output is dropped).
@@ -48,11 +48,7 @@ pub fn start(command: &str, workspace: &Path) -> Result<String> {
 pub fn spawn(command: &str, workspace: &Path, by_user: bool) -> Result<String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let mut cmd = shell_command(command);
-    cmd.current_dir(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.current_dir(workspace).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     scrub_secrets(&mut cmd);
     // Its own process group, so `stop` (kill_tree) reaches what it started.
     #[cfg(unix)]
@@ -64,10 +60,12 @@ pub fn spawn(command: &str, workspace: &Path, by_user: bool) -> Result<String> {
     let out = Arc::new(Mutex::new(Vec::new()));
     let dropped = Arc::new(Mutex::new(0usize));
     let exit = Arc::new(Mutex::new(None));
-    for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
-                 child.stderr.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>)]
-        .into_iter()
-        .flatten()
+    for pipe in [
+        child.stdout.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+        child.stderr.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+    ]
+    .into_iter()
+    .flatten()
     {
         let (out, dropped) = (out.clone(), dropped.clone());
         tokio::spawn(async move {
@@ -132,9 +130,7 @@ fn prune(map: &mut HashMap<String, Job>) {
     }
     ended.sort_unstable();
     let cutoff = ended[ended.len() - KEEP_ENDED];
-    map.retain(|id, j| {
-        j.by_user || j.exit.lock().unwrap_or_else(|e| e.into_inner()).is_none() || num(id) >= cutoff
-    });
+    map.retain(|id, j| j.by_user || j.exit.lock().unwrap_or_else(|e| e.into_inner()).is_none() || num(id) >= cutoff);
 }
 
 /// How many jobs are remembered (tests).
@@ -236,10 +232,7 @@ pub async fn stop(id: &str) -> Result<String> {
 pub async fn stop_all() {
     let pids: Vec<Option<u32>> = {
         let map = jobs().lock().unwrap_or_else(|e| e.into_inner());
-        map.values()
-            .filter(|j| j.exit.lock().unwrap_or_else(|e| e.into_inner()).is_none())
-            .map(|j| j.pid)
-            .collect()
+        map.values().filter(|j| j.exit.lock().unwrap_or_else(|e| e.into_inner()).is_none()).map(|j| j.pid).collect()
     };
     for pid in pids {
         kill_tree(pid).await;

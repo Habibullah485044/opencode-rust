@@ -141,12 +141,7 @@ impl App {
         }
         // Goal B: agent tools ask this loop to act on the webview.
         while let Ok(req) = self.cmd_rx.try_recv() {
-            self.bridge.start(
-                &self.browser_webview,
-                req,
-                &mut self.gs.browser,
-                self.st.cfg.browser.allow_remote,
-            );
+            self.bridge.start(&self.browser_webview, req, &mut self.gs.browser, self.st.cfg.browser.allow_remote);
             changed = true;
         }
         // Requests that never get an answer must not hang the run.

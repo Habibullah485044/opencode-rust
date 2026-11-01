@@ -172,9 +172,8 @@ fn slots(parent: &str, max: usize) -> Arc<tokio::sync::Semaphore> {
     let mut map = SLOTS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
     // A chat with nobody running or waiting holds no clone: forget it.
     map.retain(|_, (_, sem)| Arc::strong_count(sem) > 1);
-    let (limit, sem) = map
-        .entry(parent.to_string())
-        .or_insert_with(|| (max, Arc::new(tokio::sync::Semaphore::new(max))));
+    let (limit, sem) =
+        map.entry(parent.to_string()).or_insert_with(|| (max, Arc::new(tokio::sync::Semaphore::new(max))));
     if *limit < max {
         sem.add_permits(max - *limit);
     } else if *limit > max {
@@ -195,22 +194,12 @@ fn slots(parent: &str, max: usize) -> Arc<tokio::sync::Semaphore> {
 }
 
 fn info(id: &str, run: &Run) -> AgentInfo {
-    AgentInfo {
-        id: id.to_string(),
-        parent: run.parent.clone(),
-        name: run.role.name.clone(),
-        task: run.task.clone(),
-    }
+    AgentInfo { id: id.to_string(), parent: run.parent.clone(), name: run.role.name.clone(), task: run.task.clone() }
 }
 
 /// Execute a `spawn` call. A plain spawn waits for the child and returns its
 /// report; `background: true` returns the child's id at once.
-pub async fn spawn_subagent(
-    st: &Shared,
-    parent_session_id: &str,
-    args: &Value,
-    abort: &AtomicBool,
-) -> Result<String> {
+pub async fn spawn_subagent(st: &Shared, parent_session_id: &str, args: &Value, abort: &AtomicBool) -> Result<String> {
     let roles = agents::load_subagents(&st.workspace_for(parent_session_id));
     let names = || roles.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
     let name = args
@@ -360,9 +349,7 @@ async fn run_child(st: &Shared, id: &str) -> Result<(RunState, String)> {
         allow = Some(crate::worktree::isolated_tools(role.tools.as_deref()));
     }
     // A read-only role may use the cheaper small model.
-    let model = role.model.clone().or_else(|| {
-        role.read_only.then(|| st.cfg.provider.small_model.clone()).flatten()
-    });
+    let model = role.model.clone().or_else(|| role.read_only.then(|| st.cfg.provider.small_model.clone()).flatten());
     let opts = LoopOpts {
         system,
         emit_activity: false, // activity goes to the agents panel instead
@@ -561,9 +548,8 @@ pub fn stop(id: &str) -> bool {
 /// True when a `review` agent of `parent` finished its work after `since`.
 pub fn reviewed_since(parent: &str, since: Instant) -> bool {
     with_runs(|m| {
-        m.values().any(|r| {
-            r.parent == parent && r.role.name == "review" && r.state == RunState::Done && r.started >= since
-        })
+        m.values()
+            .any(|r| r.parent == parent && r.role.name == "review" && r.state == RunState::Done && r.started >= since)
     })
 }
 
@@ -602,8 +588,7 @@ pub fn take_mail(session_id: &str) -> Option<String> {
             })
             .collect()
     });
-    (!reports.is_empty())
-        .then(|| format!("Background agents finished:\n\n{}", reports.join("\n\n---\n\n")))
+    (!reports.is_empty()).then(|| format!("Background agents finished:\n\n{}", reports.join("\n\n---\n\n")))
 }
 
 /// Execute the `agent` tool (wait, send, stop, list) for the agents of
@@ -620,9 +605,9 @@ async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, 
     let mine = |id: &str| with_runs(|m| m.get(id).filter(|r| r.parent == parent).cloned());
     let id_arg = || {
         let id = input.get("id").and_then(Value::as_str).ok_or_else(|| anyhow!("missing `id`"))?;
-        mine(id).map(|run| (id.to_string(), run)).ok_or_else(|| {
-            anyhow!("no agent `{id}` in this chat — action list shows the ids")
-        })
+        mine(id)
+            .map(|run| (id.to_string(), run))
+            .ok_or_else(|| anyhow!("no agent `{id}` in this chat — action list shows the ids"))
     };
     match name {
         "list" => {
@@ -631,7 +616,15 @@ async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, 
                     .filter(|(_, r)| r.parent == parent)
                     .map(|(id, r)| {
                         let task: String = r.task.chars().take(80).collect();
-                        (r.started, format!("{id} · {} · {} · {:.0}s · {task}", r.role.name, r.state.as_str(), r.elapsed().as_secs_f64()))
+                        (
+                            r.started,
+                            format!(
+                                "{id} · {} · {} · {:.0}s · {task}",
+                                r.role.name,
+                                r.state.as_str(),
+                                r.elapsed().as_secs_f64()
+                            ),
+                        )
                     })
                     .collect()
             });
@@ -698,7 +691,12 @@ async fn agent_tool_inner(st: &Shared, parent: &str, name: &str, input: &Value, 
                 for id in &ids {
                     let Some(r) = m.get_mut(id) else { continue };
                     if r.running() {
-                        busy.push(format!("{id} ({}, {}, {:.0}s)", r.role.name, r.state.as_str(), r.elapsed().as_secs_f64()));
+                        busy.push(format!(
+                            "{id} ({}, {}, {:.0}s)",
+                            r.role.name,
+                            r.state.as_str(),
+                            r.elapsed().as_secs_f64()
+                        ));
                     } else {
                         r.delivered = true;
                         done.push(r.report.clone().unwrap_or_default());
@@ -790,23 +788,9 @@ data: [DONE]
 
         let err = spawn_subagent(&st, &s.id, &json!({}), &abort).await.unwrap_err();
         assert!(err.to_string().contains("missing `subagent`"));
-        let err = spawn_subagent(
-            &st,
-            &s.id,
-            &json!({"subagent": "explore", "task": ""}),
-            &abort,
-        )
-        .await
-        .unwrap_err();
+        let err = spawn_subagent(&st, &s.id, &json!({"subagent": "explore", "task": ""}), &abort).await.unwrap_err();
         assert!(err.to_string().contains("missing `task`"));
-        let err = spawn_subagent(
-            &st,
-            &s.id,
-            &json!({"subagent": "nope", "task": "t"}),
-            &abort,
-        )
-        .await
-        .unwrap_err();
+        let err = spawn_subagent(&st, &s.id, &json!({"subagent": "nope", "task": "t"}), &abort).await.unwrap_err();
         assert!(err.to_string().contains("unknown subagent"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -818,10 +802,7 @@ data: [DONE]
         let dir = std::env::temp_dir().join(format!(
             "ocrs-spawn-e2e-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let mut cfg = crate::config::Config::default();
@@ -852,8 +833,7 @@ data: [DONE]
 
         // Child session exists, parented, with the task as its user message.
         let all = st.db.list_sessions().unwrap();
-        let child = all.iter().find(|x| x.parent_id.as_deref() == Some(s.id.as_str()))
-            .expect("child session created");
+        let child = all.iter().find(|x| x.parent_id.as_deref() == Some(s.id.as_str())).expect("child session created");
         assert!(child.title.starts_with("sub:"));
         let child_msgs = st.db.messages(&child.id).unwrap();
         assert!(child_msgs.iter().any(|m| m.role == "user"
@@ -907,11 +887,8 @@ data: [DONE]
         let mut specs = crate::tools::tool_specs();
         specs.extend(st.mcp.lock().await.specs());
         specs.push(spawn_spec(&agents::builtin_subagents()));
-        let kept: Vec<String> = crate::agents::AgentMode::Plan
-            .filter_specs(specs)
-            .into_iter()
-            .map(|x| x.function.name)
-            .collect();
+        let kept: Vec<String> =
+            crate::agents::AgentMode::Plan.filter_specs(specs).into_iter().map(|x| x.function.name).collect();
         assert!(!kept.contains(&"spawn".to_string()));
         assert!(!kept.contains(&"bash".to_string()));
         assert!(kept.contains(&"read".to_string()));
@@ -970,10 +947,7 @@ data: [DONE]
         let dir = std::env::temp_dir().join(format!(
             "ocrs-spawn-par-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let mut cfg = crate::config::Config::default();
@@ -991,10 +965,7 @@ data: [DONE]
 
         // Both children ran, parented to the main session.
         let all = st.db.list_sessions().unwrap();
-        let kids: Vec<_> = all
-            .iter()
-            .filter(|x| x.parent_id.as_deref() == Some(s.id.as_str()))
-            .collect();
+        let kids: Vec<_> = all.iter().filter(|x| x.parent_id.as_deref() == Some(s.id.as_str())).collect();
         assert_eq!(kids.len(), 2, "one child session per spawn");
 
         // Tool results recorded in call order, with each subagent's summary.
@@ -1002,9 +973,7 @@ data: [DONE]
         let results: Vec<String> = msgs
             .iter()
             .filter_map(|m| match m.parts.first() {
-                Some(Part::ToolResult { tool_id, output, .. }) => {
-                    Some(format!("{tool_id}:{output}"))
-                }
+                Some(Part::ToolResult { tool_id, output, .. }) => Some(format!("{tool_id}:{output}")),
                 _ => None,
             })
             .collect();
@@ -1022,18 +991,11 @@ data: [DONE]
                 evs.push((agent_id, state));
             }
         }
-        let first_done = evs
-            .iter()
-            .position(|(_, state)| state == "done")
-            .expect("a done event");
-        let started: std::collections::HashSet<&str> =
-            evs[..first_done].iter().map(|(id, _)| id.as_str()).collect();
+        let first_done = evs.iter().position(|(_, state)| state == "done").expect("a done event");
+        let started: std::collections::HashSet<&str> = evs[..first_done].iter().map(|(id, _)| id.as_str()).collect();
         assert!(started.len() >= 2, "both agents started before the first finish: {evs:?}");
-        let done: std::collections::HashSet<&String> = evs
-            .iter()
-            .filter(|(_, state)| state == "done")
-            .map(|(id, _)| id)
-            .collect();
+        let done: std::collections::HashSet<&String> =
+            evs.iter().filter(|(_, state)| state == "done").map(|(id, _)| id).collect();
         assert_eq!(done.len(), 2, "both agents reached done: {evs:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1104,11 +1066,7 @@ data: [DONE]
 
         assert!(!dir.join("from_worker.txt").exists(), "the real workspace is untouched");
         assert!(out.contains("[isolated worktree]") && out.contains("from_worker.txt"), "{out}");
-        let patch = out
-            .lines()
-            .find_map(|l| l.strip_prefix("Patch: "))
-            .expect("patch path in the summary")
-            .to_string();
+        let patch = out.lines().find_map(|l| l.strip_prefix("Patch: ")).expect("patch path in the summary").to_string();
         git(&["apply", &patch]);
         assert_eq!(std::fs::read_to_string(dir.join("from_worker.txt")).unwrap(), "hi\n");
         let list = git(&["worktree", "list", "--porcelain"]);
@@ -1141,7 +1099,8 @@ mod b27_tests {
                     .last()
                     .unwrap_or("")
                     .to_string();
-                let frame = json!({"choices": [{"delta": {"content": format!("got: {last}")}, "finish_reason": "stop"}]});
+                let frame =
+                    json!({"choices": [{"delta": {"content": format!("got: {last}")}, "finish_reason": "stop"}]});
                 (
                     [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
                     format!("data: {frame}\n\ndata: [DONE]\n\n"),
@@ -1170,7 +1129,8 @@ mod b27_tests {
     }
 
     fn states(parent: &str) -> Vec<&'static str> {
-        let mut v: Vec<_> = with_runs(|m| m.values().filter(|r| r.parent == parent).map(|r| r.state.as_str()).collect());
+        let mut v: Vec<_> =
+            with_runs(|m| m.values().filter(|r| r.parent == parent).map(|r| r.state.as_str()).collect());
         v.sort();
         v
     }
@@ -1264,7 +1224,8 @@ mod b27_tests {
         assert!(take_mail(&parent).is_none(), "delivered once");
 
         // A finished agent starts again with the new message.
-        let (out, ok) = agent_tool(&st, &parent, &json!({"action": "send", "id": id, "message": "now check tests"}), &no).await;
+        let (out, ok) =
+            agent_tool(&st, &parent, &json!({"action": "send", "id": id, "message": "now check tests"}), &no).await;
         assert!(ok && out.contains("started again"), "{out}");
         let (out, _) = agent_tool(&st, &parent, &json!({"action": "wait", "ids": [id]}), &no).await;
         assert!(out.contains("got: now check tests"), "{out}");
@@ -1341,5 +1302,4 @@ mod b27_tests {
         assert_eq!(states.last().map(String::as_str), Some("failed"));
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }

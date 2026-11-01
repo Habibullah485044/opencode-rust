@@ -1,9 +1,7 @@
 //! Drawing: the Freebuff-CLI palette, the frame layout, and the widgets.
 //! The team and spawned-agent panels share [`draw_agent_card`].
 
-use super::state::{
-    wrap_n, App, EntryKind, MissionPicker, PendingEdit, SessionsOverlay, TeamPhase, TeamStatus,
-};
+use super::state::{wrap_n, App, EntryKind, MissionPicker, PendingEdit, SessionsOverlay, TeamPhase, TeamStatus};
 use crate::commands::{builtins, help_text};
 use ratatui::{
     prelude::*,
@@ -37,12 +35,7 @@ const TEAM_H: u16 = 8;
 pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(3), Constraint::Length(1)])
         .split(f.area());
 
     draw_header(f, app, chunks[0]);
@@ -77,18 +70,13 @@ pub fn draw(f: &mut Frame, app: &App) {
 /// Busy spinner: while busy the loop ticks and redraws every 100 ms (T-062).
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     const SPIN: [&str; 4] = ["◐", "◓", "◑", "◒"];
-    let status = if app.busy {
-        format!("{} working", SPIN[app.tick as usize % SPIN.len()])
-    } else {
-        "ready".to_string()
-    };
+    let status =
+        if app.busy { format!("{} working", SPIN[app.tick as usize % SPIN.len()]) } else { "ready".to_string() };
     // T-100: a short id; the full one pushed the api status off narrow
     // terminals.
     let session = app.session_id.as_deref().map_or("-", short_session_id);
     let api = match app.api {
-        Some((true, ms)) => {
-            Span::styled(format!("api ok {ms}ms"), Style::default().fg(FB_SUCCESS))
-        }
+        Some((true, ms)) => Span::styled(format!("api ok {ms}ms"), Style::default().fg(FB_SUCCESS)),
         Some((false, _)) => Span::styled("api DOWN", Style::default().fg(FB_ERROR)),
         None => Span::styled("api …", Style::default().fg(FB_MUTED)),
     };
@@ -96,32 +84,17 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     // Left: who/where/state. Right: connection and model facts, right-aligned
     // so the bar reads as a status strip instead of a word pile.
     let mut left = vec![
-        Span::styled(
-            " opencode-rust ",
-            Style::default()
-                .fg(FB_INK)
-                .bg(FB_GREEN)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(" opencode-rust ", Style::default().fg(FB_INK).bg(FB_GREEN).add_modifier(Modifier::BOLD)),
         sep(),
         Span::styled(format!("session {session}"), Style::default().fg(FB_MUTED)),
         sep(),
         Span::styled(format!("mode {}", app.mode.as_str()), Style::default().fg(FB_MUTED)),
         sep(),
-        Span::styled(
-            status,
-            Style::default().fg(if app.busy { FB_WARNING } else { FB_SUCCESS }),
-        ),
+        Span::styled(status, Style::default().fg(if app.busy { FB_WARNING } else { FB_SUCCESS })),
     ];
     if app.turbo {
         left.push(sep());
-        left.push(Span::styled(
-            " TURBO ",
-            Style::default()
-                .fg(FB_INK)
-                .bg(FB_WARNING)
-                .add_modifier(Modifier::BOLD),
-        ));
+        left.push(Span::styled(" TURBO ", Style::default().fg(FB_INK).bg(FB_WARNING).add_modifier(Modifier::BOLD)));
     }
     let mut right: Vec<Span> = Vec::new();
     if let Some(m) = &app.model {
@@ -142,14 +115,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(right_w)])
         .split(area);
-    f.render_widget(
-        Paragraph::new(Line::from(left)).style(Style::default().bg(FB_SURFACE)),
-        cols[0],
-    );
-    f.render_widget(
-        Paragraph::new(Line::from(right)).style(Style::default().bg(FB_SURFACE)),
-        cols[1],
-    );
+    f.render_widget(Paragraph::new(Line::from(left)).style(Style::default().bg(FB_SURFACE)), cols[0]);
+    f.render_widget(Paragraph::new(Line::from(right)).style(Style::default().bg(FB_SURFACE)), cols[1]);
 }
 
 /// Live panels above the transcript: team cards and/or spawned-agent
@@ -157,8 +124,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 /// panel wins contested space. Returns the area left for the transcript.
 fn draw_panels(f: &mut Frame, app: &App, area: Rect) -> Rect {
     let show_agents = !app.agents.is_empty() && area.height >= TEAM_H + 6;
-    let show_team = app.team.is_some()
-        && area.height >= TEAM_H + 6 + if show_agents { TEAM_H } else { 0 };
+    let show_team = app.team.is_some() && area.height >= TEAM_H + 6 + if show_agents { TEAM_H } else { 0 };
     if show_team || show_agents {
         let mut cons: Vec<Constraint> = Vec::new();
         if show_team {
@@ -168,10 +134,7 @@ fn draw_panels(f: &mut Frame, app: &App, area: Rect) -> Rect {
             cons.push(Constraint::Length(TEAM_H));
         }
         cons.push(Constraint::Min(3));
-        let parts = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(cons)
-            .split(area);
+        let parts = Layout::default().direction(Direction::Vertical).constraints(cons).split(area);
         let mut i = 0;
         if show_team {
             draw_team(f, app, parts[i]);
@@ -194,9 +157,7 @@ fn draw_transcript(f: &mut Frame, app: &App, transcript_area: Rect) {
         let style = match e.kind {
             EntryKind::User => Style::default().fg(FB_GREEN).add_modifier(Modifier::BOLD),
             EntryKind::Assistant => Style::default().fg(FB_FG),
-            EntryKind::Thinking => {
-                Style::default().fg(FB_MUTED).add_modifier(Modifier::ITALIC)
-            }
+            EntryKind::Thinking => Style::default().fg(FB_MUTED).add_modifier(Modifier::ITALIC),
             EntryKind::Tool => Style::default().fg(FB_AI),
             EntryKind::System => Style::default().fg(FB_SECONDARY),
             EntryKind::Error => Style::default().fg(FB_ERROR).add_modifier(Modifier::BOLD),
@@ -217,12 +178,8 @@ fn draw_transcript(f: &mut Frame, app: &App, transcript_area: Rect) {
     app.scroll_max.set(max_scroll.min(u16::MAX as usize) as u16);
     let up = (app.scroll as usize).min(max_scroll);
     let top = max_scroll - up; // first row shown
-    // The title counts the scrollback so nobody wonders where the rest went.
-    let title = if top > 0 {
-        format!(" transcript · ↑{top} earlier ")
-    } else {
-        " transcript ".to_string()
-    };
+                               // The title counts the scrollback so nobody wonders where the rest went.
+    let title = if top > 0 { format!(" transcript · ↑{top} earlier ") } else { " transcript ".to_string() };
     let transcript = paragraph
         .block(
             Block::default()
@@ -237,11 +194,7 @@ fn draw_transcript(f: &mut Frame, app: &App, transcript_area: Rect) {
 
 /// The message box, with the terminal cursor placed in it when idle.
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
-    let placeholder = if app.busy {
-        " agent working — input queued until ready"
-    } else {
-        " type your message…"
-    };
+    let placeholder = if app.busy { " agent working — input queued until ready" } else { " type your message…" };
     // B-35: show the slice around the cursor, measured in terminal columns.
     let input_w = area.width.saturating_sub(2) as usize;
     let (input_text, cursor_col) = if app.input.is_empty() {
@@ -249,25 +202,15 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     } else {
         super::state::input_view(&app.input, app.cursor, input_w)
     };
-    let input = Paragraph::new(Span::styled(
-        input_text,
-        Style::default().fg(if app.input.is_empty() {
-            FB_AI
-        } else {
-            FB_FG
-        }),
-    ))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(if app.busy {
-                FB_BORDER
-            } else {
-                FB_GREEN
-            }))
-            .title(" message "),
-    );
+    let input =
+        Paragraph::new(Span::styled(input_text, Style::default().fg(if app.input.is_empty() { FB_AI } else { FB_FG })))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(if app.busy { FB_BORDER } else { FB_GREEN }))
+                    .title(" message "),
+            );
     f.render_widget(input, area);
     if !app.busy {
         let x = area.x + 1 + cursor_col.min(u16::MAX as usize) as u16;
@@ -284,12 +227,7 @@ fn draw_palette(f: &mut Frame, app: &App, input: Rect) {
     let want = pal.matches.len() as u16 + 2;
     let h = want.min(input.y.saturating_sub(1));
     if h >= 3 {
-        let area = Rect {
-            x: input.x,
-            y: input.y - h,
-            width: input.width.min(64),
-            height: h,
-        };
+        let area = Rect { x: input.x, y: input.y - h, width: input.width.min(64), height: h };
         f.render_widget(Clear, area);
         let mut lines: Vec<Line> = Vec::new();
         // B-41: scroll the list so the selected row is always drawn.
@@ -298,16 +236,11 @@ fn draw_palette(f: &mut Frame, app: &App, input: Rect) {
         for (i, &idx) in pal.matches.iter().enumerate().skip(first).take(rows) {
             let b = &builtins()[idx];
             let sel = i == pal.sel;
-            lines.push(
-                Line::from(format!(" {:<26} {}", b.usage(), b.help)).style(if sel {
-                    Style::default()
-                        .fg(FB_INK)
-                        .bg(FB_GREEN)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(FB_FG)
-                }),
-            );
+            lines.push(Line::from(format!(" {:<26} {}", b.usage(), b.help)).style(if sel {
+                Style::default().fg(FB_INK).bg(FB_GREEN).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(FB_FG)
+            }));
         }
         let block = Paragraph::new(lines).block(
             Block::default()
@@ -335,16 +268,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else if app.palette.is_some() {
         (" ↑↓ select   Tab complete   Enter run   Esc dismiss ", false)
     } else {
-        (
-            " Enter send · Tab complete · / commands · F1 help · ↑↓ scroll · /team /edit /parallel ",
-            false,
-        )
+        (" Enter send · Tab complete · / commands · F1 help · ↑↓ scroll · /team /edit /parallel ", false)
     };
     let footer = Paragraph::new(hint).style(if attention {
-        Style::default()
-            .fg(FB_INK)
-            .bg(FB_GREEN)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(FB_INK).bg(FB_GREEN).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(FB_MUTED).bg(FB_SURFACE)
     });
@@ -356,26 +283,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 fn draw_mission_picker(f: &mut Frame, mp: &MissionPicker) {
     let area = centered_rect(60, 45, f.area());
     f.render_widget(Clear, area);
-    let mut lines: Vec<Line> = vec![
-        Line::from("Missions").style(Style::default().fg(FB_FG).add_modifier(Modifier::BOLD)),
-        Line::from(""),
-    ];
+    let mut lines: Vec<Line> =
+        vec![Line::from("Missions").style(Style::default().fg(FB_FG).add_modifier(Modifier::BOLD)), Line::from("")];
     for (i, k) in crate::mission::MissionKind::all().iter().enumerate() {
         let checked = if i == mp.kind_idx { "✓" } else { " " };
-        lines.push(
-            Line::from(format!("  {checked} {}", k.label()))
-                .style(if i == mp.kind_idx {
-                    Style::default().fg(FB_GREEN).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(FB_FG)
-                }),
-        );
+        lines.push(Line::from(format!("  {checked} {}", k.label())).style(if i == mp.kind_idx {
+            Style::default().fg(FB_GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(FB_FG)
+        }));
     }
     lines.push(Line::from(""));
-    lines.push(
-        Line::from("Mission effort")
-            .style(Style::default().fg(FB_FG).add_modifier(Modifier::BOLD)),
-    );
+    lines.push(Line::from("Mission effort").style(Style::default().fg(FB_FG).add_modifier(Modifier::BOLD)));
     let row: Vec<Span> = crate::mission::Effort::all()
         .iter()
         .enumerate()
@@ -384,10 +303,7 @@ fn draw_mission_picker(f: &mut Frame, mp: &MissionPicker) {
             let mut v = vec![Span::styled(
                 format!(" {} ", e.label()),
                 if sel {
-                    Style::default()
-                        .fg(FB_INK)
-                        .bg(FB_GREEN)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().fg(FB_INK).bg(FB_GREEN).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(FB_MUTED)
                 },
@@ -400,10 +316,7 @@ fn draw_mission_picker(f: &mut Frame, mp: &MissionPicker) {
         .collect();
     lines.push(Line::from(row));
     lines.push(Line::from(""));
-    lines.push(
-        Line::from("[↑↓] mission  [←→] effort  [Enter] run  [Esc] cancel")
-            .style(Style::default().fg(FB_GREEN)),
-    );
+    lines.push(Line::from("[↑↓] mission  [←→] effort  [Enter] run  [Esc] cancel").style(Style::default().fg(FB_GREEN)));
     let block = Paragraph::new(lines)
         .block(
             Block::default()
@@ -452,8 +365,7 @@ fn draw_edit_preview(f: &mut Frame, app: &App, pe: &PendingEdit) {
                 .border_style(Style::default().fg(FB_BORDER))
                 .title(" edit preview ")
                 .title_bottom(
-                    Line::from(" [y] apply   [n/Esc] reject   [↑↓] scroll ")
-                        .style(Style::default().fg(FB_GREEN)),
+                    Line::from(" [y] apply   [n/Esc] reject   [↑↓] scroll ").style(Style::default().fg(FB_GREEN)),
                 ),
         )
         .scroll((app.edit_scroll.min(end), 0));
@@ -505,20 +417,14 @@ fn draw_sessions(f: &mut Frame, ov: &SessionsOverlay) {
                 truncate_str(&s.title.replace(['\r', '\n'], " "), 44)
             ))
             .style(if sel {
-                Style::default()
-                    .fg(FB_INK)
-                    .bg(FB_GREEN)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(FB_INK).bg(FB_GREEN).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(FB_FG)
             }),
         );
     }
     lines.push(Line::from(""));
-    lines.push(
-        Line::from("[↑↓] select   [Enter] switch   [Esc] close")
-            .style(Style::default().fg(FB_GREEN)),
-    );
+    lines.push(Line::from("[↑↓] select   [Enter] switch   [Esc] close").style(Style::default().fg(FB_GREEN)));
     let block = Paragraph::new(lines)
         .block(
             Block::default()
@@ -538,7 +444,8 @@ fn draw_team(f: &mut Frame, app: &App, area: Rect) {
     let mut title = format!(" team · {} · {} ", truncate_str(&team.goal, 40), team.phase.label());
     if team.phase == TeamPhase::Reviewing || team.phase == TeamPhase::Done {
         if let Some(v) = &team.verdict {
-            title = format!(" team · {} · {} — {} ", truncate_str(&team.goal, 30), team.phase.label(), truncate_str(v, 40));
+            title =
+                format!(" team · {} · {} — {} ", truncate_str(&team.goal, 30), team.phase.label(), truncate_str(v, 40));
         }
     }
     let outer = Block::default()
@@ -552,10 +459,7 @@ fn draw_team(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     if team.agents.is_empty() {
-        f.render_widget(
-            Paragraph::new("spawning agents…").style(Style::default().fg(FB_MUTED)),
-            inner,
-        );
+        f.render_widget(Paragraph::new("spawning agents…").style(Style::default().fg(FB_MUTED)), inner);
         return;
     }
     let n = team.agents.len().min(4);
@@ -577,11 +481,7 @@ fn draw_team(f: &mut Frame, app: &App, area: Rect) {
             *card_area,
             accent,
             border,
-            &format!(
-                "Agent {} · {}",
-                i + 1,
-                truncate_str(&a.title, w.saturating_sub(10).max(4))
-            ),
+            &format!("Agent {} · {}", i + 1, truncate_str(&a.title, w.saturating_sub(10).max(4))),
             mark,
             &a.task,
         );
@@ -630,21 +530,14 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
         };
         let w = card_area.width.saturating_sub(2) as usize;
         // B-41: a finished card's clock stops when it finished.
-        let secs = a
-            .finished
-            .unwrap_or_else(std::time::Instant::now)
-            .duration_since(a.started)
-            .as_secs();
+        let secs = a.finished.unwrap_or_else(std::time::Instant::now).duration_since(a.started).as_secs();
         draw_agent_card(
             f,
             *card_area,
             accent,
             border,
             &truncate_str(&a.name, w.max(4)),
-            &format!(
-                "{mark} {secs}s · {}",
-                truncate_str(&a.detail, w.saturating_sub(14).max(3))
-            ),
+            &format!("{mark} {secs}s · {}", truncate_str(&a.detail, w.saturating_sub(14).max(3))),
             &a.task,
         );
     }
@@ -652,20 +545,11 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
 
 /// One medium card, shared by the team and agents panels: accent title,
 /// status line, wrapped muted body. The status color does the border too.
-fn draw_agent_card(
-    f: &mut Frame,
-    area: Rect,
-    accent: Color,
-    border: Color,
-    title: &str,
-    mark: &str,
-    body: &str,
-) {
+fn draw_agent_card(f: &mut Frame, area: Rect, accent: Color, border: Color, title: &str, mark: &str, body: &str) {
     let w = area.width.saturating_sub(2) as usize;
     let body_rows = area.height.saturating_sub(4).max(1) as usize;
     let mut lines = vec![
-        Line::from(title.to_string())
-            .style(Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+        Line::from(title.to_string()).style(Style::default().fg(accent).add_modifier(Modifier::BOLD)),
         Line::from(mark.to_string()).style(Style::default().fg(border)),
     ];
     for t in wrap_n(body, w.max(1), body_rows) {
@@ -728,8 +612,7 @@ fn draw_approval(f: &mut Frame, app: &App) {
     let area = centered_rect(80, 70, f.area());
     f.render_widget(Clear, area);
     let mut text = vec![
-        Line::from("Tool approval required")
-            .style(Style::default().fg(FB_ERROR).add_modifier(Modifier::BOLD)),
+        Line::from("Tool approval required").style(Style::default().fg(FB_ERROR).add_modifier(Modifier::BOLD)),
         Line::from(format!("Tool:  {}", ap.tool)).style(Style::default().fg(FB_FG)),
         Line::from("Input:").style(Style::default().fg(FB_FG)),
     ];

@@ -15,7 +15,11 @@ pub const GUI_COMMANDS: &[(&str, &str, &str)] = &[
     ("compact", "", "Summarize old messages to make room"),
     ("review", "", "Review the uncommitted changes"),
     ("deep", "[n] <task>", "Try the task n times (default 3) in separate copies, keep the best checked one"),
-    ("mission", "<goal> | status | stop | resume", "Mission mode: works on the goal step by step, on its own, until it is done"),
+    (
+        "mission",
+        "<goal> | status | stop | resume",
+        "Mission mode: works on the goal step by step, on its own, until it is done",
+    ),
     ("undo", "", "Put the files back as they were before the last run"),
     ("redo", "", "Re-apply what /undo put back"),
     ("init", "", "Write a starter AGENTS.md for this project"),
@@ -24,7 +28,12 @@ pub const GUI_COMMANDS: &[(&str, &str, &str)] = &[
 
 /// Run `line` when it is one of `GUI_COMMANDS`. False = not one of them:
 /// it goes to the agent (project commands are resolved by the core).
-pub(super) fn gui_command(gs: &mut GuiState, st: &Arc<server::AppState>, rt: &tokio::runtime::Handle, line: &str) -> bool {
+pub(super) fn gui_command(
+    gs: &mut GuiState,
+    st: &Arc<server::AppState>,
+    rt: &tokio::runtime::Handle,
+    line: &str,
+) -> bool {
     let Some(rest) = line.trim().strip_prefix('/') else { return false };
     let (name, arg) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(n, a)| (n, a.trim()));
     if !GUI_COMMANDS.iter().any(|(n, _, _)| *n == name) {
@@ -115,7 +124,8 @@ pub(super) fn gui_command(gs: &mut GuiState, st: &Arc<server::AppState>, rt: &to
             }
             Some(crate::commands::Command::Mission { kind, goal }) => {
                 let (effort, goal) = crate::mission::split_effort(&goal);
-                let mission = crate::mission::Mission { kind: kind.unwrap_or(crate::mission::MissionKind::Custom), effort, goal };
+                let mission =
+                    crate::mission::Mission { kind: kind.unwrap_or(crate::mission::MissionKind::Custom), effort, goal };
                 if gs.title() == NEW_CHAT {
                     let _ = st.db.set_session_title(&sid, &clip(&mission.goal, 40));
                     refresh_sessions(gs, st);
@@ -147,7 +157,9 @@ pub(super) fn gui_command(gs: &mut GuiState, st: &Arc<server::AppState>, rt: &to
             let (st2, sid2, name) = (st.clone(), sid.clone(), name.to_string());
             rt.spawn(async move {
                 let text = match crate::frontend::run_snapshot(root, st2.state_dir.clone(), redo, force).await {
-                    Ok(Ok(Some(m))) => format!("{} done: files are back as of snapshot {}.", if redo { "Redo" } else { "Undo" }, m.id),
+                    Ok(Ok(Some(m))) => {
+                        format!("{} done: files are back as of snapshot {}.", if redo { "Redo" } else { "Undo" }, m.id)
+                    }
                     Ok(Ok(None)) => format!("Nothing to {name} (or this project is not a git repository)."),
                     Ok(Err(e)) => format!("{name} failed: {e:#}"),
                     Err(e) => format!("{name} failed: {e}"),

@@ -46,10 +46,7 @@ fn write_crash_log(msg: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{stamp}] {msg}");
     }
@@ -79,10 +76,7 @@ fn run() -> Result<()> {
     // M4: `preview <url>` — open the embedded preview browser and block.
     // Handled before the core server/TUI so it stays a pure window process.
     if args.first().map(String::as_str) == Some("preview") {
-        let url = args
-            .get(1)
-            .context("preview requires a URL: opencode-rust preview http://127.0.0.1:5173")?
-            .clone();
+        let url = args.get(1).context("preview requires a URL: opencode-rust preview http://127.0.0.1:5173")?.clone();
         let title = args
             .iter()
             .position(|a| a == "--title")
@@ -137,10 +131,7 @@ fn run() -> Result<()> {
         cfg.provider.base_url = opencode_rust::config::SETUP_PLACEHOLDER_URL.to_string();
     }
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("building tokio runtime")?;
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().context("building tokio runtime")?;
 
     rt.block_on(async move {
         // Start the core server (loopback + ephemeral or configured port).

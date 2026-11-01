@@ -87,8 +87,7 @@ pub async fn propose(
     if size > MAX_EDIT_BYTES as u64 {
         bail!("file is {size} bytes; inline /edit caps at {MAX_EDIT_BYTES} bytes");
     }
-    let old = std::fs::read_to_string(&abs)
-        .with_context(|| format!("reading {} (not UTF-8 text?)", abs.display()))?;
+    let old = std::fs::read_to_string(&abs).with_context(|| format!("reading {} (not UTF-8 text?)", abs.display()))?;
     let user = format!("FILE: {path}\n\n<file>\n{old}\n</file>\n\nINSTRUCTION: {instruction}");
     let raw = crate::server::tagged("inline edit", "", one_shot(st, SYSTEM, &user, abort, false)).await?;
     let new = finish_reply(&raw, &old);
@@ -219,11 +218,7 @@ impl JumpTracker {
             return;
         }
         let key = (site.path.as_str(), site.line);
-        let pos = self
-            .sites
-            .iter()
-            .position(|s| (s.path.as_str(), s.line) > key)
-            .unwrap_or(self.sites.len());
+        let pos = self.sites.iter().position(|s| (s.path.as_str(), s.line) > key).unwrap_or(self.sites.len());
         self.sites.insert(pos, site);
         if let Some(i) = self.idx {
             if pos <= i {
@@ -465,8 +460,7 @@ mod tests {
     #[test]
     fn apply_writes_and_guards_races() {
         // B-49: a folder per test, cleared first in case a crashed run left it.
-        let dir = std::env::temp_dir()
-            .join(format!("ocrs-edit-{}-apply_writes_and_guards_races", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ocrs-edit-{}-apply_writes_and_guards_races", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("x.txt");
@@ -489,10 +483,8 @@ mod tests {
         use axum::{routing::post, Router};
         use serde_json::Value;
 
-        let dir = std::env::temp_dir().join(format!(
-            "ocrs-edit-{}-propose_end_to_end_with_mock_provider",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir()
+            .join(format!("ocrs-edit-{}-propose_end_to_end_with_mock_provider", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("app.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
@@ -501,10 +493,8 @@ mod tests {
         let app = Router::new().route(
             "/v1/chat/completions",
             post(|body: axum::extract::Json<Value>| async move {
-                let is_edit = body["messages"][0]["content"]
-                    .as_str()
-                    .map(|c| c.contains("inline edit engine"))
-                    .unwrap_or(false);
+                let is_edit =
+                    body["messages"][0]["content"].as_str().map(|c| c.contains("inline edit engine")).unwrap_or(false);
                 assert!(is_edit, "inline edit must use the edit system prompt");
                 let content = if is_edit {
                     "```rust\nfn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n```"
@@ -518,10 +508,7 @@ mod tests {
                     }))
                     .unwrap()
                 );
-                (
-                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                    payload,
-                )
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], payload)
             }),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

@@ -44,28 +44,19 @@ pub(super) fn top_level_symbols(content: &str) -> Vec<String> {
         }
         let mut t = line.trim();
         loop {
-            let stripped = ["pub ", "export ", "async ", "public ", "static "]
-                .iter()
-                .find_map(|p| t.strip_prefix(p));
+            let stripped = ["pub ", "export ", "async ", "public ", "static "].iter().find_map(|p| t.strip_prefix(p));
             match stripped {
                 Some(s) => t = s.trim_start(),
                 None => break,
             }
         }
-        const KW: [&str; 7] = [
-            "fn ", "def ", "class ", "struct ", "function ", "interface ", "trait ",
-        ];
+        const KW: [&str; 7] = ["fn ", "def ", "class ", "struct ", "function ", "interface ", "trait "];
         if let Some(k) = KW.iter().find(|k| t.starts_with(**k)) {
             let rest = &t[k.len()..];
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
+            let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
             // New (P-04): short and very common names exist everywhere.
-            const COMMON: [&str; 12] = [
-                "main", "new", "run", "test", "init", "default", "from", "build", "start", "stop",
-                "handle", "setup",
-            ];
+            const COMMON: [&str; 12] =
+                ["main", "new", "run", "test", "init", "default", "from", "build", "start", "stop", "handle", "setup"];
             if name.chars().count() >= 4 && !COMMON.contains(&name.as_str()) && !out.contains(&name) {
                 out.push(name);
             }
@@ -77,22 +68,14 @@ pub(super) fn top_level_symbols(content: &str) -> Vec<String> {
 /// New (P-04): ONE walk over the workspace's source files (skipping the file
 /// just written) that finds where any of `syms` is DEFINED (`fn name`,
 /// `def name`, `class name`, …). Returns (name, file) pairs.
-pub(super) fn find_symbols(
-    workspace: &std::path::Path,
-    skip_path: &str,
-    syms: &[String],
-) -> Vec<(String, String)> {
+pub(super) fn find_symbols(workspace: &std::path::Path, skip_path: &str, syms: &[String]) -> Vec<(String, String)> {
     let mut found: Vec<(String, String)> = Vec::new();
     if syms.is_empty() {
         return found;
     }
     let skip = workspace.join(skip_path);
     let mut scanned = 0usize;
-    for entry in ignore::WalkBuilder::new(workspace)
-        .hidden(true)
-        .build()
-        .flatten()
-    {
+    for entry in ignore::WalkBuilder::new(workspace).hidden(true).build().flatten() {
         if found.len() == syms.len() {
             break; // every name was found
         }
@@ -104,12 +87,7 @@ pub(super) fn find_symbols(
             continue;
         }
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if ![
-            "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "rb", "c", "cpp", "h",
-            "cs", "php",
-        ]
-        .contains(&ext)
-        {
+        if !["rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "rb", "c", "cpp", "h", "cs", "php"].contains(&ext) {
             continue;
         }
         scanned += 1;
@@ -138,8 +116,7 @@ pub(super) fn defines(text: &str, sym: &str) -> bool {
         KW.iter().any(|k| {
             line.find(k).is_some_and(|i| {
                 let rest = &line[i + k.len()..];
-                rest.starts_with(sym)
-                    && !rest[sym.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                rest.starts_with(sym) && !rest[sym.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
             })
         })
     })
@@ -166,7 +143,10 @@ pub(super) fn review_diff(ws: &std::path::Path) -> Option<String> {
     for f in &files {
         let part = format!("### {} ({})\n```diff\n{}\n```\n", f.path, f.status, f.diff.trim_end());
         if out.len() + part.len() > 12_000 {
-            out.push_str(&format!("… and {} more changed file(s); read them if needed.\n", files.len() - out.matches("### ").count()));
+            out.push_str(&format!(
+                "… and {} more changed file(s); read them if needed.\n",
+                files.len() - out.matches("### ").count()
+            ));
             break;
         }
         out.push_str(&part);
@@ -193,7 +173,10 @@ pub(super) fn review_targets(ws: &std::path::Path, since: Option<std::time::Syst
         let content = std::fs::read_to_string(f).unwrap_or_else(|_| "(unreadable)".to_string());
         let part = format!("### {} (changed by the run)\n```\n{}\n```\n", rel.display(), content.trim_end());
         if out.len() + part.len() > 12_000 {
-            out.push_str(&format!("… and {} more changed file(s); read them if needed.\n", files.len() - out.matches("### ").count()));
+            out.push_str(&format!(
+                "… and {} more changed file(s); read them if needed.\n",
+                files.len() - out.matches("### ").count()
+            ));
             break;
         }
         out.push_str(&part);
@@ -272,7 +255,12 @@ pub const VERIFY_PREFIX: &str = "[verify]";
 /// The work spec for a request (see [`crate::spec`]), shown to the user as
 /// a note. `None` when it is off, the message is chatter or a question, or
 /// the model's reply is not a spec: the run goes on without one.
-pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abort: &AtomicBool) -> Option<crate::spec::Spec> {
+pub(crate) async fn make_spec(
+    st: &Shared,
+    session_id: &str,
+    request: &str,
+    abort: &AtomicBool,
+) -> Option<crate::spec::Spec> {
     // The user's own main prompt: no planning call of Habi's (and so no final
     // check, which proves the spec). They asked for their prompt alone.
     if !st.cfg.agent.sharpen || st.own_prompt_only() || !crate::spec::needs_spec(request) {
@@ -285,17 +273,17 @@ pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abor
     }
     let ws = st.workspace_for_async(session_id).await;
     let mut files: Vec<String> = std::fs::read_dir(&ws)
-        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !n.starts_with('.')).collect())
+        .map(|d| {
+            d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !n.starts_with('.')).collect()
+        })
         .unwrap_or_default();
     files.sort();
     files.truncate(30);
     let context = last_assistant_text(st, session_id).await;
     // The spec step also picks the skills that fit the task: it sees every
     // skill's description, which the prompt no longer lists when there are many.
-    let skills: Vec<skills::Doc> = skills::load_skills(&ws)
-        .into_iter()
-        .filter(|s| !skills::NOT_AUTO_PICKED.contains(&s.name.as_str()))
-        .collect();
+    let skills: Vec<skills::Doc> =
+        skills::load_skills(&ws).into_iter().filter(|s| !skills::NOT_AUTO_PICKED.contains(&s.name.as_str())).collect();
     let user = crate::spec::prompt(request, context.as_deref(), &files, &skills::skill_menu(&skills));
     let reply = match tagged("spec", session_id, one_shot(st, crate::spec::SYSTEM, &user, abort, false)).await {
         Ok(r) => r,
@@ -307,7 +295,8 @@ pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abor
     let mut spec = crate::spec::parse(&reply)?;
     // Only skills that exist (a model can make one up).
     spec.skills.retain(|n| skills.iter().any(|s| s.name.eq_ignore_ascii_case(n)));
-    let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text: crate::spec::for_user(&spec) });
+    let _ =
+        st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text: crate::spec::for_user(&spec) });
     Some(spec)
 }
 
@@ -352,7 +341,10 @@ pub(crate) async fn final_check(
         let problem = if !looked {
             "you answered without calling a tool, so nothing was proven".to_string()
         } else if fails.is_empty() && pass > 0 {
-            note(format!("final check passed — {pass} item(s) proven{}", if fixed { " after a fix round" } else { "" }));
+            note(format!(
+                "final check passed — {pass} item(s) proven{}",
+                if fixed { " after a fix round" } else { "" }
+            ));
             return Some(true);
         } else if fails.is_empty() && !asked_for_lines {
             // Seen live: a mission step checked everything, then wrote a
@@ -373,7 +365,10 @@ pub(crate) async fn final_check(
         }
         fixed = true;
         looked = false;
-        note(format!("final check: not proven yet ({}) — one fix round", problem.chars().take(160).collect::<String>()));
+        note(format!(
+            "final check: not proven yet ({}) — one fix round",
+            problem.chars().take(160).collect::<String>()
+        ));
         msg = crate::spec::retry_request(&problem);
     }
     note("final check: some items are still not proven — see the last reply".into());
@@ -507,10 +502,7 @@ pub(super) async fn check_after_run(
             undone = true;
         }
     }
-    note(format!(
-        "{VERIFY_PREFIX} {} still failing after {max_rounds} fix round(s) — over to you",
-        best.summary
-    ));
+    note(format!("{VERIFY_PREFIX} {} still failing after {max_rounds} fix round(s) — over to you", best.summary));
     Some((false, best.summary))
 }
 
@@ -556,7 +548,13 @@ pub(super) fn verify_command_for(st: &AppState, ws: &std::path::Path, note: &imp
 /// in an untrusted repository that is code execution — so it goes through
 /// the same check as any `bash` call: allow rules, "always allow", turbo and
 /// a mission's approvals pass, otherwise the user is asked.
-pub(super) async fn verify_permitted(st: &Shared, session_id: &str, cmd: &str, note: &impl Fn(String), abort: &AtomicBool) -> bool {
+pub(super) async fn verify_permitted(
+    st: &Shared,
+    session_id: &str,
+    cmd: &str,
+    note: &impl Fn(String),
+    abort: &AtomicBool,
+) -> bool {
     let configured = st.cfg.agent.verify_command.as_deref().map(str::trim).is_some_and(|c| c == cmd);
     if configured || check_permission(st, session_id, "bash", cmd, abort).await {
         return true;
@@ -787,7 +785,12 @@ async fn gate_pages(st: &Shared, ws: &std::path::Path, gate: &mut Gate, note: &i
 
 // Web pages this run changed: files the tools wrote, plus (when shell
 /// commands ran) web files modified since the run started.
-pub(super) fn changed_web_pages(ws: &std::path::Path, since: std::time::SystemTime, bash_used: bool, enabled: bool) -> Vec<String> {
+pub(super) fn changed_web_pages(
+    ws: &std::path::Path,
+    since: std::time::SystemTime,
+    bash_used: bool,
+    enabled: bool,
+) -> Vec<String> {
     if !enabled {
         return Vec::new();
     }
@@ -808,16 +811,13 @@ pub fn detect_verify_command(ws: &std::path::Path) -> Option<String> {
         return Some("go test ./...".into());
     }
     if let Ok(text) = std::fs::read_to_string(ws.join("package.json")) {
-        let test = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v["scripts"]["test"].as_str().map(str::to_string));
+        let test =
+            serde_json::from_str::<Value>(&text).ok().and_then(|v| v["scripts"]["test"].as_str().map(str::to_string));
         if test.is_some_and(|t| !t.contains("no test specified")) {
             return Some("npm test --silent".into());
         }
     }
-    let is_test = |name: &str| {
-        name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py"))
-    };
+    let is_test = |name: &str| name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py"));
     let has_py_tests = [ws.to_path_buf(), ws.join("tests")].iter().any(|dir| {
         std::fs::read_dir(dir)
             .map(|it| it.flatten().any(|e| is_test(&e.file_name().to_string_lossy())))
@@ -829,9 +829,14 @@ pub fn detect_verify_command(ws: &std::path::Path) -> Option<String> {
 /// The check command itself is missing (not the project failing it).
 pub(super) fn command_unavailable(out: &str) -> bool {
     let head: String = out.chars().take(600).collect::<String>().to_ascii_lowercase();
-    ["command not found", "is not recognized as an internal or external command", "no module named pytest", "missing script: test"]
-        .iter()
-        .any(|m| head.contains(m))
+    [
+        "command not found",
+        "is not recognized as an internal or external command",
+        "no module named pytest",
+        "missing script: test",
+    ]
+    .iter()
+    .any(|m| head.contains(m))
 }
 
 /// How many failures a failing check's output shows (at least 1).

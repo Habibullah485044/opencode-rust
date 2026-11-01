@@ -45,7 +45,8 @@ pub(super) fn pick_files(window: &tao::window::Window) -> Vec<std::path::PathBuf
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
     };
     use windows::Win32::UI::Shell::{
-        FileOpenDialog, IFileOpenDialog, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, SIGDN_FILESYSPATH,
+        FileOpenDialog, IFileOpenDialog, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
+        SIGDN_FILESYSPATH,
     };
     let mut out = Vec::new();
     // SAFETY: plain COM calls on the UI thread; each returned string is

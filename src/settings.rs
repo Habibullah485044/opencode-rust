@@ -238,7 +238,11 @@ mod tests {
         let read = || std::fs::read_to_string(&path).unwrap().parse::<toml::Table>().unwrap();
         save_user_prompt_to(&path, Some("You are Habi.\nAnswer briefly."), None).unwrap();
         let t = read();
-        assert_eq!(t["agent"]["system_prompt"].as_str(), Some("You are Habi.\nAnswer briefly."), "multi-line text survives");
+        assert_eq!(
+            t["agent"]["system_prompt"].as_str(),
+            Some("You are Habi.\nAnswer briefly."),
+            "multi-line text survives"
+        );
         assert!(t["agent"].get("extra_prompt").is_none());
         assert_eq!(t["agent"]["max_steps"].as_integer(), Some(7), "other settings stay");
         assert_eq!(t["provider"]["model"].as_str(), Some("m"));
@@ -277,13 +281,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(&path, "[provider]
+        std::fs::write(
+            &path,
+            "[provider]
 model = \"old\"
 api_key = \"plain\"
 
 [agent]
 max_steps = 7
-").unwrap();
+",
+        )
+        .unwrap();
         save_provider_to(&path, "https://openrouter.ai/api/v1", "qwen/qwen3-coder:free", "low").unwrap();
         let cfg: crate::config::Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cfg.provider.model, "qwen/qwen3-coder:free");

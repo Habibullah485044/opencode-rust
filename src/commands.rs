@@ -24,7 +24,10 @@ pub enum Command {
     Skills,
     Quit,
     /// M3: inline edit — one completion, diff preview, accept (no agent loop).
-    Edit { path: String, instruction: String },
+    Edit {
+        path: String,
+        instruction: String,
+    },
     /// Ponytail review: senior-dev review of the uncommitted changes,
     /// including callers OUTSIDE the diff.
     Review,
@@ -33,14 +36,22 @@ pub enum Command {
     /// Deep mode: try the task in isolated git worktrees, check each attempt
     /// and keep the best. `attempts: None` = `agent.deep_attempts`.
     /// `/parallel <task>` is `/deep 2 <task>`.
-    Deep { attempts: Option<usize>, task: String },
+    Deep {
+        attempts: Option<usize>,
+        task: String,
+    },
     /// Assign a mission: `kind` preselected or `None` (open the picker).
     /// The goal is expanded into a well-worded briefing before the run.
-    Mission { kind: Option<crate::mission::MissionKind>, goal: String },
+    Mission {
+        kind: Option<crate::mission::MissionKind>,
+        goal: String,
+    },
     /// `/mission status`, `/mission stop`, `/mission resume`.
     MissionCtl(String),
     /// Turbo mode: toggle (no prompt) or enable + run `prompt` immediately.
-    Turbo { prompt: Option<String> },
+    Turbo {
+        prompt: Option<String>,
+    },
     /// Install a skill from a local path or URL: vet it, then bake it in.
     SkillInstall(String),
     /// M6: show the command/key reference overlay.
@@ -95,14 +106,22 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "clear", args: "", help: "Clear the transcript view (history kept)" },
         Builtin { name: "compact", args: "", help: "Summarize old history, keep the recent tail" },
         Builtin { name: "debt", args: "", help: "Laziness Meter: lines added/deleted/reuse hints" },
-        Builtin { name: "deep", args: "[n] <task>", help: "Try the task n times (default 3), keep the best checked one" },
+        Builtin {
+            name: "deep",
+            args: "[n] <task>",
+            help: "Try the task n times (default 3), keep the best checked one",
+        },
         Builtin { name: "diff", args: "[id|n]", help: "Diff against the parent or another session" },
         Builtin { name: "edit", args: "<file> <what>", help: "Inline edit: one completion, diff preview" },
         Builtin { name: "export", args: "[path]", help: "Write the transcript to markdown" },
         Builtin { name: "fork", args: "", help: "Branch this session into a child session" },
         Builtin { name: "help", args: "", help: "Show the command and key reference" },
         Builtin { name: "init", args: "", help: "Create a starter AGENTS.md when missing" },
-        Builtin { name: "mission", args: "[kind] <goal> | status | stop | resume", help: "Mission mode: work on the goal step by step, on its own, until it is done" },
+        Builtin {
+            name: "mission",
+            args: "[kind] <goal> | status | stop | resume",
+            help: "Mission mode: work on the goal step by step, on its own, until it is done",
+        },
         Builtin { name: "model", args: "[id]", help: "Show the active model, or switch to <id>" },
         Builtin { name: "new", args: "", help: "Start a fresh session" },
         Builtin { name: "parallel", args: "<task>", help: "Same as /deep 2 <task>" },
@@ -169,16 +188,8 @@ pub fn classify(input: &str) -> Option<Command> {
         "todos" if arg.is_empty() => Some(Command::Todos),
         "usage" if arg.is_empty() => Some(Command::Usage),
         "init" if arg.is_empty() => Some(Command::Init),
-        "model" | "models" => Some(Command::Model(if arg.is_empty() {
-            None
-        } else {
-            Some(arg.to_string())
-        })),
-        "export" => Some(Command::Export(if arg.is_empty() {
-            None
-        } else {
-            Some(arg.to_string())
-        })),
+        "model" | "models" => Some(Command::Model(if arg.is_empty() { None } else { Some(arg.to_string()) })),
+        "export" => Some(Command::Export(if arg.is_empty() { None } else { Some(arg.to_string()) })),
         "team" if !arg.is_empty() => Some(Command::Team(arg.to_string())),
         "plan" if arg.is_empty() => Some(Command::Plan),
         "build" if arg.is_empty() => Some(Command::Build),
@@ -188,11 +199,7 @@ pub fn classify(input: &str) -> Option<Command> {
         "redo" if arg.is_empty() => Some(Command::Redo),
         "fork" if arg.is_empty() => Some(Command::Fork),
         "resume" if !arg.is_empty() => Some(Command::Resume(arg.to_string())),
-        "diff" => Some(Command::Diff(if arg.is_empty() {
-            None
-        } else {
-            Some(arg.to_string())
-        })),
+        "diff" => Some(Command::Diff(if arg.is_empty() { None } else { Some(arg.to_string()) })),
         "skills" if arg.is_empty() => Some(Command::Skills),
         "review" if arg.is_empty() => Some(Command::Review),
         "debt" if arg.is_empty() => Some(Command::Debt),
@@ -219,15 +226,11 @@ pub fn classify(input: &str) -> Option<Command> {
             let rest = it.next().unwrap_or("").trim();
             match (crate::mission::MissionKind::parse(first), rest) {
                 (Some(_), "") => None, // kind without a goal
-                (Some(kind), goal) => {
-                    Some(Command::Mission { kind: Some(kind), goal: goal.to_string() })
-                }
+                (Some(kind), goal) => Some(Command::Mission { kind: Some(kind), goal: goal.to_string() }),
                 (None, _) => Some(Command::Mission { kind: None, goal: arg.to_string() }),
             }
         }
-        "turbo" => Some(Command::Turbo {
-            prompt: if arg.is_empty() { None } else { Some(arg.to_string()) },
-        }),
+        "turbo" => Some(Command::Turbo { prompt: if arg.is_empty() { None } else { Some(arg.to_string()) } }),
         // P-05: bare `/ponytail` shows the level; an unknown level is a usage error.
         "ponytail" if arg.is_empty() => Some(Command::Ponytail(None)),
         "ponytail" => crate::agents::PonytailLevel::parse(arg).map(|l| Command::Ponytail(Some(l))),
@@ -282,10 +285,7 @@ mod tests {
         );
         assert_eq!(
             classify("/mission explore the auth flow"),
-            Some(Command::Mission {
-                kind: Some(crate::mission::MissionKind::Explore),
-                goal: "the auth flow".into()
-            })
+            Some(Command::Mission { kind: Some(crate::mission::MissionKind::Explore), goal: "the auth flow".into() })
         );
         assert_eq!(
             classify("/mission custom fix the flaky test"),
@@ -301,26 +301,17 @@ mod tests {
         );
         assert_eq!(
             classify("/mission merge PR #12"),
-            Some(Command::Mission {
-                kind: Some(crate::mission::MissionKind::MergePr),
-                goal: "PR #12".into()
-            })
+            Some(Command::Mission { kind: Some(crate::mission::MissionKind::MergePr), goal: "PR #12".into() })
         );
         assert_eq!(classify("/turbo"), Some(Command::Turbo { prompt: None }));
-        assert_eq!(
-            classify("/turbo fix the build"),
-            Some(Command::Turbo { prompt: Some("fix the build".into()) })
-        );
+        assert_eq!(classify("/turbo fix the build"), Some(Command::Turbo { prompt: Some("fix the build".into()) }));
         assert_eq!(
             classify("/skill install ./skills/deploy.md"),
             Some(Command::SkillInstall("./skills/deploy.md".into()))
         );
         assert_eq!(
             classify("/edit src/main.rs add logging to startup"),
-            Some(Command::Edit {
-                path: "src/main.rs".into(),
-                instruction: "add logging to startup".into()
-            })
+            Some(Command::Edit { path: "src/main.rs".into(), instruction: "add logging to startup".into() })
         );
         assert_eq!(
             classify("/edit  docs/a b   with   spaces  "),
@@ -340,15 +331,9 @@ mod tests {
         assert_eq!(classify("/init"), Some(Command::Init));
         assert_eq!(classify("/model"), Some(Command::Model(None)), "bare /model lists");
         assert_eq!(classify("/models"), Some(Command::Model(None)));
-        assert_eq!(
-            classify("/model gpt-5"),
-            Some(Command::Model(Some("gpt-5".into())))
-        );
+        assert_eq!(classify("/model gpt-5"), Some(Command::Model(Some("gpt-5".into()))));
         assert_eq!(classify("/export"), Some(Command::Export(None)));
-        assert_eq!(
-            classify("/export notes/run.md"),
-            Some(Command::Export(Some("notes/run.md".into())))
-        );
+        assert_eq!(classify("/export notes/run.md"), Some(Command::Export(Some("notes/run.md".into()))));
     }
 
     #[test]
@@ -424,10 +409,7 @@ mod tests {
                 _ if b.args.is_empty() => format!("/{}", b.name),
                 _ => format!("/{} x", b.name),
             };
-            assert!(
-                classify(&typed).is_some(),
-                "`{typed}` is registered but does not classify"
-            );
+            assert!(classify(&typed).is_some(), "`{typed}` is registered but does not classify");
         }
     }
 

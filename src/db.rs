@@ -8,12 +8,24 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Part {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// Model chain-of-thought, persisted for replay but NEVER sent back to
     /// the provider (providers reject reasoning roles in history).
-    Reasoning { text: String },
-    ToolCall { id: String, name: String, input: serde_json::Value },
-    ToolResult { tool_id: String, output: String, is_error: bool },
+    Reasoning {
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_id: String,
+        output: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,13 +147,8 @@ fn migrate_usage_and_missions(conn: &Connection) -> Result<()> {
 /// be in any later state, so every step checks before it changes anything
 /// (IF NOT EXISTS, column lists). A new step goes at the end, never in
 /// between.
-const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
-    migrate_base,
-    migrate_approvals,
-    migrate_usage_and_missions,
-    migrate_missions,
-    migrate_projects,
-];
+const MIGRATIONS: &[fn(&Connection) -> Result<()>] =
+    &[migrate_base, migrate_approvals, migrate_usage_and_missions, migrate_missions, migrate_projects];
 
 /// "database is locked"/"busy", which SQLite sometimes returns without
 /// waiting for `busy_timeout`.
@@ -198,11 +205,9 @@ fn migrate_projects(conn: &Connection) -> Result<()> {
         );",
     )?;
     let cols = columns(conn, "sessions")?;
-    for (col, def) in [
-        ("project_id", "TEXT"),
-        ("pinned", "INTEGER NOT NULL DEFAULT 0"),
-        ("archived", "INTEGER NOT NULL DEFAULT 0"),
-    ] {
+    for (col, def) in
+        [("project_id", "TEXT"), ("pinned", "INTEGER NOT NULL DEFAULT 0"), ("archived", "INTEGER NOT NULL DEFAULT 0")]
+    {
         if !cols.iter().any(|c| c == col) {
             conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {col} {def};"))?;
         }
@@ -217,10 +222,7 @@ pub fn now_ms_for_tests() -> i64 {
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 pub fn new_id(prefix: &str) -> String {
@@ -228,14 +230,10 @@ pub fn new_id(prefix: &str) -> String {
     // `RandomState` is seeded randomly per process, so two processes that
     // start in the same instant still get different ids; time plus a counter
     // keeps ids unique inside one process. Ids are unique, not secret.
-    static SEED: std::sync::OnceLock<std::collections::hash_map::RandomState> =
-        std::sync::OnceLock::new();
+    static SEED: std::sync::OnceLock<std::collections::hash_map::RandomState> = std::sync::OnceLock::new();
     static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut h = SEED.get_or_init(std::collections::hash_map::RandomState::new).build_hasher();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     nanos.hash(&mut h);
     CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed).hash(&mut h);
     format!("{prefix}_{:016x}", h.finish())
@@ -410,8 +408,7 @@ pub fn workspace_key(workspace: &Path) -> String {
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         // Another process (a second window, the CLI) may hold the write
@@ -458,10 +455,7 @@ impl Db {
     /// Run `f` on a blocking thread with a clone of this database, for
     /// async code: SQLite calls block, and on a tokio worker they hold up
     /// every other task on it.
-    pub async fn run<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&Db) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
+    pub async fn run<T: Send + 'static>(&self, f: impl FnOnce(&Db) -> Result<T> + Send + 'static) -> Result<T> {
         let db = self.clone();
         tokio::task::spawn_blocking(move || f(&db)).await.context("database task failed")?
     }
@@ -477,12 +471,7 @@ impl Db {
     }
 
     /// A new chat in a given project (`None` = no project).
-    pub fn create_session_in(
-        &self,
-        title: &str,
-        parent_id: Option<&str>,
-        project_id: Option<&str>,
-    ) -> Result<Session> {
+    pub fn create_session_in(&self, title: &str, parent_id: Option<&str>, project_id: Option<&str>) -> Result<Session> {
         let now = now_ms();
         let s = Session {
             id: new_id("ses"),
@@ -536,11 +525,7 @@ impl Db {
         let key = workspace_key(root);
         let conn = self.conn();
         let found = conn
-            .query_row(
-                "SELECT id,name,root,created_at FROM projects WHERE root_key=?1",
-                params![key],
-                project_from_row,
-            )
+            .query_row("SELECT id,name,root,created_at FROM projects WHERE root_key=?1", params![key], project_from_row)
             .optional()?;
         if let Some(p) = found {
             return Ok(p);
@@ -583,8 +568,7 @@ impl Db {
     }
 
     pub fn set_session_project(&self, id: &str, project_id: Option<&str>) -> Result<()> {
-        self.conn()
-            .execute("UPDATE sessions SET project_id=?2 WHERE id=?1", params![id, project_id])?;
+        self.conn().execute("UPDATE sessions SET project_id=?2 WHERE id=?1", params![id, project_id])?;
         Ok(())
     }
 
@@ -598,8 +582,7 @@ impl Db {
     }
 
     pub fn set_session_pinned(&self, id: &str, pinned: bool) -> Result<()> {
-        self.conn()
-            .execute("UPDATE sessions SET pinned=?2 WHERE id=?1", params![id, pinned as i64])?;
+        self.conn().execute("UPDATE sessions SET pinned=?2 WHERE id=?1", params![id, pinned as i64])?;
         Ok(())
     }
 
@@ -616,10 +599,7 @@ impl Db {
 
     /// Rename a session (the GUI titles chats after their first message).
     pub fn set_session_title(&self, id: &str, title: &str) -> Result<()> {
-        self.conn().execute(
-            "UPDATE sessions SET title=?2, updated_at=?3 WHERE id=?1",
-            params![id, title, now_ms()],
-        )?;
+        self.conn().execute("UPDATE sessions SET title=?2, updated_at=?3 WHERE id=?1", params![id, title, now_ms()])?;
         Ok(())
     }
 
@@ -650,11 +630,9 @@ impl Db {
     pub fn mission(&self, session_id: &str) -> Result<Option<Mission>> {
         let conn = self.conn();
         let head = conn
-            .query_row(
-                "SELECT goal, status, deep FROM missions WHERE session_id=?1",
-                params![session_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
-            )
+            .query_row("SELECT goal, status, deep FROM missions WHERE session_id=?1", params![session_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })
             .optional()?;
         let Some((goal, status, deep)) = head else { return Ok(None) };
         let mut stmt = conn.prepare(
@@ -684,7 +662,14 @@ impl Db {
     }
 
     /// Save a step's state and receipt.
-    pub fn mission_step_update(&self, id: i64, status: &str, attempts: i64, result: &str, child_id: Option<&str>) -> Result<()> {
+    pub fn mission_step_update(
+        &self,
+        id: i64,
+        status: &str,
+        attempts: i64,
+        result: &str,
+        child_id: Option<&str>,
+    ) -> Result<()> {
         self.conn().execute(
             "UPDATE mission_steps SET status=?2, attempts=?3, result=?4, child_id=COALESCE(?5, child_id) WHERE id=?1",
             params![id, status, attempts, result, child_id],
@@ -727,12 +712,27 @@ impl Db {
     }
 
     /// Record one model request: the daily totals and the detailed log.
-    pub fn add_usage_entry(&self, session_id: &str, model: &str, purpose: &str, u: &crate::provider::Usage) -> Result<()> {
+    pub fn add_usage_entry(
+        &self,
+        session_id: &str,
+        model: &str,
+        purpose: &str,
+        u: &crate::provider::Usage,
+    ) -> Result<()> {
         self.add_usage(session_id, u)?;
         self.conn().execute(
             "INSERT INTO usage_log (ts, session_id, model, purpose, input, cached, cache_write, output)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![now_ms(), session_id, model, purpose, u.input as i64, u.cached as i64, u.cache_write as i64, u.output as i64],
+            params![
+                now_ms(),
+                session_id,
+                model,
+                purpose,
+                u.input as i64,
+                u.cached as i64,
+                u.cache_write as i64,
+                u.output as i64
+            ],
         )?;
         Ok(())
     }
@@ -846,13 +846,7 @@ impl Db {
     }
 
     /// Insert with an explicit timestamp (used by fork/compaction to preserve order).
-    fn insert_message(
-        &self,
-        session_id: &str,
-        role: &str,
-        parts: &[Part],
-        created_at: i64,
-    ) -> Result<Message> {
+    fn insert_message(&self, session_id: &str, role: &str, parts: &[Part], created_at: i64) -> Result<Message> {
         let m = Message {
             id: new_id("msg"),
             session_id: session_id.to_string(),
@@ -872,11 +866,10 @@ impl Db {
         // Messages are read back ordered by `created_at`: a clock that steps
         // back must not put a tool result before its call. Each message is
         // at least 1 ms after the chat's newest one.
-        let last: Option<i64> = tx.query_row(
-            "SELECT MAX(created_at) FROM messages WHERE session_id=?1",
-            params![m.session_id],
-            |r| r.get(0),
-        )?;
+        let last: Option<i64> =
+            tx.query_row("SELECT MAX(created_at) FROM messages WHERE session_id=?1", params![m.session_id], |r| {
+                r.get(0)
+            })?;
         if let Some(last) = last {
             m.created_at = m.created_at.max(last.saturating_add(1));
         }
@@ -894,9 +887,7 @@ impl Db {
 
     /// Fork/branch: copy every message of `id` into a new child session.
     pub fn fork_session(&self, id: &str, title: &str) -> Result<Session> {
-        let parent = self
-            .get_session(id)?
-            .with_context(|| format!("no session `{id}`"))?;
+        let parent = self.get_session(id)?.with_context(|| format!("no session `{id}`"))?;
         let msgs = self.messages(&parent.id)?;
         let now = now_ms();
         let new = Session {
@@ -918,9 +909,8 @@ impl Db {
             params![new.id, new.title, new.parent_id, new.created_at, new.updated_at, new.project_id],
         )?;
         {
-            let mut ins = tx.prepare(
-                "INSERT INTO messages (id, session_id, role, parts, created_at) VALUES (?1,?2,?3,?4,?5)",
-            )?;
+            let mut ins =
+                tx.prepare("INSERT INTO messages (id, session_id, role, parts, created_at) VALUES (?1,?2,?3,?4,?5)")?;
             for m in &msgs {
                 let json = serde_json::to_string(&m.parts)?;
                 ins.execute(params![new_id("msg"), new.id, m.role, json, m.created_at])?;
@@ -938,23 +928,16 @@ impl Db {
     /// (timestamp minus 1 ms, so it sorts first). Everything happens in one
     /// transaction. Messages that arrived while the summary was being
     /// written are not in `summarized_ids`, so they are kept.
-    pub fn replace_with_summary(
-        &self,
-        session_id: &str,
-        summarized_ids: &[String],
-        summary: &str,
-    ) -> Result<()> {
+    pub fn replace_with_summary(&self, session_id: &str, summarized_ids: &[String], summary: &str) -> Result<()> {
         let mut conn = self.conn();
         // IMMEDIATE: reads before it writes (see `insert_message`).
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut first_at: Option<i64> = None;
         {
-            let mut find =
-                tx.prepare("SELECT created_at FROM messages WHERE id=?1 AND session_id=?2")?;
+            let mut find = tx.prepare("SELECT created_at FROM messages WHERE id=?1 AND session_id=?2")?;
             let mut del = tx.prepare("DELETE FROM messages WHERE id=?1 AND session_id=?2")?;
             for id in summarized_ids {
-                let at: Option<i64> =
-                    find.query_row(params![id, session_id], |r| r.get(0)).optional()?;
+                let at: Option<i64> = find.query_row(params![id, session_id], |r| r.get(0)).optional()?;
                 if let Some(at) = at {
                     first_at = Some(first_at.map_or(at, |f| f.min(at)));
                     del.execute(params![id, session_id])?;
@@ -1007,9 +990,8 @@ impl Db {
         for row in rows {
             let (id, role, parts_json, created_at) = row?;
             // A row we cannot read is shown, never silently emptied.
-            let parts: Vec<Part> = serde_json::from_str(&parts_json).unwrap_or_else(|e| {
-                vec![Part::Text { text: format!("[unreadable message parts: {e}]") }]
-            });
+            let parts: Vec<Part> = serde_json::from_str(&parts_json)
+                .unwrap_or_else(|e| vec![Part::Text { text: format!("[unreadable message parts: {e}]") }]);
             out.push(Message { id, session_id: session_id.to_string(), role, parts, created_at });
         }
         Ok(out)
@@ -1321,22 +1303,13 @@ mod tests {
         for _ in 0..3 {
             db.add_approval("/ws/one", "bash", "cargo test", "session").unwrap();
         }
-        let n: i64 = db
-            .conn
-            .lock()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0))
-            .unwrap();
+        let n: i64 = db.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
     }
 
     #[test]
     fn old_unscoped_approvals_stop_applying() {
-        let path = std::env::temp_dir().join(format!(
-            "ocrs-approvals-{}-{}.db",
-            std::process::id(),
-            now_ms()
-        ));
+        let path = std::env::temp_dir().join(format!("ocrs-approvals-{}-{}.db", std::process::id(), now_ms()));
         {
             // A database written by the previous version (no workspace column).
             let conn = Connection::open(&path).unwrap();
@@ -1364,8 +1337,7 @@ mod tests {
         for i in 0..4 {
             db.add_message(&s.id, "user", &[Part::Text { text: format!("m{i}") }]).unwrap();
         }
-        let summarized: Vec<String> =
-            db.messages(&s.id).unwrap()[..2].iter().map(|m| m.id.clone()).collect();
+        let summarized: Vec<String> = db.messages(&s.id).unwrap()[..2].iter().map(|m| m.id.clone()).collect();
         // A new message lands while the summary is being written.
         db.add_message(&s.id, "user", &[Part::Text { text: "late".into() }]).unwrap();
         db.replace_with_summary(&s.id, &summarized, "[context compacted] s").unwrap();

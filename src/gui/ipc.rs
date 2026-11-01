@@ -30,7 +30,10 @@ pub enum IpcMsg {
     /// The "Open Dev Server" CTA, optionally with an explicit URL.
     OpenDevServer(Option<String>),
     /// D1: answer a pending `ask` gate.
-    Approve { id: String, always: bool },
+    Approve {
+        id: String,
+        always: bool,
+    },
     Deny(String),
     /// Composer mode selector: default / manual / turbo autonomy.
     Mode(PermissionMode),
@@ -41,10 +44,18 @@ pub enum IpcMsg {
     /// A4: stop one spawned agent.
     AgentStop(String),
     /// Settings page: save the provider; `api_key` None keeps the saved one.
-    SaveSettings { base_url: String, model: String, api_key: Option<String>, effort: String },
+    SaveSettings {
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+        effort: String,
+    },
     /// Settings → System prompt: the text (empty = none) and whether it
     /// replaces Habi's base instructions.
-    SavePrompt { text: String, replace: bool },
+    SavePrompt {
+        text: String,
+        replace: bool,
+    },
     /// Settings → Temperature: 0..=2, or `None` = the model's default.
     SaveTemperature(Option<f32>),
     /// Settings page: ask the provider which models it has.
@@ -58,7 +69,10 @@ pub enum IpcMsg {
     /// Open the token usage dashboard for the last N days (`None` = all time).
     LoadUsage(Option<i64>),
     /// Set a model's price per 1M tokens (dashboard).
-    SetPrice { model: String, price: crate::db::Price },
+    SetPrice {
+        model: String,
+        price: crate::db::Price,
+    },
     /// Make a new git branch in the chat's project and switch to it.
     NewBranch(String),
     /// Terminal panel: shown or hidden.
@@ -71,13 +85,19 @@ pub enum IpcMsg {
     TermClear,
     /// Rewind the chat to before this user message (`skip` = later
     /// messages with the same text to pass over).
-    Rewind { text: String, skip: usize },
+    Rewind {
+        text: String,
+        skip: usize,
+    },
     /// `@` autocomplete: project files matching the text.
     FindFiles(String),
     /// Send line comments from the Changes view to the agent.
     ReviewComments(Vec<(String, u32, String)>),
     /// Attach a pasted or dropped file (`data` is base64).
-    SaveAttachment { name: String, data: String },
+    SaveAttachment {
+        name: String,
+        data: String,
+    },
     /// Open the chat's project folder in a code editor (by name, or the first found).
     OpenInEditor(Option<String>),
     /// Projects sidebar: a new chat inside project `id`.
@@ -86,11 +106,23 @@ pub enum IpcMsg {
     AddProject(Option<String>),
     /// Take a project off the list (its chats stay, without a project).
     RemoveProject(String),
-    Pin { id: String, on: bool },
-    Archive { id: String, on: bool },
-    Rename { id: String, title: String },
+    Pin {
+        id: String,
+        on: bool,
+    },
+    Archive {
+        id: String,
+        on: bool,
+    },
+    Rename {
+        id: String,
+        title: String,
+    },
     /// Move a chat to a project (`None` = no project).
-    MoveChat { id: String, project: Option<String> },
+    MoveChat {
+        id: String,
+        project: Option<String>,
+    },
     /// Delete a chat for good (from History).
     DeleteChat(String),
     /// File every chat without a project under project `id`.
@@ -132,7 +164,11 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
     match v.get("type")?.as_str()? {
         "send" => {
             let text = v.get("text")?.as_str()?.trim().to_string();
-            if text.is_empty() { None } else { Some(IpcMsg::Send(text)) }
+            if text.is_empty() {
+                None
+            } else {
+                Some(IpcMsg::Send(text))
+            }
         }
         "new" => Some(IpcMsg::NewSession),
         "load" => Some(IpcMsg::Load(v.get("id")?.as_str()?.to_string())),
@@ -149,12 +185,14 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
             let num = |k: &str| v.get(k)?.as_f64();
             let rect = PanelRect { x: num("x")?, y: num("y")?, w: num("w")?, h: num("h")? };
             let dpr = v.get("dpr").and_then(|d| d.as_f64()).unwrap_or(0.0);
-            if rect.is_usable() { Some(IpcMsg::PanelRect(rect, dpr)) } else { None }
+            if rect.is_usable() {
+                Some(IpcMsg::PanelRect(rect, dpr))
+            } else {
+                None
+            }
         }
         "panel_visible" => Some(IpcMsg::PanelVisible(v.get("visible")?.as_bool()?)),
-        "open_dev_server" => {
-            Some(IpcMsg::OpenDevServer(v.get("url").and_then(|u| u.as_str()).map(str::to_string)))
-        }
+        "open_dev_server" => Some(IpcMsg::OpenDevServer(v.get("url").and_then(|u| u.as_str()).map(str::to_string))),
         "approve" => Some(IpcMsg::Approve {
             id: v.get("id")?.as_str()?.to_string(),
             always: v.get("always").and_then(|a| a.as_bool()).unwrap_or(false),
@@ -198,7 +236,11 @@ pub fn parse_ipc(raw: &str) -> Option<IpcMsg> {
         "term_open" => Some(IpcMsg::TermOpen(v.get("open")?.as_bool()?)),
         "term_run" => {
             let c = v.get("command")?.as_str()?.trim().to_string();
-            if c.is_empty() { None } else { Some(IpcMsg::TermRun(c)) }
+            if c.is_empty() {
+                None
+            } else {
+                Some(IpcMsg::TermRun(c))
+            }
         }
         "term_stop" => Some(IpcMsg::TermStop(v.get("id").and_then(|i| i.as_str()).map(str::to_string))),
         "term_clear" => Some(IpcMsg::TermClear),
@@ -291,17 +333,21 @@ mod tests {
         assert_eq!(parse_ipc(r#"{"type":"load_usage","days":null}"#), Some(IpcMsg::LoadUsage(None)));
         assert_eq!(
             parse_ipc(r#"{"type":"set_price","model":"gpt-6-sol","input":2,"cached":0.5,"output":8}"#),
-            Some(IpcMsg::SetPrice { model: "gpt-6-sol".into(), price: crate::db::Price { input: 2.0, cached: 0.5, output: 8.0 } })
+            Some(IpcMsg::SetPrice {
+                model: "gpt-6-sol".into(),
+                price: crate::db::Price { input: 2.0, cached: 0.5, output: 8.0 }
+            })
         );
-        assert_eq!(parse_ipc(r#"{"type":"set_price","model":"m","input":-1,"cached":0,"output":0}"#), None, "no negative prices");
+        assert_eq!(
+            parse_ipc(r#"{"type":"set_price","model":"m","input":-1,"cached":0,"output":0}"#),
+            None,
+            "no negative prices"
+        );
         assert_eq!(
             parse_ipc(r#"{"type":"add_project","path":"C:/code/app"}"#),
             Some(IpcMsg::AddProject(Some("C:/code/app".into())))
         );
-        assert_eq!(
-            parse_ipc(r#"{"type":"pin","id":"s","on":true}"#),
-            Some(IpcMsg::Pin { id: "s".into(), on: true })
-        );
+        assert_eq!(parse_ipc(r#"{"type":"pin","id":"s","on":true}"#), Some(IpcMsg::Pin { id: "s".into(), on: true }));
         assert_eq!(
             parse_ipc(r#"{"type":"rename","id":"s","title":" New name "}"#),
             Some(IpcMsg::Rename { id: "s".into(), title: "New name".into() })
@@ -312,10 +358,7 @@ mod tests {
             Some(IpcMsg::MoveChat { id: "s".into(), project: None })
         );
         assert_eq!(parse_ipc(r#"{"type":"delete","id":"s"}"#), Some(IpcMsg::DeleteChat("s".into())));
-        assert_eq!(
-            parse_ipc(r#"{"type":"adopt_unfiled","project":"p"}"#),
-            Some(IpcMsg::AdoptUnfiled("p".into()))
-        );
+        assert_eq!(parse_ipc(r#"{"type":"adopt_unfiled","project":"p"}"#), Some(IpcMsg::AdoptUnfiled("p".into())));
         assert_eq!(parse_ipc(r#"{"type":"load","id":"ses_9"}"#), Some(IpcMsg::Load("ses_9".into())));
         assert_eq!(parse_ipc(r#"{"type":"load"}"#), None, "load without id is malformed");
         assert_eq!(parse_ipc(r#"{"type":"ready"}"#), Some(IpcMsg::Ready));
@@ -328,10 +371,7 @@ mod tests {
 
     #[test]
     fn ipc_parses_save_temperature() {
-        assert_eq!(
-            parse_ipc(r#"{"type":"save_temperature","value":0.7}"#),
-            Some(IpcMsg::SaveTemperature(Some(0.7)))
-        );
+        assert_eq!(parse_ipc(r#"{"type":"save_temperature","value":0.7}"#), Some(IpcMsg::SaveTemperature(Some(0.7))));
         assert_eq!(parse_ipc(r#"{"type":"save_temperature","value":0}"#), Some(IpcMsg::SaveTemperature(Some(0.0))));
         assert_eq!(parse_ipc(r#"{"type":"save_temperature","value":2}"#), Some(IpcMsg::SaveTemperature(Some(2.0))));
         assert_eq!(
@@ -346,18 +386,9 @@ mod tests {
 
     #[test]
     fn ipc_mode_selector_parses_the_three_modes() {
-        assert_eq!(
-            parse_ipc(r#"{"type":"mode","mode":"default"}"#),
-            Some(IpcMsg::Mode(PermissionMode::Default))
-        );
-        assert_eq!(
-            parse_ipc(r#"{"type":"mode","mode":"manual"}"#),
-            Some(IpcMsg::Mode(PermissionMode::Manual))
-        );
-        assert_eq!(
-            parse_ipc(r#"{"type":"mode","mode":"turbo"}"#),
-            Some(IpcMsg::Mode(PermissionMode::Turbo))
-        );
+        assert_eq!(parse_ipc(r#"{"type":"mode","mode":"default"}"#), Some(IpcMsg::Mode(PermissionMode::Default)));
+        assert_eq!(parse_ipc(r#"{"type":"mode","mode":"manual"}"#), Some(IpcMsg::Mode(PermissionMode::Manual)));
+        assert_eq!(parse_ipc(r#"{"type":"mode","mode":"turbo"}"#), Some(IpcMsg::Mode(PermissionMode::Turbo)));
         assert_eq!(parse_ipc(r#"{"type":"mode","mode":"yolo"}"#), None, "unknown mode dropped");
         assert_eq!(parse_ipc(r#"{"type":"mode"}"#), None, "mode without value dropped");
     }
@@ -413,9 +444,6 @@ mod tests {
             Some(IpcMsg::Approve { id: "apr_1".into(), always: false })
         );
         assert_eq!(parse_ipc(r#"{"type":"approve"}"#), None, "id is required");
-        assert_eq!(
-            parse_ipc(r#"{"type":"deny","id":"apr_1"}"#),
-            Some(IpcMsg::Deny("apr_1".into()))
-        );
+        assert_eq!(parse_ipc(r#"{"type":"deny","id":"apr_1"}"#), Some(IpcMsg::Deny("apr_1".into())));
     }
 }

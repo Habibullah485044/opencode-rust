@@ -79,8 +79,11 @@ pub fn dashboard(db: &Db, days: Option<i64>, now_ms: i64) -> Value {
 
     let mut total = Sum::default();
     let mut by_day: BTreeMap<i64, Sum> = BTreeMap::new();
-    let (mut by_model, mut by_purpose, mut by_chat): (HashMap<String, Sum>, HashMap<String, Sum>, HashMap<String, Sum>) =
-        Default::default();
+    let (mut by_model, mut by_purpose, mut by_chat): (
+        HashMap<String, Sum>,
+        HashMap<String, Sum>,
+        HashMap<String, Sum>,
+    ) = Default::default();
     for e in &entries {
         let c = cost(e, prices.get(&e.model));
         total.add(e, c);
@@ -143,8 +146,7 @@ pub fn dashboard(db: &Db, days: Option<i64>, now_ms: i64) -> Value {
     models.extend(prices.keys().cloned());
     models.sort();
     models.dedup();
-    let price_rows: Vec<Value> =
-        models.iter().map(|m| json!({"model": m, "price": prices.get(m)})).collect();
+    let price_rows: Vec<Value> = models.iter().map(|m| json!({"model": m, "price": prices.get(m)})).collect();
     // Requests counted before the per-request log existed (no detail).
     let older = db.usage_totals(None, days).map(|t| t.requests.saturating_sub(total.requests)).unwrap_or(0);
     json!({
@@ -230,7 +232,8 @@ mod tests {
         assert!((total - 2.68).abs() < 1e-9, "{total}");
         assert_eq!(d["total"]["unpriced"], 1, "luna's request has no price");
         assert_eq!(d["models"][0]["name"], "gpt-6-sol", "the costliest model first");
-        let purposes: Vec<&str> = d["purposes"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+        let purposes: Vec<&str> =
+            d["purposes"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
         assert_eq!(purposes, ["chat", "final check", "spec"]);
         assert_eq!(d["chats"][0]["title"], "Bakery site");
         assert_eq!(d["chats"][1]["title"], "Outside a chat (planning, summaries)");

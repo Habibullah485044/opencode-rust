@@ -127,7 +127,12 @@ pub(super) fn grep_files_with(
         for (i, line) in text.lines().enumerate() {
             if re.is_match(line) {
                 let rel = path.strip_prefix(workspace).unwrap_or(path);
-                out.push(format!("{}:{}:{}", rel.display().to_string().replace('\\', "/"), i + 1, truncate(line.trim_end(), 300)));
+                out.push(format!(
+                    "{}:{}:{}",
+                    rel.display().to_string().replace('\\', "/"),
+                    i + 1,
+                    truncate(line.trim_end(), 300)
+                ));
                 if out.len() >= 200 {
                     out.push("… [match limit 200 reached]".into());
                     return Ok(out.join("\n"));

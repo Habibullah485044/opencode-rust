@@ -259,7 +259,11 @@ pub fn verdicts(reply: &str) -> (usize, Vec<String>) {
     let mut pass = 0;
     let mut fails = Vec::new();
     for line in reply.lines() {
-        let l = line.trim().trim_start_matches(['*', '-', '`', ' ']).trim_start_matches(|c: char| c.is_ascii_digit() || c == '.').trim();
+        let l = line
+            .trim()
+            .trim_start_matches(['*', '-', '`', ' '])
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.')
+            .trim();
         let upper = l.to_ascii_uppercase();
         if upper.starts_with("PASS") {
             pass += 1;
@@ -293,11 +297,18 @@ mod tests {
                      DESIGN: families nearby; warm, playful; tomato red and flour white, chunky sans\n\
                      DONE WHEN:\n- check_page passes";
         let s = parse(reply).unwrap();
-        assert_eq!(s.design.as_deref(), Some("families nearby; warm, playful; tomato red and flour white, chunky sans"));
+        assert_eq!(
+            s.design.as_deref(),
+            Some("families nearby; warm, playful; tomato red and flour white, chunky sans")
+        );
         assert!(for_model(&s).contains("Design: families nearby"));
         assert_eq!(parse("KIND: task\nGOAL: x\nOUTPUT: y\nDESIGN: <only for…>\nDONE WHEN:\n- z").unwrap().design, None);
         let review = design_review_request("A site", s.design.as_deref(), &["d.png".into()]);
-        assert!(review.starts_with(DESIGN_REVIEW_PREFIX) && review.contains("[image: d.png]") && review.contains("coloured italics"));
+        assert!(
+            review.starts_with(DESIGN_REVIEW_PREFIX)
+                && review.contains("[image: d.png]")
+                && review.contains("coloured italics")
+        );
     }
 
     #[test]
@@ -336,7 +347,8 @@ mod tests {
 
     #[test]
     fn verdict_lines_are_counted() {
-        let reply = "Checked.\n1. PASS: file exists — read it\n- **FAIL**: shows a heart — it is a text grid\nPASS: menu works";
+        let reply =
+            "Checked.\n1. PASS: file exists — read it\n- **FAIL**: shows a heart — it is a text grid\nPASS: menu works";
         let (pass, fails) = verdicts(reply);
         assert_eq!(pass, 2);
         assert_eq!(fails, ["shows a heart — it is a text grid"]);
@@ -345,7 +357,12 @@ mod tests {
 
     #[test]
     fn the_prompt_carries_the_context() {
-        let p = prompt("why is it a txt?", Some("Created image.txt"), &["binary-image".into()], "- frontend-design: Distinctive interfaces");
+        let p = prompt(
+            "why is it a txt?",
+            Some("Created image.txt"),
+            &["binary-image".into()],
+            "- frontend-design: Distinctive interfaces",
+        );
         assert!(p.contains("Created image.txt") && p.contains("binary-image") && p.contains("why is it a txt?"));
         assert!(prompt("x", None, &[], "").contains("Project folder: empty"));
         assert!(p.contains("SKILLS:") && p.contains("frontend-design: Distinctive"), "the skill menu to pick from");
@@ -359,7 +376,10 @@ mod tests {
         let s = parse(reply).unwrap();
         assert_eq!(s.skills, ["frontend-design", "build-anything"], "two at most: each one read rides along");
         let note = for_model(&s);
-        assert!(note.contains("First read these skills") && note.contains(".opencode/skills/frontend-design/SKILL.md"), "{note}");
+        assert!(
+            note.contains("First read these skills") && note.contains(".opencode/skills/frontend-design/SKILL.md"),
+            "{note}"
+        );
         assert!(for_user(&s).contains("Skills: frontend-design, build-anything"));
         assert!(parse("KIND: task\nGOAL: x\nOUTPUT: y\nDONE WHEN:\n- z\nSKILLS: none").unwrap().skills.is_empty());
         // A mission keeps the pick with its goal.

@@ -82,10 +82,8 @@ pub(super) fn canonical_json(v: &Value) -> String {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-            let fields: Vec<String> = keys
-                .into_iter()
-                .map(|k| format!("{}:{}", Value::String(k.clone()), canonical_json(&map[k])))
-                .collect();
+            let fields: Vec<String> =
+                keys.into_iter().map(|k| format!("{}:{}", Value::String(k.clone()), canonical_json(&map[k]))).collect();
             format!("{{{}}}", fields.join(","))
         }
         Value::Array(items) => {
@@ -165,10 +163,7 @@ pub(super) fn log_cache(st: &AppState, session_id: &str, usage: Option<&crate::p
     if session_id.is_empty() {
         return;
     }
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let line = match usage {
         Some(u) => format!(
             "{secs} {} in={} cached={} ({}%) out={} {prefix}",
@@ -214,7 +209,11 @@ pub(super) fn rewind_key(text: &str) -> String {
         .or_else(|| {
             t.strip_prefix("/deep ").map(|r| {
                 let (first, rest) = r.split_once(' ').unwrap_or((r, ""));
-                if first.parse::<usize>().is_ok() && !rest.is_empty() { rest } else { r }
+                if first.parse::<usize>().is_ok() && !rest.is_empty() {
+                    rest
+                } else {
+                    r
+                }
             })
         })
         .unwrap_or(t);
@@ -288,12 +287,8 @@ pub(super) fn files_changed_since(ws: &std::path::Path, since: std::time::System
         if n > 20_000 {
             return true;
         }
-        let changed = entry
-            .metadata()
-            .ok()
-            .filter(|m| m.is_file())
-            .and_then(|m| m.modified().ok())
-            .is_some_and(|t| t >= since);
+        let changed =
+            entry.metadata().ok().filter(|m| m.is_file()).and_then(|m| m.modified().ok()).is_some_and(|t| t >= since);
         if changed {
             return true;
         }
@@ -336,14 +331,22 @@ pub fn announces_work(text: &str) -> bool {
     if lower.ends_with(':') {
         return true;
     }
-    let sentences: Vec<&str> = lower
-        .split(['.', '!', '\n'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
+    let sentences: Vec<&str> = lower.split(['.', '!', '\n']).map(str::trim).filter(|s| !s.is_empty()).collect();
     const STARTS: [&str; 14] = [
-        "i'll ", "i will ", "let me ", "let's ", "i'm going to ", "i am going to ", "now i'll ", "now i will ",
-        "next, i", "next i", "first, i", "now let me ", "now, let me ", "i'll now ",
+        "i'll ",
+        "i will ",
+        "let me ",
+        "let's ",
+        "i'm going to ",
+        "i am going to ",
+        "now i'll ",
+        "now i will ",
+        "next, i",
+        "next i",
+        "first, i",
+        "now let me ",
+        "now, let me ",
+        "i'll now ",
     ];
     sentences.iter().rev().take(2).any(|s| {
         // The sentence itself, or its last clause ("No, not yet. Let me…").
@@ -375,10 +378,18 @@ pub fn tool_alias(name: &str, input: &Value) -> Option<(&'static str, Value)> {
     let n = name.to_ascii_lowercase().replace(['-', ' '], "_");
     let real = match n.as_str() {
         "list_files" | "list_dir" | "list_directory" | "ls" | "listdir" | "dir" => "list",
-        "bash" | "shell" | "run_terminal_command" | "run_command" | "execute_command" | "terminal" | "run_shell_command" | "exec" => "bash",
+        "bash"
+        | "shell"
+        | "run_terminal_command"
+        | "run_command"
+        | "execute_command"
+        | "terminal"
+        | "run_shell_command"
+        | "exec" => "bash",
         "read_file" | "read_files" | "view" | "open_file" | "cat" | "view_file" => "read",
         "write_file" | "create_file" | "write_to_file" => "write",
-        "edit_file" | "str_replace" | "str_replace_editor" | "replace_in_file" | "apply_edit" | "multiedit" | "multi_edit" => "edit",
+        "edit_file" | "str_replace" | "str_replace_editor" | "replace_in_file" | "apply_edit" | "multiedit"
+        | "multi_edit" => "edit",
         "find_files" | "file_search" | "search_files_by_name" => "glob",
         "search" | "code_search" | "search_files" | "ripgrep" | "rg" | "grep_search" => "grep",
         "web_fetch" | "fetch" | "read_url" | "fetch_url" | "web_search" => "webfetch",
@@ -397,7 +408,17 @@ pub fn tool_alias(name: &str, input: &Value) -> Option<(&'static str, Value)> {
             }
         }
     };
-    for from in ["file_path", "filepath", "filename", "file", "target_file", "dir", "directory", "dir_path", "relative_workspace_path"] {
+    for from in [
+        "file_path",
+        "filepath",
+        "filename",
+        "file",
+        "target_file",
+        "dir",
+        "directory",
+        "dir_path",
+        "relative_workspace_path",
+    ] {
         rename(&mut args, from, "path");
     }
     for from in ["cmd", "script", "shell_command"] {
@@ -428,8 +449,19 @@ pub fn denies_file_access(text: &str) -> bool {
     if t.chars().count() > 2500 {
         return false;
     }
-    let cannot = ["can't see", "cannot see", "can't read", "cannot read", "can't access", "cannot access",
-        "don't have access", "do not have access", "unable to access", "unable to read", "no access to"];
+    let cannot = [
+        "can't see",
+        "cannot see",
+        "can't read",
+        "cannot read",
+        "can't access",
+        "cannot access",
+        "don't have access",
+        "do not have access",
+        "unable to access",
+        "unable to read",
+        "no access to",
+    ];
     let files = ["file", "folder", "director", "local", "computer", "system", "project", "repo"];
     let ask = ["paste", "upload", "share", "provide", "send me"];
     cannot.iter().any(|c| t.contains(c)) && files.iter().any(|f| t.contains(f)) && ask.iter().any(|a| t.contains(a))
@@ -457,12 +489,7 @@ impl LoopEnd {
 
 /// The agent loop: load history, call model, execute tools, repeat until done.
 /// An aborted run returns the text "aborted" (see [`LoopEnd`]).
-pub async fn run_loop(
-    st: &Shared,
-    session_id: &str,
-    opts: &LoopOpts,
-    abort: &AtomicBool,
-) -> Result<String> {
+pub async fn run_loop(st: &Shared, session_id: &str, opts: &LoopOpts, abort: &AtomicBool) -> Result<String> {
     run_loop_inner(st, session_id, opts, abort).await.map(LoopEnd::into_legacy)
 }
 
@@ -652,7 +679,9 @@ async fn run_specs(
         // three folders (and the chat's project from the DB).
         let roles = {
             let (st, sid) = (st.clone(), session_id.to_string());
-            tokio::task::spawn_blocking(move || agents::load_subagents(&st.workspace_for(&sid))).await.unwrap_or_default()
+            tokio::task::spawn_blocking(move || agents::load_subagents(&st.workspace_for(&sid)))
+                .await
+                .unwrap_or_default()
         };
         specs.push(crate::subagent::spawn_spec(&roles));
         specs.extend(crate::subagent::agent_tool_specs());
@@ -668,10 +697,7 @@ async fn run_specs(
         specs.retain(|s| s.function.name != "ask_user");
     }
     match &opts.allow {
-        Some(allow) => specs
-            .into_iter()
-            .filter(|s| allow.contains(&s.function.name))
-            .collect(),
+        Some(allow) => specs.into_iter().filter(|s| allow.contains(&s.function.name)).collect(),
         None => specs,
     }
 }
@@ -780,14 +806,19 @@ async fn read_reply(
             StreamEvent::Reasoning(t) => {
                 reasoning.push_str(t);
                 if opts.emit_activity {
-                    let _ = st.events.send(ServerEvent::ReasoningDelta {
-                        session_id: session_id.to_string(),
-                        text: t.clone(),
-                    });
+                    let _ = st
+                        .events
+                        .send(ServerEvent::ReasoningDelta { session_id: session_id.to_string(), text: t.clone() });
                 }
             }
             StreamEvent::Usage(u) => {
-                st.record_usage_as_async(if opts.agent.is_some() { "subagent" } else { usage_tag().0 }, session_id, model, u).await;
+                st.record_usage_as_async(
+                    if opts.agent.is_some() { "subagent" } else { usage_tag().0 },
+                    session_id,
+                    model,
+                    u,
+                )
+                .await;
                 request_usage = Some(*u);
             }
             StreamEvent::Done { finish_reason: fr } => {
@@ -797,7 +828,15 @@ async fn read_reply(
             _ => acc.push(&ev),
         }
     }
-    Ok(StreamOutcome::Reply(Box::new(StreamedReply { text, reasoning, acc, shown, finish_reason, broke_off, request_usage })))
+    Ok(StreamOutcome::Reply(Box::new(StreamedReply {
+        text,
+        reasoning,
+        acc,
+        shown,
+        finish_reason,
+        broke_off,
+        request_usage,
+    })))
 }
 
 /// The reply was an upstream error served as text. `Ok` means ask the same
@@ -923,11 +962,7 @@ async fn save_assistant_reply(
         assistant_parts.push(Part::Text { text: text.to_string() });
     }
     for (id, name, input) in calls {
-        assistant_parts.push(Part::ToolCall {
-            id: id.clone(),
-            name: name.clone(),
-            input: input.clone(),
-        });
+        assistant_parts.push(Part::ToolCall { id: id.clone(), name: name.clone(), input: input.clone() });
     }
     if !assistant_parts.is_empty() {
         save_message(st, session_id, "assistant", assistant_parts).await?;
@@ -1071,9 +1106,7 @@ async fn run_tool_calls(
     }
     // Join the parallel spawns; results are recorded in call order.
     let (meta, futs): (Vec<_>, Vec<_>) = spawns.into_iter().unzip();
-    for ((id, name, input, _detail), (output, ok)) in
-        meta.into_iter().zip(futures::future::join_all(futs).await)
-    {
+    for ((id, name, input, _detail), (output, ok)) in meta.into_iter().zip(futures::future::join_all(futs).await) {
         finish_tool_call(st, opts, session_id, &id, &name, &input, output, ok).await?;
     }
     Ok(())
@@ -1103,10 +1136,7 @@ async fn call_denied(
         // the review run: it tried Bash twice, then claimed even
         // grep was blocked).
         Some(match &opts.allow {
-            Some(allow) => format!(
-                "tool blocked: this run can only call these tools: {}",
-                allow.join(", ")
-            ),
+            Some(allow) => format!("tool blocked: this run can only call these tools: {}", allow.join(", ")),
             None => "tool blocked: not allowed in this mode/role".to_string(),
         })
     } else if crate::tools::is_job_control(name, input) && agent_job(input) {
@@ -1133,10 +1163,7 @@ fn steps_ran_out(st: &Shared, session_id: &str, max_steps: usize) -> LoopEnd {
         "stopped after {max_steps} steps (agent.max_steps) — the task may be unfinished. \
          Send a message to continue, or raise agent.max_steps in the config."
     );
-    let _ = st.events.send(ServerEvent::Note {
-        session_id: session_id.to_string(),
-        text: msg.clone(),
-    });
+    let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text: msg.clone() });
     LoopEnd::Done(msg)
 }
 
@@ -1220,20 +1247,14 @@ pub(super) async fn finish_tool_call(
     // having to remember the port.
     if ok && name == "bash" {
         if let Some(url) = crate::browser::detect_dev_server(&output) {
-            let _ = st.events.send(ServerEvent::DevServer {
-                session_id: session_id.to_string(),
-                url,
-            });
+            let _ = st.events.send(ServerEvent::DevServer { session_id: session_id.to_string(), url });
         }
     }
     if ok && st.cfg.agent.reuse_gate {
         if let Some(hint) = reuse_gate(opts.workspace.as_deref().unwrap_or(&st.workspace), name, input) {
             output.push_str(&format!("\n[{hint}]"));
             bump_hints(st, session_id);
-            let _ = st.events.send(ServerEvent::Note {
-                session_id: session_id.to_string(),
-                text: hint,
-            });
+            let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text: hint });
         }
     }
     {
@@ -1256,7 +1277,8 @@ pub(super) async fn finish_tool_call(
         });
     }
     // T-006: off the async threads, awaited before the next call's result.
-    save_message(st, session_id, "tool", vec![Part::ToolResult { tool_id: id.to_string(), output, is_error: !ok }]).await
+    save_message(st, session_id, "tool", vec![Part::ToolResult { tool_id: id.to_string(), output, is_error: !ok }])
+        .await
 }
 
 /// Save one message off the async threads (`Db::run`) and wait for it: the
@@ -1281,10 +1303,7 @@ pub(crate) fn agent_status(st: &Shared, a: &AgentInfo, state: &str, detail: Stri
 
 /// Laziness Meter: current totals for a session.
 pub(super) fn snapshot_stats(st: &Shared, session_id: &str) -> RunStats {
-    st.stats
-        .lock()
-        .map(|m| m.get(session_id).cloned().unwrap_or_default())
-        .unwrap_or_default()
+    st.stats.lock().map(|m| m.get(session_id).cloned().unwrap_or_default()).unwrap_or_default()
 }
 
 /// Laziness Meter: account a tool call's line impact.

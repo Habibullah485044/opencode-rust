@@ -1,8 +1,8 @@
 //! The terminal UI runner: bridges the core's event bus to the TUI and
 //! carries out the TUI's actions against the core, like an API client.
 
-use opencode_rust::frontend;
 use anyhow::Result;
+use opencode_rust::frontend;
 use opencode_rust::{agents::AgentMode, server, tui};
 use std::sync::Arc;
 
@@ -18,10 +18,7 @@ pub(crate) async fn tui_run(
     let session = state.db.run(|db| db.create_session("tui", None)).await?;
     let mut app = tui::App::new();
     app.session_id = Some(session.id.clone());
-    app.push(
-        tui::EntryKind::System,
-        format!("[boot] {boot_ms}ms · core at http://{addr} · session {}", session.id),
-    );
+    app.push(tui::EntryKind::System, format!("[boot] {boot_ms}ms · core at http://{addr} · session {}", session.id));
 
     // New (B-23): subscribe to the event bus BEFORE the first run starts,
     // so its first events (even a fast failure) reach the TUI. The
@@ -76,26 +73,17 @@ fn spawn_action_handler(
 
 /// Text into the session's transcript, as if the assistant said it.
 fn say(st: &State, sid: &str, text: String) {
-    let _ = st.events.send(server::ServerEvent::AssistantDelta {
-        session_id: sid.to_string(),
-        text,
-    });
+    let _ = st.events.send(server::ServerEvent::AssistantDelta { session_id: sid.to_string(), text });
 }
 
 /// A system note in the session's transcript.
 fn note(st: &State, sid: &str, text: String) {
-    let _ = st.events.send(server::ServerEvent::Note {
-        session_id: sid.to_string(),
-        text,
-    });
+    let _ = st.events.send(server::ServerEvent::Note { session_id: sid.to_string(), text });
 }
 
 /// T-018: run `f` on a blocking thread — DB and file calls must not hold
 /// up the async worker the action handler runs on.
-async fn blocking<T: Send + 'static>(
-    st: &State,
-    f: impl FnOnce(&server::AppState) -> T + Send + 'static,
-) -> Result<T> {
+async fn blocking<T: Send + 'static>(st: &State, f: impl FnOnce(&server::AppState) -> T + Send + 'static) -> Result<T> {
     let st = st.clone();
     Ok(tokio::task::spawn_blocking(move || f(&st)).await?)
 }
@@ -104,11 +92,7 @@ async fn blocking<T: Send + 'static>(
 fn show_session(st: &State, sid: &mut String, id: String, transcript: Vec<server::TranscriptLine>) {
     let mode = st.mode_for(&id).as_str().to_string();
     *sid = id.clone();
-    let _ = st.events.send(server::ServerEvent::SessionLoaded {
-        session_id: id,
-        mode,
-        transcript,
-    });
+    let _ = st.events.send(server::ServerEvent::SessionLoaded { session_id: id, mode, transcript });
 }
 
 async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
@@ -125,7 +109,8 @@ async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
             "resume" => st.kick_mission(sid.clone(), None).await,
             "stop" => {
                 let stopped = st.abort_run(sid).await;
-                let text = if stopped { "mission: stopping — /mission resume carries on" } else { "no mission is running" };
+                let text =
+                    if stopped { "mission: stopping — /mission resume carries on" } else { "no mission is running" };
                 note(st, sid, text.into());
             }
             _ => note(st, sid, server::mission_report(st, sid).await),
@@ -179,21 +164,16 @@ async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
         }
         tui::InputAction::Diff(arg) => {
             let me = sid.clone();
-            let text = blocking(st, move |st| diff(st, &me, arg))
-                .await
-                .unwrap_or_else(|e| format!("[error] diff: {e:#}"));
+            let text =
+                blocking(st, move |st| diff(st, &me, arg)).await.unwrap_or_else(|e| format!("[error] diff: {e:#}"));
             say(st, sid, format!("{text}\n"));
         }
         tui::InputAction::Skills => {
             let skills = opencode_rust::skills::load_skills(&st.workspace);
             let text = if skills.is_empty() {
-                "[skills] none found in .opencode/skills or ~/.config/opencode-rust/skills\n"
-                    .to_string()
+                "[skills] none found in .opencode/skills or ~/.config/opencode-rust/skills\n".to_string()
             } else {
-                format!(
-                    "[skills]\n{}\n",
-                    opencode_rust::skills::skill_menu(&skills)
-                )
+                format!("[skills]\n{}\n", opencode_rust::skills::skill_menu(&skills))
             };
             say(st, sid, text);
         }
@@ -258,9 +238,7 @@ async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
             // New (S-16): inside the workspace only, no silent overwrite.
             // T-018: reads the DB and writes a file, so off the async task.
             let me = sid.clone();
-            let res = blocking(st, move |st| st.export_transcript(&me, arg.as_deref()))
-                .await
-                .and_then(|r| r);
+            let res = blocking(st, move |st| st.export_transcript(&me, arg.as_deref())).await.and_then(|r| r);
             let text = match res {
                 Ok(path) => format!("[export] wrote transcript to {}\n", path.display()),
                 Err(e) => format!("[export] failed: {e:#}\n"),
@@ -270,9 +248,8 @@ async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
         tui::InputAction::Todos => say(st, sid, format!("{}\n", st.todos_report(sid))),
         tui::InputAction::Usage => {
             let me = sid.clone();
-            let text = blocking(st, move |st| st.usage_report(&me))
-                .await
-                .unwrap_or_else(|e| format!("[error] usage: {e:#}"));
+            let text =
+                blocking(st, move |st| st.usage_report(&me)).await.unwrap_or_else(|e| format!("[error] usage: {e:#}"));
             say(st, sid, format!("{text}\n"));
         }
         tui::InputAction::Init => {
@@ -298,9 +275,7 @@ async fn handle_action(st: &State, sid: &mut String, action: tui::InputAction) {
             let _ = st.decide(&id, false, false);
         }
         tui::InputAction::Edit { path, instruction } => inline_edit(st, sid, path, instruction).await,
-        tui::InputAction::ApplyEdit { path, old, new, line } => {
-            apply_edit(st, sid, path, old, new, line)
-        }
+        tui::InputAction::ApplyEdit { path, old, new, line } => apply_edit(st, sid, path, old, new, line),
     }
 }
 
@@ -313,22 +288,14 @@ async fn snapshot_command(st: State, sid: String, redo: bool, force: bool) {
     let res = frontend::run_snapshot(ws, sd, redo, force).await;
     let verb = if redo { "redo" } else { "undo" };
     let text = match res {
-        Ok(Ok(Some(m))) => format!(
-            "[{verb}] restored snapshot {} ({}, {} file(s))\n",
-            m.id,
-            m.label,
-            m.present.len()
-        ),
+        Ok(Ok(Some(m))) => format!("[{verb}] restored snapshot {} ({}, {} file(s))\n", m.id, m.label, m.present.len()),
         Ok(Ok(None)) => {
             format!("[{verb}] nothing to {verb} - no snapshot recorded (not a git repository?)\n")
         }
         Ok(Err(e)) => format!("[{verb}] failed: {e:#}\n"),
         Err(e) => format!("[{verb}] failed: {e}\n"),
     };
-    let _ = st.events.send(server::ServerEvent::AssistantDelta {
-        session_id: sid,
-        text,
-    });
+    let _ = st.events.send(server::ServerEvent::AssistantDelta { session_id: sid, text });
 }
 
 /// `/skill install <src>`. New (B-06): registered in `busy`, so it can be stopped.
@@ -336,10 +303,7 @@ async fn skill_install(st: &State, sid: &str, src: String) {
     st.kick_task(sid.to_string(), move |st2, sid2, abort| async move {
         match opencode_rust::server::install_skill_flow(&st2, &src, &abort).await {
             Ok(report) => {
-                let _ = st2.events.send(server::ServerEvent::AssistantDelta {
-                    session_id: sid2,
-                    text: report,
-                });
+                let _ = st2.events.send(server::ServerEvent::AssistantDelta { session_id: sid2, text: report });
             }
             Err(e) => {
                 let _ = st2.events.send(server::ServerEvent::RunFinished {
@@ -356,22 +320,11 @@ async fn skill_install(st: &State, sid: &str, src: String) {
 /// `/compact`. New (B-06): registered in `busy`, so it can be stopped.
 async fn compact(st: &State, sid: &str) {
     st.kick_task(sid.to_string(), |st2, sid2, abort| async move {
-        let (ok, message) =
-            match opencode_rust::compact::compact(&st2, &sid2, &abort).await {
-                Ok(o) => (
-                    true,
-                    format!(
-                        "compacted {} message(s) -> 1 summary + {} kept",
-                        o.removed, o.kept
-                    ),
-                ),
-                Err(e) => (false, format!("compact failed: {e}")),
-            };
-        let _ = st2.events.send(server::ServerEvent::RunFinished {
-            session_id: sid2,
-            ok,
-            message: Some(message),
-        });
+        let (ok, message) = match opencode_rust::compact::compact(&st2, &sid2, &abort).await {
+            Ok(o) => (true, format!("compacted {} message(s) -> 1 summary + {} kept", o.removed, o.kept)),
+            Err(e) => (false, format!("compact failed: {e}")),
+        };
+        let _ = st2.events.send(server::ServerEvent::RunFinished { session_id: sid2, ok, message: Some(message) });
     })
     .await;
 }
@@ -409,13 +362,9 @@ fn diff(st: &server::AppState, sid: &str, arg: Option<String>) -> String {
             .ok()
             .flatten()
             .and_then(|s| s.parent_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!("no parent session - pass one: /diff <id|index>")
-            }),
+            .ok_or_else(|| anyhow::anyhow!("no parent session - pass one: /diff <id|index>")),
     };
-    match target.and_then(|t| {
-        opencode_rust::sessions::diff_sessions(&st.db, sid, &t)
-    }) {
+    match target.and_then(|t| opencode_rust::sessions::diff_sessions(&st.db, sid, &t)) {
         Ok(d) => d,
         Err(e) => format!("[error] diff: {e:#}"),
     }
@@ -430,16 +379,11 @@ async fn inline_edit(st: &State, sid: &str, path: String, instruction: String) {
             let _ = st2.events.send(server::ServerEvent::RunFinished {
                 session_id: sid2,
                 ok: false,
-                message: Some(
-                    "inline /edit is blocked in plan mode (switch with /build)"
-                        .into(),
-                ),
+                message: Some("inline /edit is blocked in plan mode (switch with /build)".into()),
             });
             return;
         }
-        let result =
-            opencode_rust::inline_edit::propose(&st2, &sid2, &path, &instruction, &abort)
-                .await;
+        let result = opencode_rust::inline_edit::propose(&st2, &sid2, &path, &instruction, &abort).await;
         // A newer run took the slot: this edit was cancelled,
         // and its events must not end that run's busy state.
         if st2.is_superseded(&sid2, &abort).await {
@@ -476,24 +420,16 @@ fn apply_edit(st: &State, sid: &str, path: String, old: String, new: String, lin
     let path_c = path.clone();
     // Same contract as an agent run: snapshot before we
     // mutate, so /undo can revert an accepted inline edit.
-    if let Err(e) = opencode_rust::gitsnap::record_before_run(
-        &ws,
-        &st2.state_dir,
-        "pre-edit",
-    ) {
+    if let Err(e) = opencode_rust::gitsnap::record_before_run(&ws, &st2.state_dir, "pre-edit") {
         // New (B-48): stderr would draw over the TUI.
         opencode_rust::server::core_log(&format!("[snapshot] {e:#}"));
     }
     tokio::spawn(async move {
-        let res = tokio::task::spawn_blocking(
-            move || -> Result<std::path::PathBuf, anyhow::Error> {
-                let abs = opencode_rust::inline_edit::resolve_in_workspace(
-                    &ws, &path_c,
-                )?;
-                opencode_rust::inline_edit::apply(&abs, &old, &new)?;
-                Ok(abs)
-            },
-        )
+        let res = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, anyhow::Error> {
+            let abs = opencode_rust::inline_edit::resolve_in_workspace(&ws, &path_c)?;
+            opencode_rust::inline_edit::apply(&abs, &old, &new)?;
+            Ok(abs)
+        })
         .await;
         let (ok, message) = match res {
             Ok(Ok(abs)) => {
@@ -502,21 +438,11 @@ fn apply_edit(st: &State, sid: &str, path: String, old: String, new: String, lin
                     path: path.clone(),
                     line,
                 });
-                (
-                    true,
-                    Some(format!(
-                        "applied {path}:{line} ({})",
-                        abs.display()
-                    )),
-                )
+                (true, Some(format!("applied {path}:{line} ({})", abs.display())))
             }
             Ok(Err(e)) => (false, Some(format!("edit failed: {e:#}"))),
             Err(e) => (false, Some(format!("edit failed: {e}"))),
         };
-        let _ = st2.events.send(server::ServerEvent::RunFinished {
-            session_id: sid2,
-            ok,
-            message,
-        });
+        let _ = st2.events.send(server::ServerEvent::RunFinished { session_id: sid2, ok, message });
     });
 }

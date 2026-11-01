@@ -171,11 +171,7 @@ pub async fn execute_with(
         }
         "bash" => {
             let cmd = arg_str(args, "command")?;
-            let timeout = args
-                .get("timeout_secs")
-                .and_then(Value::as_u64)
-                .unwrap_or(120)
-                .clamp(1, 600);
+            let timeout = args.get("timeout_secs").and_then(Value::as_u64).unwrap_or(120).clamp(1, 600);
             bash(cmd, workspace, Duration::from_secs(timeout), abort).await
         }
         "webfetch" => {
@@ -234,12 +230,9 @@ fn file_tool(name: &str, args: &Value, workspace: &Path, hidden: &crate::permiss
                 ),
             }
         }
-        "glob" => glob_files_with(
-            workspace,
-            arg_str(args, "pattern")?,
-            args.get("path").and_then(Value::as_str),
-            hidden,
-        ),
+        "glob" => {
+            glob_files_with(workspace, arg_str(args, "pattern")?, args.get("path").and_then(Value::as_str), hidden)
+        }
         "grep" => grep_files_with(
             workspace,
             arg_str(args, "pattern")?,
@@ -253,9 +246,7 @@ fn file_tool(name: &str, args: &Value, workspace: &Path, hidden: &crate::permiss
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("missing string arg `{key}`"))
+    args.get(key).and_then(Value::as_str).ok_or_else(|| anyhow!("missing string arg `{key}`"))
 }
 
 /// New (B-06): read a child's pipe to the end (empty when there is none).
@@ -376,10 +367,7 @@ mod tests {
                 let p = std::env::temp_dir().join(format!(
                     "ocrs-test-{tag}-{}-{}",
                     std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .subsec_nanos()
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()
                 ));
                 std::fs::create_dir_all(&p).unwrap();
                 TempDir(p)
@@ -411,7 +399,8 @@ mod tests {
     fn edits_forgive_indentation_and_line_endings() {
         let file = "fn main() {\r\n    if ready {\r\n        go();\r\n    }\r\n}\r\n";
         // Indented two levels too little, LF instead of CRLF.
-        let (out, n, loose) = apply_edit(file, "if ready {\n    go();\n}", "if ready {\n    go();\n    done();\n}", false).unwrap();
+        let (out, n, loose) =
+            apply_edit(file, "if ready {\n    go();\n}", "if ready {\n    go();\n    done();\n}", false).unwrap();
         assert!(loose && n == 1);
         assert_eq!(out, "fn main() {\r\n    if ready {\r\n        go();\r\n        done();\r\n    }\r\n}\r\n");
         // Exact matches still win and say nothing about looseness.
@@ -435,9 +424,14 @@ mod tests {
         let _turn = JOB_TESTS.lock().await;
         let dir = TempDir::new("jobs");
         let no = std::sync::atomic::AtomicBool::new(false);
-        let started = execute("bash", &json!({"command": "echo ONE$((0+1)); sleep 1; echo TWO$((1+1)); sleep 30", "background": true}), dir.path(), &no)
-            .await
-            .unwrap();
+        let started = execute(
+            "bash",
+            &json!({"command": "echo ONE$((0+1)); sleep 1; echo TWO$((1+1)); sleep 30", "background": true}),
+            dir.path(),
+            &no,
+        )
+        .await
+        .unwrap();
         let id = started.split_whitespace().nth(1).unwrap().to_string();
         assert!(id.starts_with("job"), "{started}");
         assert!(is_job_control("bash", &json!({"job": id})));
@@ -480,7 +474,11 @@ mod tests {
         let bad = json!({"path": "m.txt", "edits": [{"old_str": "beta", "new_str": "B"}, {"old_str": "nope", "new_str": "x"}]});
         let err = execute("edit", &bad, ws, &std::sync::atomic::AtomicBool::new(false)).await.unwrap_err().to_string();
         assert!(err.contains("edit 2 of 2"), "{err}");
-        assert_eq!(std::fs::read_to_string(ws.join("m.txt")).unwrap(), "A\nbeta\nG\n", "nothing written when one edit fails");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("m.txt")).unwrap(),
+            "A\nbeta\nG\n",
+            "nothing written when one edit fails"
+        );
     }
 
     #[tokio::test]
@@ -525,7 +523,8 @@ mod tests {
     #[test]
     fn read_outline_lists_parts_with_lines() {
         let dir = TempDir::new("read-outline");
-        std::fs::write(dir.path().join("app.py"), "import os\n\nclass Cart:\n    def add(self):\n        pass\n").unwrap();
+        std::fs::write(dir.path().join("app.py"), "import os\n\nclass Cart:\n    def add(self):\n        pass\n")
+            .unwrap();
         let out = read_outline(dir.path(), "app.py").unwrap();
         assert!(out.contains("     3  class Cart") && out.contains("     4  def add"), "{out}");
         assert!(read_outline(dir.path(), ".").unwrap_err().to_string().contains("list"));
@@ -552,7 +551,10 @@ mod tests {
         assert!(as_project.unwrap().contains("hello skill"));
         assert!(no_name.unwrap().contains("probe reference"));
         assert!(read_file(ws.path(), "C:/Windows/win.ini", 0, 5).is_err() || cfg!(not(windows)));
-        assert!(write_file(ws.path(), &skills.join("x.txt").display().to_string(), "no").is_err(), "writing there stays refused");
+        assert!(
+            write_file(ws.path(), &skills.join("x.txt").display().to_string(), "no").is_err(),
+            "writing there stays refused"
+        );
     }
 
     #[test]
@@ -743,13 +745,9 @@ mod s05_tests {
             }
             crate::permissions::Shell::Cmd => "if defined OPENCODE_RUST_API_KEY (echo LEAKED) else (echo CLEAN)",
         };
-        let out = bash(
-            line,
-            &std::env::temp_dir(),
-            Duration::from_secs(10),
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .await;
+        let out =
+            bash(line, &std::env::temp_dir(), Duration::from_secs(10), &std::sync::atomic::AtomicBool::new(false))
+                .await;
         std::env::remove_var("OPENCODE_RUST_API_KEY");
         let out = out.unwrap();
         assert!(out.contains("CLEAN"), "{out}");
@@ -814,7 +812,11 @@ mod review_fix_tests {
         std::fs::write(ws.join("secrets/key.pem"), "TOKEN=abc").unwrap();
         std::fs::write(ws.join("app.txt"), "TOKEN=public").unwrap();
         let cfg = crate::config::PermissionsCfg {
-            rules: vec![crate::config::RuleCfg { tool: "read".into(), pattern: "secrets/*".into(), action: "deny".into() }],
+            rules: vec![crate::config::RuleCfg {
+                tool: "read".into(),
+                pattern: "secrets/*".into(),
+                action: "deny".into(),
+            }],
             ..Default::default()
         };
         let filter = crate::permissions::Engine::new(&cfg).read_filter("grep");

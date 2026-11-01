@@ -33,9 +33,8 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
                 return is_public_ip(IpAddr::V4(v4));
             }
             let s = v6.segments();
-            let embedded = |hi: u16, lo: u16| {
-                IpAddr::V4(Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8))
-            };
+            let embedded =
+                |hi: u16, lo: u16| IpAddr::V4(Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8));
             // 64:ff9b::/96 (NAT64) and 2002::/16 (6to4) carry an IPv4 address.
             if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
                 return is_public_ip(embedded(s[6], s[7]));
@@ -112,11 +111,7 @@ async fn fetch_body(url: &str, allowed: fn(std::net::IpAddr) -> bool) -> Result<
             .no_proxy()
             .resolve_to_addrs(&host, &addrs)
             .build()?;
-        let mut resp = http
-            .get(current.clone())
-            .send()
-            .await
-            .with_context(|| format!("fetching {current}"))?;
+        let mut resp = http.get(current.clone()).send().await.with_context(|| format!("fetching {current}"))?;
         let status = resp.status();
         if status.is_redirection() {
             let next = resp
@@ -124,9 +119,7 @@ async fn fetch_body(url: &str, allowed: fn(std::net::IpAddr) -> bool) -> Result<
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| anyhow!("{current} returned {status} without a Location header"))?;
-            current = current
-                .join(next)
-                .with_context(|| format!("bad redirect target `{next}`"))?;
+            current = current.join(next).with_context(|| format!("bad redirect target `{next}`"))?;
             continue;
         }
         if !status.is_success() {
@@ -153,9 +146,7 @@ async fn fetch_checked(url: &str, allowed: fn(std::net::IpAddr) -> bool) -> Resu
     let (body, cut) = fetch_body(url, allowed).await?;
     let mut text = truncate(&html_to_text(&String::from_utf8_lossy(&body)), 20_000);
     if cut {
-        text.push_str(&format!(
-            "\n… [page is larger than {WEBFETCH_MAX_BYTES} bytes; only the start was read]"
-        ));
+        text.push_str(&format!("\n… [page is larger than {WEBFETCH_MAX_BYTES} bytes; only the start was read]"));
     }
     Ok(text)
 }
@@ -293,9 +284,21 @@ mod s06_ip_tests {
     fn only_public_addresses_pass() {
         let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
         for bad in [
-            "127.0.0.1", "10.1.2.3", "172.16.5.4", "192.168.1.1", "169.254.169.254",
-            "100.64.0.1", "0.0.0.0", "255.255.255.255", "::1", "::", "fe80::1", "fd00::1",
-            "::ffff:10.0.0.1", "64:ff9b::a00:1", "2002:c0a8:101::1",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.5.4",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::a00:1",
+            "2002:c0a8:101::1",
         ] {
             assert!(!is_public_ip(ip(bad)), "{bad} must be refused");
         }

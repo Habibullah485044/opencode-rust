@@ -63,9 +63,7 @@ impl Engine {
         // `cfg.defaults` is a HashMap, whose order changes from run to run.
         // Sort so the most specific entry is found first: exact tool names,
         // then patterns with more literal characters, then by name.
-        defaults.sort_by(|(a, _), (b, _)| {
-            default_specificity(b).cmp(&default_specificity(a)).then_with(|| a.cmp(b))
-        });
+        defaults.sort_by(|(a, _), (b, _)| default_specificity(b).cmp(&default_specificity(a)).then_with(|| a.cmp(b)));
         let rules = cfg
             .rules
             .iter()
@@ -87,12 +85,7 @@ impl Engine {
     /// part that is not allowed makes it ask. Syntax the splitter cannot
     /// follow, and output redirected into a file, also ask unless the user
     /// approved this exact command before.
-    pub fn evaluate(
-        &self,
-        tool: &str,
-        detail: &str,
-        remembered: impl Fn(&str, &str) -> bool,
-    ) -> Decision {
+    pub fn evaluate(&self, tool: &str, detail: &str, remembered: impl Fn(&str, &str) -> bool) -> Decision {
         if tool != "bash" {
             return self.evaluate_single(tool, detail, &remembered);
         }
@@ -132,12 +125,7 @@ impl Engine {
     }
 
     /// One detail against the rules, then the defaults (the old `evaluate`).
-    fn evaluate_single(
-        &self,
-        tool: &str,
-        detail: &str,
-        remembered: impl Fn(&str, &str) -> bool,
-    ) -> Decision {
+    fn evaluate_single(&self, tool: &str, detail: &str, remembered: impl Fn(&str, &str) -> bool) -> Decision {
         // 1. Ordered rules; first match wins.
         // Windows file paths ignore letter case, so file rules do too (S-04).
         let fold_case = cfg!(windows) && is_path_tool(tool);
@@ -145,11 +133,8 @@ impl Engine {
             if glob_match(&rule.tool, tool) && detail_matches(&rule.pattern, detail, fold_case) {
                 if let Some(a) = Action::parse(&rule.action) {
                     // A rule that says "ask" can be pre-satisfied by a remembered approval.
-                    let action = if a == Action::Ask && remembered(&rule.tool, &rule.pattern) {
-                        Action::Allow
-                    } else {
-                        a
-                    };
+                    let action =
+                        if a == Action::Ask && remembered(&rule.tool, &rule.pattern) { Action::Allow } else { a };
                     // `git *` is meant for git, not for `git -c core.pager=sh…`:
                     // a wildcard allow does not cover arguments that run code.
                     // Only an approval of this exact command does.
@@ -166,18 +151,9 @@ impl Engine {
             }
         }
         // 2. Defaults per tool.
-        let default = self
-            .defaults
-            .iter()
-            .find(|(t, _)| glob_match(t, tool))
-            .map(|(_, a)| *a)
-            .unwrap_or(Action::Ask); // unknown tool → ask, never silently allow
-        // 3. A remembered session approval downgrades ask → allow.
-        let action = if default == Action::Ask && remembered(tool, detail) {
-            Action::Allow
-        } else {
-            default
-        };
+        let default = self.defaults.iter().find(|(t, _)| glob_match(t, tool)).map(|(_, a)| *a).unwrap_or(Action::Ask); // unknown tool → ask, never silently allow
+                                                                                                                       // 3. A remembered session approval downgrades ask → allow.
+        let action = if default == Action::Ask && remembered(tool, detail) { Action::Allow } else { default };
         Decision { action, key: format!("{tool}:{detail}") }
     }
 
@@ -234,10 +210,7 @@ impl ReadFilter {
 /// - find: `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`;
 /// - any command: `--exec`.
 pub fn runs_code(command: &str) -> bool {
-    let words: Vec<&str> = command
-        .split_whitespace()
-        .map(|w| w.trim_matches(|c| c == '\'' || c == '"'))
-        .collect();
+    let words: Vec<&str> = command.split_whitespace().map(|w| w.trim_matches(|c| c == '\'' || c == '"')).collect();
     let first = words.first().map(|w| w.rsplit(['/', '\\']).next().unwrap_or(w)).unwrap_or("");
     let first = first.strip_suffix(".exe").unwrap_or(first);
     let flag = |w: &str, f: &str| w == f || w.starts_with(&format!("{f}="));
@@ -376,8 +349,8 @@ pub struct CommandPart {
 /// Words that start compound commands (loops, `if`, negation): their parts
 /// cannot be judged one by one, so the whole line asks.
 const POSIX_KEYWORDS: &[&str] = &[
-    "if", "then", "elif", "else", "fi", "case", "esac", "for", "select", "while", "until",
-    "do", "done", "function", "time", "coproc", "!",
+    "if", "then", "elif", "else", "fi", "case", "esac", "for", "select", "while", "until", "do", "done", "function",
+    "time", "coproc", "!",
 ];
 const CMD_KEYWORDS: &[&str] = &["if", "for"];
 
@@ -611,11 +584,19 @@ pub fn normalize_path_detail_with(workspace: &std::path::Path, path: &str, fold_
     let out = match abs.strip_prefix(&ws) {
         Ok(rel) => {
             let rel = rel.to_string_lossy().replace('\\', "/");
-            if rel.is_empty() { ".".to_string() } else { rel }
+            if rel.is_empty() {
+                ".".to_string()
+            } else {
+                rel
+            }
         }
         Err(_) => format!("{OUTSIDE_PREFIX}{}", display_abs(&abs)),
     };
-    if fold_case { out.to_lowercase() } else { out }
+    if fold_case {
+        out.to_lowercase()
+    } else {
+        out
+    }
 }
 
 /// Resolve a path the way the file system will: canonical when it exists;
@@ -697,11 +678,7 @@ mod tests {
     #[test]
     fn rule_allow_exact_command() {
         let cfg = PermissionsCfg {
-            rules: vec![RuleCfg {
-                tool: "bash".into(),
-                pattern: "git status".into(),
-                action: "allow".into(),
-            }],
+            rules: vec![RuleCfg { tool: "bash".into(), pattern: "git status".into(), action: "allow".into() }],
             ..Default::default()
         };
         let e = Engine::new(&cfg);
@@ -712,11 +689,7 @@ mod tests {
     #[test]
     fn rule_deny_wildcard() {
         let cfg = PermissionsCfg {
-            rules: vec![RuleCfg {
-                tool: "bash".into(),
-                pattern: "rm *".into(),
-                action: "deny".into(),
-            }],
+            rules: vec![RuleCfg { tool: "bash".into(), pattern: "rm *".into(), action: "deny".into() }],
             ..Default::default()
         };
         let e = Engine::new(&cfg);
@@ -751,10 +724,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!(
             "ocrs-perm-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(d.join("src")).unwrap();
         d
@@ -1035,11 +1005,7 @@ mod tests {
     #[test]
     fn bad_rule_action_asks_instead_of_being_skipped() {
         let rule = |action: &str| PermissionsCfg {
-            rules: vec![RuleCfg {
-                tool: "read".into(),
-                pattern: "secrets/*".into(),
-                action: action.into(),
-            }],
+            rules: vec![RuleCfg { tool: "read".into(), pattern: "secrets/*".into(), action: action.into() }],
             ..Default::default()
         };
         // Before this fix the bad rule was skipped and the read default

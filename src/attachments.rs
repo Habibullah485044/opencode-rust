@@ -131,10 +131,7 @@ fn in_picture_dir(path: &Path) -> bool {
     if ends(&["attachments", ".opencode"]) || ends(&["shots", "scratch", ".opencode"]) {
         return true;
     }
-    std::env::temp_dir()
-        .join("opencode-rust-screenshots")
-        .canonicalize()
-        .is_ok_and(|shots| shots.as_path() == parent)
+    std::env::temp_dir().join("opencode-rust-screenshots").canonicalize().is_ok_and(|shots| shots.as_path() == parent)
 }
 
 /// The image type from the file's first bytes (PNG, JPEG, GIF, WebP).
@@ -183,9 +180,12 @@ pub fn model_sees_images(setting: &str, model: &str) -> bool {
         "off" => false,
         _ => {
             let m = model.to_ascii_lowercase();
-            ["vl", "vision", "gpt-4o", "gpt-4.1", "gpt-5", "gpt-6", "gpt-7", "claude", "gemini", "llava", "pixtral", "gemma-3", "omni"]
-                .iter()
-                .any(|k| m.contains(k))
+            [
+                "vl", "vision", "gpt-4o", "gpt-4.1", "gpt-5", "gpt-6", "gpt-7", "claude", "gemini", "llava", "pixtral",
+                "gemma-3", "omni",
+            ]
+            .iter()
+            .any(|k| m.contains(k))
         }
     }
 }
@@ -215,7 +215,9 @@ pub fn attach_images(body: &mut serde_json::Value) {
             "type": "text",
             "text": "[app] The screenshots from the tool results above, so you can see them:"
         })];
-        parts.extend(shots.into_iter().map(|url| serde_json::json!({ "type": "image_url", "image_url": { "url": url } })));
+        parts.extend(
+            shots.into_iter().map(|url| serde_json::json!({ "type": "image_url", "image_url": { "url": url } })),
+        );
         msgs.push(serde_json::json!({ "role": "user", "content": parts }));
         return;
     }
@@ -250,7 +252,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).unwrap();
         // A 1x1 PNG.
-        let png: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137];
+        let png: &[u8] = &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31,
+            21, 196, 137,
+        ];
         let shot = save_bytes(&ws, "my shot?.png", png).unwrap();
         assert!(shot.starts_with(dir(&ws)) && shot.file_name().unwrap().to_string_lossy().ends_with("my_shot_.png"));
         assert_eq!(std::fs::read_to_string(dir(&ws).join(".gitignore")).unwrap(), "*\n");

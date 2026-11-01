@@ -84,7 +84,13 @@ impl AppState {
     }
 
     /// [`AppState::record_usage_async`] with the purpose given.
-    pub async fn record_usage_as_async(&self, purpose: &str, session_id: &str, model: &str, u: &crate::provider::Usage) {
+    pub async fn record_usage_as_async(
+        &self,
+        purpose: &str,
+        session_id: &str,
+        model: &str,
+        u: &crate::provider::Usage,
+    ) {
         let (purpose, sid, model, usage) = (purpose.to_string(), session_id.to_string(), model.to_string(), *u);
         let saved = self
             .db
@@ -97,11 +103,7 @@ impl AppState {
             Err(e) => core_log(&format!("[core] saving token usage failed: {e}")),
             Ok(None) => {}
             Ok(Some(session)) => {
-                let _ = self.events.send(ServerEvent::Usage {
-                    session_id: session_id.to_string(),
-                    last: *u,
-                    session,
-                });
+                let _ = self.events.send(ServerEvent::Usage { session_id: session_id.to_string(), last: *u, session });
             }
         }
     }
@@ -114,10 +116,7 @@ impl AppState {
             .db
             .messages(session_id)?
             .iter()
-            .map(|m| TranscriptLine {
-                role: m.role.clone(),
-                text: crate::sessions::flatten_msg(m),
-            })
+            .map(|m| TranscriptLine { role: m.role.clone(), text: crate::sessions::flatten_msg(m) })
             .collect())
     }
 
@@ -127,12 +126,7 @@ impl AppState {
             .list_sessions()
             .unwrap_or_default()
             .into_iter()
-            .map(|s| SessionInfo {
-                id: s.id,
-                title: s.title,
-                parent_id: s.parent_id,
-                updated_at: s.updated_at,
-            })
+            .map(|s| SessionInfo { id: s.id, title: s.title, parent_id: s.parent_id, updated_at: s.updated_at })
             .collect()
     }
 
@@ -155,13 +149,8 @@ impl AppState {
 
     /// M6: `/export` — the session transcript as a standalone markdown file.
     pub fn transcript_markdown(&self, session_id: &str) -> String {
-        let title = self
-            .db
-            .get_session(session_id)
-            .ok()
-            .flatten()
-            .map(|s| s.title)
-            .unwrap_or_else(|| "session".to_string());
+        let title =
+            self.db.get_session(session_id).ok().flatten().map(|s| s.title).unwrap_or_else(|| "session".to_string());
         let mut out = format!("# {title}\n\n`{session_id}`\n\n");
         for line in self.transcript(session_id).unwrap_or_default() {
             let who = match line.role.as_str() {
@@ -193,11 +182,7 @@ impl AppState {
                 raw = rest.trim();
             }
         }
-        let name = if raw.is_empty() {
-            format!("opencode-rust-transcript-{session_id}.md")
-        } else {
-            raw.to_string()
-        };
+        let name = if raw.is_empty() { format!("opencode-rust-transcript-{session_id}.md") } else { raw.to_string() };
         let workspace = self.workspace_for(session_id);
         let path = Self::export_path(&workspace, &name)?;
         // The text check above cannot see links: a symlinked folder (or
@@ -309,10 +294,7 @@ impl AppState {
             ("All time", self.db.usage_totals(None, None)),
         ];
         let mut out = String::from("Token usage (cached = read from the provider's prompt cache)\n");
-        out.push_str(&format!(
-            "  {:<12} {:>8} {:>9} {:>17} {:>9}\n",
-            "", "requests", "input", "cached", "output"
-        ));
+        out.push_str(&format!("  {:<12} {:>8} {:>9} {:>17} {:>9}\n", "", "requests", "input", "cached", "output"));
         let mut week = crate::db::UsageTotals::default();
         for (label, t) in rows {
             let t = t.unwrap_or_default();

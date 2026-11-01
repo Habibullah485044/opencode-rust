@@ -42,7 +42,8 @@ pub(super) fn edit_many(workspace: &Path, path: &str, edits: &[(String, String)]
     let mut loose = 0;
     for (i, (old, new)) in edits.iter().enumerate() {
         let which = if edits.len() > 1 { format!(" (edit {} of {})", i + 1, edits.len()) } else { String::new() };
-        let (next, n, fuzzy) = apply_edit(&new_text, old, new, replace_all).map_err(|e| anyhow!("{e} in {path}{which}"))?;
+        let (next, n, fuzzy) =
+            apply_edit(&new_text, old, new, replace_all).map_err(|e| anyhow!("{e} in {path}{which}"))?;
         new_text = next;
         total += n;
         loose += usize::from(fuzzy);
@@ -172,7 +173,11 @@ fn reindent(new_lines: &[&str], block: &[&str], first: &str) -> Vec<String> {
 fn end_like_block(fixed: Vec<String>, inner_cr: bool, last_cr: bool) -> impl Iterator<Item = String> {
     let n = fixed.len();
     fixed.into_iter().enumerate().map(move |(k, l)| {
-        if (k + 1 < n && inner_cr) || (k + 1 == n && last_cr) { format!("{l}\r") } else { l }
+        if (k + 1 < n && inner_cr) || (k + 1 == n && last_cr) {
+            format!("{l}\r")
+        } else {
+            l
+        }
     })
 }
 
@@ -194,13 +199,9 @@ fn closest_region(lines: &[&str], want: &[&str]) -> String {
     }
     let Some((_, start)) = best else { return String::new() };
     let end = (start + want.len().max(1)).min(lines.len());
-    let shown: Vec<String> = lines[start..end].iter().take(12).enumerate().map(|(k, l)| format!("{:>5}\t{l}", start + k + 1)).collect();
-    format!(
-        ". Closest match at lines {}-{} (copy old_str from here):\n{}",
-        start + 1,
-        end,
-        shown.join("\n")
-    )
+    let shown: Vec<String> =
+        lines[start..end].iter().take(12).enumerate().map(|(k, l)| format!("{:>5}\t{l}", start + k + 1)).collect();
+    format!(". Closest match at lines {}-{} (copy old_str from here):\n{}", start + 1, end, shown.join("\n"))
 }
 
 #[cfg(test)]

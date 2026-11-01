@@ -125,8 +125,7 @@ pub async fn run(
 
     let rt = tokio::runtime::Handle::current();
 
-    let event_loop: EventLoop<AppEvent> =
-        tao::event_loop::EventLoopBuilder::<AppEvent>::with_user_event().build();
+    let event_loop: EventLoop<AppEvent> = tao::event_loop::EventLoopBuilder::<AppEvent>::with_user_event().build();
     let window = build_window(&event_loop)?;
     // Breadcrumbs: a window that dies between these lines used to leave no
     // trace at all (exit code 1, empty stderr). Now the last line printed says
@@ -252,7 +251,10 @@ fn initial_state(state: &server::AppState, session: &crate::db::Session) -> GuiS
         }
     }
     gs.editors = find_editors().into_iter().map(|(n, _)| n.to_string()).collect();
-    gs.commands = GUI_COMMANDS.iter().map(|(n, a, h)| (format!("{n}{}{a}", if a.is_empty() { "" } else { " " }), h.to_string())).collect();
+    gs.commands = GUI_COMMANDS
+        .iter()
+        .map(|(n, a, h)| (format!("{n}{}{a}", if a.is_empty() { "" } else { " " }), h.to_string()))
+        .collect();
     for doc in crate::skills::load_commands(&state.workspace) {
         gs.commands.push((doc.name.clone(), doc.description.clone()));
     }

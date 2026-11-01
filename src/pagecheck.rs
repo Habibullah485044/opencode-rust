@@ -129,7 +129,8 @@ fn probe_browser() -> Option<PathBuf> {
     if let Some(found) = tries.into_iter().find(|p| p.is_file()) {
         return Some(found);
     }
-    let names = ["msedge", "microsoft-edge", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"];
+    let names =
+        ["msedge", "microsoft-edge", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"];
     for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
         for name in names {
             for file in [name.to_string(), format!("{name}.exe")] {
@@ -212,7 +213,13 @@ enum Capture<'a> {
     Shot { out: &'a Path, width: u32, height: u32 },
 }
 
-async fn run_headless(exe: &Path, url: &str, timeout: Duration, profile: &Path, capture: Capture<'_>) -> Result<String> {
+async fn run_headless(
+    exe: &Path,
+    url: &str,
+    timeout: Duration,
+    profile: &Path,
+    capture: Capture<'_>,
+) -> Result<String> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args([
         "--headless=new",
@@ -236,10 +243,10 @@ async fn run_headless(exe: &Path, url: &str, timeout: Duration, profile: &Path, 
         }
     };
     cmd.arg(url)
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped())
-    .kill_on_drop(true);
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     let child = cmd.spawn().with_context(|| format!("starting {}", exe.display()))?;
     let out = tokio::time::timeout(timeout, child.wait_with_output()).await;
     let out = out.map_err(|_| anyhow!("the browser did not finish within {}s", timeout.as_secs()))??;
@@ -376,7 +383,8 @@ type Resp = axum::response::Response;
 
 fn status(code: u16, text: &str) -> Resp {
     use axum::response::IntoResponse;
-    (axum::http::StatusCode::from_u16(code).unwrap_or(axum::http::StatusCode::NOT_FOUND), text.to_string()).into_response()
+    (axum::http::StatusCode::from_u16(code).unwrap_or(axum::http::StatusCode::NOT_FOUND), text.to_string())
+        .into_response()
 }
 
 /// Largest file the preview server hands out.
@@ -441,11 +449,7 @@ async fn serve_file(
     } else {
         bytes
     };
-    (
-        [(axum::http::header::CONTENT_TYPE, kind), (axum::http::header::CACHE_CONTROL, "no-store")],
-        body,
-    )
-        .into_response()
+    ([(axum::http::header::CONTENT_TYPE, kind), (axum::http::header::CACHE_CONTROL, "no-store")], body).into_response()
 }
 
 /// `/frame?w=390&h=1500&src=<url>`: the page in a frame of that width.
@@ -454,7 +458,8 @@ async fn serve_file(
 async fn serve_frame(axum::extract::RawQuery(query): axum::extract::RawQuery) -> Resp {
     use axum::response::IntoResponse;
     let q = query.unwrap_or_default();
-    let num = |k: &str, d: u32| q.split('&').find_map(|kv| kv.strip_prefix(k)).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let num =
+        |k: &str, d: u32| q.split('&').find_map(|kv| kv.strip_prefix(k)).and_then(|v| v.parse().ok()).unwrap_or(d);
     let (w, h) = (num("w=", 390), num("h=", 1500));
     let src = q.split_once("src=").map_or("", |(_, s)| s).replace('"', "%22");
     let html = format!(
@@ -569,7 +574,11 @@ async fn proxy_pass(axum::extract::State(p): axum::extract::State<Arc<AppProxy>>
             !is_probe
         })
         .collect();
-    let url = if query.is_empty() { format!("{}{path}", p.origin) } else { format!("{}{path}?{}", p.origin, query.join("&")) };
+    let url = if query.is_empty() {
+        format!("{}{path}", p.origin)
+    } else {
+        format!("{}{path}?{}", p.origin, query.join("&"))
+    };
     let Ok(bytes) = axum::body::to_bytes(body, 32 * 1024 * 1024).await else {
         return status(413, "request body too large");
     };
@@ -613,7 +622,8 @@ fn local_app_url(raw: &str) -> Option<(String, String)> {
         None => (rest, "/"),
     };
     let name = host.rsplit_once(':').map_or(host, |(h, _)| h).to_ascii_lowercase();
-    matches!(name.as_str(), "localhost" | "127.0.0.1" | "[::1]").then(|| (format!("{scheme}://{host}"), path.to_string()))
+    matches!(name.as_str(), "localhost" | "127.0.0.1" | "[::1]")
+        .then(|| (format!("{scheme}://{host}"), path.to_string()))
 }
 
 /// Is an app answering at this origin? (Any HTTP answer counts.)
@@ -805,14 +815,16 @@ pub async fn check(root: &Path, page: &str, widths: &[u32], expect: &[String]) -
 fn read_report(dom: &str, widths: &[u32], expect: &[String], page: String, url: String) -> Result<Report> {
     let json = between(dom, "<script type=\"application/json\" id=\"__probe\">", "</script>")
         .ok_or_else(|| anyhow!("the page did not finish loading in the browser (no probe result)"))?;
-    let all: HashMap<String, Value> =
-        serde_json::from_str(&html_unescape(json)).context("reading the probe result")?;
+    let all: HashMap<String, Value> = serde_json::from_str(&html_unescape(json)).context("reading the probe result")?;
     let mut report = Report { page, url, ..Default::default() };
     let mut text = String::new();
     for w in widths {
         let Some(r) = all.get(&w.to_string()) else { continue };
         let strings = |k: &str| -> Vec<String> {
-            r.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default()
+            r.get(k)
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                .unwrap_or_default()
         };
         if text.is_empty() {
             text = r.get("text").and_then(Value::as_str).unwrap_or("").to_string();
@@ -824,7 +836,9 @@ fn read_report(dom: &str, widths: &[u32], expect: &[String], page: String, url: 
     for e in expect {
         let want = flat(e);
         if !want.is_empty() && !page_text.contains(&want) {
-            report.general.push(format!("the page should show \"{want}\" as written, but it does not appear in the visible text"));
+            report.general.push(format!(
+                "the page should show \"{want}\" as written, but it does not appear in the visible text"
+            ));
         }
     }
     Ok(report)
@@ -915,7 +929,9 @@ pub async fn run_tool(root: &Path, input: &Value) -> Result<(String, Report)> {
     let widths: Vec<u32> = input
         .get("widths")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_u64).map(|w| w as u32).filter(|w| (200..=4000).contains(w)).take(4).collect())
+        .map(|a| {
+            a.iter().filter_map(Value::as_u64).map(|w| w as u32).filter(|w| (200..=4000).contains(w)).take(4).collect()
+        })
         .unwrap_or_default();
     let expect: Vec<String> = input
         .get("expect_text")
@@ -1087,7 +1103,11 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("ocrs-shots-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("index.html"), "<!doctype html><title>t</title><body style=\"margin:0\"><h1>Hello</h1></body>").unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            "<!doctype html><title>t</title><body style=\"margin:0\"><h1>Hello</h1></body>",
+        )
+        .unwrap();
         let shots = page_shots(&dir, "index.html", &dir.join("shots")).await.unwrap();
         let size = |p: &Path| {
             let b = std::fs::read(p).unwrap();
@@ -1103,7 +1123,10 @@ mod tests {
 
     #[test]
     fn local_app_urls_are_told_apart() {
-        assert_eq!(local_app_url("http://localhost:3000/board?x=1"), Some(("http://localhost:3000".into(), "/board?x=1".into())));
+        assert_eq!(
+            local_app_url("http://localhost:3000/board?x=1"),
+            Some(("http://localhost:3000".into(), "/board?x=1".into()))
+        );
         assert_eq!(local_app_url("http://127.0.0.1:8080"), Some(("http://127.0.0.1:8080".into(), "/".into())));
         assert_eq!(local_app_url("https://example.com/"), None);
         assert_eq!(local_app_url("index.html"), None);
@@ -1120,8 +1143,14 @@ mod tests {
                     <script>fetch('/api/name',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})\
                     .then(r=>r.json()).then(d=>{document.getElementById('t').textContent=d.name})</script></body></html>";
         let app = axum::Router::new()
-            .route("/", axum::routing::get(move || async move { ([(axum::http::header::CONTENT_TYPE, "text/html")], page) }))
-            .route("/api/name", axum::routing::post(|| async { axum::Json(serde_json::json!({"name": "Flowboard from the API"})) }));
+            .route(
+                "/",
+                axum::routing::get(move || async move { ([(axum::http::header::CONTENT_TYPE, "text/html")], page) }),
+            )
+            .route(
+                "/api/name",
+                axum::routing::post(|| async { axum::Json(serde_json::json!({"name": "Flowboard from the API"})) }),
+            );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1143,7 +1172,15 @@ mod tests {
         std::fs::create_dir_all(dir.join("shop")).unwrap();
         std::fs::write(dir.join("index.html"), "<p>x</p>").unwrap();
         std::fs::write(dir.join("shop/index.html"), "<p>x</p>").unwrap();
-        for raw in ["index.html", "/index.html", "./index.html", "/", "", "http://localhost:8000/index.html", "http://127.0.0.1:8000/?a=1"] {
+        for raw in [
+            "index.html",
+            "/index.html",
+            "./index.html",
+            "/",
+            "",
+            "http://localhost:8000/index.html",
+            "http://127.0.0.1:8000/?a=1",
+        ] {
             assert_eq!(page_arg(&dir, raw).unwrap(), "index.html", "{raw:?}");
         }
         assert_eq!(page_arg(&dir, "shop").unwrap(), "shop/index.html");
@@ -1156,7 +1193,8 @@ mod tests {
 
     #[test]
     fn quoted_names_become_expected_texts() {
-        let req = "build a homepage for \"Lumen Coffee Roasters\" with id \"form-status\" and a \"<header>\", “Fresh Daily”";
+        let req =
+            "build a homepage for \"Lumen Coffee Roasters\" with id \"form-status\" and a \"<header>\", “Fresh Daily”";
         assert_eq!(expected_texts(req), vec!["Lumen Coffee Roasters".to_string(), "Fresh Daily".to_string()]);
     }
 
@@ -1221,7 +1259,11 @@ mod tests {
 <button aria-expanded="false" aria-controls="n"><span class="icon"></span></button></header>
 <main><div class="wide">Lumen<span>Coffee</span> Roasters</div></main><script>nope()</script></body></html>"##;
         std::fs::write(dir.join("index.html"), bad).unwrap();
-        std::fs::write(dir.join("s.css"), ".wide{width:900px} .icon{display:block;width:20px;height:20px;background:#000}").unwrap();
+        std::fs::write(
+            dir.join("s.css"),
+            ".wide{width:900px} .icon{display:block;width:20px;height:20px;background:#000}",
+        )
+        .unwrap();
         let expect = vec!["Lumen Coffee Roasters".to_string()];
         let r = check(&dir, "index.html", &[375, 1440], &expect).await.unwrap();
         let text = r.render();
@@ -1236,7 +1278,11 @@ mod tests {
 
         // A stylesheet that @imports a web font (outside hosts are blocked
         // during the check) loaded fine and must not be reported.
-        std::fs::write(dir.join("g.css"), "@import url('https://fonts.googleapis.com/css2?family=Inter');\nbody{margin:0}").unwrap();
+        std::fs::write(
+            dir.join("g.css"),
+            "@import url('https://fonts.googleapis.com/css2?family=Inter');\nbody{margin:0}",
+        )
+        .unwrap();
         let good = r##"<!doctype html><html><head><meta name="viewport" content="width=device-width"><link rel="stylesheet" href="g.css"><style>
 nav ul{list-style:none;display:flex;gap:8px;margin:0;padding:0} button{display:none}
 @media (max-width:767px){nav{display:none} nav.open{display:block} button{display:block}}</style></head>

@@ -310,10 +310,7 @@ impl BrowserView {
 
     /// New (B-11): should the native child view be on screen right now?
     pub fn wants_native_view(&self) -> bool {
-        self.visible
-            && !self.covered
-            && self.error.is_none()
-            && matches!(self.rect, Some(r) if r.is_usable())
+        self.visible && !self.covered && self.error.is_none() && matches!(self.rect, Some(r) if r.is_usable())
     }
 }
 
@@ -338,10 +335,7 @@ impl GuiState {
             self.finish_approval(id);
         }
         if !stale.is_empty() {
-            self.push(
-                EntryKind::System,
-                "An approval got no answer in time and was denied.".to_string(),
-            );
+            self.push(EntryKind::System, "An approval got no answer in time and was denied.".to_string());
         }
         !stale.is_empty()
     }
@@ -353,11 +347,7 @@ impl GuiState {
 
     /// New (B-12): sidebar title of chat `id` ("New chat" when unknown).
     pub fn session_title(&self, id: &str) -> &str {
-        self.sessions
-            .iter()
-            .find(|c| c.id == id)
-            .map(|c| c.title.as_str())
-            .unwrap_or(NEW_CHAT)
+        self.sessions.iter().find(|c| c.id == id).map(|c| c.title.as_str()).unwrap_or(NEW_CHAT)
     }
 
     /// New (B-12): approval `id` is answered or gone. Drop it (on screen or
@@ -384,12 +374,7 @@ impl GuiState {
     pub fn title(&self) -> &str {
         self.session
             .as_ref()
-            .and_then(|id| {
-                self.sessions
-                    .iter()
-                    .find(|c| &c.id == id)
-                    .map(|c| c.title.as_str())
-            })
+            .and_then(|id| self.sessions.iter().find(|c| &c.id == id).map(|c| c.title.as_str()))
             .unwrap_or(NEW_CHAT)
     }
 

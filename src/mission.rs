@@ -84,7 +84,11 @@ impl Mission {
     /// a custom mission, the full brief for the other kinds (their playbook
     /// is the point).
     pub fn goal_for_mission_mode(&self) -> String {
-        if self.kind == MissionKind::Custom { self.goal.clone() } else { self.briefing() }
+        if self.kind == MissionKind::Custom {
+            self.goal.clone()
+        } else {
+            self.briefing()
+        }
     }
 }
 
@@ -128,9 +132,7 @@ impl Effort {
     /// How much work the mission asks for.
     fn guidance(&self) -> &'static str {
         match self {
-            Self::Low => {
-                "EFFORT Low — answer fast: minimal tool use, one focused pass, no ceremony."
-            }
+            Self::Low => "EFFORT Low — answer fast: minimal tool use, one focused pass, no ceremony.",
             Self::Medium => {
                 "EFFORT Medium — steady work: inspect what you need, verify the main path, \
                  skip the exotic cases."
@@ -163,11 +165,7 @@ pub struct Mission {
 impl Mission {
     /// Expand the raw goal into the briefing prompt that runs as the message.
     pub fn briefing(&self) -> String {
-        let goal = if self.goal.trim().is_empty() {
-            "the task at hand"
-        } else {
-            self.goal.trim()
-        };
+        let goal = if self.goal.trim().is_empty() { "the task at hand" } else { self.goal.trim() };
         format!(
             "MISSION: {} · effort {}\nGOAL: {}\n\n{}\n\n{}",
             self.kind.label(),
@@ -215,11 +213,7 @@ mod tests {
 
     #[test]
     fn briefing_expands_the_goal_into_a_prompt() {
-        let m = Mission {
-            kind: MissionKind::Explore,
-            effort: Effort::Xhigh,
-            goal: "the auth flow".into(),
-        };
+        let m = Mission { kind: MissionKind::Explore, effort: Effort::Xhigh, goal: "the auth flow".into() };
         let b = m.briefing();
         assert!(b.contains("MISSION: Explore · effort Xhigh"), "{b}");
         assert!(b.contains("GOAL: the auth flow"), "{b}");

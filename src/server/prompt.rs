@@ -21,7 +21,8 @@ impl AppState {
             frozen.entry(session_id.to_string()).or_insert_with(|| load_lessons(self, &workspace)).clone()
         };
         let request = self.first_request(session_id).unwrap_or_default();
-        let map = crate::repomap::for_chat(session_id, &workspace, &self.state_dir, &request, self.cfg.agent.repo_map_tokens);
+        let map =
+            crate::repomap::for_chat(session_id, &workspace, &self.state_dir, &request, self.cfg.agent.repo_map_tokens);
         let (main, extra) = self.user_prompt.read().map(|p| p.clone()).unwrap_or_default();
         // The user's main prompt (Settings -> System prompt) is the system
         // prompt, with only the tool guide after it: no base instructions,
@@ -78,14 +79,18 @@ impl AppState {
     /// the chat, so prompt additions based on it keep the cached prefix.
     pub fn first_request(&self, session_id: &str) -> Option<String> {
         let msgs = self.db.messages(session_id).ok()?;
-        msgs.iter().find(|m| m.role == "user" && !m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.starts_with("[app] ")))).and_then(|m| {
-            m.parts.iter().find_map(|p| match p {
-                Part::Text { text } => Some(text.clone()),
-                _ => None,
+        msgs.iter()
+            .find(|m| {
+                m.role == "user"
+                    && !m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.starts_with("[app] ")))
             })
-        })
+            .and_then(|m| {
+                m.parts.iter().find_map(|p| match p {
+                    Part::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            })
     }
-
 }
 
 /// True when `name` may execute in this run (mode + role enforcement).
@@ -150,11 +155,7 @@ pub fn context_from_ollama_ps(body: &Value, model: &str) -> Option<usize> {
     let want = norm(model);
     let entry = list
         .iter()
-        .find(|m| {
-            ["name", "model"]
-                .iter()
-                .any(|k| m.get(*k).and_then(Value::as_str).is_some_and(|n| norm(n) == want))
-        })
+        .find(|m| ["name", "model"].iter().any(|k| m.get(*k).and_then(Value::as_str).is_some_and(|n| norm(n) == want)))
         .or_else(|| list.first())?;
     entry.get("context_length").and_then(Value::as_u64).map(|n| n as usize).filter(|n| *n >= 1024)
 }
@@ -162,18 +163,9 @@ pub fn context_from_ollama_ps(body: &Value, model: &str) -> Option<usize> {
 /// Best-effort `GET {base minus /v1}/api/ps` (an Ollama server, also the
 /// one behind the token proxy in `kaggle_setup_cell.py`). `None` for any
 /// other server — the caller then simply knows no context size.
-pub(super) async fn probe_ollama_context(
-    http: &reqwest::Client,
-    base: &str,
-    key: &str,
-    model: &str,
-) -> Option<usize> {
+pub(super) async fn probe_ollama_context(http: &reqwest::Client, base: &str, key: &str, model: &str) -> Option<usize> {
     let root = base.trim_end_matches('/').trim_end_matches("/v1");
-    let req = crate::provider::with_auth(
-        http.get(format!("{root}/api/ps")),
-        crate::config::ProviderApi::OpenAi,
-        key,
-    );
+    let req = crate::provider::with_auth(http.get(format!("{root}/api/ps")), crate::config::ProviderApi::OpenAi, key);
     let resp = req.send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -201,7 +193,9 @@ pub(super) fn fit_tool_results(msgs: &mut [ChatMsg], limit: usize) -> usize {
             let Some(c) = msgs[i].content.as_mut() else { continue };
             if c.chars().count() > cap {
                 let head: String = c.chars().take(cap).collect();
-                *c = format!("{head}\n… [shortened to fit the model's context window; run the tool again if you need the rest]");
+                *c = format!(
+                    "{head}\n… [shortened to fit the model's context window; run the tool again if you need the rest]"
+                );
                 cut += 1;
             }
         }
@@ -233,10 +227,7 @@ pub(super) async fn auto_compact_if_needed(
         return false;
     }
     let failed = COMPACT_FAILED_AT.get_or_init(|| Mutex::new(HashMap::new()));
-    let tried_here = failed
-        .lock()
-        .map(|m| m.get(session_id) == Some(&msgs.len()))
-        .unwrap_or(false);
+    let tried_here = failed.lock().map(|m| m.get(session_id) == Some(&msgs.len())).unwrap_or(false);
     if tried_here {
         return false;
     }
@@ -325,12 +316,7 @@ pub(super) fn chat_messages_from(st: &Shared, history: Vec<Message>, system: &st
                         text.push_str(t);
                     }
                 }
-                out.push(ChatMsg {
-                    role: "user".into(),
-                    content: Some(text),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
+                out.push(ChatMsg { role: "user".into(), content: Some(text), tool_calls: None, tool_call_id: None });
             }
             "assistant" => {
                 let mut text = String::new();
@@ -376,8 +362,7 @@ pub(super) fn chat_messages_from(st: &Shared, history: Vec<Message>, system: &st
             "tool" => {
                 for p in &msg.parts {
                     if let Part::ToolResult { tool_id, output, is_error } = p {
-                        let content =
-                            if *is_error { format!("[error]\n{output}") } else { output.clone() };
+                        let content = if *is_error { format!("[error]\n{output}") } else { output.clone() };
                         out.push(ChatMsg {
                             role: "tool".into(),
                             content: Some(content),
@@ -400,12 +385,15 @@ pub(super) fn chat_messages_from(st: &Shared, history: Vec<Message>, system: &st
     // message, and a compacted chat can keep only tool steps in its tail.
     if !out.iter().any(|m| m.role == "user") {
         let at = usize::from(out.first().is_some_and(|m| m.role == "system"));
-        out.insert(at, ChatMsg {
-            role: "user".into(),
-            content: Some("(The earlier conversation is summarized above. Continue with the task.)".into()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
+        out.insert(
+            at,
+            ChatMsg {
+                role: "user".into(),
+                content: Some("(The earlier conversation is summarized above. Continue with the task.)".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        );
     }
     // Last: moving the prompt to the tail must not hide that the chat has no
     // user message of its own from the check above.
@@ -561,11 +549,8 @@ pub(super) fn repair_history(msgs: Vec<ChatMsg>) -> Vec<ChatMsg> {
             }
             "assistant" => {
                 let has_text = m.content.as_deref().is_some_and(|t| !t.trim().is_empty());
-                let ids: Vec<String> = m
-                    .tool_calls
-                    .as_ref()
-                    .map(|calls| calls.iter().map(|c| c.id.clone()).collect())
-                    .unwrap_or_default();
+                let ids: Vec<String> =
+                    m.tool_calls.as_ref().map(|calls| calls.iter().map(|c| c.id.clone()).collect()).unwrap_or_default();
                 if !has_text && ids.is_empty() {
                     continue;
                 }
@@ -577,8 +562,7 @@ pub(super) fn repair_history(msgs: Vec<ChatMsg>) -> Vec<ChatMsg> {
                 if out.iter().all(|x| x.role == "system") {
                     match out.first_mut() {
                         Some(first) => {
-                            let joined =
-                                format!("{}\n\n{text}", first.content.as_deref().unwrap_or(""));
+                            let joined = format!("{}\n\n{text}", first.content.as_deref().unwrap_or(""));
                             first.content = Some(joined);
                         }
                         None => out.push(ChatMsg {

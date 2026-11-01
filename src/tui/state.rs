@@ -76,12 +76,7 @@ pub fn palette_matches(input: &str) -> Vec<usize> {
         return Vec::new();
     }
     let q = rest.to_ascii_lowercase();
-    builtins()
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| b.name.starts_with(&q))
-        .map(|(i, _)| i)
-        .collect()
+    builtins().iter().enumerate().filter(|(_, b)| b.name.starts_with(&q)).map(|(i, _)| i).collect()
 }
 
 /// Team-mode panel: one medium card per worker, fed by the `[team]` text
@@ -606,9 +601,7 @@ impl App {
                     self.next_approval();
                 }
             }
-            ServerEvent::Stats {
-                added, deleted, hints, ..
-            } => {
+            ServerEvent::Stats { added, deleted, hints, .. } => {
                 self.stats = Some((added, deleted, hints));
             }
             ServerEvent::SessionList { sessions } => {
@@ -665,15 +658,7 @@ impl App {
                     None => {
                         let now = std::time::Instant::now();
                         let finished = (state != TeamStatus::Working).then_some(now);
-                        self.agents.push(AgentCard {
-                            agent_id,
-                            name,
-                            task,
-                            state,
-                            detail,
-                            started: now,
-                            finished,
-                        })
+                        self.agents.push(AgentCard { agent_id, name, task, state, detail, started: now, finished })
                     }
                 }
             }
@@ -703,7 +688,10 @@ pub enum InputAction {
     /// Laziness Meter report (local, instant).
     Debt,
     /// Deep mode: several checked attempts at one task, best one kept.
-    Deep { attempts: Option<usize>, task: String },
+    Deep {
+        attempts: Option<usize>,
+        task: String,
+    },
     SetMode(AgentMode),
     Compact,
     Undo,
@@ -714,12 +702,23 @@ pub enum InputAction {
     Resume(String),
     Diff(Option<String>),
     Skills,
-    Approve { id: String, always: bool },
+    Approve {
+        id: String,
+        always: bool,
+    },
     Deny(String),
     /// M3: run one inline-edit completion and show the diff preview.
-    Edit { path: String, instruction: String },
+    Edit {
+        path: String,
+        instruction: String,
+    },
     /// M3: the user accepted the preview — write it.
-    ApplyEdit { path: String, old: String, new: String, line: usize },
+    ApplyEdit {
+        path: String,
+        old: String,
+        new: String,
+        line: usize,
+    },
     /// M6: ask the core for the session list (opens the picker).
     ListSessions,
     /// M6: switch to the session the picker selected.

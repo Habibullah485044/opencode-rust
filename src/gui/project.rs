@@ -12,8 +12,8 @@ pub fn chat_home(start: &std::path::Path) -> std::path::PathBuf {
     let fallback = home.clone().unwrap_or_else(std::env::temp_dir).join("Habi Projects");
     let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let start_c = canon(start);
-    let is_habi_source = std::fs::read_to_string(start.join("Cargo.toml"))
-        .is_ok_and(|t| t.contains("name = \"opencode-rust\""));
+    let is_habi_source =
+        std::fs::read_to_string(start.join("Cargo.toml")).is_ok_and(|t| t.contains("name = \"opencode-rust\""));
     let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(canon));
     let lower = start_c.to_string_lossy().to_lowercase().replace('/', "\\");
     let system = ["\\windows", "\\program files", "\\programdata"].iter().any(|s| lower.contains(s));
@@ -22,7 +22,11 @@ pub fn chat_home(start: &std::path::Path) -> std::path::PathBuf {
         || exe_dir.as_deref() == Some(start_c.as_path())
         || home.as_deref().map(canon).as_deref() == Some(start_c.as_path())
         || system;
-    if unsuitable { fallback } else { start.to_path_buf() }
+    if unsuitable {
+        fallback
+    } else {
+        start.to_path_buf()
+    }
 }
 
 /// The folder of the open chat's project (the start folder without one).
@@ -92,11 +96,8 @@ pub(super) fn find_project_files(root: &std::path::Path, query: &str, max: usize
 /// Code editors that can open a folder, found on this machine: (name, program).
 pub(super) fn find_editors() -> Vec<(&'static str, std::path::PathBuf)> {
     let mut found = Vec::new();
-    let candidates: &[(&str, &[&str])] = &[
-        ("VS Code", &["code.cmd", "code"]),
-        ("Cursor", &["cursor.cmd", "cursor"]),
-        ("Zed", &["zed.exe", "zed"]),
-    ];
+    let candidates: &[(&str, &[&str])] =
+        &[("VS Code", &["code.cmd", "code"]), ("Cursor", &["cursor.cmd", "cursor"]), ("Zed", &["zed.exe", "zed"])];
     let path = std::env::var_os("PATH").unwrap_or_default();
     for (name, files) in candidates {
         let hit = std::env::split_paths(&path).find_map(|dir| files.iter().map(|f| dir.join(f)).find(|p| p.is_file()));
@@ -142,7 +143,8 @@ mod tests {
     fn chats_never_work_in_habis_own_source_or_system_folders() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(chat_home(src).ends_with("Habi Projects"), "Habi's own source is no project");
-        let home = std::path::PathBuf::from(std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).unwrap());
+        let home =
+            std::path::PathBuf::from(std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).unwrap());
         assert!(chat_home(&home).ends_with("Habi Projects"), "the home folder is no project");
         if cfg!(windows) {
             assert!(chat_home(std::path::Path::new("C:\\Windows\\System32")).ends_with("Habi Projects"));
@@ -160,7 +162,23 @@ mod tests {
         for ok in ["feature/login", "fix-1.2", "v1.0_rc", "a/b/c"] {
             assert_eq!(branch_name_problem(ok), None, "{ok}");
         }
-        for bad in ["", "a..b", "x.lock", "a/x.lock/b", ".hidden", "a/.b", "/lead", "trail/", "a//b", "a@{1}", "-x", "end.", "has space", "a~1", "a:b"] {
+        for bad in [
+            "",
+            "a..b",
+            "x.lock",
+            "a/x.lock/b",
+            ".hidden",
+            "a/.b",
+            "/lead",
+            "trail/",
+            "a//b",
+            "a@{1}",
+            "-x",
+            "end.",
+            "has space",
+            "a~1",
+            "a:b",
+        ] {
             let why = branch_name_problem(bad).unwrap_or_else(|| panic!("{bad:?} accepted"));
             assert!(why.contains("is not a usable branch name"), "{why}");
         }

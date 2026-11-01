@@ -64,10 +64,7 @@ impl AgentMode {
     pub fn filter_specs(self, specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
         match self.allowed_tools() {
             None => specs,
-            Some(allowed) => specs
-                .into_iter()
-                .filter(|s| allowed.contains(&s.function.name.as_str()))
-                .collect(),
+            Some(allowed) => specs.into_iter().filter(|s| allowed.contains(&s.function.name.as_str())).collect(),
         }
     }
 }
@@ -202,7 +199,8 @@ pub fn load_subagents(workspace: &Path) -> Vec<SubagentDef> {
             role.read_only = true;
         }
         if taken.contains(&role.name) {
-            role.description = format!("{} (project role; `{}` is built in or the user's)", role.description, role.name);
+            role.description =
+                format!("{} (project role; `{}` is built in or the user's)", role.description, role.name);
             role.name = format!("project-{}", role.name);
         }
         roles.retain(|r| r.name != role.name);
@@ -317,10 +315,7 @@ fn parse_role(path: &Path, text: &str) -> Option<(SubagentDef, bool)> {
 
 /// `- name: description` lines for the system prompt.
 pub fn subagent_index(defs: &[SubagentDef]) -> String {
-    defs.iter()
-        .map(|d| format!("- {}: {}", d.name, d.description))
-        .collect::<Vec<_>>()
-        .join("\n")
+    defs.iter().map(|d| format!("- {}: {}", d.name, d.description)).collect::<Vec<_>>().join("\n")
 }
 
 /// P-05: how strongly the Ponytail rules apply in one session. `Full` is
@@ -356,7 +351,11 @@ impl PonytailLevel {
 
     /// The level a session starts with: config `agent.ponytail` on = full.
     pub fn from_config(enabled: bool) -> Self {
-        if enabled { Self::Full } else { Self::Off }
+        if enabled {
+            Self::Full
+        } else {
+            Self::Off
+        }
     }
 }
 
@@ -431,9 +430,26 @@ its working screen, not a marketing hero. check_page with look: true shows you t
 /// True when a request is about building or changing a web page.
 pub fn is_web_task(text: &str) -> bool {
     let t = text.to_lowercase();
-    ["website", "web site", "homepage", "home page", "landing page", "web page", "webpage", "web app", "storefront", "online store", "portfolio", "dashboard", "html", "css", "frontend", "front-end"]
-        .iter()
-        .any(|k| t.contains(k))
+    [
+        "website",
+        "web site",
+        "homepage",
+        "home page",
+        "landing page",
+        "web page",
+        "webpage",
+        "web app",
+        "storefront",
+        "online store",
+        "portfolio",
+        "dashboard",
+        "html",
+        "css",
+        "frontend",
+        "front-end",
+    ]
+    .iter()
+    .any(|k| t.contains(k))
 }
 
 /// Vendored Ponytail rules — "lazy senior dev" discipline: the smallest
@@ -611,8 +627,10 @@ mod tests {
         let full = text(PonytailLevel::Full);
         assert!(full.contains("lazy senior developer") && !full.contains("Ponytail level:"));
         assert!(text(PonytailLevel::Lite).contains("Ponytail level: lite — Build what was asked."));
-        assert!(!full.contains("MIT License") && !full.contains("homepage:") && !full.contains("| Level |"),
-            "licence header, frontmatter and the levels table stay out of the prompt");
+        assert!(
+            !full.contains("MIT License") && !full.contains("homepage:") && !full.contains("| Level |"),
+            "licence header, frontmatter and the levels table stay out of the prompt"
+        );
         assert!(full.contains("Never cut:") && full.contains("## The smallest complete change"));
         assert!(text(PonytailLevel::Ultra).contains("Ponytail level: ultra"));
         assert_eq!(PonytailLevel::parse(" Ultra "), Some(PonytailLevel::Ultra));
@@ -684,15 +702,8 @@ mod tests {
 
     #[test]
     fn plan_mode_filters_to_read_only_tools() {
-        let specs: Vec<ToolSpec> = ["read", "bash", "write", "grep", "edit"]
-            .iter()
-            .map(|n| spec(n))
-            .collect();
-        let kept: Vec<String> = AgentMode::Plan
-            .filter_specs(specs)
-            .into_iter()
-            .map(|s| s.function.name)
-            .collect();
+        let specs: Vec<ToolSpec> = ["read", "bash", "write", "grep", "edit"].iter().map(|n| spec(n)).collect();
+        let kept: Vec<String> = AgentMode::Plan.filter_specs(specs).into_iter().map(|s| s.function.name).collect();
         assert_eq!(kept, vec!["read", "grep"]);
         // Build mode keeps everything.
         let all = AgentMode::Build.filter_specs(vec![spec("bash"), spec("write")]);
@@ -743,20 +754,14 @@ mod tests {
             web: false,
             map: None,
         });
-        assert!(
-            text.contains("lazy senior developer"),
-            "ponytail rules embedded when enabled"
-        );
+        assert!(text.contains("lazy senior developer"), "ponytail rules embedded when enabled");
         assert!(!text.contains("PLAN MODE"));
         assert!(text.starts_with("CUSTOM BASE"));
         assert!(!text.contains("## Skills"));
         // The greeting rule is product behaviour, not part of the default
         // base prompt: replacing the base must not re-enable tool calls for
         // "hi".
-        assert!(
-            text.contains("## When to act"),
-            "act-only-when-asked rule survives a custom system_prompt"
-        );
+        assert!(text.contains("## When to act"), "act-only-when-asked rule survives a custom system_prompt");
     }
 
     #[test]
@@ -780,14 +785,8 @@ mod tests {
             web: false,
             map: None,
         });
-        assert!(
-            !text.contains(".openclaw"),
-            "upstream repo path must not look like a local directory"
-        );
-        assert!(
-            text.contains("already complete"),
-            "skills list is stated as the whole answer"
-        );
+        assert!(!text.contains(".openclaw"), "upstream repo path must not look like a local directory");
+        assert!(text.contains("already complete"), "skills list is stated as the whole answer");
         assert!(text.contains("/ws/.opencode/skills"), "real location named");
     }
 
@@ -849,10 +848,7 @@ mod tests {
             web: false,
             map: None,
         });
-        assert!(
-            text.contains("## Skill: deploy — always active"),
-            "baked skill announced: {text}"
-        );
+        assert!(text.contains("## Skill: deploy — always active"), "baked skill announced: {text}");
         assert!(
             text.contains("Always run the smoke test after deploying."),
             "full body embedded, not just the index line"

@@ -58,9 +58,7 @@ impl GuiState {
         // Streaming output means that chat's run is going.
         if matches!(
             ev,
-            ServerEvent::AssistantDelta { .. }
-                | ServerEvent::ReasoningDelta { .. }
-                | ServerEvent::ToolStarted { .. }
+            ServerEvent::AssistantDelta { .. } | ServerEvent::ReasoningDelta { .. } | ServerEvent::ToolStarted { .. }
         ) {
             self.running.insert(sid.clone());
             if self.is_current(&sid) {
@@ -167,11 +165,7 @@ impl GuiState {
             }
             ServerEvent::ReasoningDelta { text, .. } => {
                 // First reasoning chunk carries the marker; appends merge bare.
-                let last_is_thinking = self
-                    .entries
-                    .last()
-                    .map(|(k, _)| *k == EntryKind::Thinking)
-                    .unwrap_or(false);
+                let last_is_thinking = self.entries.last().map(|(k, _)| *k == EntryKind::Thinking).unwrap_or(false);
                 if last_is_thinking {
                     self.push(EntryKind::Thinking, text);
                 } else {
@@ -223,13 +217,8 @@ impl GuiState {
                 if self.is_current(&session_id) {
                     self.busy = true;
                 }
-                let pending = PendingApproval {
-                    id: approval_id,
-                    session_id,
-                    tool,
-                    detail,
-                    started: std::time::Instant::now(),
-                };
+                let pending =
+                    PendingApproval { id: approval_id, session_id, tool, detail, started: std::time::Instant::now() };
                 if self.approval.is_some() {
                     self.approval_queue.push_back(pending);
                 } else {
@@ -252,14 +241,8 @@ impl GuiState {
                 self.finish_approval(&approval_id);
                 if let Some(tool) = tool {
                     match reason.as_str() {
-                        "timeout" => self.push(
-                            EntryKind::System,
-                            format!("No answer in time — `{tool}` was denied."),
-                        ),
-                        "abort" => self.push(
-                            EntryKind::System,
-                            format!("Run stopped — `{tool}` was not run."),
-                        ),
+                        "timeout" => self.push(EntryKind::System, format!("No answer in time — `{tool}` was denied.")),
+                        "abort" => self.push(EntryKind::System, format!("Run stopped — `{tool}` was not run.")),
                         _ => {}
                     }
                 }
@@ -351,11 +334,7 @@ mod tests {
         g.session = Some("s".into());
         g.on_event(delta("Hel"));
         g.on_event(delta("lo!"));
-        let assistant: Vec<_> = g
-            .entries
-            .iter()
-            .filter(|(k, _)| *k == EntryKind::Assistant)
-            .collect();
+        let assistant: Vec<_> = g.entries.iter().filter(|(k, _)| *k == EntryKind::Assistant).collect();
         assert_eq!(assistant.len(), 1);
         assert_eq!(assistant[0].1, "Hello!");
     }
@@ -391,11 +370,7 @@ mod tests {
         let mut g = GuiState::new();
         g.session = Some("s".into());
         g.busy = true;
-        g.on_event(ServerEvent::RunFinished {
-            session_id: "s".into(),
-            ok: true,
-            message: Some("done".into()),
-        });
+        g.on_event(ServerEvent::RunFinished { session_id: "s".into(), ok: true, message: Some("done".into()) });
         assert!(!g.busy);
         assert!(g.entries.iter().any(|(k, t)| *k == EntryKind::System && t == "done"));
     }
@@ -446,11 +421,7 @@ mod tests {
         g.on_event(delta_for("b", "text from b"));
         assert!(g.entries.is_empty(), "nothing from chat b in chat a");
         assert!(!g.busy, "chat a is not running");
-        g.on_event(ServerEvent::RunFinished {
-            session_id: "b".into(),
-            ok: false,
-            message: Some("b failed".into()),
-        });
+        g.on_event(ServerEvent::RunFinished { session_id: "b".into(), ok: false, message: Some("b failed".into()) });
         assert!(g.entries.is_empty());
     }
 

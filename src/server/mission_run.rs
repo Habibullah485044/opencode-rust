@@ -135,7 +135,11 @@ fn done_so_far(m: &Mission) -> String {
             format!("- step {} ({}): {first}", i + 1, s.status)
         })
         .collect();
-    if lines.is_empty() { "nothing yet".into() } else { lines.join("\n") }
+    if lines.is_empty() {
+        "nothing yet".into()
+    } else {
+        lines.join("\n")
+    }
 }
 
 /// What a worker is told for one step.
@@ -169,7 +173,11 @@ async fn plan(st: &Shared, ws: &std::path::Path, goal: &str, abort: &AtomicBool)
     match one_shot(st, COORDINATOR, &user, abort, false).await {
         Ok(reply) => {
             let steps = parse_steps(&reply);
-            if steps.is_empty() { vec![goal.to_string()] } else { steps }
+            if steps.is_empty() {
+                vec![goal.to_string()]
+            } else {
+                steps
+            }
         }
         Err(_) => vec![goal.to_string()],
     }
@@ -213,7 +221,8 @@ async fn say(st: &Shared, session_id: &str, text: String) {
     if let Err(e) = save_message(st, session_id, "assistant", vec![Part::Text { text: text.clone() }]).await {
         core_log(&format!("[mission] saving a note in {session_id} failed: {e:#}"));
     }
-    let _ = st.events.send(ServerEvent::AssistantDelta { session_id: session_id.to_string(), text: format!("{text}\n\n") });
+    let _ =
+        st.events.send(ServerEvent::AssistantDelta { session_id: session_id.to_string(), text: format!("{text}\n\n") });
 }
 
 /// [`Db::mission_step_update`] off the async threads (no child chat change).
@@ -268,7 +277,10 @@ pub(super) async fn run_mission(
             return Ok("This mission is already complete.".into());
         }
         deep = m.deep;
-        note(format!("mission: resuming — {} step(s) left", m.steps.iter().filter(|s| s.status != "done" && s.status != "failed").count()));
+        note(format!(
+            "mission: resuming — {} step(s) left",
+            m.steps.iter().filter(|s| s.status != "done" && s.status != "failed").count()
+        ));
     }
 
     // Nobody is there to approve: this chat and its step chats run like
@@ -280,7 +292,10 @@ pub(super) async fn run_mission(
         note("mission: approvals in this mission's chats are automatic until it ends (deny rules still apply)".into());
     }
     if deep {
-        note(format!("mission: each step is a Deep run ({} attempts, the best checked one kept)", st.cfg.agent.deep_attempts));
+        note(format!(
+            "mission: each step is a Deep run ({} attempts, the best checked one kept)",
+            st.cfg.agent.deep_attempts
+        ));
     }
     let result = steps_loop(st, session_id, &ws, deep, abort).await;
     let checked = if matches!(result, Ok(true)) {
@@ -357,7 +372,9 @@ async fn checks_after_mission(
             let passed = final_check(st, &child.id, &spec, abort, None).await;
             checked = match passed {
                 Some(true) => "\nFinal check: every done-when item proven.".into(),
-                Some(false) => "\nFinal check: not every done-when item could be proven — see the final check chat.".into(),
+                Some(false) => {
+                    "\nFinal check: not every done-when item could be proven — see the final check chat.".into()
+                }
                 None => "\nFinal check: could not run (provider unreachable) — check the result yourself.".into(),
             };
         }
@@ -399,7 +416,13 @@ fn mission_summary(m: &Mission, status: &str, result: &Result<bool>, checked: &s
 
 /// Work through the steps. `Ok(true)` = mission complete, `Ok(false)` = the
 /// step limit was reached.
-async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: bool, abort: &Arc<AtomicBool>) -> Result<bool> {
+async fn steps_loop(
+    st: &Shared,
+    session_id: &str,
+    ws: &std::path::Path,
+    deep: bool,
+    abort: &Arc<AtomicBool>,
+) -> Result<bool> {
     let limit = st.cfg.agent.mission_max_steps;
     let mut runs = 0usize;
     let mut errors = 0usize;
@@ -409,7 +432,8 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
             anyhow::bail!("aborted");
         }
         let m = current(st, session_id).await?;
-        let Some((i, step)) = m.steps.iter().enumerate().find(|(_, s)| s.status == "pending" || s.status == "working") else {
+        let Some((i, step)) = m.steps.iter().enumerate().find(|(_, s)| s.status == "pending" || s.status == "working")
+        else {
             return Ok(true);
         };
         if limit > 0 && runs >= limit {
@@ -505,7 +529,9 @@ async fn run_step(st: &Shared, child_id: &str, brief: &str, deep: bool, abort: &
                 }
                 Ok(summary)
             }
-            Err(e) if format!("{e:#}").contains("needs a git repository") => agent_inner(st, child_id, brief, abort).await.map(LoopEnd::into_legacy),
+            Err(e) if format!("{e:#}").contains("needs a git repository") => {
+                agent_inner(st, child_id, brief, abort).await.map(LoopEnd::into_legacy)
+            }
             Err(e) => Err(e),
         }
     } else {
@@ -566,11 +592,8 @@ fn step_receipt(
     proof: Option<Option<bool>>,
     title: &str,
 ) -> String {
-    let shown: Vec<String> = files
-        .iter()
-        .take(12)
-        .map(|f| f.strip_prefix(ws).unwrap_or(f).to_string_lossy().replace('\\', "/"))
-        .collect();
+    let shown: Vec<String> =
+        files.iter().take(12).map(|f| f.strip_prefix(ws).unwrap_or(f).to_string_lossy().replace('\\', "/")).collect();
     format!(
         "{}\nFiles changed: {}\nChecks: {}{}",
         report.trim(),
@@ -617,7 +640,12 @@ async fn apply_verdict(
         Verdict::Redo(why) if attempts < MAX_ATTEMPTS => {
             update_step(st, step.id, "pending", attempts, receipt).await?;
             agent_status(st, info, "failed", format!("redo: {why}"));
-            say(st, session_id, format!("↻ Step {n} again — {}", if why.is_empty() { "not done yet".to_string() } else { why.clone() })).await;
+            say(
+                st,
+                session_id,
+                format!("↻ Step {n} again — {}", if why.is_empty() { "not done yet".to_string() } else { why.clone() }),
+            )
+            .await;
             *redo_reason = Some(why);
         }
         Verdict::Redo(why) => {
@@ -634,7 +662,12 @@ async fn apply_verdict(
                 })
                 .await?;
             agent_status(st, info, "done", first_line.to_string());
-            say(st, session_id, format!("✓ Step {n}: {} — {first_line}\n➕ Added next: {new_step}", split_check(&step.title).0)).await;
+            say(
+                st,
+                session_id,
+                format!("✓ Step {n}: {} — {first_line}\n➕ Added next: {new_step}", split_check(&step.title).0),
+            )
+            .await;
         }
         Verdict::Done => {
             update_step(st, step.id, "done", attempts, receipt).await?;
@@ -679,7 +712,10 @@ mod tests {
             split_check("Add the cart module — check: `node tests/cart.test.mjs` passes"),
             ("Add the cart module", Some("`node tests/cart.test.mjs` passes"))
         );
-        assert_eq!(split_check("Draw the heart (check: heart.png opens as a PNG)"), ("Draw the heart", Some("heart.png opens as a PNG")));
+        assert_eq!(
+            split_check("Draw the heart (check: heart.png opens as a PNG)"),
+            ("Draw the heart", Some("heart.png opens as a PNG"))
+        );
         assert_eq!(split_check("Build the page layout"), ("Build the page layout", None));
         assert_eq!(split_check("Build it - Check:"), ("Build it", None));
     }
@@ -756,7 +792,8 @@ mod tests {
         let s = st.db.create_session("mission", None).unwrap();
         let mut rx = st.events.subscribe();
 
-        let out = run_mission(&st, &s.id, Some("make three files"), false, &Arc::new(AtomicBool::new(false))).await.unwrap();
+        let out =
+            run_mission(&st, &s.id, Some("make three files"), false, &Arc::new(AtomicBool::new(false))).await.unwrap();
         assert!(out.starts_with("**Mission complete**"), "{out}");
         for f in ["a.txt", "b.txt", "c.txt"] {
             assert!(dir.join(f).is_file(), "{f} written");
@@ -776,10 +813,17 @@ mod tests {
             }
         }
         assert_eq!(cards, 3, "one finished card per step");
-        let chat: Vec<String> = st.db.messages(&s.id).unwrap().iter().flat_map(|m| m.parts.clone()).filter_map(|p| match p {
-            Part::Text { text } => Some(text),
-            _ => None,
-        }).collect();
+        let chat: Vec<String> = st
+            .db
+            .messages(&s.id)
+            .unwrap()
+            .iter()
+            .flat_map(|m| m.parts.clone())
+            .filter_map(|p| match p {
+                Part::Text { text } => Some(text),
+                _ => None,
+            })
+            .collect();
         assert!(chat.iter().any(|t| t.starts_with("**Mission plan**")));
         assert!(chat.iter().any(|t| t.contains("Added next: Write c.txt")));
         assert!(mission_report(&st, &s.id).await.contains("Mission (done)"));
@@ -801,8 +845,14 @@ mod tests {
             post(move |body: axum::extract::Json<Value>| {
                 let w = w.clone();
                 async move {
-                    let user: String = body["messages"].as_array().cloned().unwrap_or_default().iter()
-                        .filter(|m| m["role"] == "user").filter_map(|m| m["content"].as_str().map(str::to_string)).collect();
+                    let user: String = body["messages"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|m| m["role"] == "user")
+                        .filter_map(|m| m["content"].as_str().map(str::to_string))
+                        .collect();
                     let text = if user.contains("Split the mission") {
                         "1. Make it perfect"
                     } else if user.contains("Decide what happens next") {
@@ -812,7 +862,10 @@ mod tests {
                         "I looked at it."
                     };
                     let frame = serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]});
-                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], format!("data: {frame}\n\ndata: [DONE]\n\n"))
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        format!("data: {frame}\n\ndata: [DONE]\n\n"),
+                    )
                 }
             }),
         );
@@ -843,7 +896,10 @@ mod tests {
         let gone = format!("ses_gone_{}_{}", std::process::id(), crate::db::now_ms_for_tests());
         say(&st, &gone, "step 1 done".into()).await;
         let log = std::fs::read_to_string(core_log_path()).unwrap_or_default();
-        assert!(log.lines().any(|l| l.contains("[mission]") && l.contains(&gone)), "no core.log line for the lost note");
+        assert!(
+            log.lines().any(|l| l.contains("[mission]") && l.contains(&gone)),
+            "no core.log line for the lost note"
+        );
     }
 
     #[tokio::test]
@@ -868,9 +924,10 @@ mod tests {
         // The other chat is already waiting on an approval.
         let mut rx = st.events.subscribe();
         let (st2, oid) = (st.clone(), other.id.clone());
-        let waiting = tokio::spawn(async move {
-            check_permission(&st2, &oid, "bash", "rm -rf build", &AtomicBool::new(false)).await
-        });
+        let waiting =
+            tokio::spawn(
+                async move { check_permission(&st2, &oid, "bash", "rm -rf build", &AtomicBool::new(false)).await },
+            );
         loop {
             if let Ok(ServerEvent::ApprovalNeeded { .. }) = rx.recv().await {
                 break;
@@ -907,7 +964,10 @@ mod tests {
     fn verdicts_are_read_leniently() {
         assert_eq!(parse_verdict("NEXT"), Verdict::Next);
         assert_eq!(parse_verdict("**REDO**: the cart total is wrong"), Verdict::Redo("the cart total is wrong".into()));
-        assert_eq!(parse_verdict("Looks good.\nADD: write tests for the cart"), Verdict::Add("write tests for the cart".into()));
+        assert_eq!(
+            parse_verdict("Looks good.\nADD: write tests for the cart"),
+            Verdict::Add("write tests for the cart".into())
+        );
         assert_eq!(parse_verdict("DONE — all goals met"), Verdict::Done);
         assert_eq!(parse_verdict("I think it is fine"), Verdict::Next, "chatter goes on");
     }

@@ -145,10 +145,7 @@ impl App {
         {
             self.cursor = content.chars().count();
             self.input = content;
-            self.push(
-                EntryKind::Error,
-                "a run is still going — wait for it to finish, then press Enter again",
-            );
+            self.push(EntryKind::Error, "a run is still going — wait for it to finish, then press Enter again");
             return None;
         }
         self.push(EntryKind::User, content.clone());
@@ -188,12 +185,8 @@ impl App {
             Some(Command::Skills) => (Some(InputAction::Skills), false),
             Some(Command::Review) => (Some(InputAction::Review), true),
             Some(Command::Debt) => (Some(InputAction::Debt), false),
-            Some(Command::Deep { attempts, task }) => {
-                (Some(InputAction::Deep { attempts, task }), true)
-            }
-            Some(Command::Edit { path, instruction }) => {
-                (Some(InputAction::Edit { path, instruction }), true)
-            }
+            Some(Command::Deep { attempts, task }) => (Some(InputAction::Deep { attempts, task }), true),
+            Some(Command::Edit { path, instruction }) => (Some(InputAction::Edit { path, instruction }), true),
             Some(Command::Mission { kind: Some(kind), goal }) => (
                 Some(InputAction::Mission(crate::mission::Mission {
                     kind,
@@ -208,11 +201,7 @@ impl App {
             }
             Some(Command::Mission { kind: None, goal }) => {
                 // Open the dialog — Custom checked, High effort, like Freebuff.
-                self.mission_picker = Some(MissionPicker {
-                    goal,
-                    kind_idx: 3,
-                    effort_idx: 2,
-                });
+                self.mission_picker = Some(MissionPicker { goal, kind_idx: 3, effort_idx: 2 });
                 (None, false)
             }
             Some(Command::Turbo { prompt }) => {
@@ -224,9 +213,7 @@ impl App {
                 let busy = prompt.is_some();
                 (Some(InputAction::Turbo(prompt)), busy)
             }
-            Some(Command::SkillInstall(src)) => {
-                (Some(InputAction::SkillInstall(src)), true)
-            }
+            Some(Command::SkillInstall(src)) => (Some(InputAction::SkillInstall(src)), true),
             Some(Command::Help) => {
                 self.help = true;
                 self.help_scroll = 0;
@@ -299,12 +286,7 @@ impl App {
             }
             KeyCode::Delete => {
                 if self.cursor < self.input.chars().count() {
-                    let byte = self
-                        .input
-                        .char_indices()
-                        .nth(self.cursor)
-                        .map(|(b, _)| b)
-                        .unwrap_or(self.input.len());
+                    let byte = self.input.char_indices().nth(self.cursor).map(|(b, _)| b).unwrap_or(self.input.len());
                     self.input.remove(byte);
                 }
                 self.refresh_palette();
@@ -336,12 +318,7 @@ impl App {
                 if ctrl != alt {
                     return None;
                 }
-                let byte = self
-                    .input
-                    .char_indices()
-                    .nth(self.cursor)
-                    .map(|(b, _)| b)
-                    .unwrap_or(self.input.len());
+                let byte = self.input.char_indices().nth(self.cursor).map(|(b, _)| b).unwrap_or(self.input.len());
                 self.input.insert(byte, c);
                 self.cursor += 1;
                 self.refresh_palette();
@@ -363,12 +340,7 @@ impl App {
             return; // overlays take keys, not text
         }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let byte = self
-            .input
-            .char_indices()
-            .nth(self.cursor)
-            .map(|(b, _)| b)
-            .unwrap_or(self.input.len());
+        let byte = self.input.char_indices().nth(self.cursor).map(|(b, _)| b).unwrap_or(self.input.len());
         self.input.insert_str(byte, &text);
         self.cursor += text.chars().count();
         self.refresh_palette();
@@ -396,8 +368,7 @@ impl App {
                 None
             }
             KeyCode::Down => {
-                self.edit_scroll =
-                    self.edit_scroll.saturating_add(1).min(self.edit_scroll_max.get());
+                self.edit_scroll = self.edit_scroll.saturating_add(1).min(self.edit_scroll_max.get());
                 None
             }
             KeyCode::PageUp => {
@@ -405,8 +376,7 @@ impl App {
                 None
             }
             KeyCode::PageDown => {
-                self.edit_scroll =
-                    self.edit_scroll.saturating_add(10).min(self.edit_scroll_max.get());
+                self.edit_scroll = self.edit_scroll.saturating_add(10).min(self.edit_scroll_max.get());
                 None
             }
             _ => None,
@@ -422,10 +392,7 @@ impl App {
         let site = if backwards { self.jumps.prev() } else { self.jumps.next() };
         if let Some(JumpSite { path, line }) = site {
             let pos = self.jumps.position().unwrap_or(0);
-            self.push(
-                EntryKind::System,
-                format!("[jump] {}/{} {path}:{line}", pos, self.jumps.len()),
-            );
+            self.push(EntryKind::System, format!("[jump] {}/{} {path}:{line}", pos, self.jumps.len()));
         }
     }
 
@@ -537,13 +504,9 @@ impl App {
             }
             // B-41: arrows scroll the help; any other key closes it.
             KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
-            KeyCode::Down => {
-                self.help_scroll = self.help_scroll.saturating_add(1).min(self.help_scroll_max.get())
-            }
+            KeyCode::Down => self.help_scroll = self.help_scroll.saturating_add(1).min(self.help_scroll_max.get()),
             KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
-            KeyCode::PageDown => {
-                self.help_scroll = self.help_scroll.saturating_add(10).min(self.help_scroll_max.get())
-            }
+            KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(10).min(self.help_scroll_max.get()),
             _ => self.help = false,
         }
         None
@@ -597,11 +560,7 @@ impl App {
             return;
         }
         let m = palette_matches(&self.input);
-        self.palette = if m.is_empty() {
-            None
-        } else {
-            Some(Palette { matches: m, sel: 0 })
-        };
+        self.palette = if m.is_empty() { None } else { Some(Palette { matches: m, sel: 0 }) };
     }
 
     /// M6: `/clear` — drop the view, keep the session history.
@@ -613,8 +572,7 @@ impl App {
         self.agents.clear();
         self.push(
             EntryKind::System,
-            "[view cleared — history kept: /resume to other sessions, /export to save]"
-                .to_string(),
+            "[view cleared — history kept: /resume to other sessions, /export to save]".to_string(),
         );
     }
 }

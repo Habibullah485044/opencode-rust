@@ -127,7 +127,8 @@ fn rules() -> &'static Rules {
     })
 }
 
-const JS_NOT_METHODS: [&str; 9] = ["if", "for", "while", "switch", "catch", "function", "return", "constructor", "else"];
+const JS_NOT_METHODS: [&str; 9] =
+    ["if", "for", "while", "switch", "catch", "function", "return", "constructor", "else"];
 
 /// The main parts of a file, in order. Empty for kinds of files we do not
 /// outline. Rust stops at a top-level `#[cfg(test)]` (tests come last).
@@ -225,7 +226,10 @@ pub fn outline_text(display: &str, text: &str, abs: &Path) -> String {
             "{display}: {lines} lines, no outline for this kind of file. Read it with offset/limit, or grep for what you need."
         );
     }
-    let mut out = format!("{display}: {lines} lines, {} parts (line, kind, name). Read a part with offset:<line>.\n", parts.len());
+    let mut out = format!(
+        "{display}: {lines} lines, {} parts (line, kind, name). Read a part with offset:<line>.\n",
+        parts.len()
+    );
     for p in parts.iter().take(400) {
         out.push_str(&format!("{:>6}  {} {}\n", p.line, p.kind, p.name));
     }
@@ -255,8 +259,22 @@ fn cache_path(state_dir: &Path, root: &Path) -> PathBuf {
 fn skipped_dir(name: &str) -> bool {
     matches!(
         name,
-        ".git" | "node_modules" | "target" | "dist" | "build" | "out" | ".next" | ".nuxt" | "vendor"
-            | "__pycache__" | ".venv" | "venv" | ".opencode" | "coverage" | ".cache" | "third_party"
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | "out"
+            | ".next"
+            | ".nuxt"
+            | "vendor"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | ".opencode"
+            | "coverage"
+            | ".cache"
+            | "third_party"
     )
 }
 
@@ -275,7 +293,9 @@ pub fn scan(root: &Path, state_dir: &Path) -> Vec<FileEntry> {
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
         .require_git(false)
-        .filter_entry(|e| !(e.file_type().is_some_and(|t| t.is_dir()) && e.file_name().to_str().is_some_and(skipped_dir)))
+        .filter_entry(|e| {
+            !(e.file_type().is_some_and(|t| t.is_dir()) && e.file_name().to_str().is_some_and(skipped_dir))
+        })
         .build();
     let started = std::time::Instant::now();
     for (visited, entry) in walker.flatten().enumerate() {
@@ -400,7 +420,9 @@ fn map_parts<'a>(e: &'a FileEntry, words: &[String]) -> Vec<&'a Part> {
             return 0;
         }
         match p.kind.as_str() {
-            "struct" | "enum" | "trait" | "class" | "interface" | "type" | "record" | "union" | "module" | "object" => 1,
+            "struct" | "enum" | "trait" | "class" | "interface" | "type" | "record" | "union" | "module" | "object" => {
+                1
+            }
             _ if p.top => 2,
             _ => 3,
         }
@@ -434,7 +456,8 @@ pub fn render(entries: &[FileEntry], request: &str, changed: &[String], budget_t
     let words = request_words(request);
     let mut ranked: Vec<(i64, &FileEntry)> = entries.iter().map(|e| (score(e, &words, changed), e)).collect();
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.rel.cmp(&b.1.rel)));
-    let head = "\n\n## Project map\n\nFiles and their main parts, most relevant first (paths from the project folder). \
+    let head =
+        "\n\n## Project map\n\nFiles and their main parts, most relevant first (paths from the project folder). \
                 `read` with `outline: true` lists a file's parts with line numbers.\n";
     let mut out = String::from(head);
     let mut shown = 0;
@@ -472,7 +495,11 @@ pub fn render(entries: &[FileEntry], request: &str, changed: &[String], budget_t
         }
         let mut dirs: Vec<(&str, usize)> = dirs.into_iter().collect();
         dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        let list: Vec<String> = dirs.iter().take(6).map(|(d, n)| if *d == "." { format!("{n} at the top") } else { format!("{n} in {d}/") }).collect();
+        let list: Vec<String> = dirs
+            .iter()
+            .take(6)
+            .map(|(d, n)| if *d == "." { format!("{n} at the top") } else { format!("{n} in {d}/") })
+            .collect();
         out.push_str(&format!("- … {rest} more files: {}\n", list.join(", ")));
     }
     out
@@ -520,7 +547,8 @@ mod tests {
     #[test]
     fn outlines_common_languages() {
         let rs = "use x;\npub struct App {\n}\nimpl App {\n    pub async fn run(&self) {}\n}\nfn helper() {}\n#[cfg(test)]\nmod tests { fn t() {} }\n";
-        let names: Vec<String> = outline(Path::new("a.rs"), rs).into_iter().map(|p| format!("{} {}", p.kind, p.name)).collect();
+        let names: Vec<String> =
+            outline(Path::new("a.rs"), rs).into_iter().map(|p| format!("{} {}", p.kind, p.name)).collect();
         assert_eq!(names, ["struct App", "impl App", "fn run", "fn helper"], "tests are left out");
         let py = "class Shop:\n    def add(self):\n        def inner(): pass\nasync def main():\n";
         let names: Vec<String> = outline(Path::new("a.py"), py).into_iter().map(|p| p.name).collect();
@@ -580,9 +608,14 @@ mod tests {
             rel: rel.into(),
             size: 1,
             mtime: 1,
-            parts: parts.iter().enumerate().map(|(i, n)| Part { line: i + 1, kind: "fn".into(), name: (*n).into(), top: true }).collect(),
+            parts: parts
+                .iter()
+                .enumerate()
+                .map(|(i, n)| Part { line: i + 1, kind: "fn".into(), name: (*n).into(), top: true })
+                .collect(),
         };
-        let mut entries = vec![e("src/lib.rs", &["start"]), e("src/billing/invoice.rs", &["total", "tax"]), e("docs/notes.md", &[])];
+        let mut entries =
+            vec![e("src/lib.rs", &["start"]), e("src/billing/invoice.rs", &["total", "tax"]), e("docs/notes.md", &[])];
         for i in 0..3000 {
             entries.push(e(&format!("gen/file{i}.rs"), &["a", "b", "c"]));
         }

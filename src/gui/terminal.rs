@@ -104,7 +104,8 @@ pub(super) fn cd_target(
     let dir = if arg.is_empty() {
         root.to_path_buf()
     } else if arg == "~" || arg.starts_with("~/") {
-        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(std::path::PathBuf::from)?;
+        let home =
+            std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(std::path::PathBuf::from)?;
         home.join(arg.trim_start_matches('~').trim_start_matches('/'))
     } else {
         let arg = crate::tools::msys_to_windows(arg).unwrap_or_else(|| arg.to_string());
@@ -161,9 +162,7 @@ impl App {
     /// Terminal panel: stop a command (`None` = the running one typed there).
     pub(super) fn on_term_stop(&self, id: Option<String>) {
         let running = crate::tools::jobs::list(0);
-        let target = id.or_else(|| {
-            running.iter().rev().find(|j| j.by_user && j.exit.is_none()).map(|j| j.id.clone())
-        });
+        let target = id.or_else(|| running.iter().rev().find(|j| j.by_user && j.exit.is_none()).map(|j| j.id.clone()));
         if let Some(id) = target {
             self.rt.spawn(async move {
                 let _ = crate::tools::jobs::stop(&id).await;

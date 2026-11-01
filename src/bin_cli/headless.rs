@@ -1,8 +1,8 @@
 //! `--headless`: run one prompt (or one builtin command) without the TUI,
 //! print the result, exit.
 
-use opencode_rust::frontend;
 use anyhow::{Context, Result};
+use opencode_rust::frontend;
 use opencode_rust::{agents::AgentMode, commands::Command as Cmd, server};
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
@@ -114,7 +114,10 @@ async fn run_command(state: &State, sid: &str, cmd: Cmd) -> Outcome {
         Cmd::Todos => println!("{}", state.todos_report(sid)),
         Cmd::Usage => println!("{}", state.usage_report(sid)),
         Cmd::Clear | Cmd::New => {
-            println!("[{cmd_kind}] headless runs are one session per invocation", cmd_kind = if matches!(cmd, Cmd::Clear) { "clear" } else { "new" });
+            println!(
+                "[{cmd_kind}] headless runs are one session per invocation",
+                cmd_kind = if matches!(cmd, Cmd::Clear) { "clear" } else { "new" }
+            );
         }
         Cmd::Init => match opencode_rust::skills::init_agents_md(&state.workspace) {
             Ok(Some(p)) => println!("[init] wrote a starter {}", p.display()),
@@ -176,10 +179,7 @@ async fn run_command(state: &State, sid: &str, cmd: Cmd) -> Outcome {
         },
         Cmd::Turbo { prompt } => {
             let on = frontend::switch_turbo(state, prompt.is_some());
-            println!(
-                "[turbo] {}",
-                if on { "ON — full access, runs continue on their own" } else { "off" }
-            );
+            println!("[turbo] {}", if on { "ON — full access, runs continue on their own" } else { "off" });
             if let Some(p) = prompt {
                 // New (B-06): kick_run registers the run in `busy`.
                 state.kick_run(sid.to_string(), p).await;
@@ -210,16 +210,18 @@ async fn run_command(state: &State, sid: &str, cmd: Cmd) -> Outcome {
 /// `/undo`, `/undo --force`, `/redo` on the workspace.
 async fn snapshot(state: &State, redo: bool, force: bool) {
     let verb = if redo { "redo" } else { "undo" };
-    let res =
-        frontend::run_snapshot(state.workspace.clone(), state.state_dir.clone(), redo, force).await;
+    let res = frontend::run_snapshot(state.workspace.clone(), state.state_dir.clone(), redo, force).await;
     match res {
-        Ok(Ok(Some(m))) => println!(
-            "[{verb}] restored snapshot {} ({}, {} file(s))",
-            m.id, m.label, m.present.len()
-        ),
+        Ok(Ok(Some(m))) => println!("[{verb}] restored snapshot {} ({}, {} file(s))", m.id, m.label, m.present.len()),
         Ok(Ok(None)) => println!("[{verb}] nothing to {verb} (not a git repository?)"),
-        Ok(Err(e)) => { eprintln!("[{verb}] failed: {e:#}"); std::process::exit(1); }
-        Err(e) => { eprintln!("[{verb}] failed: {e}"); std::process::exit(1); }
+        Ok(Err(e)) => {
+            eprintln!("[{verb}] failed: {e:#}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("[{verb}] failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -230,7 +232,10 @@ async fn compact(state: &State, sid: &str) {
     state.release_run(sid, &abort).await;
     match res {
         Ok(o) => println!("[compact] {} message(s) -> 1 summary + {} kept", o.removed, o.kept),
-        Err(e) => { eprintln!("[compact] failed: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("[compact] failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -262,16 +267,13 @@ async fn inline_edit(state: &State, sid: &str, path: &str, instruction: &str) {
         std::process::exit(1);
     }
     let abort = Arc::new(AtomicBool::new(false));
-    let proposal =
-        match opencode_rust::inline_edit::propose(state, sid, path, instruction, &abort)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[edit] failed: {e:#}");
-                std::process::exit(1);
-            }
-        };
+    let proposal = match opencode_rust::inline_edit::propose(state, sid, path, instruction, &abort).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[edit] failed: {e:#}");
+            std::process::exit(1);
+        }
+    };
     for d in &proposal.diff {
         println!("{d}");
     }
@@ -285,11 +287,7 @@ async fn inline_edit(state: &State, sid: &str, path: &str, instruction: &str) {
         std::process::exit(2);
     }
     // Snapshot first so /undo can revert the inline edit.
-    if let Err(e) = opencode_rust::gitsnap::record_before_run(
-        &state.workspace,
-        &state.state_dir,
-        "pre-edit",
-    ) {
+    if let Err(e) = opencode_rust::gitsnap::record_before_run(&state.workspace, &state.state_dir, "pre-edit") {
         eprintln!("[snapshot] {e:#}");
     }
     let applied = tokio::task::spawn_blocking({
@@ -317,7 +315,11 @@ async fn inline_edit(state: &State, sid: &str, path: &str, instruction: &str) {
 
 /// What a headless approval answer says after the arrow.
 fn approval_verdict(approve: bool) -> &'static str {
-    if approve { "auto-approved (--yes)" } else { "denied (pass --yes to allow)" }
+    if approve {
+        "auto-approved (--yes)"
+    } else {
+        "denied (pass --yes to allow)"
+    }
 }
 
 /// Print the run's events until it finishes: the answer on stdout, thinking
@@ -439,15 +441,8 @@ async fn stream_events(
 /// (seconds) or OPENCODE_RUST_HEADLESS_TIMEOUT; default 2 hours; 0 = no
 /// limit. A value that is not a number falls back to the default.
 pub(crate) fn headless_timeout(args: &[String], env: Option<&str>) -> Option<std::time::Duration> {
-    let from_args = args
-        .iter()
-        .position(|a| a == "--timeout")
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str);
-    let secs = from_args
-        .or(env)
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(7200);
+    let from_args = args.iter().position(|a| a == "--timeout").and_then(|i| args.get(i + 1)).map(String::as_str);
+    let secs = from_args.or(env).and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(7200);
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 

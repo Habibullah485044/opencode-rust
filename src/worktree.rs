@@ -58,9 +58,8 @@ impl Worktree {
     /// Make a worktree for one worker. The error text says why not (shown to
     /// the parent and the user): no git repository, no commit yet, ...
     pub fn create(workspace: &Path, state_dir: &Path, label: &str) -> Result<Self> {
-        let inside = git(workspace, &["rev-parse", "--is-inside-work-tree"])
-            .map(|s| s.trim() == "true")
-            .unwrap_or(false);
+        let inside =
+            git(workspace, &["rev-parse", "--is-inside-work-tree"]).map(|s| s.trim() == "true").unwrap_or(false);
         if !inside {
             bail!("the workspace is not a git repository");
         }
@@ -69,10 +68,7 @@ impl Worktree {
             .trim()
             .to_string();
         let root = PathBuf::from(git(workspace, &["rev-parse", "--show-toplevel"])?.trim());
-        let prefix = git(workspace, &["rev-parse", "--show-prefix"])?
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
+        let prefix = git(workspace, &["rev-parse", "--show-prefix"])?.trim().trim_end_matches('/').to_string();
         let workers = std::path::absolute(state_dir.join("workers"))?;
         std::fs::create_dir_all(&workers)?;
         // `git add -A` below must never pick up our own worktrees.
@@ -81,10 +77,8 @@ impl Worktree {
             bail!("the state dir {} is inside the repository", state_dir.display());
         }
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let stamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
         let name = format!("{label}-{stamp}-{}", COUNTER.fetch_add(1, Ordering::Relaxed));
         let dir = workers.join(&name);
         let index = workers.join(format!("{name}.index"));
@@ -244,12 +238,12 @@ impl Isolation {
     /// [`Isolation::start`] on a blocking thread, for async callers.
     pub async fn start_async(workspace: PathBuf, state_dir: PathBuf, label: String) -> Self {
         let sd = state_dir.clone();
-        tokio::task::spawn_blocking(move || Self::start(&workspace, &state_dir, &label))
-            .await
-            .unwrap_or_else(|e| Self {
+        tokio::task::spawn_blocking(move || Self::start(&workspace, &state_dir, &label)).await.unwrap_or_else(|e| {
+            Self {
                 state: IsoState::Skipped(format!("worktree setup crashed: {e}")),
                 patch_dir: sd.join("worker-patches"),
-            })
+            }
+        })
     }
 
     /// The folder for the worker's tools. `None` = the real workspace.
@@ -367,10 +361,7 @@ mod tests {
     }
 
     fn temp(tag: &str) -> PathBuf {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let p = std::env::temp_dir().join(format!("ocrs-wt-{tag}-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -417,11 +408,8 @@ mod tests {
         assert!(branches.trim().is_empty(), "branch deleted: {branches}");
         assert_eq!(read(&repo.join("a.txt")), "two\n", "nothing applied yet");
 
-        let patch = report
-            .lines()
-            .find_map(|l| l.strip_prefix("Patch: "))
-            .expect("patch path in the report")
-            .to_string();
+        let patch =
+            report.lines().find_map(|l| l.strip_prefix("Patch: ")).expect("patch path in the report").to_string();
         git(&repo, &["apply", &patch]).unwrap();
         assert_eq!(read(&repo.join("a.txt")), "three\n");
         assert_eq!(read(&repo.join("new.txt")), "from worker\n");
@@ -451,9 +439,7 @@ mod tests {
         std::fs::write(repo.join("a.txt"), "one\n").unwrap();
         git(&repo, &["add", "-A"]).unwrap();
         git(&repo, &["commit", "-q", "-m", "init"]).unwrap();
-        let patches = |state: &Path| {
-            std::fs::read_dir(state.join("worker-patches")).map(|d| d.count()).unwrap_or(0)
-        };
+        let patches = |state: &Path| std::fs::read_dir(state.join("worker-patches")).map(|d| d.count()).unwrap_or(0);
 
         let iso = Isolation::start(&repo, &state, "worker");
         let ws = iso.workspace().unwrap();
@@ -484,14 +470,22 @@ mod tests {
         git(&repo, &["config", "user.email", "t@t"]).unwrap();
         git(&repo, &["config", "user.name", "t"]).unwrap();
         git(&repo, &["config", "commit.gpgsign", "false"]).unwrap();
-        std::fs::write(repo.join("a.txt"), "one
-").unwrap();
+        std::fs::write(
+            repo.join("a.txt"),
+            "one
+",
+        )
+        .unwrap();
         git(&repo, &["add", "-A"]).unwrap();
         git(&repo, &["commit", "-q", "-m", "init"]).unwrap();
         let iso = Isolation::start(&repo, &state, "worker");
         let ws = iso.workspace().unwrap();
-        std::fs::write(ws.join("a.txt"), "worker edit
-").unwrap();
+        std::fs::write(
+            ws.join("a.txt"),
+            "worker edit
+",
+        )
+        .unwrap();
         let patch_dir = iso.patch_dir.clone();
 
         drop(iso);

@@ -71,9 +71,8 @@ impl App {
     /// The URL bar. S-11: typed URLs pass the same check as links,
     /// redirects, the dev-server button and the agent.
     pub(super) fn on_browse(&mut self, raw: &str) -> bool {
-        let target = normalize_url(raw).and_then(|url| {
-            check_navigation(&url, self.st.cfg.browser.allow_remote).map(|()| url)
-        });
+        let target =
+            normalize_url(raw).and_then(|url| check_navigation(&url, self.st.cfg.browser.allow_remote).map(|()| url));
         match target {
             Ok(url) => match &self.browser_webview {
                 Some(wv) => {
@@ -151,13 +150,16 @@ impl App {
             .or_else(|| self.gs.dev_server.clone())
             .or_else(|| {
                 let home = self.gs.browser.home.clone();
-                if home.is_empty() { None } else { Some(home) }
+                if home.is_empty() {
+                    None
+                } else {
+                    Some(home)
+                }
             })
             .unwrap_or_else(|| "http://localhost:3000".into());
         // S-11: the button obeys `allow_remote` too.
-        let checked = normalize_url(&target).and_then(|url| {
-            check_navigation(&url, self.st.cfg.browser.allow_remote).map(|()| url)
-        });
+        let checked = normalize_url(&target)
+            .and_then(|url| check_navigation(&url, self.st.cfg.browser.allow_remote).map(|()| url));
         match checked {
             Ok(u) => {
                 if let Some(wv) = &self.browser_webview {

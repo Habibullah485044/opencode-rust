@@ -44,11 +44,7 @@ pub async fn kick_team(st: &Arc<server::AppState>, sid: String, goal: String) {
             Ok(s) => (true, Some(s.lines().last().unwrap_or("team done").to_string())),
             Err(e) => (false, Some(format!("team failed: {e}"))),
         };
-        let _ = st2.events.send(server::ServerEvent::RunFinished {
-            session_id: sid2,
-            ok,
-            message,
-        });
+        let _ = st2.events.send(server::ServerEvent::RunFinished { session_id: sid2, ok, message });
     })
     .await;
 }
@@ -56,12 +52,7 @@ pub async fn kick_team(st: &Arc<server::AppState>, sid: String, goal: String) {
 /// Start a mission. An explore (read-only) mission reads and reports: one
 /// run in plan mode (`announce_plan` tells the chat plan mode is now on).
 /// Any other kind runs in mission mode: step by step until the goal is met.
-pub async fn start_mission(
-    st: &Arc<server::AppState>,
-    sid: String,
-    mission: Mission,
-    announce_plan: bool,
-) {
+pub async fn start_mission(st: &Arc<server::AppState>, sid: String, mission: Mission, announce_plan: bool) {
     if mission.kind.read_only() {
         st.set_mode(&sid, AgentMode::Plan);
         if announce_plan {

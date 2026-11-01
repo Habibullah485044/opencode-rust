@@ -33,12 +33,7 @@ impl GuiState {
             sent.clear();
             *self.sent_session.borrow_mut() = self.session.clone();
         }
-        let from = self
-            .entries
-            .iter()
-            .zip(sent.iter())
-            .take_while(|(now, before)| now == before)
-            .count();
+        let from = self.entries.iter().zip(sent.iter()).take_while(|(now, before)| now == before).count();
         sent.truncate(from);
         sent.extend(self.entries[from..].iter().cloned());
         drop(sent);
@@ -61,12 +56,8 @@ impl GuiState {
             .map(|(k, t)| serde_json::json!({ "k": kind_class(k).to_string(), "t": t }))
             .collect();
         // Chats blocked on an approval: shown as "needs you" in the sidebar.
-        let waiting: std::collections::HashSet<&str> = self
-            .approval
-            .iter()
-            .chain(self.approval_queue.iter())
-            .map(|a| a.session_id.as_str())
-            .collect();
+        let waiting: std::collections::HashSet<&str> =
+            self.approval.iter().chain(self.approval_queue.iter()).map(|a| a.session_id.as_str()).collect();
         let sessions: Vec<serde_json::Value> = self
             .sessions
             .iter()
@@ -101,11 +92,8 @@ impl GuiState {
                 })
             })
             .collect();
-        let projects: Vec<serde_json::Value> = self
-            .projects
-            .iter()
-            .map(|p| serde_json::json!({ "id": p.id, "name": p.name, "root": p.root }))
-            .collect();
+        let projects: Vec<serde_json::Value> =
+            self.projects.iter().map(|p| serde_json::json!({ "id": p.id, "name": p.name, "root": p.root })).collect();
         serde_json::json!({
             "session": self.session.clone().unwrap_or_default(),
             "title": self.title(),

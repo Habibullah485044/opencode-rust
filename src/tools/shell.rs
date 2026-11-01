@@ -72,9 +72,7 @@ pub fn shell_kind() -> crate::permissions::Shell {
 /// right syntax.
 pub(super) fn shell_label() -> &'static str {
     match shell_kind() {
-        crate::permissions::Shell::Posix if cfg!(windows) => {
-            "bash (Git Bash: POSIX syntax and tools)"
-        }
+        crate::permissions::Shell::Posix if cfg!(windows) => "bash (Git Bash: POSIX syntax and tools)",
         crate::permissions::Shell::Posix => "sh",
         crate::permissions::Shell::Cmd => {
             "Windows cmd.exe (cmd syntax: dir, type, del, `&&` between commands — not ls/rm/`;`)"
@@ -112,12 +110,7 @@ pub(super) async fn bash(
     abort: &std::sync::atomic::AtomicBool,
 ) -> Result<String> {
     let mut child = shell_command(command);
-    child
-        .current_dir(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    child.current_dir(workspace).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     // S-05: the shell never sees our provider key or API token.
     scrub_secrets(&mut child);
     // New (B-06): on Linux/macOS the shell leads its own process group, so

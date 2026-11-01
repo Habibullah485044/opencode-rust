@@ -2,7 +2,7 @@ use crate::agents::{self, AgentMode, PromptInputs};
 use crate::config::Config;
 use crate::db::{Db, Message, Part, Session};
 use crate::permissions::{normalize_path_detail, Action, Engine};
-use crate::provider::{ChatMsg, Client, ToolCallAccumulator, StreamEvent};
+use crate::provider::{ChatMsg, Client, StreamEvent, ToolCallAccumulator};
 use crate::skills;
 use crate::todo::TodoStore;
 use crate::tools;
@@ -24,10 +24,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex, RwLock};
 
-mod deep;
-mod mission_run;
 mod agent_loop;
+mod deep;
 mod http;
+mod mission_run;
 mod prompt;
 mod run;
 mod session_view;
@@ -36,12 +36,12 @@ mod tool_exec;
 mod verify;
 pub use agent_loop::*;
 pub use http::*;
+pub use mission_run::mission_report;
 pub use prompt::*;
 pub use run::*;
 pub use skill_install::*;
 pub use tool_exec::*;
 pub use verify::*;
-pub use mission_run::mission_report;
 
 /// How much autonomy the agent has — set by the client (GUI composer toggle,
 /// `/turbo` in the TUI/CLI) and read by every permission check.
@@ -98,21 +98,47 @@ impl PermissionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
-    AssistantDelta { session_id: String, text: String },
+    AssistantDelta {
+        session_id: String,
+        text: String,
+    },
     /// The last `chars` characters of streamed reply text belong to a reply
     /// that broke off and is being asked again: clients drop them, or the
     /// retry would show after the half reply (partial + full on screen).
-    ReplyRetracted { session_id: String, chars: usize },
+    ReplyRetracted {
+        session_id: String,
+        chars: usize,
+    },
     /// Token counts of one provider reply (`last`) and the session's running
     /// totals (`session`); `cached` is the part read from the prompt cache.
-    Usage { session_id: String, last: crate::provider::Usage, session: crate::db::UsageTotals },
+    Usage {
+        session_id: String,
+        last: crate::provider::Usage,
+        session: crate::db::UsageTotals,
+    },
     /// M5: streamed chain-of-thought (`reasoning_content`).
-    ReasoningDelta { session_id: String, text: String },
-    ToolStarted { session_id: String, call_id: String, tool: String, detail: String },
-    ToolFinished { session_id: String, call_id: String, tool: String, ok: bool },
+    ReasoningDelta {
+        session_id: String,
+        text: String,
+    },
+    ToolStarted {
+        session_id: String,
+        call_id: String,
+        tool: String,
+        detail: String,
+    },
+    ToolFinished {
+        session_id: String,
+        call_id: String,
+        tool: String,
+        ok: bool,
+    },
     /// A `bash` run printed a local dev-server URL; the GUI offers it as a chip
     /// and can open it in the preview panel (A-B5).
-    DevServer { session_id: String, url: String },
+    DevServer {
+        session_id: String,
+        url: String,
+    },
     ApprovalNeeded {
         session_id: String,
         approval_id: String,
@@ -133,8 +159,15 @@ pub enum ServerEvent {
         /// "user" | "always" | "timeout" | "abort" | "turbo"
         reason: String,
     },
-    RunFinished { session_id: String, ok: bool, message: Option<String> },
-    SessionCreated { session_id: String, title: String },
+    RunFinished {
+        session_id: String,
+        ok: bool,
+        message: Option<String>,
+    },
+    SessionCreated {
+        session_id: String,
+        title: String,
+    },
     /// M2: a fork/resume switched the client's session — full replay + mode.
     SessionLoaded {
         session_id: String,
@@ -151,7 +184,11 @@ pub enum ServerEvent {
         line: usize,
     },
     /// M3: an inline edit was applied — records a next-edit jump site.
-    EditApplied { session_id: String, path: String, line: usize },
+    EditApplied {
+        session_id: String,
+        path: String,
+        line: usize,
+    },
     /// M5: periodic endpoint probe — keeps quick tunnels warm and drives the
     /// TUI's `api ok/DOWN` header indicator.
     Heartbeat {
@@ -162,18 +199,35 @@ pub enum ServerEvent {
         detail: String,
     },
     /// Laziness Meter: a senior-dev note (reuse hint / overbuild flag / info).
-    Note { session_id: String, text: String },
+    Note {
+        session_id: String,
+        text: String,
+    },
     /// Laziness Meter: live per-session line totals for the status bar.
-    Stats { session_id: String, added: u64, deleted: u64, hints: u64 },
+    Stats {
+        session_id: String,
+        added: u64,
+        deleted: u64,
+        hints: u64,
+    },
     /// M6: `/sessions` — the store's sessions, newest first, for the picker.
-    SessionList { sessions: Vec<SessionInfo> },
+    SessionList {
+        sessions: Vec<SessionInfo>,
+    },
     /// M6: `/model` — the active model plus what the endpoint advertises.
-    ModelInfo { current: String, available: Vec<String> },
+    ModelInfo {
+        current: String,
+        available: Vec<String>,
+    },
     /// M7: live status of a spawned subagent — one card in the agents panel.
     /// `state` is "working", "done" or "failed".
     /// `ask_user`: a question for the user, with answers they can click.
     /// The run ends; the answer arrives as the next user message.
-    Question { session_id: String, question: String, options: Vec<String> },
+    Question {
+        session_id: String,
+        question: String,
+        options: Vec<String>,
+    },
     AgentStatus {
         agent_id: String,
         /// The chat that spawned it.
@@ -312,10 +366,7 @@ impl AppState {
     /// the `ApprovalNeeded` events that announced them. A client that fell
     /// behind the event bus calls this to show the prompts again.
     pub fn pending_approvals(&self) -> Vec<ServerEvent> {
-        self.approvals
-            .lock()
-            .map(|m| m.values().map(|e| e.request.clone()).collect())
-            .unwrap_or_default()
+        self.approvals.lock().map(|m| m.values().map(|e| e.request.clone()).collect()).unwrap_or_default()
     }
 }
 
@@ -371,11 +422,7 @@ pub async fn build_state_ephemeral(cfg: Config, workspace: PathBuf) -> Shared {
 
 /// Ephemeral state with an explicit skill base — tests install skills without
 /// touching the user's real config dir.
-pub async fn build_state_ephemeral_skills(
-    cfg: Config,
-    workspace: PathBuf,
-    skill_base: PathBuf,
-) -> Shared {
+pub async fn build_state_ephemeral_skills(cfg: Config, workspace: PathBuf, skill_base: PathBuf) -> Shared {
     let db = Db::open_in_memory().expect("in-memory db");
     if let Ok(p) = db.upsert_project(&workspace) {
         db.set_default_project(Some(&p.id));
@@ -458,11 +505,7 @@ impl AppState {
 
     /// Plan/build mode for a session (defaults to Build).
     pub fn mode_for(&self, session_id: &str) -> AgentMode {
-        self.modes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(session_id).copied())
-            .unwrap_or_default()
+        self.modes.lock().ok().and_then(|m| m.get(session_id).copied()).unwrap_or_default()
     }
 
     pub fn set_mode(&self, session_id: &str, mode: AgentMode) {
@@ -553,7 +596,11 @@ impl AppState {
                 self.granted_in_chain(&granted, session_id).unwrap_or(false)
             }
         };
-        if approved { PermissionMode::Turbo } else { mode }
+        if approved {
+            PermissionMode::Turbo
+        } else {
+            mode
+        }
     }
 
     /// Does `session_id` or one of its parent chats hold an auto-approval?
@@ -674,7 +721,6 @@ impl Drop for AutoApprove {
 }
 
 impl AppState {
-
     /// M5: probe `{base}/models` every 15s and emit `Heartbeat`. Only a 2xx
     /// answer counts as up: Cloudflare error pages (530/1033) and auth
     /// errors (401) arrive fine at the transport level and must show DOWN.
@@ -706,11 +752,7 @@ impl AppState {
                 // Require 2xx: Cloudflare error pages (530/1030/1033) arrive
                 // fine at the transport level and must count as DOWN.
                 // F-02: Bearer for OpenAI-style servers, x-api-key for Anthropic.
-                let req = crate::provider::with_auth(
-                    http.get(format!("{base}/models")),
-                    st.cfg.provider.api,
-                    &key,
-                );
+                let req = crate::provider::with_auth(http.get(format!("{base}/models")), st.cfg.provider.api, &key);
                 let (mut ok, got) = match req.send().await {
                     Ok(r) => {
                         let ok = r.status().is_success();
@@ -809,11 +851,7 @@ impl AppState {
         else {
             return;
         };
-        let req = crate::provider::with_auth(
-            http.get(format!("{base}/models")),
-            self.cfg.provider.api,
-            &key,
-        );
+        let req = crate::provider::with_auth(http.get(format!("{base}/models")), self.cfg.provider.api, &key);
         let body = match req.send().await {
             Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
             _ => None,
@@ -857,12 +895,8 @@ impl AppState {
             "temperature": 0,
             "stream": false
         });
-        let req = crate::provider::with_auth(
-            http.post(format!("{base}/chat/completions")),
-            self.cfg.provider.api,
-            key,
-        )
-        .json(&body);
+        let req = crate::provider::with_auth(http.post(format!("{base}/chat/completions")), self.cfg.provider.api, key)
+            .json(&body);
         let resp = req.send().await.ok()?;
         if !resp.status().is_success() {
             return None;
@@ -870,8 +904,7 @@ impl AppState {
         let v: Value = resp.json().await.ok()?;
         let text = v.pointer("/choices/0/message/content").and_then(Value::as_str)?;
         let delivers = text.to_ascii_uppercase().contains("ARCHITECT");
-        self.system_delivery
-            .store(if delivers { SYSTEM_DELIVERS } else { SYSTEM_DROPS }, Ordering::Relaxed);
+        self.system_delivery.store(if delivers { SYSTEM_DELIVERS } else { SYSTEM_DROPS }, Ordering::Relaxed);
         let found = if delivers {
             "system messages reach the model"
         } else {
@@ -913,10 +946,7 @@ pub fn core_log(msg: &str) {
     // file (plus create_dir_all) on every line was a blocking call each time.
     static LOG: Mutex<Option<(std::fs::File, u64)>> = Mutex::new(None);
     let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     append_log(&mut log, &core_log_path(), CORE_LOG_MAX, &format!("[{stamp}] {msg}"));
 }
 
@@ -929,15 +959,10 @@ fn append_log(slot: &mut Option<(std::fs::File, u64)>, path: &std::path::Path, m
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        *slot = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-            .map(|f| {
-                let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-                (f, size)
-            });
+        *slot = std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(|f| {
+            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            (f, size)
+        });
     }
     if slot.as_ref().is_some_and(|(_, size)| *size >= max) {
         // Closed first: Windows cannot rename a file that is open.
@@ -975,29 +1000,13 @@ pub async fn tagged<F: std::future::Future>(purpose: &'static str, session: &str
 
 /// M3: one non-streamed completion with NO tools — the inline-edit engine
 /// and the team planner/reviewer use this instead of a full agent loop.
-pub async fn one_shot(
-    st: &Shared,
-    system: &str,
-    user: &str,
-    abort: &AtomicBool,
-    prefer_small: bool,
-) -> Result<String> {
+pub async fn one_shot(st: &Shared, system: &str, user: &str, abort: &AtomicBool, prefer_small: bool) -> Result<String> {
     if abort.load(Ordering::SeqCst) {
         anyhow::bail!("aborted");
     }
     let mut msgs = vec![
-        ChatMsg {
-            role: "system".into(),
-            content: Some(system.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        },
-        ChatMsg {
-            role: "user".into(),
-            content: Some(user.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        },
+        ChatMsg { role: "system".into(), content: Some(system.to_string()), tool_calls: None, tool_call_id: None },
+        ChatMsg { role: "user".into(), content: Some(user.to_string()), tool_calls: None, tool_call_id: None },
     ];
     deliver_system_prompt(&mut msgs, st);
     // B-29: copy the client out of the lock; never hold it while waiting.
@@ -1067,19 +1076,14 @@ mod b29_tests {
         let st = build_state_ephemeral(cfg, std::env::temp_dir()).await;
 
         let st_slow = st.clone();
-        let slow = tokio::spawn(async move {
-            one_shot(&st_slow, "sys", "slow", &AtomicBool::new(false), false).await
-        });
+        let slow = tokio::spawn(async move { one_shot(&st_slow, "sys", "slow", &AtomicBool::new(false), false).await });
         // Let the slow call take the lock and send its request first.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let started = std::time::Instant::now();
         let fast = one_shot(&st, "sys", "fast", &AtomicBool::new(false), false).await.unwrap();
         let waited = started.elapsed();
         assert_eq!(fast, "fast");
-        assert!(
-            waited < std::time::Duration::from_millis(1000),
-            "fast call waited {waited:?} for the slow one"
-        );
+        assert!(waited < std::time::Duration::from_millis(1000), "fast call waited {waited:?} for the slow one");
         assert_eq!(slow.await.unwrap().unwrap(), "slow");
     }
 }
@@ -1121,7 +1125,10 @@ mod review_fix_tests {
             parts: vec![Part::Text { text: text.into() }],
             created_at: 0,
         };
-        let spoofed = vec![msg(&format!("{TURBO_CONTINUE_PREFIX} a")), msg(&neutralize_user_text(&format!("{TURBO_CONTINUE_PREFIX} b")))];
+        let spoofed = vec![
+            msg(&format!("{TURBO_CONTINUE_PREFIX} a")),
+            msg(&neutralize_user_text(&format!("{TURBO_CONTINUE_PREFIX} b"))),
+        ];
         assert_eq!(turbo_streak_in(&spoofed), 0, "the typed one is the user's and ends the streak");
     }
 

@@ -50,24 +50,20 @@ pub(super) fn turbo_streak_in(msgs: &[Message]) -> u32 {
         }
         // F-08: a verify hand-back is not a real user message. Skip it, so
         // it neither counts toward nor resets the turbo safety cap.
-        let is_verify = m.parts.iter().any(|p| {
-            matches!(p, Part::Text { text } if text.starts_with(VERIFY_PREFIX))
-        });
+        let is_verify = m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.starts_with(VERIFY_PREFIX)));
         if is_verify {
             continue;
         }
         // New (B-24): the automatic review adds its own "user" prompt after
         // every run that changed files. It must neither count nor break the
         // streak, or the cap never holds.
-        let is_review = m.parts.iter().any(|p| {
-            matches!(p, Part::Text { text } if text.starts_with(AUTO_REVIEW_PROMPT_START))
-        });
+        let is_review =
+            m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.starts_with(AUTO_REVIEW_PROMPT_START)));
         if is_review {
             continue;
         }
-        let is_continue = m.parts.iter().any(|p| {
-            matches!(p, Part::Text { text } if text.starts_with(TURBO_CONTINUE_PREFIX))
-        });
+        let is_continue =
+            m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.starts_with(TURBO_CONTINUE_PREFIX)));
         if is_continue {
             streak += 1;
         } else {
@@ -88,7 +84,12 @@ pub(super) fn continuation_answered_without_tools(msgs: &[Message]) -> bool {
     // Only when nothing the user wrote came after it.
     let after = &msgs[cont + 1..];
     !after.is_empty()
-        && !after.iter().any(|m| m.role == "user" && !m.parts.iter().any(|p| matches!(p, Part::Text { text } if text.starts_with("[app] ") || text.starts_with(VERIFY_PREFIX))))
+        && !after.iter().any(|m| {
+            m.role == "user"
+            && !m.parts.iter().any(
+                |p| matches!(p, Part::Text { text } if text.starts_with("[app] ") || text.starts_with(VERIFY_PREFIX)),
+            )
+        })
         && !after.iter().any(|m| m.parts.iter().any(|p| matches!(p, Part::ToolCall { .. })))
 }
 
@@ -111,7 +112,13 @@ pub(super) struct Chain {
 /// (`flag`). Deliberately NOT async: `run_agent` → spawn → `run_agent` would
 /// otherwise make their future types recursive (E0391). A sync call keeps
 /// the cycle broken. New (B-24): replaces `spawn_kick_run`.
-pub(super) fn spawn_claimed_run(st: Shared, session_id: String, user_content: String, flag: Arc<AtomicBool>, chain: Chain) {
+pub(super) fn spawn_claimed_run(
+    st: Shared,
+    session_id: String,
+    user_content: String,
+    flag: Arc<AtomicBool>,
+    chain: Chain,
+) {
     let slot = RunSlot::new(st.clone(), session_id.clone(), flag.clone());
     tokio::spawn(async move {
         run_agent_in(&st, &session_id, &user_content, flag, Some(chain)).await;
@@ -149,11 +156,9 @@ pub(super) async fn turbo_continuation(st: &Shared, session_id: &str, result: &R
         return None;
     }
     let open: Vec<String> = match st.todo_store.exec(session_id, crate::todo::TodoOp::List) {
-        crate::todo::TodoResult::Listed { items } => items
-            .iter()
-            .filter(|i| !i.completed)
-            .map(|i| format!("{} ({})", i.content, i.id))
-            .collect(),
+        crate::todo::TodoResult::Listed { items } => {
+            items.iter().filter(|i| !i.completed).map(|i| format!("{} ({})", i.content, i.id)).collect()
+        }
         _ => Vec::new(),
     };
     Some(format!(
@@ -219,7 +224,13 @@ pub async fn run_agent(st: &Shared, session_id: &str, user_content: &str, abort:
 
 /// [`run_agent`], as a turbo continuation of an earlier run (`chain`) or as
 /// a new prompt (`None`).
-pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &str, abort: Arc<AtomicBool>, chain: Option<Chain>) {
+pub(super) async fn run_agent_in(
+    st: &Shared,
+    session_id: &str,
+    user_content: &str,
+    abort: Arc<AtomicBool>,
+    chain: Option<Chain>,
+) {
     // Safety net before anything mutates the workspace. Failure is not
     // fatal — snapshotting is a convenience, the run must still work.
     record_snapshot_before_run(st, session_id).await;
@@ -230,16 +241,13 @@ pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &s
     let before = snapshot_stats(st, session_id);
     // New (P-02): fingerprint the git working tree first, so a run that only
     // ran read-only commands (ls, cargo test, git log) gets no review.
-    let tree_before = if st.cfg.agent.auto_review {
-        st.workspace_fingerprint(session_id).await
-    } else {
-        None
-    };
+    let tree_before = if st.cfg.agent.auto_review { st.workspace_fingerprint(session_id).await } else { None };
     let started = std::time::Instant::now();
     // Coarse file times: a second of slack so this run's first writes count.
     let started_at = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
     let spec = make_spec(st, session_id, user_content, &abort).await;
-    let result = agent_inner_with(st, session_id, user_content, spec.as_ref().map(crate::spec::for_model), &abort).await;
+    let result =
+        agent_inner_with(st, session_id, user_content, spec.as_ref().map(crate::spec::for_model), &abort).await;
     let (touched, bash_used) = workspace_touched(st, session_id, &before, tree_before, started_at).await;
     // The reply already streamed to clients as AssistantDelta — resending it
     // as `message` made the TUI print the whole answer a second time.
@@ -259,7 +267,9 @@ pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &s
     // it BEFORE this run returns and announce no RunFinished in between:
     // every client (headless, TUI, GUI) sees one run that ends when the
     // last continuation ends.
-    if let Some(next) = turbo_continuation(st, session_id, &result).await.filter(|_| budget.take(st, session_id, "another turbo round")) {
+    if let Some(next) =
+        turbo_continuation(st, session_id, &result).await.filter(|_| budget.take(st, session_id, "another turbo round"))
+    {
         let _ = st.events.send(ServerEvent::Note {
             session_id: session_id.to_string(),
             text: "turbo: continuing on my own — no questions, no waiting".into(),
@@ -278,10 +288,14 @@ pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &s
     if let Ok(Err(e)) = tokio::task::spawn_blocking(move || crate::gitsnap::record_after_run(&ws, &sd)).await {
         core_log(&format!("[snapshot] after run: {e:#}"));
     }
-    st.finish_run(session_id, &abort, match message {
-        None => Ok(None),
-        Some(m) => Err(m),
-    })
+    st.finish_run(
+        session_id,
+        &abort,
+        match message {
+            None => Ok(None),
+            Some(m) => Err(m),
+        },
+    )
     .await;
 }
 
@@ -289,10 +303,7 @@ pub(super) async fn run_agent_in(st: &Shared, session_id: &str, user_content: &s
 /// New (B-48): git runs off the async threads; errors go to core.log.
 async fn record_snapshot_before_run(st: &Shared, session_id: &str) {
     let (ws, sd) = (st.workspace_for_async(session_id).await, st.state_dir.clone());
-    let snap = tokio::task::spawn_blocking(move || {
-        crate::gitsnap::record_before_run(&ws, &sd, "pre-run")
-    })
-    .await;
+    let snap = tokio::task::spawn_blocking(move || crate::gitsnap::record_before_run(&ws, &sd, "pre-run")).await;
     if let Ok(Err(e)) = snap {
         core_log(&format!("[snapshot] {e:#}"));
     }
@@ -376,7 +387,12 @@ async fn checks_after_run(
     // A `review` agent already checked this run's work: a second review
     // would only repeat it at the cost of another full agent loop.
     let reviewed = crate::subagent::reviewed_since(session_id, started);
-    if ok && touched && !aborted() && !reviewed && st.cfg.agent.auto_review && !st.own_prompt_only()
+    if ok
+        && touched
+        && !aborted()
+        && !reviewed
+        && st.cfg.agent.auto_review
+        && !st.own_prompt_only()
         && budget.take(st, session_id, "the ponytail review")
     {
         let _ = st.events.send(ServerEvent::Note {
@@ -514,11 +530,7 @@ impl AppState {
 
     /// Laziness Meter report for `/debt`.
     pub fn debt_report(&self, session_id: &str) -> String {
-        let s = self
-            .stats
-            .lock()
-            .map(|m| m.get(session_id).cloned().unwrap_or_default())
-            .unwrap_or_default();
+        let s = self.stats.lock().map(|m| m.get(session_id).cloned().unwrap_or_default()).unwrap_or_default();
         format!(
             "debt this session: +{} −{} lines · {} write(s) · {} edit(s) · {} bash · \
              {} reuse hint(s). The point is fewer lines, not golf — ponytail.",
@@ -542,7 +554,9 @@ impl AppState {
         // `/mission --deep <goal>`: every step is a Deep run.
         let (deep, goal) = match goal {
             Some(g) => match g.trim_start().strip_prefix("--deep") {
-                Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => (true, Some(rest.trim().to_string())),
+                Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
+                    (true, Some(rest.trim().to_string()))
+                }
                 _ => (false, Some(g)),
             },
             None => (false, None),
@@ -619,7 +633,12 @@ impl AppState {
     /// saved and streamed as the last reply, then one `RunFinished` (an
     /// `Err` carries its message). Nothing at all when a newer run took the
     /// slot: that run reports for itself. False then.
-    pub async fn finish_run(&self, session_id: &str, flag: &Arc<AtomicBool>, outcome: std::result::Result<Option<String>, String>) -> bool {
+    pub async fn finish_run(
+        &self,
+        session_id: &str,
+        flag: &Arc<AtomicBool>,
+        outcome: std::result::Result<Option<String>, String>,
+    ) -> bool {
         if self.is_superseded(session_id, flag).await {
             return false;
         }
@@ -821,9 +840,7 @@ pub(super) async fn agent_inner_with(
                     db.add_message(
                         &sid,
                         "system",
-                        &[Part::Text {
-                            text: format!("[slash command `/{}` expanded]\n{}", doc.name, rendered),
-                        }],
+                        &[Part::Text { text: format!("[slash command `/{}` expanded]\n{}", doc.name, rendered) }],
                     )?;
                 }
                 Ok((st2.composed_system(&sid), st2.run_workspace(&sid)))
