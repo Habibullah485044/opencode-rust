@@ -66,8 +66,14 @@ pub(super) fn gui_command(gs: &mut GuiState, st: &Arc<server::AppState>, rt: &to
             say(gs, format!("Model switched to {arg} (until restart; Settings keeps it)."));
         }
         "usage" => {
-            let report = st.usage_report(&sid);
-            say(gs, report);
+            // T-070: the report builds the whole system prompt (repo map,
+            // skills) and runs three queries — not on the GUI thread. It
+            // comes back as a note, like /compact's.
+            let (st2, sid2) = (st.clone(), sid.clone());
+            rt.spawn_blocking(move || {
+                let text = st2.usage_report(&sid2);
+                let _ = st2.events.send(ServerEvent::Note { session_id: sid2, text });
+            });
         }
         "compact" => {
             let st2 = st.clone();
@@ -197,6 +203,20 @@ mod tests {
         assert_eq!(st.mode_for(&s.id), crate::agents::AgentMode::Plan);
         assert!(gui_command(&mut gs, &st, &rt, "/clear"));
         assert_eq!(gs.entries.len(), 1, "only the 'cleared' note is left");
+        // T-070: /usage is built off this thread and comes back as a note.
+        let mut events = st.events.subscribe();
+        assert!(gui_command(&mut gs, &st, &rt, "/usage"));
+        let note = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Ok(ServerEvent::Note { session_id, text }) = events.recv().await {
+                    break (session_id, text);
+                }
+            }
+        })
+        .await
+        .expect("the usage note arrived");
+        assert_eq!(note.0, s.id);
+        assert!(!note.1.is_empty());
         assert!(!gui_command(&mut gs, &st, &rt, "/deploy staging"), "a project command goes to the core");
         assert!(!gui_command(&mut gs, &st, &rt, "fix the bug"));
         assert_eq!(find_project_files(&dir, "APP", 5), vec!["src/app.js".to_string()]);
