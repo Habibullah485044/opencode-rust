@@ -248,6 +248,7 @@ fn initial_state(state: &server::AppState, session: &crate::db::Session) -> GuiS
     if session.project_id.is_none() {
         if let Some(p) = &gs.default_project {
             let _ = state.db.set_session_project(&session.id, Some(p));
+            state.forget_workspaces(); // T-149
         }
     }
     gs.editors = find_editors().into_iter().map(|(n, _)| n.to_string()).collect();
@@ -335,7 +336,7 @@ mod tests {
     fn gui_diagnostics_reach_core_log() {
         let marker = format!("[gui] page error: t057-{}-{}", std::process::id(), dispatch::epoch_ms());
         gui_log(&marker);
-        let log = std::fs::read_to_string(crate::config::default_state_dir().join("core.log")).unwrap_or_default();
+        let log = std::fs::read_to_string(server::core_log_path()).unwrap_or_default();
         assert!(log.contains(&marker), "core.log has the line");
     }
 }

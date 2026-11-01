@@ -1,7 +1,7 @@
 //! `--headless`: run one prompt (or one builtin command) without the TUI,
 //! print the result, exit.
 
-use super::shared;
+use opencode_rust::frontend;
 use anyhow::{Context, Result};
 use opencode_rust::{agents::AgentMode, commands::Command as Cmd, server};
 use std::io::Write;
@@ -96,7 +96,7 @@ async fn run_command(state: &State, sid: &str, cmd: Cmd) -> Outcome {
         Cmd::Quit => {}
         Cmd::Edit { path, instruction } => inline_edit(state, sid, &path, &instruction).await,
         Cmd::Team(goal) => {
-            shared::kick_team(state, sid.to_string(), goal).await;
+            frontend::kick_team(state, sid.to_string(), goal).await;
             return Outcome::RunStarted;
         }
         // M6: discoverability + control commands, straight to stdout.
@@ -163,7 +163,7 @@ async fn run_command(state: &State, sid: &str, cmd: Cmd) -> Outcome {
                 effort,
                 goal,
             };
-            shared::start_mission(state, sid.to_string(), mission, false).await;
+            frontend::start_mission(state, sid.to_string(), mission, false).await;
             return Outcome::RunStarted;
         }
         Cmd::MissionCtl(what) => match what.as_str() {
@@ -171,11 +171,11 @@ async fn run_command(state: &State, sid: &str, cmd: Cmd) -> Outcome {
                 state.kick_mission(sid.to_string(), None).await;
                 return Outcome::RunStarted;
             }
-            "status" => println!("{}", server::mission_report(state, sid)),
+            "status" => println!("{}", server::mission_report(state, sid).await),
             _ => println!("a headless run has no mission running to stop"),
         },
         Cmd::Turbo { prompt } => {
-            let on = shared::switch_turbo(state, prompt.is_some());
+            let on = frontend::switch_turbo(state, prompt.is_some());
             println!(
                 "[turbo] {}",
                 if on { "ON — full access, runs continue on their own" } else { "off" }
@@ -211,7 +211,7 @@ async fn run_command(state: &State, sid: &str, cmd: Cmd) -> Outcome {
 async fn snapshot(state: &State, redo: bool, force: bool) {
     let verb = if redo { "redo" } else { "undo" };
     let res =
-        shared::run_snapshot(state.workspace.clone(), state.state_dir.clone(), redo, force).await;
+        frontend::run_snapshot(state.workspace.clone(), state.state_dir.clone(), redo, force).await;
     match res {
         Ok(Ok(Some(m))) => println!(
             "[{verb}] restored snapshot {} ({}, {} file(s))",
