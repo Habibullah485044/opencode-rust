@@ -106,39 +106,30 @@ fn run() -> Result<()> {
         }
     }
 
+    // A bad option value stops here, before the config is even read: it
+    // used to be dropped silently (`--port abc` ran on a random port).
+    let overrides = cli_overrides(&args).unwrap_or_else(|msg| usage_error(&msg));
+    // Positional prompt: every word that is not an option or an option's
+    // value, joined with spaces. New (B-07): see `positional_prompt`.
+    let prompt: Option<String> = positional_prompt(&args).unwrap_or_else(|msg| usage_error(&msg));
+
     let workspace = std::env::current_dir().context("determining cwd")?;
     let mut cfg = Config::load(&workspace)?;
 
     // --headless: run the agent once from CLI args, no TUI.
     let headless = args.iter().any(|a| a == "--headless");
-    // --gui: the desktop app (egui shell) instead of the terminal UI.
+    // --gui: the desktop app (wry/WebView2 window) instead of the terminal UI.
     let gui = args.iter().any(|a| a == "--gui");
-    // --port N overrides config port.
-    if let Some(i) = args.iter().position(|a| a == "--port") {
-        if let Some(p) = args.get(i + 1).and_then(|s| s.parse::<u16>().ok()) {
-            cfg.server.port = p;
-        }
+    // --port N / --model / --base-url quick overrides.
+    if let Some(p) = overrides.port {
+        cfg.server.port = p;
     }
-    // --model / --base-url quick overrides.
-    if let Some(i) = args.iter().position(|a| a == "--model") {
-        if let Some(m) = args.get(i + 1) {
-            cfg.provider.model = m.clone();
-        }
+    if let Some(m) = overrides.model {
+        cfg.provider.model = m;
     }
-    if let Some(i) = args.iter().position(|a| a == "--base-url") {
-        if let Some(u) = args.get(i + 1) {
-            cfg.provider.base_url = u.clone();
-        }
+    if let Some(u) = overrides.base_url {
+        cfg.provider.base_url = u;
     }
-    // Positional prompt: every word that is not an option or an option's
-    // value, joined with spaces. New (B-07): see `positional_prompt`.
-    let prompt: Option<String> = match positional_prompt(&args) {
-        Ok(p) => p,
-        Err(msg) => {
-            eprintln!("{msg}\nRun `opencode-rust --help` for the list of options.");
-            std::process::exit(2);
-        }
-    };
 
     // The desktop app without a provider opens its Settings page instead of
     // failing: started from a shortcut there is nobody to read an error.
@@ -232,6 +223,48 @@ fn positional_prompt(args: &[String]) -> Result<Option<String>, String> {
     Ok(if prompt.trim().is_empty() { None } else { Some(prompt) })
 }
 
+/// A command-line mistake: say what and exit with code 2.
+fn usage_error(msg: &str) -> ! {
+    eprintln!("{msg}\nRun `opencode-rust --help` for the list of options.");
+    std::process::exit(2);
+}
+
+/// Config overrides from the command line.
+#[derive(Debug, Default, PartialEq)]
+struct CliOverrides {
+    port: Option<u16>,
+    model: Option<String>,
+    base_url: Option<String>,
+}
+
+/// T-031: `--port`, `--model`, `--base-url` (and `--timeout`, read later by
+/// the headless runner), checked. Err = an option with no value or a value
+/// that does not parse, e.g. "invalid value for --port: abc".
+fn cli_overrides(args: &[String]) -> Result<CliOverrides, String> {
+    let port = option_value(args, "--port")?
+        .map(|v| v.parse::<u16>().map_err(|_| format!("invalid value for --port: {v}")))
+        .transpose()?;
+    if let Some(v) = option_value(args, "--timeout")? {
+        v.trim().parse::<u64>().map_err(|_| format!("invalid value for --timeout: {v}"))?;
+    }
+    Ok(CliOverrides {
+        port,
+        model: option_value(args, "--model")?.map(str::to_string),
+        base_url: option_value(args, "--base-url")?.map(str::to_string),
+    })
+}
+
+/// The value after `flag` (options end at `--`). Err = the option is the
+/// last word or is followed by another option.
+fn option_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
+    let opts = args.iter().position(|a| a == "--").map_or(args, |end| &args[..end]);
+    let Some(i) = opts.iter().position(|a| a == flag) else { return Ok(None) };
+    match opts.get(i + 1) {
+        Some(v) if !v.starts_with("--") && !v.is_empty() => Ok(Some(v)),
+        _ => Err(format!("missing value for {flag}")),
+    }
+}
+
 fn print_help() {
     println!(
         "opencode-rust {} — lightweight terminal AI coding agent
@@ -297,10 +330,29 @@ M4:
 
 #[cfg(test)]
 mod cli_args_tests {
-    use super::positional_prompt;
+    use super::{cli_overrides, positional_prompt, CliOverrides};
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn bad_option_values_are_errors() {
+        let ok = cli_overrides(&args(&["--port", "4000", "--model", "m", "--base-url", "http://x/v1", "hi"])).unwrap();
+        assert_eq!(
+            ok,
+            CliOverrides { port: Some(4000), model: Some("m".into()), base_url: Some("http://x/v1".into()) }
+        );
+        assert_eq!(cli_overrides(&args(&["hi"])).unwrap(), CliOverrides::default());
+        let err = |a: &[&str]| cli_overrides(&args(a)).unwrap_err();
+        assert_eq!(err(&["--port", "abc"]), "invalid value for --port: abc");
+        assert_eq!(err(&["--port", "70000"]), "invalid value for --port: 70000");
+        assert_eq!(err(&["--timeout", "soon"]), "invalid value for --timeout: soon");
+        assert_eq!(err(&["--model"]), "missing value for --model");
+        assert_eq!(err(&["--base-url", "--headless"]), "missing value for --base-url");
+        assert_eq!(err(&["--port", "--", "hi"]), "missing value for --port");
+        // After `--` it is prompt text, not an option.
+        assert_eq!(cli_overrides(&args(&["--", "--port", "abc"])).unwrap(), CliOverrides::default());
     }
 
     #[test]
