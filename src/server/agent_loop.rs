@@ -779,7 +779,7 @@ async fn read_reply(
                 }
             }
             StreamEvent::Usage(u) => {
-                st.record_usage_as(if opts.agent.is_some() { "subagent" } else { usage_tag().0 }, session_id, model, u);
+                st.record_usage_as_async(if opts.agent.is_some() { "subagent" } else { usage_tag().0 }, session_id, model, u).await;
                 request_usage = Some(*u);
             }
             StreamEvent::Done { finish_reason: fr } => {

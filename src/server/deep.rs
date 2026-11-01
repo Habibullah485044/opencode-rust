@@ -319,7 +319,7 @@ async fn run_attempt(
             cache_write: u.cache_write,
             output: u.output,
         };
-        st.record_usage_as("deep attempt", session_id, &st.current_model().await, &usage);
+        st.record_usage_as_async("deep attempt", session_id, &st.current_model().await, &usage).await;
     }
     (res, u.input + u.output)
 }

@@ -50,39 +50,15 @@ impl AppState {
     /// Save one reply's token counts (`/usage`, the usage dashboard) and tell
     /// the UIs. What it was for comes from the [`USAGE_TAG`] scope it runs
     /// in; a call outside a chat (planning, edits) takes the scope's chat.
-    pub fn record_usage(&self, session_id: &str, model: &str, u: &crate::provider::Usage) {
-        let tag = usage_tag();
-        let session_id = if session_id.is_empty() { tag.1.as_deref().unwrap_or("") } else { session_id };
-        self.record_usage_as(tag.0, session_id, model, u);
-    }
-
-    /// [`AppState::record_usage`] with the purpose given.
-    pub fn record_usage_as(&self, purpose: &str, session_id: &str, model: &str, u: &crate::provider::Usage) {
-        if let Err(e) = self.db.add_usage_entry(session_id, model, purpose, u) {
-            core_log(&format!("[core] saving token usage failed: {e}"));
-            return;
-        }
-        if session_id.is_empty() {
-            return;
-        }
-        let session = self.db.usage_totals(Some(session_id), None).unwrap_or_default();
-        let _ = self.events.send(ServerEvent::Usage {
-            session_id: session_id.to_string(),
-            last: *u,
-            session,
-        });
-    }
-
-    /// T-007: [`AppState::record_usage`] for async code: the save and the
-    /// totals in one trip to the blocking pool, then the event.
+    /// T-007: the save and the totals in one trip to the blocking pool,
+    /// then the event.
     pub async fn record_usage_async(&self, session_id: &str, model: &str, u: &crate::provider::Usage) {
         let tag = usage_tag();
         let session_id = if session_id.is_empty() { tag.1.as_deref().unwrap_or("") } else { session_id };
         self.record_usage_as_async(tag.0, session_id, model, u).await;
     }
 
-    /// T-007: [`AppState::record_usage_as`] for async code (see above). The
-    /// sync one stays for the callers that are not async yet.
+    /// [`AppState::record_usage_async`] with the purpose given.
     pub async fn record_usage_as_async(&self, purpose: &str, session_id: &str, model: &str, u: &crate::provider::Usage) {
         let (purpose, sid, model, usage) = (purpose.to_string(), session_id.to_string(), model.to_string(), *u);
         let saved = self
