@@ -823,6 +823,24 @@ impl Db {
         Ok(s)
     }
 
+    /// T-151: chat `id` and the chats above it, as (chat, its parent), from
+    /// `id` upwards, at most `max` rows, in one query. Empty for an
+    /// unknown chat; a parent that is not saved ends the chain.
+    pub fn parent_chain(&self, id: &str, max: usize) -> Result<Vec<(String, Option<String>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE chain(id, parent_id, depth) AS (
+                 SELECT id, parent_id, 1 FROM sessions WHERE id=?1
+                 UNION ALL
+                 SELECT s.id, s.parent_id, c.depth + 1 FROM sessions s JOIN chain c ON s.id = c.parent_id
+                 WHERE c.depth < ?2
+             )
+             SELECT id, parent_id FROM chain ORDER BY depth",
+        )?;
+        let rows = stmt.query_map(params![id, max as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn add_message(&self, session_id: &str, role: &str, parts: &[Part]) -> Result<Message> {
         self.insert_message(session_id, role, parts, now_ms())
     }

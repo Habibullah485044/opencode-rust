@@ -125,7 +125,7 @@ pub(super) fn spawn_claimed_run(st: Shared, session_id: String, user_content: St
 /// work: asking is the one thing turbo must respect. The model is blocked
 /// on the user, and pushing it to "decide for yourself" produces guesses.
 pub(super) async fn turbo_continuation(st: &Shared, session_id: &str, result: &Result<LoopEnd>) -> Option<String> {
-    if st.perm_mode_for(session_id) != PermissionMode::Turbo || !matches!(result, Ok(LoopEnd::Done(_))) {
+    if st.perm_mode_for_async(session_id).await != PermissionMode::Turbo || !matches!(result, Ok(LoopEnd::Done(_))) {
         return None;
     }
     if !todos_open(st, session_id) {

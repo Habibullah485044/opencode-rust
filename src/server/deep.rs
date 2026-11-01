@@ -138,7 +138,7 @@ pub(super) async fn run_deep(
     let wts = trees.get();
 
     // The chat's mode: a mission's step runs as turbo.
-    let mode = st.perm_mode_for(session_id);
+    let mode = st.perm_mode_for_async(session_id).await;
     let can_run_commands = mode == PermissionMode::Turbo;
     let cfg = attempt_config(st, can_run_commands).await;
     let infos = attempt_infos(session_id, task, n);

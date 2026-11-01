@@ -581,7 +581,7 @@ async fn forget_session_clears_every_per_chat_map() {
     FROZEN_LESSONS.get_or_init(Default::default).lock().unwrap().insert(id.clone(), None);
     COMPACT_FAILED_AT.get_or_init(Default::default).lock().unwrap().insert(id.clone(), 3);
     let _ = st.workspace_for(&id);
-    let _ = st.parent_of(&id);
+    st.load_parents(&id);
     assert!(st.workspaces.lock().unwrap().contains_key(&id));
     assert_eq!(st.parents.lock().unwrap().get(&id), Some(&Some(parent.id.clone())));
 
@@ -3540,4 +3540,28 @@ async fn permission_check_reads_approvals_once_per_call() {
     let decided = super::tool_exec::decided_without_prompt(&st, &st.db, "s1", "bash", "ls && pwd && whoami");
     assert_eq!(crate::db::APPROVAL_QUERIES.with(|n| n.get()), 1, "one approvals query per tool call");
     assert_eq!(decided, Some(true), "the saved approval still counts");
+}
+
+/// T-151: a chat's parents are read in one query and cached, so a grant on
+/// a grandparent counts and the next check needs no database.
+#[tokio::test]
+async fn auto_approval_reads_the_parent_chain_at_once() {
+    let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+    let top = st.db.create_session("mission", None).unwrap();
+    let step = st.db.create_session("step", Some(&top.id)).unwrap();
+    let agent = st.db.create_session("agent", Some(&step.id)).unwrap();
+    let other = st.db.create_session("other", None).unwrap();
+    let grant = st.auto_approve_session(&top.id);
+    assert_eq!(st.perm_mode_for_async(&agent.id).await, PermissionMode::Turbo);
+    {
+        let parents = st.parents.lock().unwrap();
+        assert_eq!(parents.get(&agent.id), Some(&Some(step.id.clone())));
+        assert_eq!(parents.get(&step.id), Some(&Some(top.id.clone())), "the whole chain is cached");
+        assert_eq!(parents.get(&top.id), Some(&None));
+    }
+    assert_eq!(st.perm_mode_for_async(&other.id).await, PermissionMode::Default);
+    assert_eq!(st.perm_mode_for_async("ses_unknown").await, PermissionMode::Default);
+    assert!(!st.parents.lock().unwrap().contains_key("ses_unknown"), "an unknown chat is not cached");
+    drop(grant);
+    assert_eq!(st.perm_mode_for_async(&agent.id).await, PermissionMode::Default);
 }

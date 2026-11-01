@@ -467,7 +467,7 @@ pub(crate) async fn run_loop_inner(
 ) -> Result<LoopEnd> {
     let mode = st.mode_for(session_id);
     // A mission's chats run like turbo without the user's mode being turbo.
-    let turbo = st.perm_mode_for(session_id) == PermissionMode::Turbo;
+    let turbo = st.perm_mode_for_async(session_id).await == PermissionMode::Turbo;
     // F-09: one loop guard per run (a spawned subagent has its own).
     let mut loop_guard = LoopGuard::default();
     // Replies that only said what the model would do next (see `announces_work`).

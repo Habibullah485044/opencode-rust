@@ -304,6 +304,9 @@ pub type Shared = Arc<AppState>;
 /// streamed text piece is one event, so 256 was easy to overrun.
 pub const EVENT_BUFFER: usize = 4096;
 
+/// How far up a chat's parents an auto-approval is looked for.
+const MAX_CHAT_DEPTH: usize = 16;
+
 impl AppState {
     /// New (B-09): every approval request still waiting for an answer, as
     /// the `ApprovalNeeded` events that announced them. A client that fell
@@ -523,7 +526,9 @@ impl AppState {
 
     /// The mode chat `session_id` runs in: the user's mode, or Turbo while
     /// the chat (or a chat it was started from) holds an [`AutoApprove`]
-    /// grant. Deny rules still apply in every mode.
+    /// grant. Deny rules still apply in every mode. This one may read the
+    /// database: call it on a blocking thread (async code uses
+    /// [`AppState::perm_mode_for_async`]).
     pub fn perm_mode_for(&self, session_id: &str) -> PermissionMode {
         let mode = self.perm_mode();
         if mode != PermissionMode::Turbo && self.auto_approved(session_id) {
@@ -532,38 +537,75 @@ impl AppState {
         mode
     }
 
-    /// Does `session_id` or one of its parent chats hold an auto-approval?
-    fn auto_approved(&self, session_id: &str) -> bool {
-        let granted: Vec<String> = match self.auto_approve.lock() {
-            Ok(m) if !m.is_empty() => m.keys().cloned().collect(),
-            _ => return false,
-        };
-        let mut id = session_id.to_string();
-        // Missions nest a few levels (step → subagent); a cycle cannot loop.
-        for _ in 0..16 {
-            if granted.contains(&id) {
-                return true;
-            }
-            match self.parent_of(&id) {
-                Some(parent) => id = parent,
-                None => return false,
-            }
+    /// T-151: [`AppState::perm_mode_for`] for async code: a parent chain
+    /// that is not cached yet is read in one trip to the blocking pool.
+    pub async fn perm_mode_for_async(&self, session_id: &str) -> PermissionMode {
+        let mode = self.perm_mode();
+        if mode == PermissionMode::Turbo {
+            return mode;
         }
-        false
+        let Some(granted) = self.granted_chats() else { return mode };
+        let approved = match self.granted_in_chain(&granted, session_id) {
+            Ok(found) => found,
+            Err(miss) => {
+                let chain = self.db.run(move |db| db.parent_chain(&miss, MAX_CHAT_DEPTH)).await.unwrap_or_default();
+                self.remember_parents(chain);
+                self.granted_in_chain(&granted, session_id).unwrap_or(false)
+            }
+        };
+        if approved { PermissionMode::Turbo } else { mode }
     }
 
-    /// The chat `session_id` was started from, from the [`AppState::parents`]
-    /// cache; a miss asks the database once. An unknown chat or a failed
-    /// read is not cached (the chat may not be written yet).
-    fn parent_of(&self, session_id: &str) -> Option<String> {
-        if let Some(known) = self.parents.lock().ok().and_then(|m| m.get(session_id).cloned()) {
-            return known;
+    /// Does `session_id` or one of its parent chats hold an auto-approval?
+    fn auto_approved(&self, session_id: &str) -> bool {
+        let Some(granted) = self.granted_chats() else { return false };
+        match self.granted_in_chain(&granted, session_id) {
+            Ok(found) => found,
+            Err(miss) => {
+                self.load_parents(&miss);
+                self.granted_in_chain(&granted, session_id).unwrap_or(false)
+            }
         }
-        let parent = self.db.get_session(session_id).ok().flatten()?.parent_id;
+    }
+
+    /// The chats holding an [`AutoApprove`] grant; `None` when there are none.
+    fn granted_chats(&self) -> Option<Vec<String>> {
+        match self.auto_approve.lock() {
+            Ok(m) if !m.is_empty() => Some(m.keys().cloned().collect()),
+            _ => None,
+        }
+    }
+
+    /// Walk from `session_id` up through the [`AppState::parents`] cache:
+    /// is one of the chats in `granted`? `Err(chat)` = that chat's parent
+    /// is not cached yet.
+    fn granted_in_chain(&self, granted: &[String], session_id: &str) -> std::result::Result<bool, String> {
+        let mut id = session_id.to_string();
+        // Missions nest a few levels (step → subagent); a cycle cannot loop.
+        for _ in 0..MAX_CHAT_DEPTH {
+            if granted.contains(&id) {
+                return Ok(true);
+            }
+            match self.parents.lock().ok().and_then(|m| m.get(&id).cloned()) {
+                Some(Some(parent)) => id = parent,
+                Some(None) => return Ok(false),
+                None => return Err(id),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Cache the parents of chat `session_id` and the chats above it, read
+    /// in one query. An unknown chat or a failed read is not cached (the
+    /// chat may not be written yet).
+    fn load_parents(&self, session_id: &str) {
+        self.remember_parents(self.db.parent_chain(session_id, MAX_CHAT_DEPTH).unwrap_or_default());
+    }
+
+    fn remember_parents(&self, chain: Vec<(String, Option<String>)>) {
         if let Ok(mut m) = self.parents.lock() {
-            m.insert(session_id.to_string(), parent.clone());
+            m.extend(chain);
         }
-        parent
     }
 
     /// Automatic approvals for chat `session_id` and its child chats until
