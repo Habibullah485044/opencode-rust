@@ -194,15 +194,38 @@ async fn review(st: &Shared, m: &Mission, n: usize, receipt: &str, abort: &Atomi
     }
 }
 
-/// The chat's mission, which must exist by now.
-fn current(st: &Shared, session_id: &str) -> Result<Mission> {
-    st.db.mission(session_id)?.ok_or_else(|| anyhow::anyhow!("the mission of this chat is gone (was the chat deleted?)"))
+/// The chat's mission, which must exist by now. T-012: read off the async
+/// threads.
+async fn current(st: &Shared, session_id: &str) -> Result<Mission> {
+    let sid = session_id.to_string();
+    st.db.run(move |db| db.mission(&sid)).await.and_then(gone_if_none)
 }
 
-/// Tell the chat: a line in the transcript and a live event.
-fn say(st: &Shared, session_id: &str, text: String) {
-    let _ = st.db.add_message(session_id, "assistant", &[Part::Text { text: text.clone() }]);
+/// A mission that is gone (the chat was deleted mid-run) as an error.
+fn gone_if_none(m: Option<Mission>) -> Result<Mission> {
+    m.ok_or_else(|| anyhow::anyhow!("the mission of this chat is gone (was the chat deleted?)"))
+}
+
+/// Tell the chat: a line in the transcript and a live event. T-012: saved
+/// off the async threads. T-060: a note that could not be saved is missing
+/// from the history, so the failure goes to core.log.
+async fn say(st: &Shared, session_id: &str, text: String) {
+    if let Err(e) = save_message(st, session_id, "assistant", vec![Part::Text { text: text.clone() }]).await {
+        core_log(&format!("[mission] saving a note in {session_id} failed: {e:#}"));
+    }
     let _ = st.events.send(ServerEvent::AssistantDelta { session_id: session_id.to_string(), text: format!("{text}\n\n") });
+}
+
+/// [`Db::mission_step_update`] off the async threads (no child chat change).
+async fn update_step(st: &Shared, id: i64, status: &'static str, attempts: i64, result: &str) -> Result<()> {
+    let result = result.to_string();
+    st.db.run(move |db| db.mission_step_update(id, status, attempts, &result, None)).await
+}
+
+/// A new child chat of the mission's chat, made off the async threads.
+async fn child_chat(st: &Shared, session_id: &str, title: &str) -> Result<Session> {
+    let (sid, title) = (session_id.to_string(), title.to_string());
+    st.db.run(move |db| db.create_session(&title, Some(&sid))).await
 }
 
 /// Start a new mission (`goal: Some`) or carry on with the chat's mission
@@ -226,14 +249,25 @@ pub(super) async fn run_mission(
     if let Some(goal) = goal {
         start_mission(st, session_id, goal, deep, &ws, abort, &note).await?;
     } else {
-        let Some(m) = st.db.mission(session_id)? else {
+        // T-014: read and mark running in one trip off the async threads.
+        let sid = session_id.to_string();
+        let found = st
+            .db
+            .run(move |db| {
+                let m = db.mission(&sid)?;
+                if m.as_ref().is_some_and(|m| m.status != "done") {
+                    db.mission_set_status(&sid, "running")?;
+                }
+                Ok(m)
+            })
+            .await?;
+        let Some(m) = found else {
             anyhow::bail!("this chat has no mission to resume; start one with /mission <goal>");
         };
         if m.status == "done" {
             return Ok("This mission is already complete.".into());
         }
         deep = m.deep;
-        st.db.mission_set_status(session_id, "running")?;
         note(format!("mission: resuming — {} step(s) left", m.steps.iter().filter(|s| s.status != "done" && s.status != "failed").count()));
     }
 
@@ -260,8 +294,15 @@ pub(super) async fn run_mission(
         Err(_) if abort.load(Ordering::SeqCst) => "stopped",
         Err(_) => "paused",
     };
-    st.db.mission_set_status(session_id, status)?;
-    let m = current(st, session_id)?;
+    let sid = session_id.to_string();
+    let m = st
+        .db
+        .run(move |db| {
+            db.mission_set_status(&sid, status)?;
+            db.mission(&sid)
+        })
+        .await
+        .and_then(gone_if_none)?;
     Ok(mission_summary(&m, status, &result, &checked))
 }
 
@@ -275,7 +316,7 @@ async fn start_mission(
     abort: &Arc<AtomicBool>,
     note: &impl Fn(String),
 ) -> Result<()> {
-    st.db.add_message(session_id, "user", &[Part::Text { text: format!("[mission] {goal}") }])?;
+    save_message(st, session_id, "user", vec![Part::Text { text: format!("[mission] {goal}") }]).await?;
     // The goal is kept with its spec: the plan, every step brief and the
     // coordinator see the done-when checks, and the final check proves them.
     let spec = make_spec(st, session_id, goal, abort).await;
@@ -285,10 +326,17 @@ async fn start_mission(
     if abort.load(Ordering::SeqCst) {
         anyhow::bail!("aborted");
     }
-    st.db.mission_start(session_id, &goal, &steps, deep)?;
-    let m = current(st, session_id)?;
+    let (sid, saved_goal) = (session_id.to_string(), goal.clone());
+    let m = st
+        .db
+        .run(move |db| {
+            db.mission_start(&sid, &saved_goal, &steps, deep)?;
+            db.mission(&sid)
+        })
+        .await
+        .and_then(gone_if_none)?;
     let shown = spec.as_ref().map(|s| format!("{}\n\n", crate::spec::for_user(s))).unwrap_or_default();
-    say(st, session_id, format!("{shown}**Mission plan** — I keep working until it is done:\n{}", plan_text(&m)));
+    say(st, session_id, format!("{shown}**Mission plan** — I keep working until it is done:\n{}", plan_text(&m))).await;
     Ok(())
 }
 
@@ -303,9 +351,9 @@ async fn checks_after_mission(
 ) -> Result<String> {
     let mut checked = String::new();
     if st.cfg.agent.final_check {
-        let goal = st.db.mission(session_id)?.map(|m| m.goal).unwrap_or_default();
+        let goal = current(st, session_id).await.map(|m| m.goal).unwrap_or_default();
         if let Some(spec) = crate::spec::from_goal(&goal) {
-            let child = st.db.create_session("mission final check", Some(session_id))?;
+            let child = child_chat(st, session_id, "mission final check").await?;
             let passed = final_check(st, &child.id, &spec, abort, None).await;
             checked = match passed {
                 Some(true) => "\nFinal check: every done-when item proven.".into(),
@@ -317,9 +365,9 @@ async fn checks_after_mission(
     // The pages the mission changed, judged by eye (a mission is where the
     // biggest sites get built, and it skipped this until the wiring audit).
     if !abort.load(Ordering::SeqCst) {
-        let goal = st.db.mission(session_id)?.map(|m| m.goal).unwrap_or_default();
+        let goal = current(st, session_id).await.map(|m| m.goal).unwrap_or_default();
         let spec = crate::spec::from_goal(&goal);
-        let child = st.db.create_session("mission design review", Some(session_id))?;
+        let child = child_chat(st, session_id, "mission design review").await?;
         if design_review(st, &child.id, &goal, spec.as_ref(), mission_started, true, abort, None).await.is_some() {
             checked.push_str("\nDesign review: done — see the design review chat.");
         }
@@ -360,7 +408,7 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
         if abort.load(Ordering::SeqCst) {
             anyhow::bail!("aborted");
         }
-        let m = current(st, session_id)?;
+        let m = current(st, session_id).await?;
         let Some((i, step)) = m.steps.iter().enumerate().find(|(_, s)| s.status == "pending" || s.status == "working") else {
             return Ok(true);
         };
@@ -371,8 +419,17 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
         let n = i + 1;
         let step = step.clone();
         let attempts = step.attempts + 1;
-        let child = st.db.create_session(&format!("mission step {n}"), Some(session_id))?;
-        st.db.mission_step_update(step.id, "working", attempts, &step.result, Some(&child.id))?;
+        // T-013: the step's chat and its "working" mark in one trip off the
+        // async threads.
+        let (sid, step_id, kept) = (session_id.to_string(), step.id, step.result.clone());
+        let child = st
+            .db
+            .run(move |db| {
+                let child = db.create_session(&format!("mission step {n}"), Some(&sid))?;
+                db.mission_step_update(step_id, "working", attempts, &kept, Some(&child.id))?;
+                Ok(child)
+            })
+            .await?;
         let info = AgentInfo {
             id: child.id.clone(),
             parent: session_id.to_string(),
@@ -380,23 +437,23 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
             task: step.title.clone(),
         };
         agent_status(st, &info, "working", if attempts > 1 { format!("try {attempts}") } else { "starting…".into() });
-        let m_now = current(st, session_id)?;
+        let m_now = current(st, session_id).await?;
         let brief = step_brief(&m_now, n, &step, redo_reason.as_deref());
         // No slack: files the previous step wrote a moment ago must not
         // count as this step's (they would show up in its receipt).
         let since = std::time::SystemTime::now();
         let run = tagged("mission step", &child.id, run_step(st, &child.id, &brief, deep, abort)).await;
         if abort.load(Ordering::SeqCst) {
-            put_step_back(st, &step, attempts, &info)?;
+            put_step_back(st, &step, attempts, &info).await?;
             anyhow::bail!("aborted");
         }
         let report = match &run {
-            Ok(_) => last_assistant_text(st, &child.id).unwrap_or_else(|| "(no report)".into()),
+            Ok(_) => last_assistant_text(st, &child.id).await.unwrap_or_else(|| "(no report)".into()),
             Err(e) => format!("the step run failed: {e:#}"),
         };
         if run.is_err() {
             errors += 1;
-            st.db.mission_step_update(step.id, "pending", attempts - 1, &report, None)?;
+            update_step(st, step.id, "pending", attempts - 1, &report).await?;
             agent_status(st, &info, "failed", report.chars().take(120).collect());
             if errors >= MAX_ERRORS_IN_A_ROW {
                 anyhow::bail!("{errors} step runs failed in a row ({})", report.chars().take(200).collect::<String>());
@@ -413,18 +470,25 @@ async fn steps_loop(st: &Shared, session_id: &str, ws: &std::path::Path, deep: b
         };
         let proof = prove_step_check(st, &child.id, &info, &step.title, abort).await;
         if abort.load(Ordering::SeqCst) {
-            put_step_back(st, &step, attempts, &info)?;
+            put_step_back(st, &step, attempts, &info).await?;
             anyhow::bail!("aborted");
         }
         let receipt = step_receipt(ws, &report, &files, &checks, proof, &step.title);
         // The coordinator sees this step as the one just worked on.
-        st.db.mission_step_update(step.id, "working", attempts, &receipt, None)?;
-        let m = current(st, session_id)?;
+        let (sid, step_id, saved) = (session_id.to_string(), step.id, receipt.clone());
+        let m = st
+            .db
+            .run(move |db| {
+                db.mission_step_update(step_id, "working", attempts, &saved, None)?;
+                db.mission(&sid)
+            })
+            .await
+            .and_then(gone_if_none)?;
         let verdict = tagged("mission planning", session_id, review(st, &m, n, &receipt, abort)).await;
         let first_line: String = report.trim().lines().next().unwrap_or("").chars().take(200).collect();
         let done = StepDone { step: &step, n, attempts, receipt: &receipt, first_line: &first_line, info: &info };
         redo_reason = None;
-        if apply_verdict(st, session_id, &m, &done, verdict, &mut redo_reason)? {
+        if apply_verdict(st, session_id, &m, &done, verdict, &mut redo_reason).await? {
             return Ok(true);
         }
     }
@@ -437,7 +501,7 @@ async fn run_step(st: &Shared, child_id: &str, brief: &str, deep: bool, abort: &
         match super::deep::run_deep(st, child_id, brief, st.cfg.agent.deep_attempts, abort).await {
             Ok(summary) => {
                 if !summary.is_empty() {
-                    st.db.add_message(child_id, "assistant", &[Part::Text { text: summary.clone() }])?;
+                    save_message(st, child_id, "assistant", vec![Part::Text { text: summary.clone() }]).await?;
                 }
                 Ok(summary)
             }
@@ -450,8 +514,8 @@ async fn run_step(st: &Shared, child_id: &str, brief: &str, deep: bool, abort: &
 }
 
 /// A stopped step goes back to pending, its try not counted.
-fn put_step_back(st: &Shared, step: &MissionStep, attempts: i64, info: &AgentInfo) -> Result<()> {
-    st.db.mission_step_update(step.id, "pending", attempts - 1, &step.result, None)?;
+async fn put_step_back(st: &Shared, step: &MissionStep, attempts: i64, info: &AgentInfo) -> Result<()> {
+    update_step(st, step.id, "pending", attempts - 1, &step.result).await?;
     agent_status(st, info, "failed", "stopped".into());
     Ok(())
 }
@@ -540,44 +604,49 @@ struct StepDone<'a> {
 
 /// Act on the coordinator's verdict for a worked step. `Ok(true)` = the
 /// goal is reached. A redo leaves its reason in `redo_reason`.
-fn apply_verdict(
+async fn apply_verdict(
     st: &Shared,
     session_id: &str,
     m: &Mission,
-    done: &StepDone,
+    done: &StepDone<'_>,
     verdict: Verdict,
     redo_reason: &mut Option<String>,
 ) -> Result<bool> {
     let StepDone { step, n, attempts, receipt, first_line, info } = *done;
     match verdict {
         Verdict::Redo(why) if attempts < MAX_ATTEMPTS => {
-            st.db.mission_step_update(step.id, "pending", attempts, receipt, None)?;
+            update_step(st, step.id, "pending", attempts, receipt).await?;
             agent_status(st, info, "failed", format!("redo: {why}"));
-            say(st, session_id, format!("↻ Step {n} again — {}", if why.is_empty() { "not done yet".to_string() } else { why.clone() }));
+            say(st, session_id, format!("↻ Step {n} again — {}", if why.is_empty() { "not done yet".to_string() } else { why.clone() })).await;
             *redo_reason = Some(why);
         }
         Verdict::Redo(why) => {
-            st.db.mission_step_update(step.id, "failed", attempts, receipt, None)?;
+            update_step(st, step.id, "failed", attempts, receipt).await?;
             agent_status(st, info, "failed", "gave up after 3 tries".into());
-            say(st, session_id, format!("✗ Step {n} failed after {MAX_ATTEMPTS} tries ({why}); moving on."));
+            say(st, session_id, format!("✗ Step {n} failed after {MAX_ATTEMPTS} tries ({why}); moving on.")).await;
         }
         Verdict::Add(new_step) if m.steps.len() < MAX_PLAN_STEPS => {
-            st.db.mission_step_update(step.id, "done", attempts, receipt, None)?;
-            st.db.mission_step_insert_after(session_id, step.id, &new_step)?;
+            let (sid, step_id, saved, added) = (session_id.to_string(), step.id, receipt.to_string(), new_step.clone());
+            st.db
+                .run(move |db| {
+                    db.mission_step_update(step_id, "done", attempts, &saved, None)?;
+                    db.mission_step_insert_after(&sid, step_id, &added)
+                })
+                .await?;
             agent_status(st, info, "done", first_line.to_string());
-            say(st, session_id, format!("✓ Step {n}: {} — {first_line}\n➕ Added next: {new_step}", split_check(&step.title).0));
+            say(st, session_id, format!("✓ Step {n}: {} — {first_line}\n➕ Added next: {new_step}", split_check(&step.title).0)).await;
         }
         Verdict::Done => {
-            st.db.mission_step_update(step.id, "done", attempts, receipt, None)?;
+            update_step(st, step.id, "done", attempts, receipt).await?;
             agent_status(st, info, "done", first_line.to_string());
-            say(st, session_id, format!("✓ Step {n}: {} — {first_line}", split_check(&step.title).0));
+            say(st, session_id, format!("✓ Step {n}: {} — {first_line}", split_check(&step.title).0)).await;
             // The coordinator says the goal is reached: what is left is not needed.
             return Ok(true);
         }
         Verdict::Next | Verdict::Add(_) => {
-            st.db.mission_step_update(step.id, "done", attempts, receipt, None)?;
+            update_step(st, step.id, "done", attempts, receipt).await?;
             agent_status(st, info, "done", first_line.to_string());
-            say(st, session_id, format!("✓ Step {n}: {} — {first_line}", split_check(&step.title).0));
+            say(st, session_id, format!("✓ Step {n}: {} — {first_line}", split_check(&step.title).0)).await;
         }
     }
     Ok(false)
@@ -763,6 +832,16 @@ mod tests {
         let runs = worker_runs.load(Ordering::SeqCst);
         assert!((3..=9).contains(&runs), "three tries, not an endless loop: {runs}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T-060: a mission note that cannot be saved leaves a core.log line.
+    #[tokio::test]
+    async fn a_lost_note_is_logged() {
+        let st = build_state_ephemeral(crate::config::Config::default(), std::env::temp_dir()).await;
+        let gone = format!("ses_gone_{}_{}", std::process::id(), crate::db::now_ms_for_tests());
+        say(&st, &gone, "step 1 done".into()).await;
+        let log = std::fs::read_to_string(crate::config::default_state_dir().join("core.log")).unwrap_or_default();
+        assert!(log.lines().any(|l| l.contains("[mission]") && l.contains(&gone)), "no core.log line for the lost note");
     }
 
     #[tokio::test]

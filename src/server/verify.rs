@@ -289,7 +289,7 @@ pub(crate) async fn make_spec(st: &Shared, session_id: &str, request: &str, abor
         .unwrap_or_default();
     files.sort();
     files.truncate(30);
-    let context = last_assistant_text(st, session_id);
+    let context = last_assistant_text(st, session_id).await;
     // The spec step also picks the skills that fit the task: it sees every
     // skill's description, which the prompt no longer lists when there are many.
     let skills: Vec<skills::Doc> = skills::load_skills(&ws)
@@ -326,8 +326,10 @@ pub(crate) async fn final_check(
     let note = |text: String| {
         let _ = st.events.send(ServerEvent::Note { session_id: session_id.to_string(), text });
     };
-    let tool_results = || {
-        st.db.messages(session_id).map(|m| m.iter().filter(|m| m.role == "tool").count()).unwrap_or(0)
+    // T-008: the chat is read off the async threads.
+    let tool_results = move || async move {
+        let sid = session_id.to_string();
+        st.db.run(move |db| db.messages(&sid)).await.map(|m| m.iter().filter(|m| m.role == "tool").count()).unwrap_or(0)
     };
     note(format!("final check — proving {} item(s) with tools…", spec.done_when.len()));
     let mut msg = crate::spec::check_request(spec);
@@ -340,13 +342,13 @@ pub(crate) async fn final_check(
         if abort.load(Ordering::SeqCst) || !spend(budget, st, session_id, "the final check") {
             return None;
         }
-        let before = tool_results();
+        let before = tool_results().await;
         if let Err(e) = tagged("final check", session_id, agent_inner(st, session_id, &msg, abort)).await {
             note(format!("final check could not run: {e}"));
             return None;
         }
-        looked |= tool_results() > before;
-        let (pass, fails) = crate::spec::verdicts(&last_assistant_text(st, session_id).unwrap_or_default());
+        looked |= tool_results().await > before;
+        let (pass, fails) = crate::spec::verdicts(&last_assistant_text(st, session_id).await.unwrap_or_default());
         let problem = if !looked {
             "you answered without calling a tool, so nothing was proven".to_string()
         } else if fails.is_empty() && pass > 0 {
@@ -525,7 +527,7 @@ fn fix_round_message(report: &str, undone: bool) -> String {
 
 /// A failure the checks proved fixed is worth remembering here.
 async fn remember_fix(st: &Shared, session_id: &str, ws: &std::path::Path, report: String) {
-    let fix = last_assistant_text(st, session_id).unwrap_or_default();
+    let fix = last_assistant_text(st, session_id).await.unwrap_or_default();
     let path = lessons_path(st, ws);
     let _ = tokio::task::spawn_blocking(move || record_lesson_at(&path, &report, &fix)).await;
 }
@@ -634,9 +636,11 @@ pub(super) fn record_lesson_at(path: &std::path::Path, report: &str, fix: &str) 
     let _ = std::fs::write(path, lines[skip..].join("\n") + "\n");
 }
 
-/// The last thing the assistant said in a session (its fix summary).
-pub(super) fn last_assistant_text(st: &AppState, session_id: &str) -> Option<String> {
-    let msgs = st.db.messages(session_id).ok()?;
+/// The last thing the assistant said in a session (its fix summary). T-008:
+/// the chat is read off the async threads.
+pub(super) async fn last_assistant_text(st: &AppState, session_id: &str) -> Option<String> {
+    let sid = session_id.to_string();
+    let msgs = st.db.run(move |db| db.messages(&sid)).await.ok()?;
     msgs.iter().rev().filter(|m| m.role == "assistant").find_map(|m| {
         m.parts.iter().rev().find_map(|p| match p {
             Part::Text { text } if !text.trim().is_empty() => Some(text.clone()),

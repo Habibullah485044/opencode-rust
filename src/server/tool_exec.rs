@@ -280,7 +280,13 @@ pub(super) async fn check_permission_preview(
     preview: &str,
     abort: &AtomicBool,
 ) -> bool {
-    match decided_without_prompt(st, session_id, tool, detail) {
+    // T-009: the rules and the saved approvals are matched off the async
+    // threads, in one trip.
+    let decided = {
+        let (st2, sid, t, d) = (st.clone(), session_id.to_string(), tool.to_string(), detail.to_string());
+        st.db.run(move |db| Ok(decided_without_prompt(&st2, db, &sid, &t, &d))).await.unwrap_or(None)
+    };
+    match decided {
         Some(allowed) => allowed,
         None => ask_for_approval(st, session_id, tool, detail, preview, abort).await,
     }
@@ -288,10 +294,18 @@ pub(super) async fn check_permission_preview(
 
 /// The answer the rules and the permission mode give without asking the
 /// user, or `None` when the user must be asked.
-fn decided_without_prompt(st: &Shared, session_id: &str, tool: &str, detail: &str) -> Option<bool> {
+fn decided_without_prompt(st: &AppState, db: &Db, session_id: &str, tool: &str, detail: &str) -> Option<bool> {
     // "Always allow" answers belong to this chat's workspace only (S-07).
     let ws_key = crate::db::workspace_key(&st.workspace_for(session_id));
-    let remembered = |t: &str, d: &str| st.db.has_approval(&ws_key, t, d).unwrap_or(false);
+    // Each (tool, pattern) is looked up once per call: the engine asks for
+    // the same pair again (every rule, then the whole command).
+    let seen = std::cell::RefCell::new(HashMap::<(String, String), bool>::new());
+    let remembered = |t: &str, d: &str| {
+        *seen
+            .borrow_mut()
+            .entry((t.to_string(), d.to_string()))
+            .or_insert_with(|| db.has_approval(&ws_key, t, d).unwrap_or(false))
+    };
     let decision = st.engine.evaluate(tool, detail, remembered);
     // Hard `deny` rules are policy, not prompts: they survive every mode.
     if matches!(decision.action, Action::Deny) {
