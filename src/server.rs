@@ -373,6 +373,15 @@ pub async fn build_state_ephemeral_skills(
     workspace: PathBuf,
     skill_base: PathBuf,
 ) -> Shared {
+    let db = Db::open_in_memory().expect("in-memory db");
+    if let Ok(p) = db.upsert_project(&workspace) {
+        db.set_default_project(Some(&p.id));
+    }
+    build_state_ephemeral_db(cfg, workspace, skill_base, db).await
+}
+
+/// Ephemeral state on a database you give (tests that need a file DB).
+pub async fn build_state_ephemeral_db(cfg: Config, workspace: PathBuf, skill_base: PathBuf, db: Db) -> Shared {
     let engine = Engine::new(&cfg.permissions);
     let (events, _) = broadcast::channel(EVENT_BUFFER);
     let client = Client::from_cfg(cfg.provider.base_url.trim().trim_end_matches('/'), &cfg.provider)
@@ -386,13 +395,7 @@ pub async fn build_state_ephemeral_skills(
         approvals: Mutex::new(HashMap::new()),
         busy: RwLock::new(HashMap::new()),
         stats: Mutex::new(HashMap::new()),
-        db: {
-            let db = Db::open_in_memory().expect("in-memory db");
-            if let Ok(p) = db.upsert_project(&workspace) {
-                db.set_default_project(Some(&p.id));
-            }
-            db
-        },
+        db,
         cfg,
         workspace,
         // New (B-25): unit tests must not write snapshots or worktrees into
@@ -437,7 +440,14 @@ impl AppState {
                 _ => self.workspace.clone(),
             };
             let ws = crate::db::workspace_key(&folder);
-            let _ = self.db.add_approval(&ws, &entry.tool, &entry.detail, "session");
+            // T-058: the run is still allowed, but the user must be able to
+            // see why the next one asks again.
+            if let Err(e) = self.db.add_approval(&ws, &entry.tool, &entry.detail, "session") {
+                core_log(&format!(
+                    "[core] saving \"always allow\" for {} `{}` in {ws} failed: {e:#}",
+                    entry.tool, entry.detail
+                ));
+            }
         }
         let reason = if allow && always { "always" } else { "user" };
         entry.tx.send(Resolution { allowed: allow, reason }).is_ok()
@@ -858,29 +868,68 @@ fn heartbeat_error(e: &reqwest::Error) -> String {
     if cause.is_empty() { kind.to_string() } else { format!("{kind}: {cause}") }
 }
 
+/// Where [`core_log`] writes: `<state_dir>/core.log`. Unit tests get a
+/// temp folder of their own, so they never touch the user's log (T-145).
+pub fn core_log_path() -> PathBuf {
+    let dir = if cfg!(test) {
+        std::env::temp_dir().join(format!("ocrs-test-state-{}", std::process::id()))
+    } else {
+        crate::config::default_state_dir()
+    };
+    dir.join("core.log")
+}
+
+/// T-055: core.log is moved to core.log.1 (replacing the older one) once it
+/// passes this size, so a long-lived install does not grow it forever.
+const CORE_LOG_MAX: u64 = 2 * 1024 * 1024;
+
 /// New (B-48): append one line to `<state_dir>/core.log`. Use this instead
 /// of `eprintln!` in code that can run while the TUI owns the terminal.
 pub fn core_log(msg: &str) {
-    use std::io::Write;
     // Opened once and kept: this runs on async threads, and reopening the
     // file (plus create_dir_all) on every line was a blocking call each time.
-    static LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+    static LOG: Mutex<Option<(std::fs::File, u64)>> = Mutex::new(None);
     let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
-    if log.is_none() {
-        let path = crate::config::default_state_dir().join("core.log");
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        *log = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if let Some(f) = log.as_mut() {
+    append_log(&mut log, &core_log_path(), CORE_LOG_MAX, &format!("[{stamp}] {msg}"));
+}
+
+/// One line to the log at `path` through the kept handle in `slot` (file and
+/// its size), opening it when needed and rotating it to `<path>.1` once it
+/// has reached `max` bytes.
+fn append_log(slot: &mut Option<(std::fs::File, u64)>, path: &std::path::Path, max: u64, line: &str) {
+    use std::io::Write;
+    if slot.is_none() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        *slot = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(|f| {
+                let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                (f, size)
+            });
+    }
+    if slot.as_ref().is_some_and(|(_, size)| *size >= max) {
+        // Closed first: Windows cannot rename a file that is open.
+        *slot = None;
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(path, &old);
+        *slot = std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(|f| (f, 0));
+    }
+    if let Some((f, size)) = slot.as_mut() {
         // A failed write (file deleted, disk full) reopens next time.
-        if writeln!(f, "[{stamp}] {msg}").is_err() {
-            *log = None;
+        match writeln!(f, "{line}") {
+            Ok(()) => *size += line.len() as u64 + 1,
+            Err(_) => *slot = None,
         }
     }
 }

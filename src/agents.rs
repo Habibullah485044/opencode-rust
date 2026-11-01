@@ -925,7 +925,7 @@ mod tests {
         std::fs::write(dir.join("ok.md"), "---\nname: fine\n---\nDo fine work.\n").unwrap();
         let roles = load_subagents(&ws);
         assert!(roles.iter().any(|r| r.name == "fine"), "the good role still loads");
-        let log = std::fs::read_to_string(crate::config::default_state_dir().join("core.log")).unwrap_or_default();
+        let log = std::fs::read_to_string(crate::server::core_log_path()).unwrap_or_default();
         let line = format!("[agents] skipping role file {}", dir.join("x.md").display());
         assert!(log.contains(&line), "core.log has the broken file");
         assert!(!log_skipped_role(&dir.join("x.md"), "needs `---` frontmatter with a name, and a prompt after it"));

@@ -487,6 +487,59 @@ async fn a_chats_folder_is_looked_up_once() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// T-055: past the size limit the log moves to `.1` and a new one starts.
+#[test]
+fn the_log_rotates_past_its_size_limit() {
+    let dir = std::env::temp_dir().join(format!("ocrs-log-rotate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("core.log");
+    let mut slot = None;
+    for i in 0..5 {
+        append_log(&mut slot, &path, 30, &format!("line {i} 0123456789"));
+    }
+    drop(slot);
+    let old = std::fs::read_to_string(dir.join("core.log.1")).unwrap();
+    let new = std::fs::read_to_string(&path).unwrap();
+    assert!(old.contains("line 3") && !old.contains("line 0"), "the older .1 was replaced: {old}");
+    assert_eq!(new.trim(), "line 4 0123456789", "a new log started");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T-058: a failed "always allow" save is written to core.log.
+#[tokio::test]
+async fn a_failed_always_allow_is_logged() {
+    let dir = std::env::temp_dir().join(format!("ocrs-always-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("broken.db");
+    let db = crate::db::Db::open(&path).unwrap();
+    // Force every approval save to fail.
+    rusqlite::Connection::open(&path).unwrap().execute_batch("DROP TABLE approvals").unwrap();
+    let st = build_state_ephemeral_db(crate::config::Config::default(), dir.clone(), dir.join("skills"), db).await;
+    let (tx, rx) = oneshot::channel();
+    let detail = format!("always-fail-{}", std::process::id());
+    let request = ServerEvent::ApprovalNeeded {
+        session_id: "s".into(),
+        approval_id: "apr_x".into(),
+        tool: "bash".into(),
+        detail: detail.clone(),
+        preview: String::new(),
+    };
+    st.approvals.lock().unwrap().insert(
+        "apr_x".into(),
+        ApprovalEntry { tx, tool: "bash".into(), detail: detail.clone(), request },
+    );
+    assert!(st.decide("apr_x", true, true));
+    assert!(rx.await.unwrap().allowed, "the call itself is still allowed");
+    let log = std::fs::read_to_string(core_log_path()).unwrap_or_default();
+    assert!(
+        log.lines().any(|l| l.contains("saving \"always allow\" for bash") && l.contains(&detail)),
+        "core.log has the failure"
+    );
+    drop(st);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// T-094: `forget_session` clears every per-chat map.
 #[tokio::test]
 async fn forget_session_clears_every_per_chat_map() {

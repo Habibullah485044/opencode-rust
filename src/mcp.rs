@@ -940,7 +940,7 @@ mod tests {
         assert!(err.contains(r#"command = "cmd", args = ["/c", "ocrs-no-such-command-xyz", ...]"#), "{err}");
         let mut reg = Registry::default();
         reg.start_all(&[cfg]).await;
-        let log = std::fs::read_to_string(crate::config::default_state_dir().join("core.log")).unwrap_or_default();
+        let log = std::fs::read_to_string(crate::server::core_log_path()).unwrap_or_default();
         assert!(log.contains(&format!("[mcp] failed to start `{name}`")), "core.log has the failure");
     }
 
