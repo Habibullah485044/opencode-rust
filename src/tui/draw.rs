@@ -82,7 +82,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "ready".to_string()
     };
-    let session = app.session_id.as_deref().unwrap_or("-");
+    // T-100: a short id; the full one pushed the api status off narrow
+    // terminals.
+    let session = app.session_id.as_deref().map_or("-", short_session_id);
     let api = match app.api {
         Some((true, ms)) => {
             Span::styled(format!("api ok {ms}ms"), Style::default().fg(FB_SUCCESS))
@@ -773,4 +775,34 @@ pub fn approval_detail_lines(detail: &str) -> Vec<String> {
                 .collect()
         })
         .collect()
+}
+
+/// The first 12 characters of a session id (`ses_` + 8): enough to tell
+/// chats apart in the header.
+fn short_session_id(id: &str) -> &str {
+    id.char_indices().nth(12).map_or(id, |(i, _)| &id[..i])
+}
+
+#[cfg(test)]
+mod t100_tests {
+    use super::*;
+
+    /// At 80 columns the header still shows the api status next to a long
+    /// session id, a model and the debt counter.
+    #[test]
+    fn the_header_fits_80_columns() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        app.session_id = Some("ses_0123456789abcdef0123456789".into());
+        app.model = Some("qwen3-coder".into());
+        app.api = Some((true, 42));
+        app.stats = Some((12, 3, 1));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let header: String = (0..80).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(header.contains("api ok 42ms"), "{header}");
+        assert!(header.contains("session ses_01234567"), "{header}");
+        assert!(!header.contains("89abcdef"), "the id is shortened: {header}");
+    }
 }
